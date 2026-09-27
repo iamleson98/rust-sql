@@ -114,6 +114,36 @@ pub fn decode_record(payload: &[u8], n_cols: usize) -> Result<Vec<Value>, String
     decode_record_enc(payload, n_cols, TextEnc::Utf8)
 }
 
+/// Decode EVERY column a record's header declares — no column cap, no
+/// NULL padding. The b-tree mutator's lazy entry decode (index cells
+/// carry their own arity; callers that pass `usize::MAX` to
+/// [`decode_record_enc`] would blow the capacity arithmetic instead).
+pub fn decode_record_all_enc(payload: &[u8], enc: TextEnc) -> Result<Vec<Value>, String> {
+    let (header_size, mut off) = read_varint(payload, 0).ok_or("truncated record header")?;
+    let header_size = header_size as usize;
+    if header_size > payload.len() || header_size == 0 {
+        return Err(format!("bad record header size {header_size}"));
+    }
+    let mut serials: Vec<u64> = Vec::with_capacity(16);
+    while off < header_size {
+        let (st, used) = read_varint(payload, off).ok_or("truncated serial type")?;
+        serials.push(st as u64);
+        off += used;
+    }
+    if off != header_size {
+        return Err("record header overrun".into());
+    }
+    let mut values = Vec::with_capacity(serials.len());
+    let mut body = header_size;
+    for st in serials {
+        if st == 10 || st == 11 {
+            return Err(format!("reserved serial type {st}"));
+        }
+        values.push(decode_value(payload, &mut body, st, enc)?);
+    }
+    Ok(values)
+}
+
 /// Encoding-aware decode (see [`decode_record`]).
 pub fn decode_record_enc(
     payload: &[u8],
@@ -125,8 +155,10 @@ pub fn decode_record_enc(
     if header_size > payload.len() || header_size == 0 {
         return Err(format!("bad record header size {header_size}"));
     }
-    // Parse serial types.
-    let mut serials: Vec<u64> = Vec::with_capacity(n_cols.max(4));
+    // Parse serial types. The capacity is a HINT — a caller passing a
+    // huge `n_cols` (the mutator once passed `usize::MAX`) must not
+    // blow up the allocation before the record's own bounds do.
+    let mut serials: Vec<u64> = Vec::with_capacity(n_cols.clamp(4, 64));
     while off < header_size {
         let (st, used) = read_varint(payload, off).ok_or("truncated serial type")?;
         serials.push(st as u64);

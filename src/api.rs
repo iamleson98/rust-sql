@@ -636,10 +636,16 @@ pub(crate) struct ForeignSqlite {
     /// `storage::sqlitefmt::container` for the architecture.
     coord: std::sync::Arc<crate::storage::sqlitefmt::container::Container>,
     /// This session's last-publish snapshot: the engine-root change
-    /// epochs and schema signature as of its last successful commit.
-    /// The next commit diffs against this to decide which objects to
-    /// splice (O(#objects), never O(database)).
+    /// epochs, the schema-tree change epoch and the per-object span
+    /// versions as of its last successful commit. The next commit
+    /// diffs against this to decide which objects to splice or
+    /// page-mutate (O(#objects) detection, O(changed pages) work).
     snap: Mutex<ForeignSnap>,
+    /// The row-delta journal — page-level splicing's capture side (see
+    /// `storage::sqlitefmt::delta`). Advisory by construction: any
+    /// exactness doubt poisons it and the commit falls back to the
+    /// whole-object splice.
+    journal: std::sync::Arc<Mutex<crate::storage::sqlitefmt::delta::DeltaJournal>>,
     /// True when this session's commits may still live only in the WAL
     /// sidecar (splice publishes under WAL mode; cleared by full
     /// publishes). The close-time contract: the LAST session folds the
@@ -651,17 +657,42 @@ pub(crate) struct ForeignSqlite {
     wal_pending: AtomicBool,
 }
 
+/// One object's cached change-epoch handle — the CREATE-time root's
+/// `Arc<AtomicU64>` (stable for the object's lifetime; root splits
+/// alias onto it), plus the epoch this session's last successful
+/// publish recorded. The per-commit dirty walk is then one LOCK-FREE
+/// atomic load per object; the pager's shard mutex is taken only when
+/// the slot set is (re)built — on DDL, where the catalog itself
+/// changed. `MAX` is the new-object baseline: the next walk marks it
+/// dirty unconditionally (a fresh session's first publish splices
+/// everything, the byte-compare decides what moves).
+struct ObjectEpochSlot {
+    slot: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    last: u64,
+}
+
 /// One session's last-publish snapshot (see `ForeignSqlite::snap`).
 #[derive(Default)]
 struct ForeignSnap {
-    /// Object key (lowercased schema name) → the owning engine root's
-    /// change epoch at the last successful publish — the diff base for
-    /// the next commit's dirty-object set.
-    epochs: HashMap<String, u64>,
-    /// Schema signature at the last publish: `(kind, name, sql, engine
-    /// root)` per persistent object, sorted — any difference is DDL
-    /// (which takes the full-publish path).
-    sig: Vec<(u8, String, String, u32)>,
+    /// Object key (lowercased schema name) → its change-epoch slot +
+    /// last-published epoch — the diff base for the next commit's
+    /// dirty-object set. Rebuilt alongside the cached snapshot (only
+    /// when the schema epoch moves — every catalog write bumps it).
+    slots: HashMap<String, ObjectEpochSlot>,
+    /// Objects that left the catalog at the last slot REBUILD (DROP /
+    /// rename), stashed for the next commit's publish to free — the
+    /// rebuild itself destroys the old slot set, so the diff is taken
+    /// there. Empty on the steady-state path (no DDL → no drops).
+    pending_dropped: Vec<String>,
+    /// The schema TREE's change epoch (`Pager::root_epoch(0)`) at the
+    /// last publish — any DDL or rootpage schema-row rewrite bumps it,
+    /// so this single u64 replaces the per-object signature build
+    /// (string clones + sort, O(total schema text) per commit).
+    schema_epoch: u64,
+    /// Object key → the coordinator span version this session's last
+    /// publish recorded. Page-level mutations are offered only on a
+    /// match (another session's publish in between → whole-splice).
+    versions: HashMap<String, u64>,
     /// Set once the session's first publish (full) has happened.
     published: bool,
     /// Set when the snapshot was seeded from a CLEAN LOAD (the
@@ -675,6 +706,16 @@ struct ForeignSnap {
     loaded_uv: u32,
     loaded_app: u32,
     loaded_journal_wal: bool,
+    /// Cached catalog snapshot + the schema epoch it was captured at.
+    /// A stable epoch means no catalog write happened since the
+    /// capture (every DDL and every rootpage schema-row rewrite bumps
+    /// root 0), so the descriptor set — the O(#objects) capture walk
+    /// with its name-keyed map builds — is reusable verbatim. The
+    /// Arc's internal `Arc<Table>` handles are the catalog's own, so
+    /// descriptor-level changes always arrive through a DDL (epoch
+    /// bump) and never mutate behind the cache.
+    cached_snapshot: Option<std::sync::Arc<SqliteCatalogSnapshot>>,
+    cached_epoch: u64,
 }
 
 impl ForeignSqlite {
@@ -715,37 +756,18 @@ struct SqliteCatalogSnapshot {
     indexes: HashMap<String, std::sync::Arc<Index>>,
     views: HashMap<String, std::sync::Arc<crate::schema::View>>,
     triggers: HashMap<String, std::sync::Arc<crate::schema::Trigger>>,
+    /// True when any persistent table carries an AUTOINCREMENT column
+    /// — the cheap gate for the synthesized-sqlite_sequence check
+    /// (the descriptor walk it guards is O(#objects); without this
+    /// flag every commit on an autoincrement-free schema would pay
+    /// it).
+    has_autoincrement: bool,
     /// The resolved sqlite_schema emit order (source rows in creation
     /// order, engine-created objects appended per kind).
     order: Vec<SchemaOrderKey>,
 }
 
-impl SqliteCatalogSnapshot {
-    /// The schema-change signature: `(kind, name, sql, engine root)`
-    /// per object, sorted — any difference between commits is DDL and
-    /// routes the next publish through the full path (schema rows
-    /// move). Cheap to build and compare (schema-sized, never
-    /// data-sized).
-    fn schema_signature(&self) -> Vec<(u8, String, String, u32)> {
-        let mut sig: Vec<(u8, String, String, u32)> = Vec::with_capacity(
-            self.tables.len() + self.indexes.len() + self.views.len() + self.triggers.len(),
-        );
-        for (n, t) in &self.tables {
-            sig.push((0, n.clone(), t.create_sql.clone(), t.root_page));
-        }
-        for (n, i) in &self.indexes {
-            sig.push((1, n.clone(), i.create_sql.clone(), i.root_page));
-        }
-        for (n, v) in &self.views {
-            sig.push((2, n.clone(), v.create_sql.clone(), 0));
-        }
-        for (n, t) in &self.triggers {
-            sig.push((3, n.clone(), t.create_sql.clone(), 0));
-        }
-        sig.sort();
-        sig
-    }
-}
+impl SqliteCatalogSnapshot {}
 
 /// The content source of one sqlite_schema row (see
 /// `Database::sqlite_schema_row_descs`).
@@ -3006,6 +3028,7 @@ impl Database {
                 c
             },
             snap: Mutex::new(ForeignSnap::default()),
+            journal: std::sync::Arc::new(Mutex::new(Default::default())),
             wal_pending: AtomicBool::new(false),
         };
         db.foreign = Some(foreign);
@@ -3064,6 +3087,7 @@ impl Database {
                 c
             },
             snap: Mutex::new(ForeignSnap::default()),
+            journal: std::sync::Arc::new(Mutex::new(Default::default())),
             wal_pending: AtomicBool::new(false),
         });
         db.dump_foreign()?;
@@ -3161,24 +3185,37 @@ impl Database {
             return;
         };
         let snapshot = self.sqlite_catalog_snapshot(foreign.order.lock().clone());
-        let mut epochs: HashMap<String, u64> =
+        // The load's post-state: every slot records its CURRENT epoch
+        // (the in-memory state IS the file's committed state — the
+        // byte-stable idle-reopen contract: no write since the load,
+        // no dirty object, no publish).
+        let mut slots: HashMap<String, ObjectEpochSlot> =
             HashMap::with_capacity(snapshot.tables.len() + snapshot.indexes.len());
         for (name, t) in &snapshot.tables {
-            epochs.insert(name.clone(), self.pager.root_epoch(t.root_page));
+            let slot = self.pager.root_epoch_slot(t.root_page);
+            let last = slot.load(Ordering::Acquire);
+            slots.insert(name.clone(), ObjectEpochSlot { slot, last });
         }
         for (name, i) in &snapshot.indexes {
-            epochs.insert(name.clone(), self.pager.root_epoch(i.root_page));
+            let slot = self.pager.root_epoch_slot(i.root_page);
+            let last = slot.load(Ordering::Acquire);
+            slots.insert(name.clone(), ObjectEpochSlot { slot, last });
         }
-        let sig = snapshot.schema_signature();
+        let schema_epoch = self.pager.root_epoch(0);
         let journal_wal = foreign.journal_wal.load(Ordering::Acquire);
         let mut snap = foreign.snap.lock();
-        snap.epochs = epochs;
-        snap.sig = sig;
+        snap.slots = slots;
+        snap.pending_dropped.clear();
+        snap.schema_epoch = schema_epoch;
         snap.published = true;
         snap.loaded_clean = true;
         snap.loaded_uv = loaded_uv;
         snap.loaded_app = loaded_app;
         snap.loaded_journal_wal = journal_wal;
+        // The load just replaced the catalog: the snapshot cache (keyed
+        // on the PRE-load schema epoch) is stale by construction.
+        snap.cached_snapshot = None;
+        snap.cached_epoch = 0;
     }
 
     fn load_foreign_image_inner(
@@ -3418,6 +3455,42 @@ impl Database {
         Ok(())
     }
 
+    /// Arm the SQLite-format delta journal for ONE statement (see
+    /// `storage::sqlitefmt::delta` — page-level splicing's capture
+    /// side). Foreign-backed databases only: one atomic load when the
+    /// database is native / in-memory. The concurrent regime's write
+    /// paths (page shadows, MERGE replay) do not flow through the
+    /// journal — capture suspends (poison) while it is open. A nested
+    /// `execute` (the sink already armed) also poisons: statement
+    /// boundaries cannot be tracked across re-entrancy.
+    pub(crate) fn delta_stmt_scope(&self) -> Option<crate::preupdate::DeltaGuard> {
+        let foreign = self.foreign.as_ref()?;
+        if self.concurrent_active.load(Ordering::Acquire) {
+            foreign.journal.lock().poison();
+            return None;
+        }
+        if !foreign.journal.lock().active() {
+            return None;
+        }
+        let target = foreign.journal.clone();
+        if crate::preupdate::arm_delta_sink(target) {
+            Some(crate::preupdate::delta_guard())
+        } else {
+            foreign.journal.lock().poison();
+            None
+        }
+    }
+
+    /// Drop the delta journal (a statement failed — the engine undid
+    /// its rows, and the journal's per-statement watermarks cannot see
+    /// re-entrant or partially-unwound shapes from here; conservative
+    /// clear, the next publish rebuilds whole-object).
+    pub(crate) fn poison_delta_journal(&self) {
+        if let Some(foreign) = self.foreign.as_ref() {
+            foreign.journal.lock().poison();
+        }
+    }
+
     /// [`note_foreign_write`] for the streaming-statement (prepare/step)
     /// path: DML executed through `Statement` bypasses
     /// `Database::execute` entirely, so the statement epilogue calls this
@@ -3486,65 +3559,122 @@ impl Database {
         // AHEAD of the collected data — is impossible because every
         // mutation path bumps its root on exit, after the pages are
         // live.
-        let snapshot = self.sqlite_catalog_snapshot(foreign.order.lock().clone());
-        // Per-object change epochs, keyed by the CATALOG's CREATE-time
-        // root — stable for the object's lifetime (root splits alias
-        // the new root's epoch cell onto the old one, so the catalog
-        // root's cell accumulates every write no matter which root the
-        // executor resolved).
-        let mut epochs_now: HashMap<String, u64> =
-            HashMap::with_capacity(snapshot.tables.len() + snapshot.indexes.len());
-        for (name, t) in &snapshot.tables {
-            epochs_now.insert(name.clone(), self.pager.root_epoch(t.root_page));
-        }
-        for (name, i) in &snapshot.indexes {
-            epochs_now.insert(name.clone(), self.pager.root_epoch(i.root_page));
-        }
-        let sig = snapshot.schema_signature();
-        let (published, prev_epochs, prev_sig, loaded_clean, loaded_uv, loaded_app, loaded_jw) = {
+        //
+        // The catalog snapshot is CACHED across commits (a stable
+        // schema epoch means the catalog did not change — every DDL
+        // and every rootpage schema-row rewrite bumps root 0), so the
+        // per-commit metadata work is one epoch read per object and
+        // one hash lookup per object — no per-object capture walk, no
+        // name-keyed map rebuilds, no String clones for clean objects.
+        let schema_epoch_now = self.pager.root_epoch(0);
+        let snapshot: std::sync::Arc<SqliteCatalogSnapshot> = {
             let snap = foreign.snap.lock();
+            match &snap.cached_snapshot {
+                Some(s) if snap.published && snap.cached_epoch == schema_epoch_now => s.clone(),
+                _ => {
+                    drop(snap);
+                    if std::env::var_os("RSQL_SPLICE_TRACE").is_some() {
+                        eprintln!("[splice] snapshot cache MISS (capture + slot rebuild)");
+                    }
+                    let s = std::sync::Arc::new(
+                        self.sqlite_catalog_snapshot(foreign.order.lock().clone()),
+                    );
+                    let mut snap = foreign.snap.lock();
+                    // A racing thread may have stored a fresher capture
+                    // (captured at a LATER epoch); never regress it.
+                    if snap.cached_epoch <= schema_epoch_now {
+                        // Rebuild the epoch-slot set from the new
+                        // snapshot: existing names keep their recorded
+                        // last-published epoch, new names take the MAX
+                        // baseline (dirty on the next walk), and names
+                        // that left the catalog are stashed as this
+                        // session's pending drops (the rebuild destroys
+                        // the old set — the diff is taken here).
+                        let mut slots = HashMap::with_capacity(s.tables.len() + s.indexes.len());
+                        let mut dropped_here: Vec<String> = Vec::new();
+                        for (name, t) in &s.tables {
+                            let last = snap.slots.get(name).map(|os| os.last).unwrap_or(u64::MAX);
+                            slots.insert(
+                                name.clone(),
+                                ObjectEpochSlot {
+                                    slot: self.pager.root_epoch_slot(t.root_page),
+                                    last,
+                                },
+                            );
+                        }
+                        for (name, i) in &s.indexes {
+                            let last = snap.slots.get(name).map(|os| os.last).unwrap_or(u64::MAX);
+                            slots.insert(
+                                name.clone(),
+                                ObjectEpochSlot {
+                                    slot: self.pager.root_epoch_slot(i.root_page),
+                                    last,
+                                },
+                            );
+                        }
+                        for name in snap.slots.keys() {
+                            if !s.tables.contains_key(name) && !s.indexes.contains_key(name) {
+                                dropped_here.push(name.clone());
+                            }
+                        }
+                        if !dropped_here.is_empty() {
+                            let pending = std::mem::take(&mut snap.pending_dropped);
+                            let mut merged = dropped_here;
+                            merged.extend(pending);
+                            snap.pending_dropped = merged;
+                        }
+                        snap.slots = slots;
+                        snap.cached_snapshot = Some(s.clone());
+                        snap.cached_epoch = schema_epoch_now;
+                    }
+                    s
+                }
+            }
+        };
+        // The per-object dirty walk: one LOCK-FREE atomic load per
+        // object (the slots were resolved at the last catalog change),
+        // a String clone only for the actually-dirty names.
+        let (
+            published,
+            prev_schema_epoch,
+            loaded_clean,
+            loaded_uv,
+            loaded_app,
+            loaded_jw,
+            dirty_keys,
+            dropped_keys,
+            epoch_updates,
+        ) = {
+            let mut snap = foreign.snap.lock();
+            let published = snap.published;
+            let mut dirty: Vec<String> = Vec::new();
+            let mut updates: Vec<(String, u64)> = Vec::new();
+            for (name, os) in &snap.slots {
+                let e = os.slot.load(std::sync::atomic::Ordering::Acquire);
+                if e != os.last {
+                    updates.push((name.clone(), e));
+                    dirty.push(name.clone());
+                }
+            }
+            // Object-set changes ride the schema epoch: every CREATE /
+            // DROP / ALTER writes through the schema tree, so a stable
+            // epoch means the set is IDENTICAL since the last publish
+            // and the (rebuilt-and-stashed) drops list is the only
+            // other source.
+            let dropped: Vec<String> = std::mem::take(&mut snap.pending_dropped);
             (
-                snap.published,
-                snap.epochs.clone(),
-                snap.sig.clone(),
+                published,
+                snap.schema_epoch,
                 snap.loaded_clean,
                 snap.loaded_uv,
                 snap.loaded_app,
                 snap.loaded_journal_wal,
+                dirty,
+                dropped,
+                updates,
             )
         };
-        let first_of_session = !published;
-        // Any schema difference (object set, DDL text) is DDL — it splices
-        // like any other commit (new objects allocate, dropped ones free
-        // into the container freelist, the schema tree rebuilds in
-        // place); only the COOKIE bumps for it.
-        let schema_changed = published && sig != prev_sig;
-        let dirty_keys: Vec<String> = if first_of_session {
-            // A fresh session on an ESTABLISHED coordinator splices
-            // straight away (prev_epochs empty → every object is
-            // "dirty" → the byte-compare decides); the full publish is
-            // for the session's true first publish only (can_splice
-            // fails until the coordinator holds a page space).
-            epochs_now.keys().cloned().collect()
-        } else {
-            epochs_now
-                .iter()
-                .filter(|(k, e)| prev_epochs.get(*k) != Some(e))
-                .map(|(k, _)| k.clone())
-                .collect()
-        };
-        // Objects this session saw at its last publish but whose catalog
-        // entries are now gone (DROP TABLE / INDEX, renames): their
-        // spans' pages join the container freelist.
-        let dropped_keys: Vec<String> = if first_of_session {
-            Vec::new()
-        } else {
-            prev_epochs
-                .keys()
-                .filter(|k| !epochs_now.contains_key(k.as_str()))
-                .cloned()
-                .collect()
-        };
+        let schema_changed = published && schema_epoch_now != prev_schema_epoch;
 
         let (counter, cookie) = coord.next_counters(schema_changed);
         let params = PublishParams {
@@ -3577,7 +3707,13 @@ impl Database {
             && params.application_id == loaded_app
             && params.journal_wal == loaded_jw
         {
-            self.finish_foreign_publish(foreign, &params, epochs_now, sig);
+            self.finish_foreign_publish(
+                foreign,
+                &params,
+                &epoch_updates,
+                &dropped_keys,
+                schema_epoch_now,
+            );
             return Ok(());
         }
 
@@ -3601,7 +3737,13 @@ impl Database {
                     foreign
                         .wal_pending
                         .store(coord.wal_has_frames(), Ordering::Release);
-                    self.finish_foreign_publish(foreign, &params, epochs_now, sig);
+                    self.finish_foreign_publish(
+                        foreign,
+                        &params,
+                        &epoch_updates,
+                        &dropped_keys,
+                        schema_epoch_now,
+                    );
                     return Ok(());
                 }
                 Ok(false) => {
@@ -3609,7 +3751,13 @@ impl Database {
                     // no write, no counter advance — but the session's
                     // snapshot still refreshes so these objects are not
                     // re-collected next commit.
-                    self.finish_foreign_publish(foreign, &params, epochs_now, sig);
+                    self.finish_foreign_publish(
+                        foreign,
+                        &params,
+                        &epoch_updates,
+                        &dropped_keys,
+                        schema_epoch_now,
+                    );
                     return Ok(());
                 }
                 Err(_) => {
@@ -3630,7 +3778,13 @@ impl Database {
             .publish_full(&built, &params)
             .map_err(|e| Error::Io(std::io::Error::other(e)))?;
         foreign.wal_pending.store(false, Ordering::Release);
-        self.finish_foreign_publish(foreign, &params, epochs_now, sig);
+        self.finish_foreign_publish(
+            foreign,
+            &params,
+            &epoch_updates,
+            &dropped_keys,
+            schema_epoch_now,
+        );
         Ok(())
     }
 
@@ -3646,21 +3800,76 @@ impl Database {
         coord: &std::sync::Arc<crate::storage::sqlitefmt::container::Container>,
         params: &crate::storage::sqlitefmt::container::PublishParams,
     ) -> Result<bool> {
-        use crate::storage::sqlitefmt::container::{SpliceItem, SpliceSchemaRow};
+        use crate::storage::sqlitefmt::container::{
+            MutateItem, SpliceError, SpliceItem, SpliceSchemaRow,
+        };
         use crate::storage::sqlitefmt::writer::SpanKey;
         use crate::storage::sqlitefmt::OutObject;
 
         // Only the objects whose trees were written get re-collected —
-        // the per-commit CPU scales with the changed data, never the
-        // database.
+        // and of those, the ones with an EXACT row-delta journal and a
+        // matching span version go through PAGE-LEVEL MUTATION instead
+        // (O(changed pages) — see `storage::sqlitefmt::mutator`).
         let registry = self.plugins.read().clone();
+        let foreign = self.foreign.as_ref().unwrap();
+        let enc = foreign.text_enc();
+        // The journal is usable only when no DDL touched the interval
+        // (DDL re-keys objects; the mutate path would verify-fail and
+        // fall back anyway, but skipping it up front is cheaper).
+        let journal_usable = !schema_changed && foreign.journal.lock().active();
+        if std::env::var_os("RSQL_SPLICE_TRACE").is_some() {
+            let j = foreign.journal.lock();
+            eprintln!(
+                "[splice] decision: journal_usable={journal_usable} schema_changed={schema_changed} active={} deltas={:?}",
+                j.active(),
+                j.deltas.keys().collect::<Vec<_>>(),
+            );
+        }
+        // The dirty keys' recorded span versions — O(dirty), never a
+        // clone of the whole per-object map (the many-tables case
+        // would pay an O(#objects) String-clone walk per commit).
+        let snap_versions: HashMap<String, u64> = {
+            let snap = foreign.snap.lock();
+            dirty_keys
+                .iter()
+                .filter_map(|k| snap.versions.get(k).map(|v| (k.clone(), *v)))
+                .collect()
+        };
+        let version_ok = |key: &str| -> bool {
+            let v = snap_versions.get(key).copied().unwrap_or(0);
+            v != 0 && v == coord.span_version(&SpanKey::Object(key.to_string()))
+        };
         let mut items: Vec<SpliceItem> = Vec::with_capacity(dirty_keys.len());
+        let mut mutates: Vec<MutateItem> = Vec::new();
         for key in dirty_keys {
             if let Some(table) = snapshot.tables.get(key) {
                 if table.vtab.is_some() {
                     // Virtual tables have no b-tree (rootpage 0); their
                     // schema rows are DDL-stable.
                     continue;
+                }
+                if journal_usable {
+                    let deltas = foreign
+                        .journal
+                        .lock()
+                        .deltas
+                        .get(key)
+                        .filter(|d| !d.is_empty() && d.len() <= 4096)
+                        .cloned();
+                    if let Some(deltas) = deltas {
+                        let ops = if table.without_rowid {
+                            self.without_rowid_mutate_ops(table, &deltas, &registry)
+                        } else {
+                            self.table_mutate_ops(table, &deltas, enc)
+                        };
+                        if let Some(ops) = ops.filter(|_| version_ok(key)) {
+                            mutates.push(MutateItem {
+                                key: SpanKey::Object(key.clone()),
+                                ops,
+                            });
+                            continue;
+                        }
+                    }
                 }
                 let obj = if table.without_rowid {
                     OutObject::WithoutRowid {
@@ -3682,6 +3891,41 @@ impl Database {
                     object: obj,
                 });
             } else if let Some(idx) = snapshot.indexes.get(key) {
+                // Index deltas are DERIVED from the owning table's row
+                // journal at publish time (the same composition the
+                // whole-object dump uses, so both paths write
+                // byte-identical entries).
+                if journal_usable
+                    && matches!(idx.kind, crate::schema::IndexKind::Btree)
+                    && idx.columns.iter().all(|c| c.expr.is_none())
+                    && idx.partial_expr.is_none()
+                {
+                    let table_lc = idx.table.to_ascii_lowercase();
+                    let eligible_table = snapshot
+                        .tables
+                        .get(&table_lc)
+                        .is_some_and(|t| !t.without_rowid && t.vtab.is_none());
+                    if eligible_table {
+                        let deltas = foreign
+                            .journal
+                            .lock()
+                            .deltas
+                            .get(&table_lc)
+                            .filter(|d| !d.is_empty() && d.len() <= 4096)
+                            .cloned();
+                        if let Some(deltas) = deltas {
+                            let table = &snapshot.tables[&table_lc];
+                            let ops = self.index_mutate_ops(idx, table, &deltas, &registry);
+                            if let Some(ops) = ops.filter(|_| version_ok(key)) {
+                                mutates.push(MutateItem {
+                                    key: SpanKey::Object(key.clone()),
+                                    ops,
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                }
                 let obj = self.dump_index_object(idx.as_ref(), &snapshot.tables, &registry)?;
                 items.push(SpliceItem {
                     key: SpanKey::Object(key.clone()),
@@ -3691,21 +3935,28 @@ impl Database {
         }
 
         // The schema rows (emit order, the shared descriptor walk) for
-        // the schema-tree rebuild on DDL / root moves.
-        let descs = self.sqlite_schema_row_descs(snapshot);
-        let schema_rows: Vec<SpliceSchemaRow> = descs
-            .iter()
-            .map(|d| SpliceSchemaRow {
-                kind: d.kind.to_string(),
-                name: d.name.clone(),
-                tbl_name: d.tbl_name.clone(),
-                sql: d.sql.clone(),
-                key: match &d.source {
-                    SchemaRowSource::Table(_) | SchemaRowSource::Index(_) => Some(d.key.clone()),
-                    _ => None,
-                },
-            })
-            .collect();
+        // the schema-tree rebuild on DDL / root moves — LAZY: the
+        // descriptor walk is O(#objects) with several String clones per
+        // object, and a data-only commit on a stable layout (the
+        // mutate path — roots never move) never needs it.
+        let schema_rows_of = || {
+            let descs = self.sqlite_schema_row_descs(snapshot);
+            descs
+                .iter()
+                .map(|d| SpliceSchemaRow {
+                    kind: d.kind.to_string(),
+                    name: d.name.clone(),
+                    tbl_name: d.tbl_name.clone(),
+                    sql: d.sql.clone(),
+                    key: match &d.source {
+                        SchemaRowSource::Table(_) | SchemaRowSource::Index(_) => {
+                            Some(d.key.clone())
+                        }
+                        _ => None,
+                    },
+                })
+                .collect::<Vec<SpliceSchemaRow>>()
+        };
 
         // The synthesized sqlite_sequence appearing for the first time
         // (a legacy image whose catalog never carried the table gains
@@ -3713,40 +3964,43 @@ impl Database {
         // build it exactly like the full collector does. Once the span
         // exists, later commits treat it as a schema row only (its
         // content is static until the real catalog table materializes,
-        // which is DDL and re-keys the same span).
+        // which is DDL and re-keys the same span). The descriptor walk
+        // runs only while the span does not exist yet.
         let seq_key = SpanKey::Object("sqlite_sequence".into());
-        if descs
-            .iter()
-            .any(|d| matches!(d.source, SchemaRowSource::SynthSequence))
-            && !coord.has_span(&seq_key)
-        {
-            let foreign = self.foreign.as_ref().unwrap();
-            let sequences = foreign.sequences.lock();
-            let mut seq_rows: Vec<(i64, Vec<Value>)> = Vec::new();
-            for (name, t) in &snapshot.tables {
-                if !t.columns.iter().any(|c| c.autoincrement) {
-                    continue;
+        if snapshot.has_autoincrement && !coord.has_span(&seq_key) {
+            let descs = self.sqlite_schema_row_descs(snapshot);
+            if descs
+                .iter()
+                .any(|d| matches!(d.source, SchemaRowSource::SynthSequence))
+            {
+                let foreign = self.foreign.as_ref().unwrap();
+                let sequences = foreign.sequences.lock();
+                let mut seq_rows: Vec<(i64, Vec<Value>)> = Vec::new();
+                for (name, t) in &snapshot.tables {
+                    if !t.columns.iter().any(|c| c.autoincrement) {
+                        continue;
+                    }
+                    let max_rowid = self.table_max_rowid(t).unwrap_or(0);
+                    let seq = sequences.get(name).copied().unwrap_or(0).max(max_rowid);
+                    seq_rows.push((
+                        seq_rows.len() as i64 + 1,
+                        vec![
+                            Value::Text(crate::types::text::Text::from(t.name.as_str())),
+                            Value::Integer(seq),
+                        ],
+                    ));
                 }
-                let max_rowid = self.table_max_rowid(t).unwrap_or(0);
-                let seq = sequences.get(name).copied().unwrap_or(0).max(max_rowid);
-                seq_rows.push((
-                    seq_rows.len() as i64 + 1,
-                    vec![
-                        Value::Text(crate::types::text::Text::from(t.name.as_str())),
-                        Value::Integer(seq),
-                    ],
-                ));
-            }
-            if !seq_rows.is_empty() {
-                items.push(SpliceItem {
-                    key: seq_key,
-                    object: OutObject::Table {
-                        name: "sqlite_sequence".into(),
-                        sql: "CREATE TABLE sqlite_sequence(name,seq)".into(),
-                        alias: None,
-                        rows: seq_rows,
-                    },
-                });
+                if !seq_rows.is_empty() {
+                    items.push(SpliceItem {
+                        key: seq_key,
+                        object: OutObject::Table {
+                            name: "sqlite_sequence".into(),
+                            sql: "CREATE TABLE sqlite_sequence(name,seq)".into(),
+                            alias: None,
+                            rows: seq_rows,
+                        },
+                    });
+                }
             }
         }
 
@@ -3754,9 +4008,212 @@ impl Database {
             .iter()
             .map(|k| SpanKey::Object(k.clone()))
             .collect();
-        coord
-            .publish_splice(&items, &dropped, schema_changed, &schema_rows, params)
-            .map_err(|e| Error::Io(std::io::Error::other(e)))
+        // The mutate/retry loop: a page-level mutation that declines
+        // (stale journal, verification mismatch) returns BEFORE
+        // anything commits; the failed objects are re-collected as
+        // whole-tree splices and the publish retried. Each round moves
+        // at least one key to the rebuild side, so it terminates.
+        loop {
+            match coord.publish_splice(
+                &items,
+                &mutates,
+                &dropped,
+                schema_changed,
+                &schema_rows_of,
+                params,
+            ) {
+                Ok(done) => return Ok(done),
+                Err(SpliceError::MutateFallback(failed)) => {
+                    let mut moved = false;
+                    for key in &failed {
+                        let SpanKey::Object(name) = key else {
+                            continue;
+                        };
+                        let Some(pos) = mutates.iter().position(|m| &m.key == key) else {
+                            continue;
+                        };
+                        let item = mutates.remove(pos);
+                        moved = true;
+                        if let Some(table) = snapshot.tables.get(name) {
+                            let obj = if table.without_rowid {
+                                OutObject::WithoutRowid {
+                                    name: table.name.clone(),
+                                    sql: table.create_sql.clone(),
+                                    pk_collations: without_rowid_pk_collations(table, &registry),
+                                    rows: self.dump_without_rowid_rows(table)?,
+                                }
+                            } else {
+                                OutObject::Table {
+                                    name: table.name.clone(),
+                                    sql: table.create_sql.clone(),
+                                    alias: table.rowid_alias,
+                                    rows: self.dump_table_rows(table)?,
+                                }
+                            };
+                            items.push(SpliceItem {
+                                key: item.key,
+                                object: obj,
+                            });
+                        } else if let Some(idx) = snapshot.indexes.get(name) {
+                            let obj =
+                                self.dump_index_object(idx.as_ref(), &snapshot.tables, &registry)?;
+                            items.push(SpliceItem {
+                                key: item.key,
+                                object: obj,
+                            });
+                        }
+                    }
+                    if !moved {
+                        return Err(Error::Io(std::io::Error::other(
+                            "splice mutation fallback made no progress",
+                        )));
+                    }
+                }
+                Err(SpliceError::Other(e)) => {
+                    return Err(Error::Io(std::io::Error::other(e)));
+                }
+            }
+        }
+    }
+
+    /// Rowid-table mutation ops from the delta journal — the record
+    /// encoding mirrors `dump_table_rows` exactly (alias elision, the
+    /// file's text encoding) so mutated and rebuilt files agree
+    /// byte-for-byte on every record.
+    fn table_mutate_ops(
+        &self,
+        table: &Table,
+        deltas: &[crate::storage::sqlitefmt::delta::RowDelta],
+        enc: crate::storage::sqlitefmt::record::TextEnc,
+    ) -> Option<crate::storage::sqlitefmt::mutator::MutateOps> {
+        use crate::storage::sqlitefmt::mutator::{MutateOps, TableRowOp};
+        use crate::storage::sqlitefmt::record::encode_record_aliased_enc;
+        let ops = deltas
+            .iter()
+            .map(|d| TableRowOp {
+                rowid: d.rowid,
+                expect: d
+                    .old
+                    .as_ref()
+                    .map(|v| encode_record_aliased_enc(v, table.rowid_alias, enc)),
+                set: d
+                    .new
+                    .as_ref()
+                    .map(|v| encode_record_aliased_enc(v, table.rowid_alias, enc)),
+            })
+            .collect();
+        Some(MutateOps::Table(ops))
+    }
+
+    /// WITHOUT ROWID mutation ops: full PK-first records (the same
+    /// reorder `dump_without_rowid_rows` performs), ordered by the PK
+    /// collations.
+    fn without_rowid_mutate_ops(
+        &self,
+        table: &Table,
+        deltas: &[crate::storage::sqlitefmt::delta::RowDelta],
+        registry: &crate::plugin::PluginRegistry,
+    ) -> Option<crate::storage::sqlitefmt::mutator::MutateOps> {
+        // The record encoding happens inside the mutator (Entries carry
+        // VALUES; the comparator needs collation semantics, not bytes).
+        use crate::storage::sqlitefmt::mutator::{EntryOp, EntryOrder, MutateOps};
+        let map = without_rowid_record_map(table);
+        let n = table.n_columns();
+        let compose = |vals: &[Value]| -> Vec<Value> {
+            let mut record: Vec<Value> = vec![Value::Null; n];
+            for (decl_i, val) in vals.iter().enumerate() {
+                if decl_i < n {
+                    record[decl_i] = val.clone();
+                }
+            }
+            let mut sorted: Vec<Option<Value>> = vec![None; n];
+            let mut used = vec![false; n];
+            for (rec_i, decl_i) in map.iter().enumerate() {
+                if *decl_i < n {
+                    sorted[rec_i] = Some(record[*decl_i].clone());
+                    used[*decl_i] = true;
+                }
+            }
+            let mut next = 0usize;
+            for decl_i in 0..n {
+                if !used[decl_i] {
+                    while next < n && sorted[next].is_some() {
+                        next += 1;
+                    }
+                    if next < n {
+                        sorted[next] = Some(record[decl_i].clone());
+                    }
+                }
+            }
+            sorted
+                .into_iter()
+                .map(|v| v.unwrap_or(Value::Null))
+                .collect()
+        };
+        let ops = deltas
+            .iter()
+            .map(|d| EntryOp {
+                expect: d.old.as_ref().map(|v| compose(v)),
+                set: d.new.as_ref().map(|v| compose(v)),
+            })
+            .collect();
+        Some(MutateOps::Entries(
+            EntryOrder {
+                desc: Vec::new(),
+                collations: without_rowid_pk_collations(table, registry),
+            },
+            ops,
+        ))
+    }
+
+    /// Index mutation ops derived from the owning table's row deltas —
+    /// `[key columns..., rowid]` per entry, exactly the whole-object
+    /// dump's composition. The caller pre-checked eligibility (plain
+    /// Btree index, no expressions, no partial predicate).
+    fn index_mutate_ops(
+        &self,
+        idx: &crate::schema::Index,
+        table: &Table,
+        deltas: &[crate::storage::sqlitefmt::delta::RowDelta],
+        registry: &crate::plugin::PluginRegistry,
+    ) -> Option<crate::storage::sqlitefmt::mutator::MutateOps> {
+        use crate::storage::sqlitefmt::mutator::{EntryOp, EntryOrder, MutateOps};
+        let key_pos: Vec<usize> = idx
+            .columns
+            .iter()
+            .map(|c| table.find_column(&c.name))
+            .collect::<Option<Vec<_>>>()?;
+        let compose = |vals: &[Value], rowid: i64| -> Vec<Value> {
+            let mut entry: Vec<Value> = key_pos.iter().map(|&p| vals[p].clone()).collect();
+            entry.push(Value::Integer(rowid));
+            entry
+        };
+        let ops = deltas
+            .iter()
+            .map(|d| {
+                // NOTE: the entry's rowid suffix is the delta's rowid —
+                // exact for inserts, deletes and rowid-preserving
+                // updates. A rowid-CHANGING update composes a stale old
+                // entry, the mutation's expect-verify fails, and the
+                // object falls back to the whole-object splice (correct,
+                // just un-accelerated).
+                EntryOp {
+                    expect: d.old.as_ref().map(|v| compose(v, d.rowid)),
+                    set: d.new.as_ref().map(|v| compose(v, d.rowid)),
+                }
+            })
+            .collect();
+        let desc: Vec<bool> = idx
+            .columns
+            .iter()
+            .map(|c| c.order == crate::sql::ast::Order::Desc)
+            .collect();
+        let collations: Vec<crate::storage::sqlitefmt::Collation> = idx
+            .columns
+            .iter()
+            .map(|c| collation_of(&c.collation, &idx.name, registry))
+            .collect();
+        Some(MutateOps::Entries(EntryOrder { desc, collations }, ops))
     }
 
     /// Post-publish bookkeeping shared by both paths: the session's
@@ -3767,16 +4224,39 @@ impl Database {
         &self,
         foreign: &ForeignSqlite,
         params: &crate::storage::sqlitefmt::container::PublishParams,
-        epochs: HashMap<String, u64>,
-        sig: Vec<(u8, String, String, u32)>,
+        epoch_updates: &[(String, u64)],
+        dropped: &[String],
+        schema_epoch: u64,
     ) {
         {
             let mut snap = foreign.snap.lock();
-            snap.epochs = epochs;
-            snap.sig = sig;
+            // Epoch bookkeeping is DELTA-based: advance the objects the
+            // walk marked (a session's opening walk carries every
+            // object, so the session's first publish still seeds every
+            // slot) and drop the gone. Clean objects keep their
+            // recorded epochs untouched.
+            for (k, e) in epoch_updates {
+                if let Some(os) = snap.slots.get_mut(k) {
+                    os.last = *e;
+                }
+            }
+            for k in dropped {
+                snap.slots.remove(k);
+                snap.versions.remove(k);
+            }
+            snap.schema_epoch = schema_epoch;
             snap.published = true;
             snap.loaded_clean = false;
+            // Per-object span versions: only the objects this publish
+            // touched (the same delta set) can have moved.
+            let names: Vec<String> = epoch_updates.iter().map(|(k, _)| k.clone()).collect();
+            let versions = foreign.coord.span_versions_of(&names);
+            for (k, v) in versions {
+                snap.versions.insert(k, v);
+            }
         }
+        // The publish consumed (or rebuilt past) the delta journal.
+        foreign.journal.lock().reset_after_publish();
         foreign
             .change_counter
             .store(params.change_counter, Ordering::Release);
@@ -4004,6 +4484,9 @@ impl Database {
         append_new_objects(&triggers, SchemaOrderKey::Trigger, &known, &mut order);
 
         SqliteCatalogSnapshot {
+            has_autoincrement: tables
+                .values()
+                .any(|t| t.columns.iter().any(|c| c.autoincrement)),
             tables,
             indexes,
             views,
@@ -6103,6 +6586,19 @@ impl Database {
     /// mutations go through interior mutability so the body could in principle
     /// be `&self`. We keep `&mut self` for API clarity (writers serialize).
     pub fn execute<P: Params>(&mut self, sql: &str, params: P) -> Result<()> {
+        let r = self.execute_stmt(sql, params);
+        if r.is_err() {
+            // A failed statement's rows were undone by the engine's
+            // statement-atomicity restore; the delta journal cannot
+            // assume anything about what survived — drop it.
+            self.poison_delta_journal();
+        }
+        r
+    }
+
+    /// [`Self::execute`]'s body (the wrapper handles delta-journal
+    /// poisoning on statement failure).
+    fn execute_stmt<P: Params>(&mut self, sql: &str, params: P) -> Result<()> {
         profile::COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Per-connection snapshot for the SQL function
         // `last_insert_rowid()` (SQLite: the value is per-connection; the
@@ -6145,6 +6641,9 @@ impl Database {
         // (script split, hook re-entry) and restores the previous sink on
         // exit, including on unwind.
         let _preupdate_guard = self.preupdate_scope();
+        // Delta-journal scope (page-level splicing capture): armed for
+        // the statement's duration on foreign-backed databases.
+        let _delta_guard = self.delta_stmt_scope();
         // Write-epoch bump: `execute` is the gateway for every mutating
         // statement (DML, DDL, transaction control, fast-path inserts),
         // so ONE bump here invalidates the memoized COUNT(*) answers for
@@ -7184,6 +7683,17 @@ impl Database {
     /// `root_overrides` and `max_rowids` are snapshot-cloned (read lock) for
     /// the duration of the query — a SELECT never writes them back.
     pub fn query<P: Params>(&self, sql: &str, params: P) -> Result<Vec<Row>> {
+        let r = self.query_inner(sql, params);
+        if r.is_err() {
+            self.poison_delta_journal();
+        }
+        r
+    }
+
+    /// [`Self::query`]'s body (the wrapper handles delta-journal
+    /// poisoning on statement failure — DML-RETURNING through this
+    /// surface journals too).
+    fn query_inner<P: Params>(&self, sql: &str, params: P) -> Result<Vec<Row>> {
         let _rbd = ReadBurstDrain {
             db: self,
             sql_len: sql.len(),
@@ -7295,6 +7805,14 @@ impl Database {
                 Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
             ) {
             self.preupdate_scope()
+        } else {
+            None
+        };
+        let _delta_guard = if matches!(
+            cached.stmt.as_ref(),
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+        ) {
+            self.delta_stmt_scope()
         } else {
             None
         };
@@ -7567,6 +8085,14 @@ impl Database {
                 Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
             ) {
             self.preupdate_scope()
+        } else {
+            None
+        };
+        let _delta_guard = if matches!(
+            cached.stmt.as_ref(),
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+        ) {
+            self.delta_stmt_scope()
         } else {
             None
         };
@@ -8903,6 +9429,10 @@ impl Database {
     /// ROLLBACK TO SAVEPOINT <name> — restore pager + bookkeeping maps to
     /// the savepoint; the transaction stays open.
     fn exec_rollback_to_savepoint(&mut self, name: &str) -> Result<()> {
+        // Partial transaction undo: the delta journal cannot track
+        // which of its rows survived the savepoint's rollback — drop
+        // it (the next publish rebuilds whole-object).
+        self.poison_delta_journal();
         // Savepoint ops can pop the __begin__ undo level (see
         // exec_savepoint): committed-view reconstruction is off until the
         // transaction ends.
@@ -11040,6 +11570,9 @@ impl Database {
                 ctx.in_transaction = true;
                 ctx.pager.note_tx_begun();
                 ctx.txn_snapshot = Some(ctx.pager.snapshot());
+                if let Some(f) = foreign {
+                    f.journal.lock().begin_txn();
+                }
                 Ok(())
             }
             Statement::Commit => {
@@ -11048,6 +11581,9 @@ impl Database {
                 ctx.pager.clear_savepoints();
                 ctx.pager.flush()?;
                 ctx.pager.note_tx_committed();
+                if let Some(f) = foreign {
+                    f.journal.lock().commit_txn();
+                }
                 Ok(())
             }
             Statement::Rollback(_) => {
@@ -11089,6 +11625,9 @@ impl Database {
                 ctx.max_rowids.clear();
                 ctx.rolled_back = true;
                 ctx.pager.note_tx_rolled_back();
+                if let Some(f) = foreign {
+                    f.journal.lock().rollback_txn();
+                }
                 Ok(())
             }
             Statement::Pragma(p) => Self::execute_pragma(p.clone(), ctx, foreign),

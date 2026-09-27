@@ -474,6 +474,16 @@ impl<'a> Statement<'a> {
 
     /// Produce the next row. Returns [`StepResult::Row`] while rows remain.
     pub fn step(&mut self) -> Result<StepResult> {
+        let r = self.step_inner();
+        if r.is_err() {
+            self.db.poison_delta_journal();
+        }
+        r
+    }
+
+    /// [`Self::step`]'s body (the wrapper handles delta-journal
+    /// poisoning on statement failure).
+    fn step_inner(&mut self) -> Result<StepResult> {
         if self.done {
             return Ok(StepResult::Done);
         }
@@ -1020,6 +1030,11 @@ impl<'a> Statement<'a> {
         // the closure's duration. No-op when none is registered or when
         // an outer scope on this thread already covers this Database.
         let _preupdate_guard = db.preupdate_scope();
+        // Delta-journal scope (page-level splicing capture — see
+        // `storage::sqlitefmt::delta`): the stepped-statement surface
+        // journals too, so prepared DML through the C ABI / sqlx
+        // accelerates exactly like `Database::execute` DML.
+        let _delta_guard = db.delta_stmt_scope();
         let out = f(&mut ctx);
         // CONCURRENT owner: NO schema-row rewrite here. The durable
         // schema row is a single HOT row under the concurrent regime

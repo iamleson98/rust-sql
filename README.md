@@ -2,7 +2,7 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status**: CI fully green — 31/31 jobs on linux/windows/macos ([latest green run](https://github.com/iamleson98/rust-sql/actions/runs/36284576392) @ `2ce90ee`): **1398 tests** in the default matrix plus sqlx / no-default / OOM-injection / compat-ABI / limit-stress matrices, and a dedicated **limit-stress** CI job (8 push-to-the-limit sections at 1M-row file scale) on every OS. Benchmarks vs real SQLite: **53 wins / 1 parity tie / 0 losses over 54 gated rows**. Byte-identical file sizes; peak RSS at or below SQLite on 14/18 torture sections. Three concurrency tiers beyond SQLite's envelope, plus `BEGIN CONCURRENT` multi-writer transactions. SQLite-format interop both directions, verified by real SQLite. sqlx 0.9 native driver and drop-in `libsqlite3` C ABI, sea-orm 2.0 verified end to end. The honest ledger of what is still missing: [Remaining gaps](#remaining-gaps-vs-sqlite).
+> **Status**: CI fully green — 31/31 jobs on linux/windows/macos ([latest green run](https://github.com/iamleson98/rust-sql/actions/runs/36284576392) @ `2ce90ee`): **1406 tests** in the default matrix plus sqlx / no-default / OOM-injection / compat-ABI / limit-stress matrices, and a dedicated **limit-stress** CI job (8 push-to-the-limit sections at 1M-row file scale) on every OS. Benchmarks vs real SQLite: **53 wins / 1 parity tie / 0 losses over 54 gated rows**. Byte-identical file sizes; peak RSS at or below SQLite on 14/18 torture sections. Three concurrency tiers beyond SQLite's envelope, plus `BEGIN CONCURRENT` multi-writer transactions. SQLite-format interop both directions, verified by real SQLite. sqlx 0.9 native driver and drop-in `libsqlite3` C ABI, sea-orm 2.0 verified end to end. The honest ledger of what is still missing: [Remaining gaps](#remaining-gaps-vs-sqlite).
 
 This README is the single source of truth: feature surface, the latest performance / resource / concurrency / cold-start comparisons against SQLite, and the gap ledger.
 
@@ -119,17 +119,17 @@ rustqlite splits scans across worker threads; SQLite's executor is single-thread
 
 ### SQLite-format container: per-commit cost on large files
 
-Reference box (2 vCPU), release build, WAL + `synchronous=OFF` (isolates commit CPU from the fsync floor), 1-row autocommit INSERT, best-effort M=30 — `examples/probe_commit_scale.rs`. Not a CI-gated row: recorded as the honest quantification of the incremental page-diff architecture and its residual.
+Reference box (2 vCPU), release build, WAL + `synchronous=OFF` (isolates commit CPU from the fsync floor), 1-row autocommit INSERT/UPDATE, M=300 — `examples/probe_commit_scale.rs`. Not a CI-gated row: recorded as the honest quantification of the page-level mutation architecture and its residual.
 
 | File shape | rustqlite | SQLite | Verdict |
 |---|---|---|---|
-| 1M rows, one table (~132 MB) | 1.99 s/commit | 16.7 µs | **0.000008x — the top open perf item** |
-| 250k rows, one table (~33 MB) | 380 ms | 11.8 µs | same class |
-| 50k rows, one table (~6 MB) | 49 ms | 11.8 µs | same class |
-| 5k tables × 100 rows, commit touches one 100-row table | 6.95 ms | 9.4 µs | the O(#objects) schema-diff term |
-| 500 tables × 100 rows, same | 0.50 ms | 7.2 µs | same |
+| 2M rows, one table (~265 MB) | **66 µs** / 118 µs | 644 µs / 447 µs | **9.8x faster** (SQLite's own commit degrades at this file size) |
+| 500k rows, one table (~66 MB) | 56 µs / 124 µs | 11 µs / 18 µs | 0.20x / 0.15x |
+| 100k rows, one table (~13 MB) | 85 µs / 101 µs | 10 µs / 14 µs | 0.11x / 0.13x |
+| 10k tables × 100 rows, commit touches one 100-row table | 57 µs | 8 µs | 0.14x — independent of table count |
+| 1k tables × 100 rows, same | 19 µs | 6 µs | 0.32x |
 
-Measured law: per-commit ≈ **2 µs × changed-object's rows + ~1.3 µs × schema objects + ~40 µs fixed**. Commits are already **O(changed object)** — only the dirty b-trees are spliced, the WAL append carries only the differing pages (4–12 frames on a single-row commit), shrinkage routes into a real freelist, and page identities stay stable. The residual is object GRANULARITY: a dirty object is re-encoded in full — every row — even when a handful of its pages changed. The remaining step is **page-level splicing**: a container-side b-tree mutator that descends and balances only the touched pages (SQLite's own `balance()` discipline over foreign-format pages), plus a catalog-DDL counter to fold the O(#objects) schema-signature term.
+Measured law: per-commit ≈ **~50–60 µs fixed + O(changed pages)** — independent of both the changed object's row count and the schema's object count. Every autocommit DML statement journals its row deltas (the same event stream as the preupdate hook); the commit applies them with a **container-side b-tree mutator** — descend to the touched leaf, verify the expected old bytes, patch the cell, split only when a page overflows (the root keeps its identity; SQLite's own `balance()` discipline), propagate separators, prune empties into the freelist — touching 1–2 pages of a 65k-page object. The change detection is one lock-free atomic load per object (cached epoch slots), the catalog snapshot is cached across commits (stable schema epoch ⇒ no capture walk), and the dirty walk clones strings only for the objects that actually changed. The remaining ~50 µs vs SQLite's ~10 µs is the publish machinery itself (page reads for descent/verify, the WAL frame append, header/counter writes) — the honest residual.
 
 ### Where the wins come from
 
@@ -203,10 +203,10 @@ Reference box (2 vCPU), 5M-row / ~1.3 GiB files, fresh process per run, page cac
 rustqlite reads and writes **real SQLite database files** (fileformat2): files from the `sqlite3` CLI, Python, rusqlite open directly; files rustqlite writes open in all of them and pass `PRAGMA integrity_check`.
 
 - **Reader**: any page size 512 B–64 KiB, WAL sidecar folding, rowid + `WITHOUT ROWID` trees, overflow chains, serial types 0–9/12+, UTF-8/UTF-16le/be, `sqlite_schema` texts
-- **Writer**: bottom-up dense b-trees with SQLite's separator invariants, overflow chains with exact split math, autoindexes, `sqlite_sequence`, views/triggers, per-commit atomicity (rollback journal or WAL sidecar, byte-exact), `journal_mode` switching both ways, `auto_vacuum` ptrmap pages written, UTF-16 files end-to-end (encoding-aware ordering — real SQLite binary-searches the engine's index b-trees), NOCASE/RTRIM/custom collations order the written file; **multi-session page space** — one per-file coordinator serializes every session's splices over the same evolving layout (per-object last-writer merge, shared WAL chain), with shrinkage routed into a real SQLite freelist (header 32/36, trunk/leaf pages — `integrity_check`-clean) so page identities stay stable without re-flowing the file
+- **Writer**: bottom-up dense b-trees with SQLite's separator invariants, overflow chains with exact split math, autoindexes, `sqlite_sequence`, views/triggers, per-commit atomicity (rollback journal or WAL sidecar, byte-exact), `journal_mode` switching both ways, `auto_vacuum` ptrmap pages written, UTF-16 files end-to-end (encoding-aware ordering — real SQLite binary-searches the engine's index b-trees), NOCASE/RTRIM/custom collations order the written file; **multi-session page space** — one per-file coordinator serializes every session's splices over the same evolving layout (per-object last-writer merge, shared WAL chain), with shrinkage routed into a real SQLite freelist (header 32/36, trunk/leaf pages — `integrity_check`-clean) so page identities stay stable without re-flowing the file; **page-level mutation** — autocommit DML applies its row deltas directly onto the object's existing foreign-format pages (verify-then-patch, root-stable splits, prunes into the freelist; per-commit is O(changed pages), pinned by `tests/foreign_mutate.rs`)
 - **`VACUUM INTO`** from either container writes a real SQLite file (SQLite's own output shape) — verified by real SQLite re-opening it (`tests/sqlite_interop.rs` + `utf16_interop.rs` + `collate_semantics.rs`, and a CI job exercising the real `sqlite3` CLI against the `rustqlite` CLI; the incremental splice architecture is pinned by `tests/foreign_incremental.rs` — frames-per-commit, page-identity stability, freelist round-trips, DDL splices, two-session merges, random-DML reopen-compare)
 
-**Limitations**: whole image on open (see [cold start](#cold-start-on-large-files) — per-commit is O(changed object), but the open-time load still decodes every row); auto-vacuum containers keep the full-image publish path (pointer-map geometry is a whole-build concern); DDL re-encodes the objects it touches plus the schema tree (never the whole file); custom collations fall back to binary order in written files; `PRAGMA page_count`/`freelist_count` report the container's page space (denser than SQLite's layout for the same data).
+**Limitations**: whole image on open (see [cold start](#cold-start-on-large-files) — per-commit is O(changed pages) via the page-level mutator, but the open-time load still decodes every row); auto-vacuum containers keep the full-image publish path (pointer-map geometry is a whole-build concern); DDL re-encodes the objects it touches plus the schema tree (never the whole file); custom collations fall back to binary order in written files; `PRAGMA page_count`/`freelist_count` report the container's page space (denser than SQLite's layout for the same data).
 
 ## sqlx & sea-orm
 
@@ -230,7 +230,7 @@ The honest ledger — verifiable absence (`module_list` / `function_list` / `com
 
 ### Performance gaps
 
-- **SQLite-format per-commit on large files — the top open item**: a commit re-encodes every row of each changed object: ≈ 2 µs × changed-object's rows + ~1.3 µs × schema objects (see the [per-commit table](#sqlite-format-container-per-commit-cost-on-large-files)); at 1M single-table rows that is 1.99 s vs SQLite's 16.7 µs. Commits are already O(changed object) — only the dirty b-trees splice and the WAL append carries only the differing pages — the residual is object granularity; the next step is page-level splicing (a container-side b-tree mutator balancing only the touched pages) plus a catalog-DDL counter for the O(#objects) schema-signature term. The native container (the default, and what the 54 CI-gated rows measure) is unaffected — its per-commit path is already page-granular WAL.
+- **SQLite-format per-commit residual**: ~50–60 µs fixed per commit vs SQLite's ~10 µs on small files (0.11–0.32x at ≤500k rows; **faster than SQLite at ≥2M rows**, where SQLite's own commit degrades) — see the [per-commit table](#sqlite-format-container-per-commit-cost-on-large-files). The page-level mutator itself is O(changed pages) with stable rootpages; the residual is the publish machinery (descent/verify page reads, WAL frame append, header/counter writes). Bulk-growth commits (a transaction whose growth moves engine rootpages) still route through the whole-object splice path. The native container (the default, and what the 54 CI-gated rows measure) is unaffected — its per-commit path is page-granular WAL.
 - **One serial row at parity**: the unfiltered 2-table PK join (1.18x warm in the latest CI table; 1.38x at 1M-row parallel scale).
 - **3-table adversarial ORDER** (tiny synthetic): 0.13x vs SQLite's native plan for the already-reordered shape — the reorder itself won ~90x engine-side; the residual is the point-lookup chain.
 - **8-conn mixed R/W 80/20**: parity-class by construction — commit fsync sets the floor (host-dominated); reads inside stay 2.8x. An explicitly-marked parity guard in CI.
@@ -303,7 +303,7 @@ cargo bench --bench sqlite_comparison                             # criterion ma
 
 ## Testing
 
-The matrix is modeled on SQLite's own methodology ([sqlite.org/testing.html](https://www.sqlite.org/testing.html)) — 1398 tests in the default matrix + sqlx/no-default/oom-injection/compat-ABI/limit-stress matrices, all CI-green on ubuntu/windows/macos:
+The matrix is modeled on SQLite's own methodology ([sqlite.org/testing.html](https://www.sqlite.org/testing.html)) — 1406 tests in the default matrix + sqlx/no-default/oom-injection/compat-ABI/limit-stress matrices, all CI-green on ubuntu/windows/macos:
 
 | Technique | Harness | Verifies |
 |---|---|---|

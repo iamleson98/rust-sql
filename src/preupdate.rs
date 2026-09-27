@@ -29,6 +29,7 @@
 use crate::schema::Table;
 use crate::types::Value;
 use std::cell::{Cell, RefCell};
+use std::sync::Arc;
 
 /// Which change is about to happen to the row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,6 +96,68 @@ enum Sink {
 thread_local! {
     static SINK: RefCell<Option<Sink>> = const { RefCell::new(None) };
     static DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// The SQLite-format delta journal sink — the page-level splicing
+/// capture path (see `storage::sqlitefmt::delta`). Armed per statement
+/// by the engine on foreign-backed databases only; one TLS load when
+/// unset (native and in-memory databases never arm it).
+type DeltaTarget = Arc<parking_lot::Mutex<crate::storage::sqlitefmt::delta::DeltaJournal>>;
+thread_local! {
+    static DELTA: RefCell<Option<DeltaTarget>> = const { RefCell::new(None) };
+    static DELTA_ARMED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Install the delta journal target for one statement. Fails (returns
+/// false, arming nothing) when a target is already armed — a nested
+/// `execute` — which the caller treats as a poison (the journal cannot
+/// track statement boundaries across re-entrancy).
+pub(crate) fn arm_delta_sink(target: DeltaTarget) -> bool {
+    DELTA.with(|d| {
+        if d.borrow().is_some() {
+            return false;
+        }
+        *d.borrow_mut() = Some(target);
+        true
+    })
+}
+
+/// The delta sink's unwind-safe guard.
+pub struct DeltaGuard {
+    armed: bool,
+}
+
+impl DeltaGuard {
+    pub fn disarm(mut self) {
+        DELTA.with(|d| {
+            *d.borrow_mut() = None;
+        });
+        DELTA_ARMED.with(|a| a.set(false));
+        self.armed = false;
+    }
+}
+
+impl Drop for DeltaGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            DELTA.with(|d| {
+                *d.borrow_mut() = None;
+            });
+            DELTA_ARMED.with(|a| a.set(false));
+        }
+    }
+}
+
+/// Wrap an armed sink into its guard (called only after a successful
+/// `arm_delta_sink`).
+pub(crate) fn delta_guard() -> DeltaGuard {
+    DELTA_ARMED.with(|a| a.set(true));
+    DeltaGuard { armed: true }
+}
+
+#[inline]
+fn delta_armed() -> bool {
+    DELTA_ARMED.with(|a| a.get())
 }
 
 /// True when the active borrowed sink points at the given hook slot —
@@ -167,6 +230,24 @@ pub(crate) fn fire(
     old: Option<&[Value]>,
     new: Option<&[Value]>,
 ) {
+    // The SQLite-format delta journal (page-level splicing capture):
+    // same events, values in declared order — no user hook required.
+    // Checked BEFORE the hook gate: foreign-backed databases arm the
+    // journal on every DML statement whether or not a preupdate hook
+    // is registered (the hook-less case is the common one).
+    if delta_armed() {
+        DELTA.with(|d| {
+            if let Some(target) = d.borrow().as_ref() {
+                let mut j = target.lock();
+                j.record(
+                    &table.name,
+                    if table.without_rowid { 0 } else { rowid },
+                    old.map(|v| v.to_vec()),
+                    new.map(|v| v.to_vec()),
+                );
+            }
+        });
+    }
     if !hook_installed() {
         return;
     }
@@ -208,7 +289,9 @@ pub(crate) fn fire(
 /// decodes the old values first (cold path — runs only when a hook is
 /// installed).
 pub(crate) fn fire_delete_payload(table: &Table, rowid: i64, payload: &[u8]) {
-    if !hook_installed() {
+    // The delta journal needs the decoded old row too (page-level
+    // splicing capture) — decode when EITHER consumer is listening.
+    if !hook_installed() && !delta_armed() {
         return;
     }
     if let Ok(old_row) =
@@ -223,4 +306,14 @@ pub(crate) fn fire_delete_payload(table: &Table, rowid: i64, payload: &[u8]) {
 #[inline]
 pub fn enabled() -> bool {
     hook_installed()
+}
+
+/// True when ANY preupdate consumer is listening — a registered user
+/// hook OR the SQLite-format delta journal's armed sink. The executor's
+/// fused/bulk drivers and old-value fetch gates ask THIS (not
+/// [`enabled`]): the journal needs the same per-row old/new values the
+/// hook does, and it arms without installing a hook.
+#[inline]
+pub(crate) fn events_needed() -> bool {
+    hook_installed() || delta_armed()
 }

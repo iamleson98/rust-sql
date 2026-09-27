@@ -23,7 +23,9 @@
 //! engine writes open in the `sqlite3` CLI.
 
 pub mod container;
+pub mod delta;
 pub mod header;
+pub mod mutator;
 pub mod reader;
 pub mod record;
 pub mod rj;

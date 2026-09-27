@@ -2932,7 +2932,7 @@ fn enforce_parent_delete_fks(
                         // SET NULL / SET DEFAULT mutation below consumes
                         // `crow` in place).
                         let old_crow_snapshot = crow.clone();
-                        let pre_row = if crate::preupdate::hook_installed() {
+                        let pre_row = if crate::preupdate::events_needed() {
                             Some(old_crow_snapshot.clone())
                         } else {
                             None
@@ -3096,7 +3096,7 @@ fn enforce_parent_update_fks(
                 }
                 ForeignKeyAction::Cascade => {
                     for (rowid, mut crow) in children {
-                        let pre_row = if crate::preupdate::hook_installed() {
+                        let pre_row = if crate::preupdate::events_needed() {
                             Some(crow.clone())
                         } else {
                             None
@@ -3140,7 +3140,7 @@ fn enforce_parent_update_fks(
                 }
                 ForeignKeyAction::SetNull | ForeignKeyAction::SetDefault => {
                     for (rowid, mut crow) in children {
-                        let pre_row = if crate::preupdate::hook_installed() {
+                        let pre_row = if crate::preupdate::events_needed() {
                             Some(crow.clone())
                         } else {
                             None
@@ -20339,7 +20339,7 @@ pub(crate) fn delete_rows_by_rowid_inner(
                 }
             }
         }
-        if pre_payload.is_none() && fire_hook && crate::preupdate::hook_installed() {
+        if pre_payload.is_none() && fire_hook && crate::preupdate::events_needed() {
             let mut bt = Btree::new(ctx.pager, root, false);
             if let LookupResult::Found(payload) = bt.lookup_table(rowid)? {
                 pre_payload = Some(payload);
@@ -22162,7 +22162,7 @@ fn try_streaming_update(
             // A preupdate hook needs per-row old/new values; the fused
             // in-place patch never materializes them. Fall to the
             // collect path (fires at collect, same event stream).
-            && !crate::preupdate::hook_installed()
+            && !crate::preupdate::events_needed()
         {
             #[allow(clippy::option_if_let_else)]
             let Some(pc) = patch_ctx.as_mut() else {
@@ -22392,7 +22392,7 @@ fn try_streaming_update(
             // A preupdate hook needs per-row old/new values; the fused
             // in-place patch never materializes them. Fall to the
             // collect path (fires at collect, same event stream).
-            && !crate::preupdate::hook_installed()
+            && !crate::preupdate::events_needed()
             {
                 #[allow(clippy::option_if_let_else)]
                 let Some(pc) = patch_ctx.as_mut() else {
@@ -22681,7 +22681,7 @@ fn try_streaming_update(
             // A preupdate hook needs per-row old/new values; the fused
             // in-place patch never materializes them. Fall to the
             // collect path (fires at collect, same event stream).
-            && !crate::preupdate::hook_installed()
+            && !crate::preupdate::events_needed()
         {
             #[allow(clippy::option_if_let_else)]
             let Some(pc) = patch_ctx.as_mut() else {
@@ -23449,7 +23449,7 @@ fn process_update_row(
                     // = row-visit order). The patch path never materializes
                     // full rows — decode both sides from the payloads (cold
                     // path, only when a hook is installed).
-                    if crate::preupdate::hook_installed() {
+                    if crate::preupdate::events_needed() {
                         if let Ok(old_row) = crate::storage::row_codec::decode_row(
                             payload,
                             n_cols,
@@ -24185,7 +24185,7 @@ fn try_streaming_delete(
         && !has_delete_triggers
         // A preupdate hook needs per-row old values — the bulk path has
         // none; the per-row loop below fetches + fires them.
-        && !crate::preupdate::hook_installed()
+        && !crate::preupdate::events_needed()
     {
         let mut bt = Btree::new(ctx.pager, new_root, false);
         let n = bt.delete_rowids_inorder(&rowids)?;
@@ -24206,7 +24206,7 @@ fn try_streaming_delete(
         // (SQLite's order: the parent's event first, then cascaded
         // children at depth+1) and before the write. The fetch runs only
         // when a hook is installed (cold path).
-        let pre_payload: Option<Vec<u8>> = if crate::preupdate::hook_installed() {
+        let pre_payload: Option<Vec<u8>> = if crate::preupdate::events_needed() {
             let mut bt = Btree::new(ctx.pager, new_root, false);
             match bt.lookup_table(rid)? {
                 LookupResult::Found(payload) => Some(payload),
@@ -24387,7 +24387,7 @@ fn exec_delete(
             // parent's DELETE event first, then cascaded children at
             // depth+1) and before the write. The fetch runs only when a
             // hook is installed (cold path).
-            let pre_payload: Option<Vec<u8>> = if crate::preupdate::hook_installed() {
+            let pre_payload: Option<Vec<u8>> = if crate::preupdate::events_needed() {
                 let mut bt = Btree::new(ctx.pager, root, false);
                 match bt.lookup_table(rowid_val)? {
                     LookupResult::Found(payload) => Some(payload),

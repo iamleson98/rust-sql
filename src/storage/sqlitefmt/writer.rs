@@ -842,17 +842,17 @@ impl PageAllocator {
 /// (with a zero 4-byte overflow pointer when `ptr_pos` is set); `tail`
 /// holds the payload bytes destined for the overflow chain.
 #[derive(Clone)]
-struct Cell {
-    head: Vec<u8>,
-    tail: Vec<u8>,
+pub(crate) struct Cell {
+    pub(crate) head: Vec<u8>,
+    pub(crate) tail: Vec<u8>,
     /// Position of the 4-byte overflow pointer inside `head`.
-    ptr_pos: Option<usize>,
+    pub(crate) ptr_pos: Option<usize>,
     /// Table trees: the cell's rowid key (used for copied-up separators).
-    rowid: i64,
+    pub(crate) rowid: i64,
 }
 
 /// Table-leaf cell: `[varint P][varint rowid][local payload][u32 next]`.
-fn make_table_leaf_cell(usable: usize, rowid: i64, payload: &[u8]) -> Cell {
+pub(crate) fn make_table_leaf_cell(usable: usize, rowid: i64, payload: &[u8]) -> Cell {
     let u = usable;
     let total = payload.len();
     let x = u - 35;
@@ -888,7 +888,7 @@ fn make_table_leaf_cell(usable: usize, rowid: i64, payload: &[u8]) -> Cell {
 /// Index cell (leaf or interior): `[varint P][local record][u32 next]`
 /// — interior cells additionally carry a 4-byte left-child pointer
 /// prepended at page-write time.
-fn make_index_cell(usable: usize, entry: &[Value], enc: TextEnc) -> Cell {
+pub(crate) fn make_index_cell(usable: usize, entry: &[Value], enc: TextEnc) -> Cell {
     let payload = encode_record_enc(entry, enc);
     let u = usable;
     let total = payload.len();

@@ -52,6 +52,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use parking_lot::Mutex;
 
 use super::header::build_header_enc;
+use super::mutator::{self, MutateOps, MutateOutcome};
 use super::reader::wal_path_of;
 use super::record::TextEnc;
 use super::wal::{append_wal, checkpoint, WalWriter};
@@ -80,6 +81,36 @@ pub struct PublishParams {
 pub struct SpliceItem {
     pub key: SpanKey,
     pub object: OutObject,
+}
+
+/// One object queued for PAGE-LEVEL mutation: the deltas apply
+/// directly onto the object's existing foreign-format pages (see
+/// `mutator`), touching only the changed pages — the next step past
+/// the whole-object splice. Offered only when the session's recorded
+/// span version matches the coordinator's (no other session moved the
+/// object since this session's last publish); any verification
+/// mismatch fails the item back to the whole-object splice.
+pub struct MutateItem {
+    pub key: SpanKey,
+    pub ops: MutateOps,
+}
+
+/// A splice publish's failure modes.
+pub enum SpliceError {
+    /// Page-level mutation declined for these objects (stale delta
+    /// journal, verification mismatch, unreadable base page). NOTHING
+    /// was committed: the caller re-collects those objects as
+    /// whole-tree `SpliceItem`s and calls again.
+    MutateFallback(Vec<SpanKey>),
+    /// Any other failure — the caller's existing recovery applies (the
+    /// full publish resets the coordinator state).
+    Other(String),
+}
+
+impl From<String> for SpliceError {
+    fn from(e: String) -> Self {
+        SpliceError::Other(e)
+    }
 }
 
 /// One sqlite_schema row for the splice path's schema-tree rebuild —
@@ -115,6 +146,15 @@ pub struct ContainerState {
     pub schema_cookie: u32,
     /// Object name → root + pages (the page space).
     pub spans: HashMap<SpanKey, SpanRec>,
+    /// Per-span layout version — a UNIQUE number stamped on every span
+    /// install (adopt, full publish, splice, mutation). Sessions
+    /// record the versions their last publish saw; a mismatch means
+    /// another publish replaced the layout in between, and page-level
+    /// mutation is declined (the whole-object splice's
+    /// last-writer-wins semantics apply instead).
+    pub span_versions: HashMap<SpanKey, u64>,
+    /// The version generator (monotonic per coordinator).
+    next_ver: u64,
     /// Free pages available for reuse (ascending by construction).
     pub free: BTreeSet<u32>,
     /// Pages newer than the main file: WAL frames committed since the
@@ -468,6 +508,16 @@ impl Container {
         st.change_counter = be32(24).max(1);
         st.schema_cookie = be32(40).max(1);
         st.spans = spans;
+        let mut next = st.next_ver;
+        st.span_versions = st
+            .spans
+            .keys()
+            .map(|k| {
+                next += 1;
+                (k.clone(), next)
+            })
+            .collect();
+        st.next_ver = next;
         st.free = free;
         st.overlay.clear();
         st.wal = if st.journal_wal {
@@ -549,6 +599,16 @@ impl Container {
         st.change_counter = params.change_counter;
         st.schema_cookie = params.schema_cookie;
         st.spans = built.spans.clone();
+        let mut next = st.next_ver;
+        st.span_versions = st
+            .spans
+            .keys()
+            .map(|k| {
+                next += 1;
+                (k.clone(), next)
+            })
+            .collect();
+        st.next_ver = next;
         st.free.clear();
         st.overlay.clear();
         st.force_full = false;
@@ -588,15 +648,18 @@ impl Container {
     pub fn publish_splice(
         &self,
         items: &[SpliceItem],
+        mutates: &[MutateItem],
         dropped: &[SpanKey],
         schema_changed: bool,
-        schema_rows: &[SpliceSchemaRow],
+        schema_rows_of: &dyn Fn() -> Vec<SpliceSchemaRow>,
         params: &PublishParams,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, SpliceError> {
         let mut st = self.state.lock();
         let ps = st.page_size;
         if ps == 0 {
-            return Err("splice without an established page space".into());
+            return Err(SpliceError::Other(
+                "splice without an established page space".into(),
+            ));
         }
         let n_old = st.n_pages;
         let mut reader = PageReader::new(&self.path);
@@ -612,6 +675,94 @@ impl Container {
             }
         }
 
+        // ---- 1b. PAGE-LEVEL MUTATIONS (all-or-nothing scratch) ----
+        // Every mutation runs against the committed view FIRST and
+        // only its OUTCOME is applied — a failure returns before any
+        // coordinator state moves, so the caller can re-offer the
+        // failed keys as whole-object splices.
+        //
+        // The publish's mutation sessions share ONE allocation view
+        // (`mut_free` / `mut_tail` / `mut_pending`): each session's
+        // fresh/freelist page grants retire from the view before the
+        // NEXT session runs — two same-commit objects that both split
+        // (a table and its index) must never be handed the same page,
+        // and a page one session pruned may be reused by the next.
+        let mut mutate_outcomes: Vec<(&MutateItem, MutateOutcome)> = Vec::new();
+        let mut mut_free: BTreeSet<u32> = st.free.clone();
+        let mut mut_tail = st.n_pages + 1;
+        let mut mut_pending: HashMap<u32, Vec<u8>> = HashMap::new();
+        for item in mutates {
+            match self.run_mutation(&st, item, &mut mut_free, &mut mut_tail, &mut mut_pending) {
+                Ok(out) => mutate_outcomes.push((item, out)),
+                Err(why) => {
+                    if std::env::var_os("RSQL_SPLICE_TRACE").is_some() {
+                        eprintln!("[splice] mutate declined {:?}: {}", item.key, why.0);
+                    }
+                    return Err(SpliceError::MutateFallback(vec![item.key.clone()]));
+                }
+            }
+        }
+        for (item, out) in mutate_outcomes {
+            if std::env::var_os("RSQL_SPLICE_TRACE").is_some() {
+                eprintln!(
+                    "[splice] mutate obj {:?}: root={} touched={} +{} -{} freed={}",
+                    item.key,
+                    out.root,
+                    out.pages.len(),
+                    out.added.len(),
+                    out.removed.len(),
+                    out.freed.len()
+                );
+            }
+            let old_root = st.spans.get(&item.key).map(|s| s.root);
+            roots_moved |= old_root != Some(out.root);
+            // Only pages whose bytes actually differ enter the commit set.
+            for (pgno, bytes) in &out.pages {
+                match reader.read(*pgno, ps, &st.overlay) {
+                    Some(old) if &old == bytes => {}
+                    _ => {
+                        changed.insert(*pgno, bytes.clone());
+                    }
+                }
+            }
+            for p in &out.took_from_free {
+                st.free.remove(p);
+            }
+            for p in &out.freed {
+                st.free.insert(*p);
+            }
+            st.n_pages = st.n_pages.max(out.max_page);
+            st.next_ver += 1;
+            let ver = st.next_ver;
+            st.span_versions.insert(item.key.clone(), ver);
+            // Incremental span maintenance: apply the session's page
+            // deltas to the existing span record (O(changes); the
+            // common commit adds and removes nothing — a page-level
+            // splice of a leaf cell moves no page identities).
+            match st.spans.get_mut(&item.key) {
+                Some(rec) => {
+                    rec.root = out.root;
+                    for p in &out.removed {
+                        if let Ok(i) = rec.pages.binary_search(p) {
+                            rec.pages.remove(i);
+                        }
+                    }
+                    for p in &out.added {
+                        match rec.pages.binary_search(p) {
+                            Ok(_) => {}
+                            Err(i) => rec.pages.insert(i, *p),
+                        }
+                    }
+                }
+                None => {
+                    return Err(SpliceError::Other(format!(
+                        "mutation outcome for unknown span {:?}",
+                        item.key
+                    )));
+                }
+            }
+        }
+
         // ---- 1. Splice each object ----
         for item in items {
             let old_span = st.spans.get(&item.key).cloned();
@@ -621,7 +772,8 @@ impl Container {
             }
             reuse.extend(st.free.iter().copied());
             let build: SpliceBuild =
-                splice_object(ps, reuse, st.n_pages + 1, &item.object, st.text_enc)?;
+                splice_object(ps, reuse, st.n_pages + 1, &item.object, st.text_enc)
+                    .map_err(SpliceError::Other)?;
             let moved = old_span.as_ref().map(|s| s.root) != Some(build.root);
             roots_moved |= moved;
             if std::env::var_os("RSQL_SPLICE_TRACE").is_some() {
@@ -658,6 +810,9 @@ impl Container {
                 }
             }
             st.n_pages = st.n_pages.max(build.max_page);
+            st.next_ver += 1;
+            let ver = st.next_ver;
+            st.span_versions.insert(item.key.clone(), ver);
             st.spans.insert(
                 item.key.clone(),
                 SpanRec {
@@ -672,9 +827,12 @@ impl Container {
         // tree in place (root fixed at page 1), reusing its own previous
         // pages first. An EMPTY row set is a legitimate state (every
         // table dropped) and must still rebuild — a stale row would
-        // reference pages the freelist now owns.
+        // reference pages the freelist now owns. The row descriptors
+        // are produced HERE (lazily): a data-only commit on a stable
+        // layout never pays the O(#objects) walk.
         let rebuild_schema = roots_moved || schema_changed || !dropped.is_empty();
         if rebuild_schema {
+            let schema_rows = schema_rows_of();
             if std::env::var_os("RSQL_SPLICE_TRACE").is_some() {
                 eprintln!("[splice] schema-tree rebuild (roots moved)");
             }
@@ -703,7 +861,8 @@ impl Container {
                 .map(|s| s.pages.iter().copied().filter(|&p| p != 1).collect())
                 .unwrap_or_default();
             reuse.extend(st.free.iter().copied());
-            let build = splice_schema_tree(ps, reuse, st.n_pages + 1, &cells, st.text_enc)?;
+            let build = splice_schema_tree(ps, reuse, st.n_pages + 1, &cells, st.text_enc)
+                .map_err(SpliceError::Other)?;
             for (pgno, bytes) in &build.pages {
                 match reader.read(*pgno, ps, &st.overlay) {
                     Some(old) if &old == bytes => {}
@@ -724,6 +883,9 @@ impl Container {
                 }
             }
             st.n_pages = st.n_pages.max(build.max_page);
+            st.next_ver += 1;
+            let ver = st.next_ver;
+            st.span_versions.insert(SpanKey::SchemaTree, ver);
             let mut pages: Vec<u32> = Vec::with_capacity(build.used.len() + 1);
             pages.push(1);
             pages.extend(build.used.iter().copied().filter(|&p| p != 1));
@@ -781,10 +943,10 @@ impl Container {
         let mut page1 = match changed.get(&1) {
             Some(p) => p.clone(),
             None => reader.read(1, ps, &st.overlay).ok_or_else(|| {
-                format!(
+                SpliceError::Other(format!(
                     "{}: page 1 unreadable for the header patch",
                     self.path.display()
-                )
+                ))
             })?,
         };
         page1[0..100].copy_from_slice(&header);
@@ -810,7 +972,7 @@ impl Container {
             let pre_len = writer.wal_len();
             let bytes = writer.encode_commit(&frames, db_size);
             let wal_path = wal_path_of(&self.path);
-            append_wal(&wal_path, &writer, pre_len, &bytes)?;
+            append_wal(&wal_path, &writer, pre_len, &bytes).map_err(SpliceError::Other)?;
             for (pgno, page) in &frames {
                 st.overlay.insert(*pgno, page.clone());
             }
@@ -824,7 +986,7 @@ impl Container {
                         writer.n_frames()
                     );
                 }
-                checkpoint(&self.path, ps)?;
+                checkpoint(&self.path, ps).map_err(SpliceError::Other)?;
                 st.overlay.clear();
                 let seq = writer.ckpt_seq() + 1;
                 writer = WalWriter::new(ps, seq);
@@ -840,21 +1002,115 @@ impl Container {
                 .filter(|(p, _)| *p <= n_old)
                 .map(|(p, _)| {
                     let bytes = reader.read(*p, ps, &st.overlay).ok_or_else(|| {
-                        format!("{}: pre-image of page {p} unreadable", self.path.display())
+                        SpliceError::Other(format!(
+                            "{}: pre-image of page {p} unreadable",
+                            self.path.display()
+                        ))
                     })?;
                     Ok((*p, bytes))
                 })
-                .collect::<Result<_, String>>()?;
-            super::rj::write_journal(&self.path, &old_pages, ps, n_old)?;
-            super::rj::write_pages(&self.path, ps, &frames)?;
+                .collect::<Result<_, SpliceError>>()?;
+            super::rj::write_journal(&self.path, &old_pages, ps, n_old)
+                .map_err(SpliceError::Other)?;
+            super::rj::write_pages(&self.path, ps, &frames).map_err(SpliceError::Other)?;
             std::fs::remove_file(super::rj::journal_path_of(&self.path))
-                .map_err(|e| format!("remove journal: {e}"))?;
+                .map_err(|e| SpliceError::Other(format!("remove journal: {e}")))?;
             // The main file is now the committed view — no overlay.
             st.overlay.clear();
             st.record_guard(&self.path);
         }
         st.epoch += 1;
         Ok(true)
+    }
+
+    /// The span versions for a set of object names (0 when no span).
+    /// The session records these at each publish's close.
+    pub fn span_versions_of(&self, names: &[String]) -> HashMap<String, u64> {
+        let st = self.state.lock();
+        names
+            .iter()
+            .map(|n| {
+                let v = st
+                    .span_versions
+                    .get(&SpanKey::Object(n.clone()))
+                    .copied()
+                    .unwrap_or(0);
+                (n.clone(), v)
+            })
+            .collect()
+    }
+
+    /// The coordinator's current span version for one object
+    /// (0 = no span installed). Sessions compare this against the
+    /// version their last publish recorded before offering a
+    /// page-level mutation.
+    pub fn span_version(&self, key: &SpanKey) -> u64 {
+        self.state
+            .lock()
+            .span_versions
+            .get(key)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Run one object's page-level mutation against the committed view
+    /// (main file + overlay) — PURE: nothing in `st` moves; the
+    /// outcome (touched pages, new span, freelist deltas) is applied
+    /// by the caller only after EVERY mutation succeeded.
+    #[allow(clippy::too_many_arguments)]
+    fn run_mutation(
+        &self,
+        st: &ContainerState,
+        item: &MutateItem,
+        free: &mut BTreeSet<u32>,
+        tail: &mut u32,
+        pending: &mut HashMap<u32, Vec<u8>>,
+    ) -> Result<MutateOutcome, mutator::MutateFallback> {
+        let span = st.spans.get(&item.key).ok_or_else(|| {
+            mutator::MutateFallback("object has no span (first publish pending?)".into())
+        })?;
+        // BORROW the span's page list (no O(object-pages) clone per
+        // commit — the mutation session reads it for membership checks
+        // only and never mutates it).
+        let span0: &[u32] = &span.pages;
+        let root = span.root;
+        let ps = st.page_size;
+        let enc = st.text_enc;
+        let free_vec: Vec<u32> = free.iter().copied().collect();
+        let start_tail = *tail;
+        let overlay = &st.overlay;
+        // Earlier sessions of THIS publish rewrote pages into `pending`;
+        // the scratch view serves them ahead of the committed view (a
+        // page one session pruned and another took must read back as
+        // the new owner's content, never the stale overlay's).
+        let scratch: HashMap<u32, Vec<u8>> = pending.clone();
+        let mut reader = PageReader::new(&self.path);
+        let mut src = move |pgno: u32| -> Option<Vec<u8>> {
+            if let Some(p) = scratch.get(&pgno) {
+                return Some(p.clone());
+            }
+            if let Some(p) = overlay.get(&pgno) {
+                return Some(p.clone());
+            }
+            reader.read(pgno, ps, &HashMap::new())
+        };
+        let m = mutator::Mutator::new(ps, enc, &mut src, free_vec, start_tail, span0);
+        let out = m.run(root, item.ops.clone())?;
+        // Retire this session's grants from the shared view so the next
+        // session cannot hand the same pages out (the publish installs
+        // the outcomes into the coordinator state only after every
+        // session succeeds — the view is the interim truth).
+        for p in &out.took_from_free {
+            free.remove(p);
+        }
+        for p in &out.freed {
+            free.insert(*p);
+        }
+        *tail = (*tail).max(out.max_page + 1);
+        for (pgno, bytes) in &out.pages {
+            pending.insert(*pgno, bytes.clone());
+        }
+        Ok(out)
     }
 
     /// Session bookkeeping: a new session attached (the close-time
