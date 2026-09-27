@@ -1363,3 +1363,18 @@ Work Log:
 Stage Summary:
 - Page-level splicing is LIVE: the SQLite-format container's autocommit commits are O(changed pages) — 66 µs at 2M rows (9.8x FASTER than SQLite there), 57 µs at 10k tables, ~50-60 µs fixed + O(changed pages) as the measured law. Rootpages are stable on DML (the mutator's split discipline), so the schema tree stops rebuilding on data-only commits.
 - CI run 36300524462 on aa382e7: COMPLETED / SUCCESS — 31/31 jobs green on all three OSes (default matrix counted 1406 passed over 100 suites incl. the new foreign_mutate 8; sqlx / no-default / oom-injection / compat-ABI / torture / bench-gate / million-record / limit-stress / interop all green). README refreshed: the per-commit table now carries the new law, the gap ledger's top item closes to a ~50-60 µs fixed residual, test counts 1398 -> 1406, status header cites the aa382e7 run.
+
+---
+Task ID: 59
+Agent: main (Super Z)
+Task: Close the remaining perf gaps vs SQLite (per-commit publish residual, adversarial-ORDER covering joins, S06, stale parity rows) — research, code, CI-green loop, then README.
+
+Work Log:
+- Measured real SQLite's WAL frame discipline with a new probe (examples/probe_wal_discipline.rs): data-only WAL commits carry 2-3 frames with NO page-1 frame and NO change-counter bump; page 1 rides only growth commits (size refresh); our engine paid +1 page-1 frame + a counter bump per commit and ignored PRAGMA synchronous/wal_checkpoint in SQLite-format mode.
+- e8c338a (CI green 31/31, run 36310028688): publish machinery overhaul — SQLite-exact WAL frame discipline (counter frozen in WAL mode, page-1 only on content-change/growth), synchronous-aware append/checkpoint (fsync only under FULL), a committed-view page cache in the coordinator (descent reads stay RAM-hot across commits; overlays fold at checkpoints), RAW binary-search descents in the mutator (no cell-model decode of interior pages; ~log2(cells) varint parses; session descent cache), a span-size-aware mutate-vs-splice gate (bulk growth no longer re-collects whole objects when mutation is cheaper), and PRAGMA wal_checkpoint through the coordinator. The change-counter pin updated to the SQLite-parity semantics. CI bench gates: 58 WIN / 0 TIE / 0 LOSS on all three OSes; S06 now 1.24x linux / 1.11x macOS-ARM / 1.21x windows (all WIN).
+- aef5d30: the adversarial 3-table ORDER join's 0.13x residual was the inner-side point-lookup chain paying a table descent per matched index entry. Added planner-proven COVERING IndexNestedLoopJoin (statement-wide column-reference analysis carried down the plan tree; restoration projections excluded; COUNT(*)'s star arg and synthetic dotted names handled), index-entry emission (alias = entry rowid), a fused COUNT(*)-over-covering-INLJ (counts entries per probe, zero materialization), EXPLAIN's COVERING INDEX wording, and TWO correctness gates: the rewrite now requires pure-equi conditions (measured bug: cross-table residual conjuncts were silently dropped — 10 rows vs SQLite's 6) and declines inner scans with pushed predicates. Adversarial 50kx50kx5: 5.3ms -> 0.4ms = 1.71x faster than SQLite; 100k shape 3.03x. New differential pins in tests/gap_closure.rs; the correlated EXPLAIN pin accepts the covering wording.
+
+Stage Summary:
+- Gaps closed this round: per-commit discipline residual (A), adversarial ORDER (C, now a win), S06 (E, now a win on every OS), the stale 1.18x parity row (B; every gated join row wins on every OS).
+- Still open by construction: the 8-conn mixed R/W fsync floor (parity guard, reads 2.8x inside), SQLite-format cold-start whole-image load.
+- CI: e8c338a green 31/31; aef5d30 queued (36318572021) — tracked to green before the README pass.
