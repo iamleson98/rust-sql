@@ -858,6 +858,36 @@ impl<'a> Btree<'a> {
         None
     }
 
+    /// Greedy byte-aware run partition for the no-feasible-2-way corner:
+    /// distributes `cells` into the FEWEST contiguous runs such that each
+    /// run's byte sum (cell sizes + 2-byte pointer slots) fits `avail`.
+    /// Every legal cell is ≤ avail on its own (`max_cell_payload` sits
+    /// below the page budget), so each run holds at least one cell and
+    /// the partition always succeeds. Callers only reach this when the
+    /// whole set does NOT fit one page, so the result has ≥ 2 runs.
+    ///
+    /// Bound: the caller arrives with the existing cells (which fit one
+    /// page) plus ONE incoming cell, so the total is ≤ 2 × avail and the
+    /// run count stays ≤ 3 in practice — but the algorithm is correct
+    /// for any count.
+    fn greedy_runs(cells: &[Cell], avail: usize) -> Vec<std::ops::Range<usize>> {
+        let size = |c: &Cell| c.encoded_size() + 2;
+        let mut runs = Vec::new();
+        let mut start = 0usize;
+        let mut acc = 0usize;
+        for (i, c) in cells.iter().enumerate() {
+            let s = size(c);
+            if i > start && acc + s > avail {
+                runs.push(start..i);
+                start = i;
+                acc = 0;
+            }
+            acc += s;
+        }
+        runs.push(start..cells.len());
+        runs
+    }
+
     /// Interior index separator cell for (left_child, key, rowid). The
     /// separator is a COPY of a leaf entry's key — when that key is
     /// oversized the copy gets its OWN fresh overflow chain (the source
@@ -1772,7 +1802,41 @@ enum InsertResult {
         split_key: i64,
         /// For index splits: the key bytes of the left page's max entry.
         split_key_bytes: Option<Vec<u8>>,
+        /// Additional siblings from a 3+-way split. A page packed to
+        /// near-avail with sizeable cells can receive a mid-key insert
+        /// where NO contiguous 2-partition fits — every split point
+        /// overloads one half past the page budget (observed: a leaf
+        /// holding two ~1.9 KB blob rows takes a ~2.5 KB INSERT OR
+        /// REPLACE between them; cells [1717, 2493, 1941] bytes against
+        /// a 4084-byte budget — both 2-way points put ≥ 4210 on one
+        /// side). The split then distributes the cells across 3+ pages:
+        /// `new_page` is the FIRST new sibling (ascending key order)
+        /// and `extra_splits` carries the remaining boundaries. Empty
+        /// for ordinary 2-way splits — the overwhelmingly common case.
+        extra_splits: Vec<ExtraSplit>,
     },
+}
+
+/// One additional boundary of a 3+-way split (see `InsertResult::Split`).
+/// Same separator semantics as the primary: table trees report the right
+/// run's first key (parents apply the -1 gap convention); index trees
+/// report the left run's max entry, full key included.
+struct ExtraSplit {
+    new_page: PageId,
+    split_key: i64,
+    split_key_bytes: Option<Vec<u8>>,
+}
+
+impl InsertResult {
+    /// Ordinary 2-way split constructor — no extra siblings.
+    fn two_way(new_page: PageId, split_key: i64, split_key_bytes: Option<Vec<u8>>) -> Self {
+        InsertResult::Split {
+            new_page,
+            split_key,
+            split_key_bytes,
+            extra_splits: Vec::new(),
+        }
+    }
 }
 
 /// A point lookup result.
@@ -2956,8 +3020,11 @@ impl<'a> Btree<'a> {
                 new_page,
                 split_key,
                 split_key_bytes,
+                extra_splits,
             } => {
-                // The root split: create a new root pointing to the old and new pages.
+                // The root split: create a new root pointing to the old and
+                // new pages (3+-way splits: one cell per boundary, the LAST
+                // new page becomes the right-most child).
                 let old_root = self.root;
                 let new_root = self.pager.allocate_page()?;
                 {
@@ -2976,6 +3043,23 @@ impl<'a> Btree<'a> {
                     key: split_key - 1,
                 };
                 self.insert_cell_into_page(new_root, &cell)?;
+                // Additional boundaries (3+-way split): each reports the
+                // first key of its right run; the page left of it is the
+                // previously installed sibling.
+                let mut left = new_page;
+                for ex in &extra_splits {
+                    let cell = Cell::TableInterior {
+                        left_child: left,
+                        key: ex.split_key - 1,
+                    };
+                    self.insert_cell_into_page(new_root, &cell)?;
+                    left = ex.new_page;
+                }
+                // The last sibling takes over the right-most slot.
+                self.pager
+                    .get_page(new_root)?
+                    .lock()
+                    .set_right_most_pointer(left);
                 self.pager.note_root_split(old_root, new_root);
                 if crate::executor::dbg_index_trace() {
                     eprintln!(
@@ -4760,9 +4844,12 @@ impl<'a> Btree<'a> {
                     new_page,
                     split_key,
                     split_key_bytes,
+                    extra_splits,
                 } => {
                     // The child split. We must replace the cell that pointed
-                    // to `child_id` with TWO cells:
+                    // to `child_id` with TWO cells (a 3+-way split: one cell
+                    // per boundary, the LAST new page inheriting the old
+                    // bound):
                     //   cell1 = (child_id, left_max)   — the child now holds
                     //                                  entries <= left_max
                     //   cell2 = (new_page, old_sep)   — the new page holds
@@ -4838,7 +4925,9 @@ impl<'a> Btree<'a> {
                             }
                         }
 
-                        if is_right_most {
+                        // The in-place splices below handle ONE new page;
+                        // a 3+-way split goes straight to the rebuild path.
+                        if is_right_most && extra_splits.is_empty() {
                             if crate::executor::dbg_index_trace() {
                                 eprintln!(
                                     "[parent:rm] parent={} child={} new_page={} sep_rowid={}",
@@ -4896,7 +4985,9 @@ impl<'a> Btree<'a> {
                                 self.pager.note_dirty(page_id);
                                 return Ok(InsertResult::Done);
                             }
-                        } else if let Some((idx, old_off)) = found {
+                        } else if let Some((idx, old_off)) =
+                            found.filter(|_| extra_splits.is_empty())
+                        {
                             // Build cell1/cell2 and splice them in place of
                             // the old cell at `idx`.
                             let (cell1, cell2, old_chain) = if is_idx_now {
@@ -5038,6 +5129,38 @@ impl<'a> Btree<'a> {
                     let effective_right_most =
                         right_most == 0 && found_idx == Some(cells.len() - 1);
 
+                    // The boundary cells this split installs, one per
+                    // boundary: each separator points at the page LEFT of
+                    // its boundary, and the LAST new page inherits the old
+                    // bound (the old separator cell below, or the
+                    // right-most slot).
+                    let mut boundary_cells: Vec<Cell> = Vec::with_capacity(1 + extra_splits.len());
+                    let mut left_page = child_id;
+                    let bounds = std::iter::once((new_page, split_key, split_key_bytes)).chain(
+                        extra_splits
+                            .into_iter()
+                            .map(|e| (e.new_page, e.split_key, e.split_key_bytes)),
+                    );
+                    for (np, sk, skb) in bounds {
+                        let cell = if is_idx_page {
+                            self.index_interior_separator(
+                                left_page,
+                                skb.as_deref().unwrap_or_default(),
+                                sk,
+                            )?
+                        } else {
+                            Cell::TableInterior {
+                                left_child: left_page,
+                                key: sk - 1,
+                            }
+                        };
+                        boundary_cells.push(cell);
+                        left_page = np;
+                    }
+                    // `left_page` is now the LAST new page; it takes the old
+                    // bound (the last inserted cell below / right_most).
+                    let n_bounds = boundary_cells.len();
+
                     if effective_right_most {
                         // The replaced cell's overflow chain (if any) dies
                         // with it — the copy builds a fresh chain.
@@ -5050,31 +5173,25 @@ impl<'a> Btree<'a> {
                         } else {
                             0
                         };
-                        let cell1 = if is_idx_page {
-                            self.index_interior_separator(
-                                child_id,
-                                split_key_bytes.as_deref().unwrap_or_default(),
-                                split_key,
-                            )?
-                        } else {
-                            Cell::TableInterior {
-                                left_child: child_id,
-                                key: split_key - 1,
-                            }
-                        };
                         if let Some(idx) = found_idx {
-                            cells[idx] = cell1;
+                            for (offset, c) in boundary_cells.into_iter().enumerate() {
+                                if offset == 0 {
+                                    cells[idx] = c;
+                                } else {
+                                    cells.insert(idx + offset, c);
+                                }
+                            }
                         }
                         if dead_chain != 0 {
                             self.free_overflow_chain(dead_chain)?;
                         }
-                        right_most = new_page;
+                        right_most = left_page;
                     } else if let Some(idx) = found_idx {
                         if is_idx_page {
                             // FULL old key (reassembled for overflow cells —
                             // the local prefix would corrupt the order), and
-                            // the removed cell's chain dies (cell2's copy
-                            // builds its own).
+                            // the removed cell's chain dies (the last cell's
+                            // copy builds its own).
                             let (old_key, old_rowid, dead_chain) = {
                                 let c = &cells[idx];
                                 match self.cell_index_key(c) {
@@ -5082,16 +5199,13 @@ impl<'a> Btree<'a> {
                                     Err(_) => (Vec::new(), i64::MAX, 0),
                                 }
                             };
-                            let cell1 = self.index_interior_separator(
-                                child_id,
-                                split_key_bytes.as_deref().unwrap_or_default(),
-                                split_key,
-                            )?;
-                            let cell2 =
-                                self.index_interior_separator(new_page, &old_key, old_rowid)?;
+                            let last_cell =
+                                self.index_interior_separator(left_page, &old_key, old_rowid)?;
                             cells.remove(idx);
-                            cells.insert(idx, cell2);
-                            cells.insert(idx, cell1);
+                            for (offset, c) in boundary_cells.into_iter().enumerate() {
+                                cells.insert(idx + offset, c);
+                            }
+                            cells.insert(idx + n_bounds, last_cell);
                             if dead_chain != 0 {
                                 self.free_overflow_chain(dead_chain)?;
                             }
@@ -5101,36 +5215,20 @@ impl<'a> Btree<'a> {
                             } else {
                                 i64::MAX
                             };
-                            let cell1 = Cell::TableInterior {
-                                left_child: child_id,
-                                key: split_key - 1,
-                            };
-                            let cell2 = Cell::TableInterior {
-                                left_child: new_page,
+                            let last_cell = Cell::TableInterior {
+                                left_child: left_page,
                                 key: old_key,
                             };
                             cells.remove(idx);
-                            cells.insert(idx, cell2);
-                            cells.insert(idx, cell1);
+                            for (offset, c) in boundary_cells.into_iter().enumerate() {
+                                cells.insert(idx + offset, c);
+                            }
+                            cells.insert(idx + n_bounds, last_cell);
                         }
                     } else {
                         // right_most case: child_id was right_most.
-                        if is_idx_page {
-                            let cell1 = self.index_interior_separator(
-                                child_id,
-                                split_key_bytes.as_deref().unwrap_or_default(),
-                                split_key,
-                            )?;
-                            cells.push(cell1);
-                            right_most = new_page;
-                        } else {
-                            let cell1 = Cell::TableInterior {
-                                left_child: child_id,
-                                key: split_key - 1,
-                            };
-                            cells.push(cell1);
-                            right_most = new_page;
-                        }
+                        cells.extend(boundary_cells);
+                        right_most = left_page;
                     }
 
                     // Does the rewritten page still fit? If not, split this
@@ -5161,10 +5259,17 @@ impl<'a> Btree<'a> {
                         let mid = match Self::byte_aware_mid(&cells, avail_i) {
                             Some(m) => m,
                             None => {
-                                return Err(Error::corruption(format!(
-                                    "interior page {} cannot split: no feasible byte-aware point",
-                                    page_id
-                                )))
+                                // No contiguous 2-partition fits (oversized
+                                // index separators can pack a parent the
+                                // same way blob rows pack a leaf) —
+                                // distribute across 3+ pages.
+                                return self.multi_way_interior_split(
+                                    page_id,
+                                    is_idx_page,
+                                    cells,
+                                    right_most,
+                                    avail_i,
+                                );
                             }
                         };
                         // Separator to propagate = cells[mid-1]'s separator.
@@ -5217,11 +5322,11 @@ impl<'a> Btree<'a> {
                             .lock()
                             .set_right_most_pointer(right_most);
 
-                        return Ok(InsertResult::Split {
-                            new_page: new_interior,
-                            split_key: prop_rowid,
-                            split_key_bytes: prop_key_bytes,
-                        });
+                        return Ok(InsertResult::two_way(
+                            new_interior,
+                            prop_rowid,
+                            prop_key_bytes,
+                        ));
                     }
 
                     // Rewrite the page in place (fits).
@@ -5686,11 +5791,11 @@ impl<'a> Btree<'a> {
                     None => return Ok(None),
                 }
             };
-            Ok(Some(InsertResult::Split {
-                new_page: new_page_id,
-                split_key: sep_rowid,
-                split_key_bytes: Some(sep_key),
-            }))
+            Ok(Some(InsertResult::two_way(
+                new_page_id,
+                sep_rowid,
+                Some(sep_key),
+            )))
         } else {
             // split_key = first key of the right page.
             let split_key = {
@@ -5702,11 +5807,7 @@ impl<'a> Btree<'a> {
                     None => return Ok(None),
                 }
             };
-            Ok(Some(InsertResult::Split {
-                new_page: new_page_id,
-                split_key,
-                split_key_bytes: None,
-            }))
+            Ok(Some(InsertResult::two_way(new_page_id, split_key, None)))
         }
     }
 
@@ -5789,18 +5890,10 @@ impl<'a> Btree<'a> {
                     }
                 }
             };
-            Ok(InsertResult::Split {
-                new_page: new_page_id,
-                split_key: sep_rowid,
-                split_key_bytes: Some(sep_key),
-            })
+            Ok(InsertResult::two_way(new_page_id, sep_rowid, Some(sep_key)))
         } else {
             // Table separator: first key of the new page = the new rowid.
-            Ok(InsertResult::Split {
-                new_page: new_page_id,
-                split_key: new_cell.key(),
-                split_key_bytes: None,
-            })
+            Ok(InsertResult::two_way(new_page_id, new_cell.key(), None))
         }
     }
 
@@ -6166,10 +6259,11 @@ impl<'a> Btree<'a> {
             match Self::byte_aware_mid(&cells, avail_l) {
                 Some(m) => m,
                 None => {
-                    return Err(Error::corruption(format!(
-                        "leaf page {} cannot split: no feasible byte-aware point",
-                        page_id
-                    )))
+                    // No contiguous 2-partition fits (a packed page plus a
+                    // mid-key insert bigger than the leftover gap — see
+                    // `InsertResult::Split::extra_splits`). Distribute
+                    // across 3+ pages instead of failing.
+                    return self.multi_way_leaf_split(page_id, pt, cells, avail_l);
                 }
             }
         };
@@ -6228,6 +6322,7 @@ impl<'a> Btree<'a> {
                 new_page: new_page_id,
                 split_key: left_max.key(),
                 split_key_bytes: Some(sep_bytes),
+                extra_splits: Vec::new(),
             })
         } else {
             // The split key is the FIRST key of the new page (the min key in
@@ -6237,8 +6332,192 @@ impl<'a> Btree<'a> {
                 new_page: new_page_id,
                 split_key,
                 split_key_bytes: None,
+                extra_splits: Vec::new(),
             })
         }
+    }
+
+    /// 3+-way LEAF split — the no-feasible-2-way corner (`greedy_runs`).
+    ///
+    /// A page packed to near-avail with sizeable rows can receive a
+    /// mid-key insert where EVERY contiguous 2-partition overloads one
+    /// half past the page budget. Distribute the cells across as many
+    /// pages as needed: run 1 stays on `page_id` (stable page identity
+    /// for in-flight descents), every further run gets a fresh page, and
+    /// every boundary reports a separator to the parent exactly like an
+    /// ordinary split (table trees: the right run's first key; index
+    /// trees: the left run's max entry, full key included).
+    fn multi_way_leaf_split(
+        &mut self,
+        page_id: PageId,
+        pt: PageType,
+        cells: Vec<Cell>,
+        avail: usize,
+    ) -> Result<InsertResult> {
+        let is_index = matches!(pt, PageType::LeafIndex);
+        // A lone cell exceeding the page budget cannot fit ANY page — the
+        // pre-existing corruption signal (unreachable for legal cells:
+        // max_cell_payload < budget).
+        if cells.iter().any(|c| c.encoded_size() + 2 > avail) {
+            return Err(Error::corruption(format!(
+                "leaf page {} cannot split: a single cell exceeds the page budget",
+                page_id
+            )));
+        }
+        let runs = Self::greedy_runs(&cells, avail);
+        debug_assert!(runs.len() >= 2, "over-budget cell set split into one run");
+        // Clear the old page; run 1 re-populates it.
+        {
+            let page_ref = self.pager.get_page(page_id)?;
+            let mut borrowed = page_ref.lock();
+            if is_index {
+                borrowed.init_leaf_index();
+            } else {
+                borrowed.init_leaf_table();
+            }
+        }
+        self.pager.note_dirty(page_id);
+
+        let mut boundaries: Vec<ExtraSplit> = Vec::with_capacity(runs.len() - 1);
+        let mut prev_end = 0usize;
+        for (ri, run) in runs.iter().enumerate() {
+            if ri == 0 {
+                for c in &cells[run.clone()] {
+                    self.insert_cell_into_page(page_id, c)?;
+                }
+            } else {
+                let new_page_id = self.pager.allocate_page()?;
+                let new_page = self.pager.get_page(new_page_id)?;
+                if is_index {
+                    new_page.lock().init_leaf_index();
+                } else {
+                    new_page.lock().init_leaf_table();
+                }
+                for c in &cells[run.clone()] {
+                    self.insert_cell_into_page(new_page_id, c)?;
+                }
+                // Boundary separator between the previous run and this
+                // one — same conventions as the 2-way split's return.
+                let (split_key, split_key_bytes) = if is_index {
+                    // Exact separator: the LEFT run's last entry, full
+                    // key (overflow variants reassemble their chain).
+                    let left_max = &cells[prev_end - 1];
+                    let full = self.cell_index_key(left_max)?;
+                    (left_max.key(), Some(full))
+                } else {
+                    // First key of the right run; the parent applies the
+                    // -1 gap convention.
+                    (cells[run.start].key(), None)
+                };
+                boundaries.push(ExtraSplit {
+                    new_page: new_page_id,
+                    split_key,
+                    split_key_bytes,
+                });
+            }
+            prev_end = run.end;
+        }
+        let mut it = boundaries.into_iter();
+        // ≥ 2 runs ⇒ ≥ 1 boundary; an over-budget set cannot yield one.
+        let first = it.next().ok_or_else(|| {
+            Error::corruption("multi-way leaf split found no boundary".to_string())
+        })?;
+        Ok(InsertResult::Split {
+            new_page: first.new_page,
+            split_key: first.split_key,
+            split_key_bytes: first.split_key_bytes,
+            extra_splits: it.collect(),
+        })
+    }
+
+    /// 3+-way INTERIOR split — the same no-feasible-2-way corner for the
+    /// parent-rewrite path (reachable with oversized index separators:
+    /// interior index cells carry full key copies in-page). Identical
+    /// distribution discipline as `multi_way_leaf_split`; the tree's old
+    /// right-most pointer moves to the LAST new page, and table trees
+    /// report boundary keys by the interior convention (left run's max
+    /// separator + 1; the parent applies -1 to recover it).
+    fn multi_way_interior_split(
+        &mut self,
+        page_id: PageId,
+        is_idx_page: bool,
+        cells: Vec<Cell>,
+        right_most: PageId,
+        avail: usize,
+    ) -> Result<InsertResult> {
+        if cells.iter().any(|c| c.encoded_size() + 2 > avail) {
+            return Err(Error::corruption(format!(
+                "interior page {} cannot split: a single cell exceeds the page budget",
+                page_id
+            )));
+        }
+        let runs = Self::greedy_runs(&cells, avail);
+        debug_assert!(runs.len() >= 2, "over-budget cell set split into one run");
+        // Rewrite the old page with run 1.
+        {
+            let p = self.pager.get_page(page_id)?;
+            let mut borrowed = p.lock();
+            if is_idx_page {
+                borrowed.init_interior_index();
+            } else {
+                borrowed.init_interior_table();
+            }
+        }
+        self.pager.note_dirty(page_id);
+        for c in &cells[runs[0].clone()] {
+            self.insert_cell_into_page(page_id, c)?;
+        }
+
+        let mut boundaries: Vec<ExtraSplit> = Vec::with_capacity(runs.len() - 1);
+        let mut prev_end = 0usize;
+        for (ri, run) in runs.iter().enumerate().skip(1) {
+            let new_page_id = self.pager.allocate_page()?;
+            {
+                let p = self.pager.get_page(new_page_id)?;
+                let mut borrowed = p.lock();
+                if is_idx_page {
+                    borrowed.init_interior_index();
+                } else {
+                    borrowed.init_interior_table();
+                }
+            }
+            for c in &cells[run.clone()] {
+                self.insert_cell_into_page(new_page_id, c)?;
+            }
+            let (split_key, split_key_bytes) = if is_idx_page {
+                // Exact separator: the left run's last cell, FULL key.
+                let left_max = &cells[prev_end - 1];
+                let full = self.cell_index_key(left_max)?;
+                (left_max.key(), Some(full))
+            } else {
+                // Interior convention: left run's max separator + 1 (the
+                // parent applies -1 to recover the left max).
+                (cells[prev_end - 1].key() + 1, None)
+            };
+            if ri == runs.len() - 1 {
+                // The tree's right-most pointer moves to the LAST page.
+                self.pager
+                    .get_page(new_page_id)?
+                    .lock()
+                    .set_right_most_pointer(right_most);
+            }
+            boundaries.push(ExtraSplit {
+                new_page: new_page_id,
+                split_key,
+                split_key_bytes,
+            });
+            prev_end = run.end;
+        }
+        let mut it = boundaries.into_iter();
+        let first = it.next().ok_or_else(|| {
+            Error::corruption("multi-way interior split found no boundary".to_string())
+        })?;
+        Ok(InsertResult::Split {
+            new_page: first.new_page,
+            split_key: first.split_key,
+            split_key_bytes: first.split_key_bytes,
+            extra_splits: it.collect(),
+        })
     }
 
     // Split an interior page. Same idea but the middle cell moves up.
@@ -9253,6 +9532,7 @@ impl<'a> Btree<'a> {
                 new_page,
                 split_key,
                 split_key_bytes,
+                extra_splits,
             } => {
                 let old_root = self.root;
                 let new_root = self.pager.allocate_page()?;
@@ -9271,6 +9551,24 @@ impl<'a> Btree<'a> {
                     split_key,
                 )?;
                 self.insert_cell_into_page(new_root, &cell)?;
+                // Additional boundaries (3+-way split): each separator is
+                // the exact max entry of the page to its LEFT; oversized
+                // separators get their own chain copies.
+                let mut left = new_page;
+                for ex in &extra_splits {
+                    let cell = self.index_interior_separator(
+                        left,
+                        ex.split_key_bytes.as_deref().unwrap_or_default(),
+                        ex.split_key,
+                    )?;
+                    self.insert_cell_into_page(new_root, &cell)?;
+                    left = ex.new_page;
+                }
+                // The last sibling takes over the right-most slot.
+                self.pager
+                    .get_page(new_root)?
+                    .lock()
+                    .set_right_most_pointer(left);
                 self.pager.note_root_split(old_root, new_root);
                 if crate::executor::dbg_index_trace() {
                     eprintln!(

@@ -1,11 +1,13 @@
-//! Repro probe (KNOWN ENGINE CORNER, pre-existing, native-format too):
-//! an INSERT OR REPLACE workload with ~2.5 KB blobs eventually asks a
-//! leaf to split with no feasible byte-aware point
-//! (`src/storage/btree.rs` byte_aware_mid) — reproducible on the NATIVE
-//! container, i.e. independent of the SQLite-format splice work. Kept
-//! as the minimal reproducer for the follow-up ledger.
-//! Run: `cargo run --example probe_native_fuzz` → "NATIVE failed at
-//! round 8: corruption: leaf page 24 cannot split".
+//! Regression probe (FIXED — the 3+-way split): an INSERT OR REPLACE
+//! workload with ~2.5 KB blobs used to ask a leaf to split with no
+//! feasible byte-aware point (a page packed with two ~2 KB rows taking a
+//! bigger mid-key row — no contiguous 2-partition fits). The split now
+//! distributes the cells across 3+ pages (`multi_way_leaf_split`); this
+//! probe runs the original failing workload on the NATIVE container and
+//! must survive all 12 rounds. Pinned as a test in
+//! tests/multiway_split.rs (`multiway_split_replace_fuzz_native`).
+//! Run: `cargo run --example probe_native_fuzz` → "native container
+//! survived 300 ops".
 
 use rustqlite::{Database, Value};
 
