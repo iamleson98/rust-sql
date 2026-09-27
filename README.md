@@ -2,10 +2,7 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status** (all numbers from the latest CI-green run [36282067462](https://github.com/iamleson98/rust-sql/actions/runs/36282067462) @ `4f191eb`, 2026-09-27, 31/31 jobs):
-> **1398 tests** in the default matrix, plus sqlx / no-default / oom-injection / compat-ABI matrices on 3 OSes — and a dedicated **limit-stress** job (8 push-to-the-limit sections at 1M-row file scale) on every OS; the 2026-09-27 round closed **the big-blob `INSERT OR REPLACE` split corner** — a page packed past every feasible 2-way point (near-avail rows + a bigger mid-key insert) now distributes its cells across 3+ pages through the ordinary propagation chain instead of raising `cannot split: no feasible byte-aware point` (`tests/multiway_split.rs`, 5 pins incl. the original fuzz workload and the SQLite-format container verified by real SQLite). The 2026-09-26 rounds closed the engine-generation-boundary durability class and landed **the SQLite-format container's incremental page-diff architecture** — per-root change epochs pick the dirty objects, each commit splices only those b-trees onto stable page identities (own previous pages → container freelist → tail), shrinkage routes into a real SQLite freelist, one per-file page-space coordinator shares the layout across sessions, and a fresh process ADOPTS the file's layout so the first commit after a restart splices too — per-commit CPU and I/O are **O(changed object)** where the whole image used to be re-derived every boundary (the measured residual — object-granularity re-encode, ≈ 2 µs × changed-object's rows — is quantified in the [per-commit table](#sqlite-format-container-per-commit-cost-on-large-files) and leads the gap ledger; the remaining step is page-level splicing). The epoch machinery is gated to SQLite-format databases, so native and in-memory hot paths pay nothing. **54 benchmark rows vs real SQLite: 53 wins, 1 parity tie, 0 losses** (the per-commit reference measurement above is recorded separately, not a gated row). Byte-identical file size, lower-or-equal peak RSS on 14/18 torture sections (the rest +1–2 MB by allocator choice). Three concurrency tiers beyond SQLite's envelope, plus `BEGIN CONCURRENT` multi-writer transactions. sqlx 0.9 native driver **and** drop-in `libsqlite3` C ABI verified with sea-orm 2.0 end to end.
-> SQLite-format interop both directions, verified by real SQLite.
-> The honest ledger of what is still missing: [Remaining gaps](#remaining-gaps-vs-sqlite).
+> **Status**: CI fully green — 31/31 jobs on linux/windows/macos ([latest green run](https://github.com/iamleson98/rust-sql/actions/runs/36284576392) @ `2ce90ee`): **1398 tests** in the default matrix plus sqlx / no-default / OOM-injection / compat-ABI / limit-stress matrices, and a dedicated **limit-stress** CI job (8 push-to-the-limit sections at 1M-row file scale) on every OS. Benchmarks vs real SQLite: **53 wins / 1 parity tie / 0 losses over 54 gated rows**. Byte-identical file sizes; peak RSS at or below SQLite on 14/18 torture sections. Three concurrency tiers beyond SQLite's envelope, plus `BEGIN CONCURRENT` multi-writer transactions. SQLite-format interop both directions, verified by real SQLite. sqlx 0.9 native driver and drop-in `libsqlite3` C ABI, sea-orm 2.0 verified end to end. The honest ledger of what is still missing: [Remaining gaps](#remaining-gaps-vs-sqlite).
 
 This README is the single source of truth: feature surface, the latest performance / resource / concurrency / cold-start comparisons against SQLite, and the gap ledger.
 
@@ -75,7 +72,7 @@ let rows = db.query("SELECT name, age FROM users WHERE age > 28 ORDER BY age", [
 
 ## Performance vs SQLite
 
-vs rusqlite (bundled SQLite 3.5x) on identical workloads, every timing row answer-equality-asserted before timing. CI bench-gate (ubuntu, 2026-09-19, run [35425398313](https://github.com/iamleson98/rust-sql/actions/runs/35425398313)): **53 wins / 1 parity tie / 0 losses over 54 rows** (gate 1: 18/18, gate 2: 20/20, gate 3: 8/8, gate 4: 7 wins + 1 tie of 8).
+vs rusqlite (bundled SQLite 3.5x) on identical workloads, every timing row answer-equality-asserted before timing. CI bench-gate summary: **53 wins / 1 parity tie / 0 losses over 54 rows**.
 
 ### Serial workloads (CI, best-of, µs/ms)
 
@@ -111,7 +108,7 @@ rustqlite splits scans across worker threads; SQLite's executor is single-thread
 | Top-25 ORDER BY REAL DESC (full rows) | 96.5 ms | 214.9 ms | **2.2x** |
 | ORDER BY INT DESC (unbounded) | 188.4 ms | 261.1 ms | **1.4x** |
 | 2-table equi-JOIN (1M × 1M, 3M out) | 451.6 ms | 624.2 ms | **1.38x** |
-| 3-table adversarial ORDER (50k×50k×5) | 5.3 ms | 0.7 ms | 0.13x — was 482 ms pre-reorder (**~90x engine-side**) |
+| 3-table adversarial ORDER (50k×50k×5) | 5.3 ms | 0.7 ms | 0.13x (**~90x engine-side** from the join reorder) |
 
 ### Specialized index access methods (engine-vs-engine, 100k rows)
 
@@ -122,7 +119,7 @@ rustqlite splits scans across worker threads; SQLite's executor is single-thread
 
 ### SQLite-format container: per-commit cost on large files
 
-Reference measurement 2026-09-27 on this 2-vCPU box, release build, WAL + `synchronous=OFF` (isolates commit CPU from the fsync floor), 1-row autocommit INSERT, best-effort M=30 — `examples/probe_commit_scale.rs`. Not a CI-gated row: recorded here as the honest quantification of the incremental page-diff architecture (2026-09-26) and its residual.
+Reference box (2 vCPU), release build, WAL + `synchronous=OFF` (isolates commit CPU from the fsync floor), 1-row autocommit INSERT, best-effort M=30 — `examples/probe_commit_scale.rs`. Not a CI-gated row: recorded as the honest quantification of the incremental page-diff architecture and its residual.
 
 | File shape | rustqlite | SQLite | Verdict |
 |---|---|---|---|
@@ -132,7 +129,7 @@ Reference measurement 2026-09-27 on this 2-vCPU box, release build, WAL + `synch
 | 5k tables × 100 rows, commit touches one 100-row table | 6.95 ms | 9.4 µs | the O(#objects) schema-diff term |
 | 500 tables × 100 rows, same | 0.50 ms | 7.2 µs | same |
 
-The measured law: per-commit ≈ **2 µs × changed-object's rows + ~1.3 µs × every schema object + ~40 µs fixed**. What the architecture already bought: the commit no longer re-derives the whole image (the pre-architecture path walked every row of the FILE at every boundary — a commit touching one 100-row table on a 500k-row file now costs ~0.5 ms instead of ~1 s), the WAL I/O is already incremental (4–12 frames per single-row commit, byte-compare-verified: 4 of 3147 pages differ on a 10k-row table's insert), shrinkage routes into a real freelist, and page identities stay stable. The residual is object GRANULARITY: a dirty object is re-dumped and re-encoded in full — every row, whole logical tree rebuild — even when a handful of its pages changed. The remaining step is **page-level splicing**: a container-side b-tree mutator that descends and balances only the touched pages (SQLite's own `balance()` discipline over foreign-format pages). The `O(#objects)` term (catalog snapshot + schema-signature build per commit) then folds into a catalog-DDL counter.
+Measured law: per-commit ≈ **2 µs × changed-object's rows + ~1.3 µs × schema objects + ~40 µs fixed**. Commits are already **O(changed object)** — only the dirty b-trees are spliced, the WAL append carries only the differing pages (4–12 frames on a single-row commit), shrinkage routes into a real freelist, and page identities stay stable. The residual is object GRANULARITY: a dirty object is re-encoded in full — every row — even when a handful of its pages changed. The remaining step is **page-level splicing**: a container-side b-tree mutator that descends and balances only the touched pages (SQLite's own `balance()` discipline over foreign-format pages), plus a catalog-DDL counter to fold the O(#objects) schema-signature term.
 
 ### Where the wins come from
 
@@ -152,7 +149,7 @@ The measured law: per-commit ≈ **2 µs × changed-object's rows + ~1.3 µs × 
 | WAL commit latency | 25.3 µs/txn | 28.5 µs/txn | **1.13x faster** (delete journal: 6.2x) |
 | Stripped CLI binary | 3.10 MB | ~2.06 MB | 1.5x larger — deliberate (mimalloc ~140 KiB buys 1.5–2.1x writes, opt-out `default-features = false`; the rest is feature surface SQLite ships as separate extensions) |
 
-**Torture matrix (18 sections, CI 2026-09-19, time verdict: 18/18 WIN; memory reported not gated):** 14 sections within 0.9–1.0x of SQLite's RSS, two memory *wins* (S03 GROUP BY 0.70x via temp-store spill, S11 IN-lists 0.74x via Arc-shared lists), the rest 0.5–0.9x (1–6 MB deltas) — the mimalloc baseline (~1 MB at open) plus WAL-side bookkeeping on file-mode builds; `default-features = false` recovers the glibc baseline. S17 open+first-query on a 1M-row file: **5.7 ms vs 12.2 ms (2.14x faster)** at 0.57x RSS. No leak: S13 sustained-2M-ops RSS flat 7→7 MB. THP: an `.init_array` `prctl(PR_SET_THP_DISABLE)` (opt-out `RSQL_ALLOW_THP=1`) halves file-backed sections on `THP=always` kernels with time columns unchanged. **Delete-churn compaction**: a leaf that cannot fit a re-inserted cell first reclaims its dead cell bytes in place (one scratch-copy rewrite, no new page — SQLite's balancer answer at leaf granularity), so delete-75% + reinsert-same-shape holds the file at ~1.0x of build size instead of growing 1.67x (683→1140 pages measured before the fix); pinned at 500k-row scale by the limit-stress suite. **VACUUM reclamation** (same campaign): emptied leaves left attached by mass deletes are pruned by the page-level copy (interiors rebuilt over the survivors, collapsing empty spines); hollow survivor shapes decline to the row-level dense rebuild; index overflow chains (leaf keys AND interior separators) are copied and re-linked — three real bugs the limit suite found, pinned by its S8 section on every OS.
+**Torture matrix (18 sections, CI; time verdict 18/18 win, memory reported not gated):** 14 sections within 0.9–1.0x of SQLite's peak RSS, two memory wins (S03 GROUP BY 0.70x via temp-store spill, S11 IN-lists 0.74x via Arc-shared lists), the rest 0.5–0.9x (1–6 MB) — mimalloc's ~1 MB open-time baseline plus WAL bookkeeping; `default-features = false` recovers the glibc baseline. Cold open + first query on a 1M-row file: **5.7 ms vs 12.2 ms (2.14x faster)** at 0.57x RSS. No leak: sustained 2M ops, RSS flat. THP is disabled at startup (opt-out `RSQL_ALLOW_THP=1`) — halves file-backed sections on `THP=always` kernels, time columns unchanged. **Delete-churn compaction**: a leaf that cannot fit a re-inserted cell reclaims its dead cell bytes in place (no new page), so delete-75% + reinsert-same-shape holds the file at ~1.0x of build size; pinned at 500k-row scale by the limit-stress suite. **VACUUM reclamation**: emptied leaves are pruned (interiors rebuilt over the survivors) and index overflow chains — leaf keys and interior separators — are copied and re-linked.
 
 ## Concurrency vs SQLite
 
@@ -172,7 +169,7 @@ Three tiers: **(1) inter-connection MRMW reads** — true parallel readers on sh
 
 **`BEGIN CONCURRENT`** — optimistic multi-writer transactions (SQLite `begin_concurrent` branch semantics): N write transactions at once over private page shadows, snapshot isolation (`SQLITE_BUSY_SNAPSHOT` 517 on moved pages), **row-level first-committer-wins with MERGE** (disjoint rows of one hot leaf page both commit; the second writer replays its row journal onto current trees atomically), readers never block, ROLLBACK nearly free, SAVEPOINT inside, **group commit** (~1 fsync per burst under `synchronous=FULL`; ~5x single-writer OLTP throughput at 8 connections, ~0.25 fsync/txn). 28 engine suites + 7 sqlx suites + 3 stress harnesses (`tests/concurrent_writes.rs`).
 
-**Implicit join** — plain autocommit INSERT/UPDATE/DELETE arriving while the regime is open no longer waits out BUSY: the statement runs as a one-statement concurrent transaction (same shadows, row-level validation, group-commit fsync) through every path — `Database::execute`, prepare/step streaming, the sqlx driver (which skips the regime wait for autocommit DML), **and the C ABI** (each `sqlite3*` handle arms a distinct engine identity, so stock sqlx/sea-orm apps through `compat/` join too; a failed concurrent COMMIT releases the handle's bookkeeping, and an abandoned transaction rolls back at close). Same-row writers get retriable 517 and win/lose by first-committer-wins; disjoint rows of one hot page MERGE. This also closed a latent hole: raw prepare/step DML during the regime previously wrote the live cache mid-regime — and the C ABI's shared identity-0 slot let one handle's reads serve another's uncommitted shadows.
+**Implicit join** — plain autocommit INSERT/UPDATE/DELETE arriving while the regime is open no longer waits out BUSY: the statement runs as a one-statement concurrent transaction (same shadows, row-level validation, group-commit fsync) through every path — `Database::execute`, prepare/step streaming, the sqlx driver (which skips the regime wait for autocommit DML), **and the C ABI** (each `sqlite3*` handle arms a distinct engine identity, so stock sqlx/sea-orm apps through `compat/` join too; a failed concurrent COMMIT releases the handle's bookkeeping, and an abandoned transaction rolls back at close). Same-row writers get retriable 517 and win/lose by first-committer-wins; disjoint rows of one hot page MERGE.
 
 **True parallel writers on a shared `Arc<Database>`** — the `&self` engine API SQLite architecturally cannot offer (its WAL admits exactly one writer at a time, database-wide):
 
@@ -189,7 +186,7 @@ N threads run N simultaneous transactions on ONE engine: the heavy DML overlaps 
 
 ## Cold start on large files
 
-Measured 2026-09-19 on this 2-vCPU box, 5M-row / ~1.3 GiB files, fresh process per run, page cache dropped (`posix_fadvise DONTNEED`) — `examples/probe_cold_large.rs`:
+Reference box (2 vCPU), 5M-row / ~1.3 GiB files, fresh process per run, page cache dropped (`posix_fadvise DONTNEED`) — `examples/probe_cold_large.rs`:
 
 | Container | Open | First COUNT+SUM (5M rows, cold) | Warm point lookup | Peak RSS |
 |---|---|---|---|---|
@@ -209,7 +206,7 @@ rustqlite reads and writes **real SQLite database files** (fileformat2): files f
 - **Writer**: bottom-up dense b-trees with SQLite's separator invariants, overflow chains with exact split math, autoindexes, `sqlite_sequence`, views/triggers, per-commit atomicity (rollback journal or WAL sidecar, byte-exact), `journal_mode` switching both ways, `auto_vacuum` ptrmap pages written, UTF-16 files end-to-end (encoding-aware ordering — real SQLite binary-searches the engine's index b-trees), NOCASE/RTRIM/custom collations order the written file; **multi-session page space** — one per-file coordinator serializes every session's splices over the same evolving layout (per-object last-writer merge, shared WAL chain), with shrinkage routed into a real SQLite freelist (header 32/36, trunk/leaf pages — `integrity_check`-clean) so page identities stay stable without re-flowing the file
 - **`VACUUM INTO`** from either container writes a real SQLite file (SQLite's own output shape) — verified by real SQLite re-opening it (`tests/sqlite_interop.rs` + `utf16_interop.rs` + `collate_semantics.rs`, and a CI job exercising the real `sqlite3` CLI against the `rustqlite` CLI; the incremental splice architecture is pinned by `tests/foreign_incremental.rs` — frames-per-commit, page-identity stability, freelist round-trips, DDL splices, two-session merges, random-DML reopen-compare)
 
-**Limitations**: whole image on open (see [cold start](#cold-start-on-large-files) — per-commit is now O(changed object) via the incremental page-diff architecture, but the load still decodes every row); auto-vacuum containers keep the full-image publish path (pointer-map geometry is a whole-build concern); DDL re-encodes the objects it touches plus the schema tree (never the whole file); custom collations fall back to binary order in written files; `PRAGMA page_count`/`freelist_count` report the container's page space (denser than SQLite's layout for the same data).
+**Limitations**: whole image on open (see [cold start](#cold-start-on-large-files) — per-commit is O(changed object), but the open-time load still decodes every row); auto-vacuum containers keep the full-image publish path (pointer-map geometry is a whole-build concern); DDL re-encodes the objects it touches plus the schema tree (never the whole file); custom collations fall back to binary order in written files; `PRAGMA page_count`/`freelist_count` report the container's page space (denser than SQLite's layout for the same data).
 
 ## sqlx & sea-orm
 
@@ -223,23 +220,21 @@ let id: i64 = sqlx::query_scalar("INSERT INTO users (name) VALUES (?) RETURNING 
     .bind("Ada").fetch_one(&pool).await?;
 ```
 
-Latest CI numbers vs sqlx-sqlite (same sqlx API and pool options): INSERT + 3 binds **3.15x**, PK point lookup **4.39x**, GROUP BY fetch_all **1.84x**, 8-task concurrent **4.24x**, 8-conn reads **10.6x**, 1W+7R **1.93x**, mixed 80/20 parity (fsync floor). The mechanism: sqlx-sqlite ferries every command/row across a worker thread + FFI; the native driver executes inline against the `Send + Sync` engine core with batch-at-a-time streaming (the historical full-table stream row measured 18.4x). Full type surface (chrono, uuid, JSON, bool, blobs); snapshot isolation between connections; dropped connections roll back.
+Latest CI numbers vs sqlx-sqlite (same sqlx API and pool options): INSERT + 3 binds **3.15x**, PK point lookup **4.39x**, GROUP BY fetch_all **1.84x**, 8-task concurrent **4.24x**, 8-conn reads **10.6x**, 1W+7R **1.93x**, mixed 80/20 parity (fsync floor). The mechanism: sqlx-sqlite ferries every command/row across a worker thread + FFI; the native driver executes inline against the `Send + Sync` engine core with batch-at-a-time streaming. Full type surface (chrono, uuid, JSON, bool, blobs); snapshot isolation between connections; dropped connections roll back.
 
 **Drop-in C ABI**: `compat/` exports the `sqlite3_*` family (135 symbols) + a `libsqlite3-sys` replacement — unmodified sqlx 0.9 / sea-orm 2.0 / sea-orm-cli / `sqlx::migrate!` run via one `[patch.crates-io]` line; `sqlite3_serialize/deserialize` real; `sqlite3_backup_*` real (init/step/remaining/pagecount/finish — the destination file becomes an exact copy of the source, `:memory:` included); `sqlite3_blob_*` real (open/read/write/bytes/reopen/close — incremental I/O over BLOB and TEXT columns, writes riding the normal transaction machinery incl. the concurrent regime's implicit join); SQLite-exact error text + extended result codes; verified by the checked-in sea-orm app in `sqlx-interop/`.
 
 ## Remaining gaps vs SQLite
 
-The honest ledger. Everything here is verifiable absence — `module_list`/`function_list`/`compile_options` report what is actually compiled in, the C ABI exports exactly its 135 symbols, and the fuzzers are seeded and reproducible. (No open correctness items right now: every pinned divergence class is closed and re-verified per push — the regression pins live in `tests/stateful_fuzz.rs` (`stateful_fuzz_fresh_seed_pins`), `tests/concurrent_reader_visibility.rs`, and the differential suites; fix histories are in `worklog.md`.)
+The honest ledger — verifiable absence (`module_list` / `function_list` / `compile_options` report what is actually compiled in, the C ABI exports exactly its 135 symbols, and the fuzzers are seeded and reproducible). No open correctness items: every pinned divergence class is closed and re-verified per push (regression pins in `tests/stateful_fuzz.rs`, `tests/concurrent_reader_visibility.rs`, and the differential suites).
 
 ### Performance gaps
 
-- **SQLite-format per-commit vs SQLite at single-object scale — the top open item (measured 2026-09-27)**: a commit on a large SQLite-format file costs ≈ 2 µs × changed-object's rows + ~1.3 µs × schema objects (see the [per-commit table](#sqlite-format-container-per-commit-cost-on-large-files)); at 1M single-table rows that is 1.99 s vs SQLite's 16.7 µs. The 2026-09-26 incremental page-diff architecture closed the O(database) class (whole-image re-derive at every boundary → O(changed object), WAL frames 4–12 per single-row commit, real freelist, stable page identities, multi-session page space) — the residual is object GRANULARITY: a dirty object re-dumps and re-encodes every row it holds. The remaining step is page-level splicing (a container-side b-tree mutator balancing only the touched pages) plus a catalog-DDL counter to fold the O(#objects) schema-signature term. The native container (the default, and what the 54 CI-gated rows measure) is unaffected — its per-commit path is already page-granular WAL.
-- **One serial row at parity**: the unfiltered 2-table PK join (1.18x warm in the latest CI table; 1.43x under deep warmup; 1.38x at 1M-row parallel scale).
-- **3-table adversarial ORDER** (tiny synthetic): 0.13x vs SQLite's native plan for the already-reordered shape — the reorder itself won ~90x engine-side; the residual is the point-lookup chain vs SQLite's.
-- **8-conn mixed R/W 80/20**: parity-class by construction (commit fsync floor; host-fsync-dominated 394 ms–6.33 s for SQLite across host families). Treated as an explicitly-marked parity guard in CI.
-- **S06 range-scan materialization** (~0.92x linux / 0.72–0.87x macOS-ARM historical draws): the fused drivers now serve raw record bytes per step (~20–33% faster step path); the CI torture matrix tracks the residual.
-- **SQLite-format per-commit CPU — the O(database) class CLOSED (2026-09-26)**: the incremental page-diff architecture landed (per-root change epochs → object splices onto stable page identities → real SQLite freelist for shrinkage → shared per-file page-space coordinator for multi-session; layout adoption from the file on reopen so the first commit after a restart splices too). The measured residual above is the next step's target.
-- **Big-blob `INSERT OR REPLACE` split corner — CLOSED (2026-09-27)**: a page packed to near-avail with ~2 KB rows taking a bigger mid-key row has NO feasible 2-way split point (every contiguous partition overloads one half past the page budget) — previously surfaced as `corruption: leaf page N cannot split: no feasible byte-aware point` (the fuzz probe failed at round 8 of 12). The split path now distributes the cells across 3+ pages (`greedy_runs` + `multi_way_leaf_split` / `multi_way_interior_split`, one separator per boundary through the ordinary propagation chain — root splits, parent splices, and the interior re-split all handle the extra siblings). Pinned by `tests/multiway_split.rs` (direct corner, the original fuzz workload, giant index keys, root/right-edge variants, and the SQLite-format container verified by real SQLite).
+- **SQLite-format per-commit on large files — the top open item**: a commit re-encodes every row of each changed object: ≈ 2 µs × changed-object's rows + ~1.3 µs × schema objects (see the [per-commit table](#sqlite-format-container-per-commit-cost-on-large-files)); at 1M single-table rows that is 1.99 s vs SQLite's 16.7 µs. Commits are already O(changed object) — only the dirty b-trees splice and the WAL append carries only the differing pages — the residual is object granularity; the next step is page-level splicing (a container-side b-tree mutator balancing only the touched pages) plus a catalog-DDL counter for the O(#objects) schema-signature term. The native container (the default, and what the 54 CI-gated rows measure) is unaffected — its per-commit path is already page-granular WAL.
+- **One serial row at parity**: the unfiltered 2-table PK join (1.18x warm in the latest CI table; 1.38x at 1M-row parallel scale).
+- **3-table adversarial ORDER** (tiny synthetic): 0.13x vs SQLite's native plan for the already-reordered shape — the reorder itself won ~90x engine-side; the residual is the point-lookup chain.
+- **8-conn mixed R/W 80/20**: parity-class by construction — commit fsync sets the floor (host-dominated); reads inside stay 2.8x. An explicitly-marked parity guard in CI.
+- **S06 range-scan materialization** (~0.92x linux / 0.72–0.87x macOS-ARM draws): the fused drivers serve raw record bytes per step; the CI torture matrix tracks the residual.
 
 ### Resource gaps
 
@@ -249,7 +244,6 @@ The honest ledger. Everything here is verifiable absence — `module_list`/`func
 
 ### Concurrency gaps
 
-- ~~The PINNED read-visibility item~~ — FIXED 2026-09-20 (see the correctness ledger above).
 - **High write fan-out flattens the read win** — same shape as SQLite's WAL under fsync, not a divergence.
 - **SQLite-format files are single-connection** (whole-image load; the native container carries MRMW).
 - **Native-format files are single-process** — and single-writer-handle: the MRMW pager coordinates threads in one process through ONE engine (the sqlx pool's per-path shared engine); two processes must not hold one native file concurrently, and a second independent handle's WRITES are rejected with SQLITE_BUSY by the WAL writer lease (never corruption). Cross-handle reads work while the sidecar is stable (crash recovery / post-drain verification). The SQLite-format container remains the cross-process interchange path (atomic temp+fsync+rename commits; WAL sidecar byte-compatible with real SQLite processes).
@@ -309,7 +303,7 @@ cargo bench --bench sqlite_comparison                             # criterion ma
 
 ## Testing
 
-The matrix is modeled on SQLite's own methodology ([sqlite.org/testing.html](https://www.sqlite.org/testing.html)) — 1343 tests in the default matrix + sqlx/no-default/oom-injection/compat-ABI/limit-stress matrices, all CI-green on ubuntu/windows/macos:
+The matrix is modeled on SQLite's own methodology ([sqlite.org/testing.html](https://www.sqlite.org/testing.html)) — 1398 tests in the default matrix + sqlx/no-default/oom-injection/compat-ABI/limit-stress matrices, all CI-green on ubuntu/windows/macos:
 
 | Technique | Harness | Verifies |
 |---|---|---|
@@ -323,7 +317,7 @@ The matrix is modeled on SQLite's own methodology ([sqlite.org/testing.html](htt
 | Numeric parity | `numeric_parity.rs` | SUM/AVG/window at the f64-bit level vs bundled SQLite |
 | Error-text parity | `error_parity.rs` | byte-identical `sqlite3_errmsg` text |
 | Concurrency | `concurrent_writes.rs`, `committed_view.rs`, `concurrent_reader_visibility.rs` | multi-writer regimes, snapshot isolation, reader invariants |
-| Push-to-the-limit | `limit_stress.rs` (dedicated `limit-stress` CI job, 3 OSes, release profile) | 1M-row file builds with per-batch throughput-degradation + peak-RSS + file-bloat + cache-capacity guards; 48-table × 64-column schema breadth; 12 read + 12 write close/open cycles (no file creep, bounded page growth); 4-writer + 2-reader concurrent soak with OCC convergence and WAL-recovery reopen; cache-hit accounting (cold/warm/hot/bounded/reset); delete-churn reuse + VACUUM reclamation + churn-round recycling; sustained mixed-workload memory flatness (RSS swing/climb/peak + time degradation); VACUUM × spilled-index-key integrity pins (the campaign's three bug fixes) |
+| Push-to-the-limit | `limit_stress.rs` (dedicated `limit-stress` CI job, 3 OSes, release profile) | 1M-row file builds with per-batch throughput-degradation / peak-RSS / file-bloat / cache-capacity guards; 48-table × 64-column schema breadth; 12 read + 12 write close/open cycles (no file creep, bounded page growth); 4-writer + 2-reader concurrent soak with OCC convergence and WAL-recovery reopen; cache-hit accounting (cold/warm/hot/bounded/reset); delete-churn reuse + VACUUM reclamation; sustained mixed-workload memory flatness; VACUUM × spilled-index-key integrity pins |
 | Parallel equality | `parallel_scan.rs`, `parallel_join.rs` | parallel == serial, bit-identical |
 | Interop | `sqlite_interop.rs`, `utf16_interop.rs`, `cli_ops.rs` | both-direction file exchange, real SQLite as oracle |
 | SQL Logic Tests | `slt_runner.rs` + `tests/slt/` | the SLT format SQLite's core team uses |

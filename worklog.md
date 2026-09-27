@@ -1310,3 +1310,22 @@ Stage Summary:
 - The REPLACE split corner is CLOSED (3+-way splits through the ordinary propagation chain; 5 regression pins; 1398 tests green locally).
 - The per-commit perf item is QUANTIFIED honestly: O(changed object) landed, but vs SQLite the per-commit is 2 us x changed-object's rows + 1.3 us x objects — 1.99 s vs 16.7 us at 1M single-table rows; page-level splicing is the recorded next step.
 - CI: 4f191eb (the split fix) pushed and tracked; the docs+probe push follows.
+
+---
+Task ID: 56
+Agent: main (Super Z)
+Task: README conciseness pass — perf comparison, missing things, gaps written concisely; strip all fixed-what-on-what-date detail.
+
+Work Log:
+- Recloned from remote at 2ce90ee (CI green: 31/31, run 36284576392; 1398 default-matrix tests per the ubuntu-default job log).
+- Status header: the 4-line fix-history wall (split-corner + page-diff narration with round dates) -> one paragraph: CI state, test count, 53W/1T/0L over 54 gated rows, RSS verdict, concurrency tiers, interop, drivers, one link to the gap ledger.
+- Performance section: bench-gate intro drops the dated run link; the adversarial-ORDER cell drops "was 482 ms pre-reorder"; the per-commit subsection drops both round dates and the pre-architecture contrast, keeping the measured law + O(changed object) verdict + page-level-splicing next step; "Where the wins come from" untouched.
+- Resource section: the torture paragraph condensed (verdicts + mechanisms only — no measured-before deltas, no campaign narration); cold-start intro drops the date; sqlx paragraph drops the historical 18.4x row.
+- Concurrency section: the implicit-join paragraph drops the closed-latent-hole narration.
+- Gap ledger: intro drops the worklog-pointer parenthetical; the two "CLOSED (2026-09-2x)" entries (per-commit O(database) class, big-blob split corner) and the "FIXED 2026-09-20" concurrency line removed — the ledger now lists only OPEN gaps, led by the per-commit object-granularity item with the 1.99 s vs 16.7 µs row; S06/join/parity residuals kept, one line each.
+- Testing: stale 1343 -> 1398 tests; the limit-stress cell drops the "three bug fixes" campaign note. Interop limitations: "per-commit is now O(...) via ..." -> plain statement.
+- Verified: zero date/fix-history strings left (rg sweep), no dangling anchors from the scripted span edits (5 fragments caught and fixed), all headings/TOC anchors intact, 336 -> 329 lines with every perf table preserved.
+
+Stage Summary:
+- README now states perf-vs-SQLite, missing parts, and open gaps concisely; fix histories live only in worklog.md, dates only in the run-link provenance.
+- Docs-only push; per instruction, not waiting on the doc-change CI run.
