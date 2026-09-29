@@ -11450,10 +11450,18 @@ impl Database {
         };
 
         // The stat table (created by ANALYZE, like SQLite).
-        const STAT1_DDL: &str =
-            "CREATE TABLE IF NOT EXISTS sqlite_stat1 (tbl TEXT, idx TEXT, stat TEXT)";
-        let ddl = parse(STAT1_DDL)?;
-        Self::execute_statement_static(&ddl, ctx, catalog, STAT1_DDL, None)?;
+        if catalog.get_table("sqlite_stat1").is_none() {
+            const STAT1_DDL: &str = "CREATE TABLE sqlite_stat1(tbl,idx,stat)";
+            let ddl = parse(STAT1_DDL)?;
+            Self::execute_statement_static(&ddl, ctx, catalog, STAT1_DDL, None)?;
+        }
+        // SQLite's exact stat4 schema (no declared types; the stored
+        // DDL text matches byte-for-byte, so CREATE only when absent).
+        if catalog.get_table("sqlite_stat4").is_none() {
+            const STAT4_DDL: &str = "CREATE TABLE sqlite_stat4(tbl,idx,neq,nlt,ndlt,sample)";
+            let ddl4 = parse(STAT4_DDL)?;
+            Self::execute_statement_static(&ddl4, ctx, catalog, STAT4_DDL, None)?;
+        }
         // Clear this run's rows (a targeted ANALYZE keeps other tables'
         // rows — SQLite only replaces the analyzed tables' entries).
         let clear_sql = match &target {
@@ -11471,6 +11479,21 @@ impl Database {
         };
         let del = parse(&clear_sql)?;
         Self::execute_statement_static(&del, ctx, catalog, &clear_sql, None)?;
+        let clear4_sql = match &target {
+            Some(t) => {
+                let owner = catalog
+                    .get_index(t)
+                    .map(|i| i.table.clone())
+                    .unwrap_or_else(|| t.clone());
+                format!(
+                    "DELETE FROM sqlite_stat4 WHERE tbl = '{}'",
+                    owner.replace('\'', "''")
+                )
+            }
+            None => "DELETE FROM sqlite_stat4".to_string(),
+        };
+        let del4 = parse(&clear4_sql)?;
+        Self::execute_statement_static(&del4, ctx, catalog, &clear4_sql, None)?;
 
         // Collect: row count per table (memoized cell-count walk) +
         // distinct-prefix counts per index (GROUP BY counting through the
@@ -11503,6 +11526,7 @@ impl Database {
                     crate::schema::IndexStats {
                         rows: n,
                         distinct_prefix: Vec::new(),
+                        samples: Vec::new(),
                     },
                 ));
             }
@@ -11551,7 +11575,42 @@ impl Database {
                 let stats = crate::schema::IndexStats {
                     rows: n,
                     distinct_prefix: dvals,
+                    samples: Vec::new(),
                 };
+                // sqlite_stat4 samples: up to 24 evenly spaced snapshots
+                // of the index in key order with per-prefix position
+                // statistics (SQLite's IDX_MAX_SAMPLES discipline; the
+                // exact positions are an internal artifact — the schema,
+                // the row format, and the histogram's planner use are
+                // the contract).
+                let mut stats = stats;
+                if n > 0 && !index.columns.is_empty() {
+                    match Self::collect_stat4_samples(ctx, catalog, table, &index, n) {
+                        Ok(samples) if !samples.is_empty() => {
+                            for s in &samples {
+                                let sample_hex: String = s
+                                    .record_hex()
+                                    .iter()
+                                    .map(|b| format!("{:02X}", b))
+                                    .collect();
+                                insert_sqls.push(format!(
+                                    "INSERT INTO sqlite_stat4 VALUES ('{}', '{}', '{}', '{}', '{}', x'{}')",
+                                    table.name.replace('\'', "''"),
+                                    index.name.replace('\'', "''"),
+                                    join_i64(&s.neq),
+                                    join_i64(&s.nlt),
+                                    join_i64(&s.ndlt),
+                                    sample_hex,
+                                ));
+                            }
+                            stats.samples = samples;
+                        }
+                        Ok(_) => {}
+                        // Sampling never fails ANALYZE — the stat1 numbers
+                        // stand alone (the planner degrades to D_k).
+                        Err(_) => {}
+                    }
+                }
                 insert_sqls.push(format!(
                     "INSERT INTO sqlite_stat1 VALUES ('{}', '{}', '{}')",
                     table.name.replace('\'', "''"),
@@ -11574,6 +11633,155 @@ impl Database {
             catalog.set_stat1(stat_rows);
         }
         Ok(())
+    }
+
+    /// Collect sqlite_stat4 samples for one index: scan the table,
+    /// build the index key values per row (collation-folded for the
+    /// sort, raw for the record), sort in index order, and stream the
+    /// per-prefix (neq, nlt, ndlt) counters, snapshotting at even
+    /// intervals (max 24 samples, consecutive same-key samples merged).
+    fn collect_stat4_samples(
+        ctx: &mut ExecContext,
+        catalog: &Catalog,
+        table: &Arc<crate::schema::Table>,
+        index: &Arc<crate::schema::Index>,
+        n_rows: i64,
+    ) -> Result<Vec<crate::schema::Stat4Sample>> {
+        use crate::plugin::collation_fold_key_ref;
+        let n_cols = table.n_columns();
+        let root = ctx.table_root(table);
+        let mut bt = Btree::new(ctx.pager, root, false);
+        // (folded sort key values, raw key values, rowid)
+        let mut entries: Vec<(Vec<Value>, Vec<Value>, i64)> = Vec::new();
+        let idx_cols = &index.columns;
+        let named: Vec<String> = table
+            .columns
+            .iter()
+            .map(|c| format!("{}.{}", table.name, c.name))
+            .collect();
+        let params: Vec<Value> = Vec::new();
+        let named_params = std::collections::HashMap::new();
+        bt.scan_table(|rowid, payload| {
+            if let Ok(row) = decode_row(payload, n_cols, rowid, table.rowid_alias) {
+                // Partial index: only rows matching the predicate.
+                if let Some(p) = &index.partial_expr {
+                    match Self::analyze_eval_expr(p, &row, &named, &params, &named_params) {
+                        Ok(v) if v.is_truthy() => {}
+                        _ => return true,
+                    }
+                }
+                let mut folded = Vec::with_capacity(idx_cols.len());
+                let mut raw = Vec::with_capacity(idx_cols.len());
+                for c in idx_cols {
+                    let v = match &c.expr {
+                        Some(e) => Self::analyze_eval_expr(e, &row, &named, &params, &named_params)
+                            .unwrap_or(Value::Null),
+                        None => row
+                            .iter()
+                            .enumerate()
+                            .find(|(i, _)| table.columns[*i].name.eq_ignore_ascii_case(&c.name))
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or(Value::Null),
+                    };
+                    folded.push(collation_fold_key_ref(&c.collation, &v).into_owned());
+                    raw.push(v);
+                }
+                entries.push((folded, raw, rowid));
+            }
+            true
+        })?;
+        drop(bt);
+        let _ = catalog;
+        // Index order: folded column values with DESC columns inverted,
+        // then rowid.
+        let desc: Vec<bool> = idx_cols
+            .iter()
+            .map(|c| matches!(c.order, crate::sql::ast::Order::Desc))
+            .collect();
+        entries.sort_by(|a, b| {
+            for (i, (x, y)) in a.0.iter().zip(b.0.iter()).enumerate() {
+                let ord = x.cmp(y);
+                let ord = if desc[i] { ord.reverse() } else { ord };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            a.2.cmp(&b.2)
+        });
+        // Per-prefix eq-class TOTALS (SQLite's neq is the whole class
+        // size, not a running count — every ia sample carries neq=100
+        // for a 100-row class regardless of the sample's position).
+        // Keyed by the folded prefix's concatenated order-key bytes.
+        let ncols = idx_cols.len();
+        let order_key = |vals: &[Value]| -> Vec<u8> {
+            let mut out = Vec::new();
+            for v in vals {
+                v.encode_order_key_into(&mut out);
+            }
+            out
+        };
+        let mut class_counts: Vec<std::collections::HashMap<Vec<u8>, i64>> = (0..=ncols + 1)
+            .map(|_| std::collections::HashMap::new())
+            .collect();
+        for (folded, _raw, rowid) in &entries {
+            let mut full: Vec<Value> = folded.clone();
+            full.push(Value::Integer(*rowid));
+            for k in 1..=ncols + 1 {
+                *class_counts[k].entry(order_key(&full[..k])).or_insert(0) += 1;
+            }
+        }
+        // Streaming per-prefix counters (nlt/ndlt are complete at any
+        // point — all smaller keys precede in the sorted walk).
+        let total = entries.len();
+        let interval = std::cmp::max(1, total / 24);
+        let mut prev: Vec<Option<Vec<u8>>> = vec![None; ncols + 2];
+        let mut eq: Vec<i64> = vec![0; ncols + 2];
+        let mut nlt: Vec<i64> = vec![0; ncols + 2];
+        let mut ndlt: Vec<i64> = vec![0; ncols + 2];
+        let mut out: Vec<crate::schema::Stat4Sample> = Vec::new();
+        let mut last_key: Option<Vec<Value>> = None;
+        for (pos, (folded, raw, rowid)) in entries.iter().enumerate() {
+            let mut full: Vec<Value> = folded.clone();
+            full.push(Value::Integer(*rowid));
+            for k in 1..=ncols + 1 {
+                let prefix = order_key(&full[..k]);
+                if prev[k].as_ref() != Some(&prefix) {
+                    nlt[k] += eq[k];
+                    ndlt[k] += 1;
+                    eq[k] = 0;
+                    prev[k] = Some(prefix);
+                }
+                eq[k] += 1;
+            }
+            // 1-indexed multiples of `interval`, capped at 24 samples,
+            // consecutive same-key samples merged (the first kept).
+            if (pos + 1) % interval == 0 && out.len() < 24 && last_key.as_ref() != Some(raw) {
+                let neq: Vec<i64> = (1..=ncols + 1)
+                    .map(|k| *class_counts[k].get(&order_key(&full[..k])).unwrap_or(&1))
+                    .collect();
+                out.push(crate::schema::Stat4Sample {
+                    keys: raw.clone(),
+                    rowid: *rowid,
+                    neq,
+                    nlt: nlt[1..=ncols + 1].to_vec(),
+                    ndlt: ndlt[1..=ncols + 1].to_vec(),
+                });
+                last_key = Some(raw.clone());
+            }
+        }
+        let _ = n_rows;
+        Ok(out)
+    }
+
+    /// Evaluate an expression against one row for ANALYZE sampling.
+    fn analyze_eval_expr(
+        e: &crate::sql::ast::Expr,
+        row: &[Value],
+        col_names: &[String],
+        params: &[Value],
+        named_params: &std::collections::HashMap<String, Value>,
+    ) -> Result<Value> {
+        crate::executor::eval_row(e, row, col_names, params, named_params)
     }
 
     /// Run a scalar `SELECT COUNT(*) …` for ANALYZE's distinct counting.
@@ -12711,6 +12919,9 @@ impl Database {
                 if catalog.get_table("sqlite_sequence").is_some() {
                     crate::executor::delete_sqlite_sequence_row(ctx, &d.name)?;
                 }
+                // SQLite removes the dropped table's stat rows (stat1's
+                // table-level entry + every index's, and stat4's samples).
+                delete_stat_rows(ctx, catalog, Some(d.name.as_str()), None);
                 // Also free root pages and delete schema rows for every
                 // index on this table — including implicit UNIQUE indexes.
                 // Previously these rows survived, so reopening the file
@@ -12766,6 +12977,9 @@ impl Database {
                     ctx.pager.free_page(pid)?;
                 }
                 delete_schema_row(ctx.pager, "index", &d.name)?;
+                // SQLite removes the dropped index's stat rows (its stat1
+                // entry AND its stat4 samples).
+                delete_stat_rows(ctx, catalog, None, Some(d.name.as_str()));
                 // Same shared-map retirement as DROP TABLE (the freed
                 // root page will be handed out again).
                 ctx.invalidate_index_root(&d.name);
@@ -15687,6 +15901,7 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
                                     crate::schema::IndexStats {
                                         rows: crate::schema::IndexStats::parse(stat.as_str()).rows,
                                         distinct_prefix: Vec::new(),
+                                        samples: Vec::new(),
                                     },
                                 ));
                             }
@@ -15697,6 +15912,47 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
                 true
             });
             catalog.set_stat1(stats);
+        }
+    }
+    // sqlite_stat4 rows -> the samples attached to the same map (the
+    // histogram survives reopen; a stale sample set is as harmless as
+    // stale stat1 — the next ANALYZE refreshes both).
+    if let Some(stat_table) = catalog.get_table("sqlite_stat4") {
+        if stat_table.n_columns() == 6 {
+            let root = stat_table.root_page;
+            let mut bt = Btree::new(pager, root, false);
+            let mut rows: Vec<(String, crate::schema::Stat4Sample)> = Vec::new();
+            let _ = bt.scan_table(|_rowid, payload| {
+                if let Ok(row) = decode_row(payload, 6, 0, None) {
+                    if let (
+                        Value::Text(idx),
+                        Value::Text(neq),
+                        Value::Text(nlt),
+                        Value::Text(ndlt),
+                        Value::Blob(sample),
+                    ) = (&row[1], &row[2], &row[3], &row[4], &row[5])
+                    {
+                        if let Some(s) = crate::schema::Stat4Sample::parse(
+                            neq.as_str(),
+                            nlt.as_str(),
+                            ndlt.as_str(),
+                            sample,
+                        ) {
+                            rows.push((idx.as_str().to_string(), s));
+                        }
+                    }
+                }
+                true
+            });
+            if !rows.is_empty() {
+                let mut stats = catalog.stat1_snapshot();
+                for (idx, s) in rows {
+                    if let Some(e) = stats.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(&idx)) {
+                        e.1.samples.push(s);
+                    }
+                }
+                catalog.set_stat1(stats);
+            }
         }
     }
     Ok(())
@@ -17831,4 +18087,57 @@ mod persist_tests {
             .unwrap();
         assert_eq!(r, vec![vec![Value::Integer(999)]]);
     }
+}
+
+/// Space-joined i64 list (sqlite_stat4's neq/nlt/ndlt text form).
+fn join_i64(v: &[i64]) -> String {
+    v.iter()
+        .map(|x| x.to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Delete sqlite_stat1/sqlite_stat4 rows for a dropped table (`tbl`) or
+/// index (`idx`) — SQLite's DROP cleanup (best-effort: absent stat
+/// tables are fine).
+fn delete_stat_rows(
+    ctx: &mut ExecContext,
+    catalog: &mut Catalog,
+    tbl: Option<&str>,
+    idx: Option<&str>,
+) {
+    for stat_table in ["sqlite_stat1", "sqlite_stat4"] {
+        if catalog.get_table(stat_table).is_none() {
+            continue;
+        }
+        let (col, val) = match (tbl, idx) {
+            (Some(t), _) => ("tbl", t),
+            (None, Some(i)) => ("idx", i),
+            _ => continue,
+        };
+        let sql = format!(
+            "DELETE FROM {} WHERE {} = '{}'",
+            stat_table,
+            col,
+            val.replace('\'', "''")
+        );
+        if let Ok(stmt) = crate::sql::parse(&sql) {
+            let _ = Database::execute_statement_static(&stmt, ctx, catalog, &sql, None);
+        }
+    }
+    // The in-memory map follows the same cleanup.
+    let snapshot = catalog.stat1_snapshot();
+    let kept: Vec<(String, crate::schema::IndexStats)> = snapshot
+        .into_iter()
+        .filter(|(name, _)| match (tbl, idx) {
+            (Some(t), _) => !name.eq_ignore_ascii_case(t),
+            (None, Some(i)) => !name.eq_ignore_ascii_case(i),
+            _ => true,
+        })
+        .collect();
+    // Index stats of indexes ON the dropped table also go (matched by
+    // the index name — DROP TABLE captured them above but the simplest
+    // correct rule here is the name match; indexes share the table's
+    // fate through the catalog's own drop).
+    catalog.set_stat1(kept);
 }

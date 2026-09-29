@@ -2413,6 +2413,41 @@ struct IdxCandidate {
     est_rows: Option<i64>,
 }
 
+/// Stat4-refined equality estimate: all-literal key expressions against
+/// the index's histogram (BINARY-collation prefixes only — the samples
+/// compare raw values). Falls back to the stat1 `D_k`.
+fn estimate_eq_stat4(
+    catalog: &Catalog,
+    index: &Arc<crate::schema::Index>,
+    key_exprs: &[Expr],
+) -> Option<i64> {
+    let stats = catalog.index_stats(&index.name)?;
+    let k = key_exprs.len();
+    if k == 0 || stats.samples.is_empty() {
+        return None;
+    }
+    // All-literal keys only (the refinement needs the actual values).
+    let mut vals = Vec::with_capacity(k);
+    for e in key_exprs {
+        match e {
+            Expr::Literal(v) => vals.push(v.clone()),
+            _ => return None,
+        }
+    }
+    // BINARY collations only (the sample comparison is raw).
+    for c in index.columns.iter().take(k) {
+        if !c.collation.eq_ignore_ascii_case("BINARY") {
+            return None;
+        }
+    }
+    let refined = stats.estimate_eq_value(k, &vals);
+    if refined > 0 {
+        Some(refined)
+    } else {
+        None
+    }
+}
+
 pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> Plan {
     if let Plan::Scan { table, .. } = &plan {
         // Virtual tables have NO B+tree: the rowid lookup/range/in plans
@@ -2615,10 +2650,13 @@ pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> 
                 }
                 let covered = key_exprs.len();
                 // Stat-based estimate for the bound prefix (None without
-                // ANALYZE statistics).
-                let est_rows = catalog
-                    .index_stats(&index.name)
-                    .map(|s| s.estimate_eq(covered));
+                // ANALYZE statistics) — the stat4 histogram refines it
+                // when every key is a literal.
+                let est_rows = estimate_eq_stat4(catalog, &index, &key_exprs).or_else(|| {
+                    catalog
+                        .index_stats(&index.name)
+                        .map(|s| s.estimate_eq(covered))
+                });
                 // Ranking: estimated rows when BOTH sides carry stats
                 // (ties fall to the covered-prefix heuristic); the
                 // covered-prefix heuristic whenever either side lacks
@@ -5686,10 +5724,14 @@ fn atom_est_rows(catalog: &Catalog, plan: &Plan) -> i64 {
             index, key_exprs, ..
         } => {
             let k = key_exprs.len();
-            catalog
-                .index_stats(&index.name)
-                .map(|s| s.estimate_eq(k))
+            estimate_eq_stat4(catalog, index, key_exprs)
                 .filter(|&e| e > 0)
+                .or_else(|| {
+                    catalog
+                        .index_stats(&index.name)
+                        .map(|s| s.estimate_eq(k))
+                        .filter(|&e| e > 0)
+                })
                 .unwrap_or(10)
         }
         Plan::IndexIn {
@@ -5705,11 +5747,45 @@ fn atom_est_rows(catalog: &Catalog, plan: &Plan) -> i64 {
                 .unwrap_or(10);
             base.saturating_mul(members).max(1)
         }
-        Plan::IndexRange { index, .. } => catalog
-            .index_stats(&index.name)
-            .map(|s| s.rows / 4)
-            .filter(|&e| e > 0)
-            .unwrap_or(UNANALYZED_ROWS / 4),
+        Plan::IndexRange {
+            index, start, end, ..
+        } => {
+            // stat4 histogram interpolation when both bounds are
+            // literals; the stat1 rows/4 guess otherwise.
+            if let Some(stats) = catalog.index_stats(&index.name) {
+                if !stats.samples.is_empty()
+                    && index
+                        .columns
+                        .first()
+                        .map(|c| c.collation.eq_ignore_ascii_case("BINARY"))
+                        .unwrap_or(false)
+                {
+                    let lit = |e: &Option<(Expr, bool)>| {
+                        e.as_ref().and_then(|(x, inc)| match x {
+                            Expr::Literal(v) => Some((v.clone(), *inc)),
+                            _ => None,
+                        })
+                    };
+                    let (lo_v, lo_inc) = match lit(start) {
+                        Some((v, inc)) => (Some(v), inc),
+                        None => (None, true),
+                    };
+                    let (hi_v, hi_inc) = match lit(end) {
+                        Some((v, inc)) => (Some(v), inc),
+                        None => (None, true),
+                    };
+                    let est = stats.estimate_range(lo_v.as_ref(), lo_inc, hi_v.as_ref(), hi_inc);
+                    if est > 0 {
+                        return est.min(stats.rows).max(1);
+                    }
+                }
+                let quarter = stats.rows / 4;
+                if quarter > 0 {
+                    return quarter;
+                }
+            }
+            UNANALYZED_ROWS / 4
+        }
         Plan::Filter { input, predicate } => {
             let base = atom_est_rows(catalog, input);
             filter_output_est(base, predicate)
@@ -6758,11 +6834,16 @@ fn atom_base_cost(catalog: &Catalog, plan: &Plan) -> f64 {
                 .unwrap_or(10) as f64;
             (base * members).max(1.0)
         }
-        Plan::IndexRange { index, .. } => catalog
-            .index_stats(&index.name)
-            .map(|s| s.rows / 4)
-            .filter(|&e| e > 0)
-            .unwrap_or(UNANALYZED_ROWS / 4) as f64,
+        Plan::IndexRange { index, .. } => {
+            // The histogram-aware estimate lives in atom_est_rows; the
+            // cost variant keeps the classic quarter guess (cost ordering
+            // tracks the row estimate through the same index).
+            catalog
+                .index_stats(&index.name)
+                .map(|s| s.rows / 4)
+                .filter(|&e| e > 0)
+                .unwrap_or(UNANALYZED_ROWS / 4) as f64
+        }
         Plan::Filter { input, .. } => {
             atom_base_cost(catalog, input) + atom_est_rows(catalog, input) as f64
         }

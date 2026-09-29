@@ -488,6 +488,71 @@ pub struct IndexStats {
     /// matches D_k rows), NOT a distinct count. Empty when the stat row
     /// carried only the table row count.
     pub distinct_prefix: Vec<i64>,
+    /// sqlite_stat4 samples (up to 24, ANALYZE's evenly spaced snapshot
+    /// of the index in key order) — the histogram that refines equality
+    /// and range estimates when the query's constants are known.
+    pub samples: Vec<Stat4Sample>,
+}
+
+/// One sqlite_stat4 row: a sample of the index in key order with
+/// per-prefix position statistics (`neq[i]` = rows equal to the sample
+/// in the first i+1 columns, `nlt[i]` = rows strictly less, `ndlt[i]`
+/// = distinct values strictly less).
+#[derive(Clone, Debug)]
+pub struct Stat4Sample {
+    /// The sample's index-column values (raw, unfolded — the collation
+    /// applied at comparison time, like SQLite's stored samples).
+    pub keys: Vec<Value>,
+    /// The sample entry's rowid (the record's last field).
+    pub rowid: i64,
+    pub neq: Vec<i64>,
+    pub nlt: Vec<i64>,
+    pub ndlt: Vec<i64>,
+}
+
+impl Stat4Sample {
+    /// The `sample` column's bytes: the index key values followed by
+    /// the rowid, in SQLite's record format (`encode_record`).
+    pub fn record_hex(&self) -> Vec<u8> {
+        let mut vals = self.keys.clone();
+        vals.push(Value::Integer(self.rowid));
+        crate::storage::sqlitefmt::record::encode_record(&vals)
+    }
+
+    /// Parse one sqlite_stat4 row's fields (neq/nlt/ndlt space-joined
+    /// text; sample a record blob). Returns None on malformed input.
+    pub fn parse(neq: &str, nlt: &str, ndlt: &str, sample: &[u8]) -> Option<Stat4Sample> {
+        let parse_list = |s: &str| -> Option<Vec<i64>> {
+            let mut v = Vec::new();
+            for part in s.split_whitespace() {
+                v.push(part.parse::<i64>().ok()?);
+            }
+            Some(v)
+        };
+        let neq = parse_list(neq)?;
+        let nlt = parse_list(nlt)?;
+        let ndlt = parse_list(ndlt)?;
+        let n = neq.len();
+        if n == 0 || nlt.len() != n || ndlt.len() != n {
+            return None;
+        }
+        let mut vals =
+            crate::storage::sqlitefmt::record::decode_record_all_enc(sample, Default::default())
+                .ok()?;
+        if vals.is_empty() {
+            return None;
+        }
+        let Some(Value::Integer(rowid)) = vals.pop() else {
+            return None;
+        };
+        Some(Stat4Sample {
+            keys: vals,
+            rowid,
+            neq,
+            nlt,
+            ndlt,
+        })
+    }
 }
 
 impl IndexStats {
@@ -499,6 +564,7 @@ impl IndexStats {
         Self {
             rows,
             distinct_prefix,
+            samples: Vec::new(),
         }
     }
 
@@ -524,6 +590,155 @@ impl IndexStats {
         }
     }
 
+    /// Equality estimate refined by the stat4 histogram: an exact
+    /// sample match returns its `neq[k]`; a value bracketed by two
+    /// samples interpolates the local density (integers); otherwise the
+    /// stat1 `D_k` (the caller's fallback). `vals.len()` must be >= k;
+    /// comparison is BINARY (the caller only refines BINARY-collation
+    /// prefixes). Returns 0 = no estimate.
+    pub fn estimate_eq_value(&self, k: usize, vals: &[Value]) -> i64 {
+        if self.rows <= 0 || k == 0 || self.samples.is_empty() {
+            return 0;
+        }
+        let want = &vals[..k.min(vals.len())];
+        // Exact sample match (any sample whose k-prefix equals `want`).
+        for s in &self.samples {
+            if s.keys.len() >= k && sample_prefix_eq(&s.keys[..k], want) {
+                return s.neq.get(k - 1).copied().unwrap_or(0).max(1);
+            }
+        }
+        // Bracketing samples: interpolate the local row density. Only
+        // meaningful for a single numeric column (multi-column linear
+        // interpolation is not well-defined).
+        if k == 1 {
+            let v = &want[0];
+            let num = |x: &Value| match x {
+                Value::Integer(i) => Some(*i as f64),
+                Value::Real(f) => Some(*f),
+                _ => None,
+            };
+            let (Some(vn), Some(a), Some(b)) = (
+                num(v),
+                self.samples
+                    .first()
+                    .and_then(|s| s.keys.first().and_then(num)),
+                self.samples
+                    .last()
+                    .and_then(|s| s.keys.first().and_then(num)),
+            ) else {
+                return 0;
+            };
+            // Below every sample: the first sample's density; above all:
+            // the last sample's.
+            if vn < a || vn > b {
+                let s = if vn < a {
+                    self.samples.first().unwrap()
+                } else {
+                    self.samples.last().unwrap()
+                };
+                return s.neq.first().copied().unwrap_or(0).max(1);
+            }
+            // Find the bracketing pair (samples are in key order).
+            for w in self.samples.windows(2) {
+                let (Some(lo), Some(hi)) = (
+                    w[0].keys.first().and_then(num),
+                    w[1].keys.first().and_then(num),
+                ) else {
+                    continue;
+                };
+                if vn >= lo && vn <= hi {
+                    let span = hi - lo;
+                    if span <= 0.0 {
+                        continue;
+                    }
+                    let rows_between =
+                        (w[1].nlt.first().unwrap_or(&0) - w[0].nlt.first().unwrap_or(&0)) as f64;
+                    return ((rows_between / span).round() as i64).max(1);
+                }
+            }
+        }
+        0
+    }
+
+    /// Range estimate for a single-column index prefix from the
+    /// histogram: interpolate the rows between the bounds' bracketing
+    /// samples. Returns 0 = no estimate (caller falls back).
+    pub fn estimate_range(
+        &self,
+        lo: Option<&Value>,
+        lo_inclusive: bool,
+        hi: Option<&Value>,
+        hi_inclusive: bool,
+    ) -> i64 {
+        if self.rows <= 0 || self.samples.is_empty() {
+            return 0;
+        }
+        let num = |x: &Value| match x {
+            Value::Integer(i) => Some(*i as f64),
+            Value::Real(f) => Some(*f),
+            _ => None,
+        };
+        // rows strictly below v (v exclusive), interpolated.
+        let below = |v: &Value, inclusive: bool| -> Option<i64> {
+            let vn = num(v)?;
+            // Exact sample match: nlt (+ neq when inclusive).
+            for s in &self.samples {
+                if let Some(sk) = s.keys.first() {
+                    if num(sk) == Some(vn) {
+                        let nlt = s.nlt.first().copied().unwrap_or(0);
+                        return Some(if inclusive {
+                            nlt + s.neq.first().copied().unwrap_or(0)
+                        } else {
+                            nlt
+                        });
+                    }
+                }
+            }
+            // Between two samples: linear interpolation of nlt.
+            for w in self.samples.windows(2) {
+                let (Some(lo), Some(hi)) = (
+                    w[0].keys.first().and_then(num),
+                    w[1].keys.first().and_then(num),
+                ) else {
+                    continue;
+                };
+                if vn >= lo && vn <= hi {
+                    let span = hi - lo;
+                    if span <= 0.0 {
+                        continue;
+                    }
+                    let nlt_lo = w[0].nlt.first().copied().unwrap_or(0) as f64;
+                    let nlt_hi = w[1].nlt.first().copied().unwrap_or(0) as f64;
+                    let frac = (vn - lo) / span;
+                    return Some((nlt_lo + (nlt_hi - nlt_lo) * frac).round() as i64);
+                }
+            }
+            // Outside the sampled range: clamp to the extremes.
+            let first = self.samples.first()?.keys.first().and_then(num)?;
+            let last = self.samples.last()?.keys.first().and_then(num)?;
+            if vn < first {
+                Some(0)
+            } else if vn > last {
+                Some(self.rows)
+            } else {
+                None
+            }
+        };
+        let upper = match hi {
+            Some(h) => below(h, hi_inclusive),
+            None => Some(self.rows),
+        };
+        let lower = match lo {
+            Some(l) => below(l, !lo_inclusive),
+            None => Some(0),
+        };
+        match (lower, upper) {
+            (Some(l), Some(u)) if u > l => (u - l).min(self.rows).max(1),
+            (Some(l), Some(u)) if u == l => 0,
+            _ => 0,
+        }
+    }
+
     /// Render back to the `stat` column text.
     pub fn to_stat_text(&self) -> String {
         let mut s = self.rows.to_string();
@@ -533,6 +748,12 @@ impl IndexStats {
         }
         s
     }
+}
+
+/// BINARY-order compare of a sample's k-prefix against query values
+/// (mixed types never equal — Value equality already encodes that).
+fn sample_prefix_eq(sample_keys: &[Value], want: &[Value]) -> bool {
+    sample_keys.len() == want.len() && sample_keys.iter().zip(want.iter()).all(|(a, b)| a == b)
 }
 
 impl Catalog {
