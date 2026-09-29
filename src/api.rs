@@ -2603,8 +2603,12 @@ impl Database {
             last_rowid: AtomicI64::new(0),
             insert_chain: Mutex::new(None),
             insert_chain_hot: AtomicBool::new(false),
-            plugins: RwLock::new(std::sync::Arc::new(crate::plugin::PluginRegistry::new())),
-            has_plugins: std::sync::atomic::AtomicBool::new(false),
+            plugins: RwLock::new(std::sync::Arc::new(
+                crate::plugin::PluginRegistry::with_builtins(),
+            )),
+            // Built-in vtab modules (fts5) are always registered: the
+            // plugin scope must install on every statement.
+            has_plugins: std::sync::atomic::AtomicBool::new(true),
             attached_schemas: Mutex::new(Vec::new()),
             foreign: None,
         })
@@ -2977,8 +2981,12 @@ impl Database {
             last_rowid: AtomicI64::new(0),
             insert_chain: Mutex::new(None),
             insert_chain_hot: AtomicBool::new(false),
-            plugins: RwLock::new(std::sync::Arc::new(crate::plugin::PluginRegistry::new())),
-            has_plugins: std::sync::atomic::AtomicBool::new(false),
+            plugins: RwLock::new(std::sync::Arc::new(
+                crate::plugin::PluginRegistry::with_builtins(),
+            )),
+            // Built-in vtab modules (fts5) are always registered: the
+            // plugin scope must install on every statement.
+            has_plugins: std::sync::atomic::AtomicBool::new(true),
             attached_schemas: Mutex::new(Vec::new()),
             foreign: None,
         }
@@ -5888,6 +5896,31 @@ impl Database {
         self.break_insert_chain();
     }
 
+    /// ROLLBACK may have restored a content-shadow vtab's pages under its
+    /// module's in-memory state: mark every content-shadow vtab for a
+    /// lazy rebuild (the next scan/DML replays the shadow rows into the
+    /// module). Cheap no-op when no vtab shadow writes were in flight.
+    fn resync_vtabs_after_rollback(&self) {
+        if !self.pager.vtab_shadow_writes.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        for (_, t) in self.catalog.all_tables() {
+            if let Some(v) = &t.vtab {
+                if v.content_shadow().is_some() {
+                    v.request_reindex();
+                }
+            }
+        }
+    }
+
+    /// The transaction ended cleanly (COMMIT or autocommit success): the
+    /// shadow rows the module indexed are the committed truth.
+    fn clear_vtab_shadow_flight(&self) {
+        self.pager
+            .vtab_shadow_writes
+            .store(false, Ordering::Release);
+    }
+
     /// Autocommit statement-atomicity restore (page level) — the cold
     /// companion of the epilogue gate. Factored out and #[inline(never)]:
     /// the 53-line inline block bloated the hot execute() epilogue and
@@ -6042,6 +6075,11 @@ impl Database {
             .store(ctx.in_transaction, Ordering::Release);
         self.set_last_insert_rowid(ctx.last_insert_rowid);
         *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
+        // Autocommit success (or a read-only statement): any vtab content
+        // shadow writes from this statement are now the committed truth.
+        if result.is_ok() && !ctx.in_transaction {
+            self.clear_vtab_shadow_flight();
+        }
         if let Ok(n) = result {
             crate::executor::change_counters::record(n);
             self.pager.note_rows_modified(n);
@@ -6626,6 +6664,9 @@ impl Database {
         // `last_insert_rowid()` (SQLite: the value is per-connection; the
         // evaluator reads the TLS, which every statement entry refreshes).
         crate::executor::change_counters::note_conn_rowid(self.last_rowid.load(Ordering::Acquire));
+        // Statement boundary: any aux-function TLS (bm25/highlight/
+        // snippet bound to a previous statement's vtab scan) is stale.
+        crate::executor::vtab_exec::aux_tls_clear();
         // File text encoding for value ordering / CAST (RAII: restored on
         // exit so a nested statement from another connection never leaks
         // its encoding into this one).
@@ -7495,6 +7536,12 @@ impl Database {
                         // Pre-BEGIN state is restored — anything stamped
                         // against the mid-transaction epoch is stale.
                         self.schema_epoch.fetch_add(1, Ordering::Release);
+                        // Content-shadow vtabs: the restored pages may
+                        // have pulled rows out from under the modules'
+                        // in-memory state — rebuild lazily.
+                        self.resync_vtabs_after_rollback();
+                    } else {
+                        self.clear_vtab_shadow_flight();
                     }
                 }
                 _ => {}
@@ -9193,7 +9240,6 @@ impl Database {
     fn rollback_concurrent_txn(&mut self) -> Result<()> {
         self.rollback_concurrent_txn_shared()
     }
-
     /// [`Self::rollback_concurrent_txn`] on `&self` — the implicit-join
     /// failure tail (a failed or conflicted joined statement must never
     /// leave its one-statement transaction open).
@@ -9209,6 +9255,9 @@ impl Database {
         let r = self.pager.rollback_concurrent(entry.txn_id);
         // The overlay is dropped — the shared maps were never touched.
         self.finish_concurrent_txn_shared();
+        // Restored pages may have pulled content-shadow rows out from
+        // under vtab modules' in-memory state.
+        self.resync_vtabs_after_rollback();
         // Cached plans may embed tables observed mid-transaction; a fresh
         // plan re-resolves from the shared (committed) maps.
         self.invalidate_stmt_cache();
@@ -9275,6 +9324,9 @@ impl Database {
                     self.write_epoch
                         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                     self.break_insert_chain();
+                    // Restored shadow pages may have pulled content rows
+                    // out from under vtab modules' in-memory state.
+                    self.resync_vtabs_after_rollback();
                 }
                 Ok(())
             }
@@ -9469,6 +9521,9 @@ impl Database {
                 if let Some(restored) = maps_snaps.last().cloned() {
                     *self.maps.get_mut() = restored;
                     self.refresh_maps_flag();
+                    // Restored shadow pages may have pulled content rows
+                    // out from under vtab modules' in-memory state.
+                    self.resync_vtabs_after_rollback();
                 }
                 Ok(())
             }
@@ -12439,6 +12494,7 @@ impl Database {
                 // xCreate: the instance supplies the column schema.
                 let instance = module.create(&name.name, &args)?;
                 let cols = instance.columns();
+                let shadows = instance.shadow_tables();
                 let mut table = crate::plugin::vtab::vtab_columns_to_schema(&name.name, &cols);
                 table.create_sql = original_sql.to_string();
                 let vtab = crate::plugin::vtab::VtabInstance::connected(
@@ -12461,6 +12517,18 @@ impl Database {
                 );
                 insert_schema_row(ctx.pager, &schema_row)?;
                 catalog.add_table(table);
+                // Engine-managed shadow tables: real tables riding the
+                // ordinary pager (the module's derived state rebuilds
+                // from the content shadow at reopen).
+                for shadow in &shadows {
+                    if catalog.get_table(&shadow.name).is_some() {
+                        return Err(Error::AlreadyExists(format!(
+                            "table {} already exists",
+                            shadow.name
+                        )));
+                    }
+                    Self::create_plain_table(ctx, catalog, &shadow.name, &shadow.create_sql)?;
+                }
                 ctx.pager.flush()?;
                 Ok(())
             }
@@ -12509,6 +12577,57 @@ impl Database {
         }
     }
 
+    /// Create a plain rowid table from raw CREATE TABLE SQL (the vtab
+    /// shadow-table path). No CTAS, no implicit indexes — the DDL comes
+    /// from the module and is ours by construction.
+    fn create_plain_table(
+        ctx: &mut ExecContext,
+        catalog: &mut Catalog,
+        name: &str,
+        create_sql: &str,
+    ) -> Result<()> {
+        let stmt = crate::sql::parse(create_sql)?;
+        let (columns, constraints, without_rowid, strict) = match stmt {
+            crate::sql::ast::Statement::Create(crate::sql::ast::CreateStatement::Table {
+                columns,
+                constraints,
+                without_rowid,
+                strict,
+                ..
+            }) => (columns, constraints, without_rowid, strict),
+            _ => {
+                return Err(Error::corruption(format!(
+                    "shadow table DDL is not CREATE TABLE: {}",
+                    create_sql
+                )))
+            }
+        };
+        let root_page = ctx.pager.allocate_page()?;
+        {
+            let page = ctx.pager.get_page(root_page)?;
+            page.lock().init_leaf_table();
+        }
+        let table = crate::schema::build_table(
+            name,
+            &columns,
+            &constraints,
+            root_page,
+            without_rowid,
+            strict,
+            create_sql,
+        )?;
+        let schema_row = crate::schema::encode_schema_row(
+            "table",
+            &table.name,
+            &table.name,
+            root_page,
+            &table.create_sql,
+        );
+        insert_schema_row(ctx.pager, &schema_row)?;
+        catalog.add_table(table);
+        Ok(())
+    }
+
     fn execute_drop(d: DropStatement, ctx: &mut ExecContext, catalog: &mut Catalog) -> Result<()> {
         match d.kind {
             DropKind::Table => {
@@ -12529,11 +12648,24 @@ impl Database {
                     .ok_or_else(|| Error::NotFound(format!("no such table: {}", d.name)))?;
                 if let Some(vtab) = &table.vtab {
                     // Virtual table: no pages to free; run xDestroy on the
-                    // module so it can drop external state.
+                    // module so it can drop external state. The engine's
+                    // shadow tables (content shadows) drop with it.
                     if let Ok((module, args)) = vtab.module_and_args() {
                         let _ = module.destroy(&d.name, &args);
                     }
+                    let shadow_names: Vec<String> =
+                        vtab.shadow_tables().into_iter().map(|s| s.name).collect();
                     delete_schema_row(ctx.pager, "table", &d.name)?;
+                    ctx.invalidate_table_root(&d.name);
+                    ctx.invalidate_max_rowid(&d.name.to_ascii_lowercase());
+                    for s in &shadow_names {
+                        let drop_shadow = crate::sql::ast::DropStatement {
+                            kind: crate::sql::ast::DropKind::Table,
+                            name: s.clone(),
+                            if_exists: true,
+                        };
+                        let _ = Self::execute_drop(drop_shadow, ctx, catalog);
+                    }
                     ctx.pager.flush()?;
                     return Ok(());
                 }
@@ -13713,6 +13845,23 @@ fn pragma_table_info(t: &Arc<crate::schema::Table>, xinfo: bool) -> PragmaRows {
             row.push(Value::Integer(hidden));
         }
         rows.push(row);
+    }
+    // Virtual-table aux (hidden) columns — SQLite's table_xinfo reports
+    // fts5's rank/self columns with hidden=1 after the user columns.
+    if xinfo {
+        if let Some(vt) = &t.vtab {
+            for (cid, (an, aty)) in vt.aux_columns().iter().enumerate() {
+                rows.push(vec![
+                    Value::Integer((t.columns.len() + cid) as i64),
+                    Value::Text(an.clone().into()),
+                    Value::Text(aty.clone().into()),
+                    Value::Integer(0),
+                    Value::Null,
+                    Value::Integer(0),
+                    Value::Integer(1),
+                ]);
+            }
+        }
     }
     PragmaRows { columns, rows }
 }
@@ -15422,15 +15571,21 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
                         // list stays empty until `create_module` connects
                         // it (the planner rejects queries over pending
                         // vtabs with "no such module").
-                        let mut table = crate::plugin::vtab::vtab_columns_to_schema(&tn.name, &[]);
-                        table.create_sql = sql.to_string();
-                        table.vtab = Some(std::sync::Arc::new(
-                            crate::plugin::vtab::VtabInstance::pending(
-                                tn.name.clone(),
-                                module.clone(),
-                                args.clone(),
-                            ),
+                        let inst = std::sync::Arc::new(crate::plugin::vtab::VtabInstance::pending(
+                            tn.name.clone(),
+                            module.clone(),
+                            args.clone(),
                         ));
+                        // Built-in modules (fts5) resolve OUTSIDE statement
+                        // scope: connect NOW so the catalog entry carries
+                        // the real column list (user-registered modules
+                        // stay pending — the planner connects them at
+                        // first use inside a statement scope).
+                        let cols = inst.connect_now().unwrap_or_default();
+                        let mut table =
+                            crate::plugin::vtab::vtab_columns_to_schema(&tn.name, &cols);
+                        table.create_sql = sql.to_string();
+                        table.vtab = Some(inst);
                         catalog.add_table(table);
                     }
                 }
@@ -16438,6 +16593,17 @@ fn resolve_insert_column(table: &crate::schema::Table, name: &str) -> Option<usi
         // No INTEGER PRIMARY KEY: `rowid` targets the rowid itself — the
         // executor routes the value to the B+tree key (sentinel index).
         return Some(crate::executor::ROWID_COLUMN_SENTINEL);
+    }
+    // Virtual-table aux columns: FTS5's INSERT-commands address the table
+    // by its self column (`INSERT INTO t(t, rowid, ...) VALUES('delete',
+    // ...)`) and `rank` (`INSERT INTO t(t, rank) VALUES('rank',
+    // 'bm25(...)')`).
+    if let Some(vtab) = &table.vtab {
+        for (an, _) in vtab.aux_columns() {
+            if an.eq_ignore_ascii_case(name) {
+                return Some(crate::executor::VTAB_SELF_SENTINEL);
+            }
+        }
     }
     None
 }

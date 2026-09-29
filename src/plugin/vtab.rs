@@ -70,6 +70,14 @@ pub struct VtabInstance {
     resolved: parking_lot::Mutex<Option<Arc<dyn VirtualTableModule>>>,
     /// xCreate-time instance (Connected) or deferred (Pending).
     state: parking_lot::Mutex<VtabState>,
+    /// Cached aux (hidden) column descriptors, filled at connect.
+    aux: parking_lot::Mutex<Vec<(String, String)>>,
+    /// Cached shadow-table declarations, filled at connect.
+    shadows: parking_lot::Mutex<Vec<ShadowTable>>,
+    /// True when the module's in-memory state must be rebuilt from the
+    /// content shadow before the next use (first use after reopen, or a
+    /// rollback that may have restored the shadow's pages).
+    needs_reindex: std::sync::atomic::AtomicBool,
 }
 
 enum VtabState {
@@ -103,12 +111,18 @@ impl VtabInstance {
         args: Vec<String>,
         instance: Box<dyn VirtualTable>,
     ) -> Self {
+        let aux = instance.aux_columns();
+        let shadows = instance.shadow_tables();
         Self {
             table_name,
             module_name: module.name().to_ascii_lowercase(),
             args,
             resolved: parking_lot::Mutex::new(Some(module)),
             state: parking_lot::Mutex::new(VtabState::Connected(instance)),
+            aux: parking_lot::Mutex::new(aux),
+            shadows: parking_lot::Mutex::new(shadows),
+            // A freshly-created instance is in sync by construction.
+            needs_reindex: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -120,6 +134,10 @@ impl VtabInstance {
             args,
             resolved: parking_lot::Mutex::new(None),
             state: parking_lot::Mutex::new(VtabState::Pending),
+            aux: parking_lot::Mutex::new(Vec::new()),
+            shadows: parking_lot::Mutex::new(Vec::new()),
+            // Reopen: the module state must be rebuilt from the shadow.
+            needs_reindex: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -146,11 +164,15 @@ impl VtabInstance {
         }
         let module = self.resolve_module()?;
         let instance = module.connect(&self.table_name, &self.args)?;
+        let aux = instance.aux_columns();
+        let shadows = instance.shadow_tables();
         let mut st = self.state.lock();
         // Another thread may have connected concurrently — keep theirs.
         if matches!(*st, VtabState::Connected(_)) {
             return Ok(());
         }
+        *self.aux.lock() = aux;
+        *self.shadows.lock() = shadows;
         *st = VtabState::Connected(instance);
         Ok(())
     }
@@ -200,6 +222,57 @@ impl VtabInstance {
     pub(crate) fn module_and_args(&self) -> Result<(Arc<dyn VirtualTableModule>, Vec<String>)> {
         Ok((self.resolve_module()?, self.args.clone()))
     }
+
+    /// Cached aux (hidden) column descriptors: (name, declared type).
+    pub fn aux_columns(&self) -> Vec<(String, String)> {
+        self.aux.lock().clone()
+    }
+
+    /// Cached shadow-table declarations.
+    pub fn shadow_tables(&self) -> Vec<ShadowTable> {
+        self.shadows.lock().clone()
+    }
+
+    /// The content shadow's table name, when the module declared one.
+    pub fn content_shadow(&self) -> Option<String> {
+        self.shadows
+            .lock()
+            .iter()
+            .find(|s| s.content)
+            .map(|s| s.name.clone())
+    }
+
+    /// Does the module want an in-memory rebuild before the next use?
+    pub fn needs_reindex(&self) -> bool {
+        self.needs_reindex
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Mark the module's state as potentially diverged from the content
+    /// shadow (rollback / reopen): the next scan or DML rebuilds it.
+    pub fn request_reindex(&self) {
+        self.needs_reindex
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The reindex ran; in-memory state matches the shadow again.
+    pub fn clear_reindex(&self) {
+        self.needs_reindex
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Run `reindex` on the connected instance with the given rows.
+    pub(crate) fn run_reindex(&self, rows: &[(i64, Vec<Value>)]) -> Result<()> {
+        self.with_table(|vt| vt.reindex(rows))
+    }
+
+    /// Connect now (if the module resolves — built-ins always do) and
+    /// return the module's USER column descriptors, so the catalog entry
+    /// can be rebuilt with the real schema at open time.
+    pub(crate) fn connect_now(&self) -> Result<Vec<(String, String)>> {
+        self.ensure_connected()?;
+        self.with_table(|vt| Ok(vt.columns()))
+    }
 }
 
 /// A constraint passed to `best_index`: one WHERE term the engine can see
@@ -213,6 +286,10 @@ pub enum VtabConstraintOp {
     Ge,
     Like,
     Glob,
+    /// Full-text `col MATCH ?` (FTS5-style). The module receives the
+    /// query string; `as_str` matches SQLite's
+    /// SQLITE_INDEX_CONSTRAINT_MATCH rendering.
+    Match,
 }
 
 /// One WHERE constraint on a virtual-table column (or the rowid, `column ==
@@ -237,6 +314,7 @@ impl VtabConstraintOp {
             VtabConstraintOp::Ge => ">=",
             VtabConstraintOp::Like => "LIKE",
             VtabConstraintOp::Glob => "GLOB",
+            VtabConstraintOp::Match => "MATCH",
         }
     }
 }
@@ -353,6 +431,60 @@ pub trait VirtualTable: Send {
     fn on_create(&mut self) -> Result<()> {
         Ok(())
     }
+
+    /// Hidden (aux) columns beyond the user columns — FTS5's `rank` and
+    /// table-self columns, for example. They are NOT part of the catalog
+    /// schema (SELECT * and INSERT arity see only user columns), but the
+    /// engine appends their values to every scan row under marker names
+    /// and resolves explicit references to them. The module indexes them
+    /// AFTER its user columns: user column i → cursor column i, aux
+    /// column j → cursor column n_user + j.
+    fn aux_columns(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    /// Engine-managed shadow tables (see [`ShadowTable`]). Called once at
+    /// CREATE VIRTUAL TABLE (the engine creates the tables) and again at
+    /// connect (the engine locates the content shadow by name).
+    fn shadow_tables(&self) -> Vec<ShadowTable> {
+        Vec::new()
+    }
+
+    /// Rebuild the module's derived state from the content shadow's rows
+    /// (rowid + user column values, scan order). Called at first use
+    /// after reopen and after any rollback that may have restored the
+    /// shadow's pages — the ground truth is always the shadow.
+    fn reindex(&mut self, _rows: &[(i64, Vec<Value>)]) -> Result<()> {
+        Ok(())
+    }
+
+    /// Statement-scoped aux function names (e.g. `bm25`, `highlight`,
+    /// `snippet`). When a query scans this virtual table, calls to these
+    /// functions resolve against the current scan's module state.
+    fn aux_functions(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// External-content tables (FTS5 `content='other_table'`): the module
+    /// stores no content of its own — user-column reads are served from
+    /// `(table, rowid_column)` of the named table, fetched by the engine
+    /// at scan time. Returns (content table, rowid column).
+    fn external_content(&self) -> Option<(String, String)> {
+        None
+    }
+
+    /// Set the module's default rank weights (FTS5's
+    /// `INSERT INTO t(t, rank) VALUES('rank', 'bm25(w0, ...)')`).
+    fn set_rank_weights(&mut self, _weights: &[f64]) -> Result<()> {
+        Ok(())
+    }
+
+    /// Evaluate one aux function for one row of the current scan. The
+    /// rowid identifies the row (the value the engine passed to the
+    /// function's first argument — the table self column).
+    fn eval_aux(&self, _name: &str, _rowid: i64, _args: &[Value]) -> Result<Value> {
+        Err(Error::Unsupported("module does not implement eval_aux"))
+    }
 }
 
 /// One scan position over a virtual table.
@@ -379,6 +511,33 @@ pub trait VirtualTableCursor: Send {
 pub struct VtabColumnDef {
     pub name: String,
     pub declared_type: String,
+}
+
+/// An engine-managed shadow table: the engine creates the regular table
+/// at `CREATE VIRTUAL TABLE` time (its DDL comes from the module), keeps
+/// the CONTENT shadow's rows in sync around `update()`, and replays them
+/// into the module at connect/reopen and after any rollback that may
+/// have restored the shadow's pages (`reindex`).
+///
+/// This is the engine-side equivalent of SQLite's fts5/rtree shadow
+/// tables (`t_content`, `t_node`, ...): modules that keep derived state
+/// in memory get transactional persistence for free — the shadow rows
+/// ride the ordinary pager (they roll back with the transaction), and
+/// the engine tells the module to rebuild whenever the ground truth may
+/// have moved under it.
+#[derive(Clone, Debug)]
+pub struct ShadowTable {
+    /// Shadow table name (e.g. `t_content`).
+    pub name: String,
+    /// Full CREATE TABLE statement (plain rowid table; no indexes — the
+    /// module owns any derived structure).
+    pub create_sql: String,
+    /// `true` = the engine maintains the row content here: one row per
+    /// vtab row, rowid = the vtab rowid, columns 1.. = the vtab's user
+    /// column values in declared order. `update()` ops are applied to
+    /// the shadow before the module sees them; `reindex` receives the
+    /// shadow's rows.
+    pub content: bool,
 }
 
 /// Build the catalog `Table` schema from a module's declared columns.

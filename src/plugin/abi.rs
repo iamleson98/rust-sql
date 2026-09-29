@@ -1234,6 +1234,8 @@ impl crate::plugin::VirtualTable for CVtab {
                     crate::plugin::vtab::VtabConstraintOp::Ge => 32,
                     crate::plugin::vtab::VtabConstraintOp::Like => 66,
                     crate::plugin::vtab::VtabConstraintOp::Glob => 74,
+                    // SQLITE_INDEX_CONSTRAINT_MATCH
+                    crate::plugin::vtab::VtabConstraintOp::Match => 82,
                 };
                 RqlIndexConstraint {
                     column: c.column.map(|i| i as c_int).unwrap_or(-1),

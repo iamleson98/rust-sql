@@ -838,6 +838,14 @@ pub(crate) enum StmtUndoEntry {
         rowid: i64,
         old_payload: Vec<u8>,
     },
+    /// Virtual-table DML touched a content-shadow-backed module: the
+    /// shadow rows are restored by the row entries above, but the
+    /// module's in-memory state was built from the pre-failure rows.
+    /// Undo = flag the instance for a lazy rebuild from the (restored)
+    /// shadow at its next use.
+    VtabResync {
+        inst: std::sync::Arc<crate::plugin::vtab::VtabInstance>,
+    },
 }
 
 /// Replay a statement journal in reverse, best-effort. Called by the
@@ -851,6 +859,9 @@ pub(crate) fn replay_stmt_undo(
 ) -> Result<()> {
     while let Some(entry) = entries.pop() {
         match entry {
+            StmtUndoEntry::VtabResync { inst } => {
+                inst.request_reindex();
+            }
             StmtUndoEntry::Inserted { table, rowid } => {
                 let indexes = ctx.catalog().indexes_on_table(&table.name);
                 let root = ctx.table_root(&table);
@@ -4859,7 +4870,9 @@ fn exec_scan_projected(
 ) -> Result<ExecResult> {
     if table.vtab.is_some() {
         // Virtual tables have no B+tree payload to selective-decode;
-        // run the module scan, then project the materialized rows.
+        // run the module scan, then project the materialized rows. The
+        // vtab row's trailing slot is the hidden rowid — bare_column_
+        // projection's ROWID_PROJ sentinel maps onto it.
         let full = vtab_exec::exec_scan_vtab(ctx, &table, None, None)?;
         return match project {
             Some(idxs) => {
@@ -4867,7 +4880,12 @@ fn exec_scan_projected(
                 for row in &full.rows {
                     let mut out: Vec<Value> = Vec::with_capacity(idxs.len());
                     for &c in idxs {
-                        out.push(row.get(c).cloned().unwrap_or(Value::Null));
+                        let v = if c == crate::storage::row_codec::ROWID_PROJ {
+                            row.last().cloned().unwrap_or(Value::Null)
+                        } else {
+                            row.get(c).cloned().unwrap_or(Value::Null)
+                        };
+                        out.push(v);
                     }
                     rows.push(out);
                 }
@@ -5323,7 +5341,9 @@ fn apply_projection(
     let hidden_count = inner
         .columns
         .iter()
-        .filter(|c| crate::planner::is_hidden_rowid(c))
+        .filter(|c| {
+            crate::planner::is_hidden_rowid(c) || crate::executor::vtab_exec::is_aux_slot(c)
+        })
         .count();
     let mut out_columns: Vec<String> = Vec::new();
     let mut star_expansions: Vec<Vec<String>> = Vec::new(); // for each column, the list of expanded names (or empty)
@@ -5414,7 +5434,9 @@ fn apply_projection(
         .columns
         .iter()
         .enumerate()
-        .filter(|(_, c)| !crate::planner::is_hidden_rowid(c))
+        .filter(|(_, c)| {
+            !crate::planner::is_hidden_rowid(c) && !crate::executor::vtab_exec::is_aux_slot(c)
+        })
         .map(|(i, _)| i)
         .collect();
     if all_resolved {
@@ -5611,6 +5633,14 @@ fn resolve_column_index<T: AsRef<str>>(
             if crate::planner::is_hidden_rowid(n.as_ref()) {
                 return Some(i);
             }
+        }
+    }
+    // Hidden vtab aux slots (FTS5's `rank` / table-self column): the
+    // marked names answer explicit references after every real column
+    // failed.
+    for (i, n) in col_names.iter().enumerate() {
+        if crate::executor::vtab_exec::aux_slot_matches(n.as_ref(), table, name) {
+            return Some(i);
         }
     }
     None
@@ -17712,6 +17742,10 @@ impl IndexMaintState {
 /// pseudo-column" (`INSERT INTO t (rowid, ...)` on a table without an
 /// INTEGER PRIMARY KEY alias). Never a valid real column index.
 pub(crate) const ROWID_COLUMN_SENTINEL: usize = usize::MAX;
+/// INSERT column-list sentinel for a virtual-table aux column (FTS5's
+/// self/`rank` command column: `INSERT INTO t(t, rowid, ...) VALUES
+/// ('delete', ...)`).
+pub(crate) const VTAB_SELF_SENTINEL: usize = usize::MAX - 1;
 
 /// Which columns an INSERT's target list EXPLICITLY provides (the
 /// rowid sentinel is not a column). DEFAULT fills only the others.

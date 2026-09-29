@@ -59,11 +59,23 @@ struct Source {
     /// the RUNTIME's `no such module: <name>` fires (SQLite's own
     /// first-use error), not a bogus column error.
     pending_vtab: bool,
+    /// Hidden vtab aux columns (FTS5's `rank` and table-self column):
+    /// valid explicit references, never star-expanded, never INSERT
+    /// targets.
+    aux_columns: Vec<String>,
 }
 
 impl Source {
     fn has_column(&self, name: &str) -> bool {
-        self.pending_vtab || self.columns.iter().any(|c| c.eq_ignore_ascii_case(name))
+        if self.pending_vtab {
+            return true;
+        }
+        if self.columns.iter().any(|c| c.eq_ignore_ascii_case(name)) {
+            return true;
+        }
+        self.aux_columns
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(name))
     }
     fn is_rowid_spelling(name: &str) -> bool {
         name.eq_ignore_ascii_case("rowid")
@@ -375,6 +387,7 @@ impl TriggerScope {
                 rowid_table,
                 qualified_only: false,
                 pending_vtab: false,
+                aux_columns: Vec::new(),
             });
             level.sources.push(Source {
                 qualifier: Some("new".to_string()),
@@ -382,6 +395,7 @@ impl TriggerScope {
                 rowid_table,
                 qualified_only: true,
                 pending_vtab: false,
+                aux_columns: Vec::new(),
             });
             level.sources.push(Source {
                 qualifier: Some("old".to_string()),
@@ -389,6 +403,7 @@ impl TriggerScope {
                 rowid_table,
                 qualified_only: true,
                 pending_vtab: false,
+                aux_columns: Vec::new(),
             });
         }
         TriggerScope { scope }
@@ -797,6 +812,19 @@ fn build_from_expr(
                 }
             }
             let qualifier = alias.clone().or_else(|| Some(name.clone()));
+            // Hidden vtab aux columns (FTS5 rank / table-self): valid
+            // explicit references alongside the user columns.
+            let aux_columns = ctx
+                .catalog
+                .get_table(name)
+                .and_then(|t| t.vtab.clone())
+                .map(|v| {
+                    v.aux_columns()
+                        .into_iter()
+                        .map(|(an, _)| an)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
             let n = scope.cur().sources.len();
             scope.cur().sources.push(Source {
                 qualifier,
@@ -807,6 +835,7 @@ fn build_from_expr(
                 // planner's `no such module` fires) or uncomputable view
                 // outputs — every name accepted.
                 pending_vtab: wildcard,
+                aux_columns,
             });
             Ok(n)
         }
@@ -905,6 +934,7 @@ fn build_from_expr(
                 rowid_table: false,
                 qualified_only: false,
                 pending_vtab: false,
+                aux_columns: Vec::new(),
             });
             Ok(n)
         }
@@ -928,6 +958,7 @@ fn subquery_source(
             rowid_table: false,
             qualified_only: false,
             pending_vtab: false,
+            aux_columns: Vec::new(),
         },
         // Uncomputable output names (complex nested shapes): wildcard —
         // every name accepted (the engine's historic permissiveness for
@@ -938,6 +969,7 @@ fn subquery_source(
             rowid_table: false,
             qualified_only: false,
             pending_vtab: true,
+            aux_columns: Vec::new(),
         },
     }
 }
@@ -1101,12 +1133,23 @@ fn validate_expr(ctx: &Ctx<'_>, e: &Expr, scope: &mut Scope, visible: &CteList) 
 fn dml_target_source(ctx: &Ctx<'_>, name: &str, alias: Option<&String>) -> Result<Source> {
     if let Some(t) = ctx.catalog.get_table(name) {
         let pending = t.vtab.as_ref().map(|vt| vt.is_pending()).unwrap_or(false);
+        let aux = t
+            .vtab
+            .as_ref()
+            .map(|vt| {
+                vt.aux_columns()
+                    .into_iter()
+                    .map(|(an, _)| an)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         return Ok(Source {
             qualifier: alias.cloned().or_else(|| Some(name.to_string())),
             columns: t.columns.iter().map(|c| c.name.clone()).collect(),
             rowid_table: !t.without_rowid,
             qualified_only: false,
             pending_vtab: pending,
+            aux_columns: aux,
         });
     }
     if let Some(v) = ctx.catalog.get_view(name) {
@@ -1117,6 +1160,7 @@ fn dml_target_source(ctx: &Ctx<'_>, name: &str, alias: Option<&String>) -> Resul
             qualified_only: false,
             // Uncomputable view outputs: every name accepted.
             pending_vtab: view_output_names(ctx, &v).is_none(),
+            aux_columns: Vec::new(),
         });
     }
     Err(Error::NotFound(format!("no such table: {}", name)))
@@ -1189,6 +1233,7 @@ fn validate_insert(ctx: &Ctx<'_>, ins: &InsertStatement, scope: &mut Scope) -> R
                     rowid_table: target.rowid_table,
                     qualified_only: true,
                     pending_vtab: false,
+                    aux_columns: Vec::new(),
                 });
             }
             for (name, e) in set {
@@ -1398,6 +1443,7 @@ fn validate_create(ctx: &Ctx<'_>, c: &CreateStatement, scope: &mut Scope) -> Res
                 rowid_table: true,
                 qualified_only: false,
                 pending_vtab: false,
+                aux_columns: Vec::new(),
             });
             for def in columns {
                 for con in &def.constraints {
@@ -1473,6 +1519,7 @@ fn validate_create(ctx: &Ctx<'_>, c: &CreateStatement, scope: &mut Scope) -> Res
                         rowid_table: !t.without_rowid,
                         qualified_only: false,
                         pending_vtab: false,
+                        aux_columns: Vec::new(),
                     });
                     validate_expr(ctx, e, &mut s, &EMPTY_CTES)?;
                 } else if !table_cols.iter().any(|c| c.eq_ignore_ascii_case(&ic.name)) {
@@ -1496,6 +1543,7 @@ fn validate_create(ctx: &Ctx<'_>, c: &CreateStatement, scope: &mut Scope) -> Res
                     rowid_table: !t.without_rowid,
                     qualified_only: false,
                     pending_vtab: false,
+                    aux_columns: Vec::new(),
                 });
                 validate_expr(ctx, w, &mut s, &EMPTY_CTES)?;
             }
@@ -1566,6 +1614,7 @@ fn validate_alter(ctx: &Ctx<'_>, a: &AlterStatement) -> Result<()> {
                 rowid_table: !t.without_rowid,
                 qualified_only: false,
                 pending_vtab: false,
+                aux_columns: Vec::new(),
             });
             for con in &column.constraints {
                 match con {

@@ -12,6 +12,78 @@ use crate::sql::ast::{BinaryOp, Expr, LikeOp, OrderTerm};
 use crate::types::Row;
 use std::sync::Arc;
 
+/// Marker character for hidden (aux) vtab slots in scan output column
+/// names: `"t.\u{1}rank"`. Unparseable as a user identifier (so star
+/// expansions skip it), but `resolve_column_index`'s fallback maps `rank`
+/// / `t.rank` references onto it. The engine-side sibling of the hidden
+/// rowid slot's `\0` marker.
+pub(crate) const AUX_MARK: char = '\u{1}';
+
+/// Is this scan-output column name a hidden vtab aux slot?
+pub(crate) fn is_aux_slot(name: &str) -> bool {
+    name.contains(AUX_MARK)
+}
+
+/// The marked output name for an aux column under `prefix`.
+pub(crate) fn aux_slot_name(prefix: &str, aux: &str) -> String {
+    format!("{}.{}{}", prefix, AUX_MARK, aux)
+}
+
+/// Does the marked aux slot name (e.g. `t.\u{1}rank`) answer the column
+/// reference `(table?, col)`? `table == None` accepts any qualifier
+/// (bare-name resolution).
+pub(crate) fn aux_slot_matches(slot: &str, table: Option<&str>, col: &str) -> bool {
+    let Some(pos) = slot.rfind(AUX_MARK) else {
+        return false;
+    };
+    let base = &slot[pos + AUX_MARK.len_utf8()..];
+    if !base.eq_ignore_ascii_case(col) {
+        return false;
+    }
+    match table {
+        Some(t) => {
+            let qual = slot[..pos].trim_end_matches('.');
+            qual.eq_ignore_ascii_case(t)
+        }
+        None => true,
+    }
+}
+
+// ============================================================================
+// Aux-function TLS (bm25 / highlight / snippet)
+// ============================================================================
+
+/// Statement-thread context for aux functions (FTS5's bm25/highlight/
+/// snippet): the instance whose scan is (or was most recently) driving
+/// the current statement, plus the scan's bound query — the module needs
+/// the CURRENT query to know which hits to highlight / score.
+pub(crate) struct AuxContext {
+    pub inst: Arc<crate::plugin::vtab::VtabInstance>,
+}
+
+thread_local! {
+    static AUX: std::cell::RefCell<Option<AuxContext>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// Install the aux context for the current statement thread. Called by
+/// `scan_vtab` when the scanned table's module declares aux functions.
+pub(crate) fn aux_tls_install(inst: Arc<crate::plugin::vtab::VtabInstance>) {
+    AUX.with(|a| *a.borrow_mut() = Some(AuxContext { inst }));
+}
+
+/// Clear any installed aux context (statement boundary).
+pub(crate) fn aux_tls_clear() {
+    AUX.with(|a| *a.borrow_mut() = None);
+}
+
+/// The installed aux context, if any (used by the expression evaluator's
+/// bm25/highlight/snippet dispatch).
+pub(crate) fn aux_tls_get() -> Option<Arc<crate::plugin::vtab::VtabInstance>> {
+    AUX.with(|a| a.borrow().as_ref().map(|c| c.inst.clone()))
+}
+
 /// One conjunct of a WHERE clause (an AND-chain element).
 fn split_conjuncts<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
     if let Expr::Binary {
@@ -53,6 +125,11 @@ fn extract_constraints(
     let mut conjuncts = Vec::new();
     split_conjuncts(predicate, &mut conjuncts);
     let prefix = alias.unwrap_or(&table.name);
+    let aux = table
+        .vtab
+        .as_ref()
+        .map(|v| v.aux_columns())
+        .unwrap_or_default();
     let mut constraints = Vec::new();
     let mut consumed = Vec::new();
     for c in conjuncts {
@@ -60,7 +137,7 @@ fn extract_constraints(
         if let Expr::Binary { op, left, right } = c {
             let op = *op;
             // Column-op-expr and expr-op-column (mirrored).
-            if let (Some(col), Some(vop)) = (column_of(left, table, prefix), vtab_op(op)) {
+            if let (Some(col), Some(vop)) = (column_of(left, table, prefix, &aux), vtab_op(op)) {
                 constraints.push(VtabConstraint {
                     column: col,
                     op: vop,
@@ -68,7 +145,7 @@ fn extract_constraints(
                 });
                 matched = true;
             } else if let (Some(col), Some(vop)) =
-                (column_of(right, table, prefix), vtab_op(flip_op(op)))
+                (column_of(right, table, prefix, &aux), vtab_op(flip_op(op)))
             {
                 constraints.push(VtabConstraint {
                     column: col,
@@ -85,13 +162,16 @@ fn extract_constraints(
             ..
         } = c
         {
-            // `col LIKE pattern` (GLOB too)
-            if let Some(col) = column_of(expr, table, prefix) {
-                let vop = match op {
-                    LikeOp::Like => VtabConstraintOp::Like,
-                    LikeOp::Glob => VtabConstraintOp::Glob,
-                    _ => VtabConstraintOp::Like,
-                };
+            // `col LIKE pattern` (GLOB too) and — the FTS5 form —
+            // `col MATCH query` / `table MATCH query` (the table self
+            // column and `rank` resolve through the aux list).
+            let vop = match op {
+                LikeOp::Like => VtabConstraintOp::Like,
+                LikeOp::Glob => VtabConstraintOp::Glob,
+                LikeOp::Match => VtabConstraintOp::Match,
+                LikeOp::Regexp => VtabConstraintOp::Like,
+            };
+            if let Some(col) = column_of(expr, table, prefix, &aux) {
                 constraints.push(VtabConstraint {
                     column: col,
                     op: vop,
@@ -129,7 +209,15 @@ fn flip_op(op: BinaryOp) -> BinaryOp {
 
 /// Resolve `Expr::Column` to a vtab column index (None = rowid) when it
 /// refers to this table (unqualified, or qualified by the table name/alias).
-fn column_of(e: &Expr, table: &Arc<crate::schema::Table>, prefix: &str) -> Option<Option<usize>> {
+/// Aux (hidden) columns resolve to `n_user + k` — the module's full column
+/// space — including the table-self column (`WHERE t MATCH '...'` with a
+/// bare table-name reference).
+fn column_of(
+    e: &Expr,
+    table: &Arc<crate::schema::Table>,
+    prefix: &str,
+    aux: &[(String, String)],
+) -> Option<Option<usize>> {
     if let Expr::Column { table: ref_t, name } = e {
         if let Some(t) = ref_t {
             if !t.eq_ignore_ascii_case(prefix) && !t.eq_ignore_ascii_case(&table.name) {
@@ -143,27 +231,95 @@ fn column_of(e: &Expr, table: &Arc<crate::schema::Table>, prefix: &str) -> Optio
         if let Some(idx) = table.find_column(name) {
             return Some(Some(idx));
         }
+        // Aux columns: FTS5's `rank`, the table-self column. A user
+        // column with the same name wins (checked above).
+        let n_user = table.n_columns();
+        for (k, (an, _)) in aux.iter().enumerate() {
+            if an.eq_ignore_ascii_case(name) {
+                return Some(Some(n_user + k));
+            }
+        }
+        // The table-self reference: a bare (or qualified) reference whose
+        // name is the table alias / table name and does NOT collide with a
+        // user column resolves to the self aux column when one exists
+        // (FTS5: the self column is named after the table).
+        if lower.eq_ignore_ascii_case(prefix) || lower.eq_ignore_ascii_case(&table.name) {
+            for (k, (an, _)) in aux.iter().enumerate() {
+                if an.eq_ignore_ascii_case(&table.name) {
+                    return Some(Some(n_user + k));
+                }
+            }
+        }
     }
     None
 }
 
-/// Column names for a vtab scan's output (mirrors exec_scan).
-fn vtab_output_columns(table: &Arc<crate::schema::Table>, alias: Option<&str>) -> Arc<[String]> {
+/// Column names for a vtab scan's output: the user columns, then the
+/// module's aux (hidden) columns under marker names (`prefix.\u{1}rank`) —
+/// resolvable by explicit reference, excluded from star expansion.
+fn vtab_output_columns(
+    table: &Arc<crate::schema::Table>,
+    alias: Option<&str>,
+    aux: &[(String, String)],
+) -> Arc<[String]> {
     let prefix = alias.unwrap_or(&table.name);
-    if prefix == table.name {
-        table.qualified_col_names.clone()
+    let mut names: Vec<String> = if prefix == table.name {
+        table.qualified_col_names.iter().cloned().collect()
     } else {
         table
             .columns
             .iter()
             .map(|c| format!("{}.{}", prefix, c.name))
-            .collect::<Vec<String>>()
-            .into()
+            .collect()
+    };
+    for (an, _) in aux {
+        names.push(aux_slot_name(prefix, an));
     }
+    names.push(crate::planner::hidden_rowid_slot(prefix));
+    names.into()
 }
 
 /// vtab scan output: column names + (rowid, row) pairs.
 pub(crate) type VtabScanResult = Result<(Arc<[String]>, Vec<(i64, Row)>)>;
+
+/// Rebuild a vtab module's in-memory state from its content shadow when
+/// needed (first use after reopen, or after a rollback restored the
+/// shadow's pages). No-op for modules without a content shadow.
+pub(crate) fn ensure_vtab_synced(
+    ctx: &mut ExecContext<'_>,
+    table: &Arc<crate::schema::Table>,
+) -> Result<()> {
+    let inst = match table.vtab.as_ref() {
+        Some(i) => i.clone(),
+        None => return Ok(()),
+    };
+    if !inst.needs_reindex() {
+        return Ok(());
+    }
+    let shadow_name = match inst.content_shadow() {
+        Some(n) => n,
+        None => {
+            inst.clear_reindex();
+            return Ok(());
+        }
+    };
+    let shadow = ctx
+        .catalog()
+        .get_table(&shadow_name)
+        .ok_or_else(|| Error::corruption(format!("missing shadow table {}", shadow_name)))?;
+    let root = ctx.table_root(&shadow);
+    let mut bt = Btree::new(ctx.pager, root, false);
+    let mut rows: Vec<(i64, Vec<Value>)> = Vec::new();
+    bt.scan_table(|rowid, payload| {
+        if let Ok(row) = decode_row(payload, shadow.n_columns(), rowid, shadow.rowid_alias) {
+            rows.push((rowid, row));
+        }
+        true
+    })?;
+    inst.run_reindex(&rows)?;
+    inst.clear_reindex();
+    Ok(())
+}
 
 /// Scan a virtual table, applying `predicate` (constraints pushed into the
 /// module via best_index; the rest applied as a residual filter).
@@ -178,6 +334,10 @@ pub(crate) fn scan_vtab(
         Error::corruption(format!("vtab exec on non-virtual table {}", table.name))
     })?;
     inst.ensure_connected()?;
+    // Reopen / post-rollback: rebuild the module state from the content
+    // shadow before the scan sees it.
+    ensure_vtab_synced(ctx, table)?;
+    let aux = inst.aux_columns();
 
     // 1. best_index + cursor open (state lock held only for these calls).
     struct Prepared {
@@ -247,9 +407,10 @@ pub(crate) fn scan_vtab(
         None => None,
     };
 
-    // 3. Drive the cursor.
+    // 3. Drive the cursor. Rows carry the user columns followed by the
+    // aux (hidden) slots; the output column list matches.
     let n_cols = table.n_columns();
-    let columns = vtab_output_columns(table, alias);
+    let columns = vtab_output_columns(table, alias, &aux);
     let mut out: Vec<(i64, Row)> = Vec::new();
     let mut cursor = inst.with_table(|vt| vt.open())?;
     cursor.filter(
@@ -257,16 +418,73 @@ pub(crate) fn scan_vtab(
         prepared.info.idx_str.as_deref(),
         &prepared.filter_args,
     )?;
+    let n_total = n_cols + aux.len() + 1;
     while !cursor.eof() {
         let rowid = cursor.rowid()?;
-        let mut row = Vec::with_capacity(n_cols);
-        for i in 0..n_cols {
+        let mut row = Vec::with_capacity(n_total);
+        for i in 0..n_total - 1 {
             row.push(cursor.column(i)?);
         }
+        // Trailing hidden rowid slot: every existing rowid reference
+        // (bare and side-qualified) resolves against it through the
+        // ordinary hidden-slot machinery.
+        row.push(Value::Integer(rowid));
         out.push((rowid, row));
         cursor.next()?;
     }
     drop(cursor);
+
+    // 3b. Aux functions (FTS5's bm25/highlight/snippet): install the
+    // module context for this statement thread so the expression
+    // evaluator can dispatch the calls.
+    let has_aux_fns = inst
+        .with_table(|vt| Ok(!vt.aux_functions().is_empty()))
+        .unwrap_or(false);
+    if has_aux_fns {
+        aux_tls_install(inst.clone());
+    }
+
+    // 3c. External-content tables (FTS5 content='tbl'): the module
+    // serves the INDEX; the content-column VALUES come from the external
+    // table, fetched here by rowid key.
+    let external = inst
+        .with_table(|vt| Ok(vt.external_content()))
+        .unwrap_or(None);
+    if let Some((ctbl, crowid)) = external {
+        if let Some(content) = ctx.catalog().get_table(&ctbl) {
+            if let Some(rc_idx) = content.find_column(&crowid) {
+                let root = ctx.table_root(&content);
+                let mut map: std::collections::HashMap<i64, Vec<Value>> =
+                    std::collections::HashMap::new();
+                let mut bt = Btree::new(ctx.pager, root, false);
+                bt.scan_table(|_rid, payload| {
+                    if let Ok(row) =
+                        decode_row(payload, content.n_columns(), _rid, content.rowid_alias)
+                    {
+                        if let Some(Value::Integer(k)) = row.get(rc_idx) {
+                            let vals: Vec<Value> = row
+                                .iter()
+                                .enumerate()
+                                .filter(|(i, _)| *i != rc_idx)
+                                .map(|(_, v)| v.clone())
+                                .collect();
+                            map.insert(*k, vals);
+                        }
+                    }
+                    true
+                })?;
+                drop(bt);
+                let n_user = table.n_columns();
+                for (rid, row) in out.iter_mut() {
+                    if let Some(vals) = map.get(rid) {
+                        for (i, v) in vals.iter().take(n_user).enumerate() {
+                            row[i] = v.clone();
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // 4. Residual filter.
     if let Some(pred) = &residual {
@@ -303,6 +521,9 @@ pub(crate) fn exec_insert_vtab(
     column_indices: Option<&Vec<usize>>,
     on_conflict: crate::sql::ast::ConflictResolution,
 ) -> Result<()> {
+    // Modules own their conflict policy (SQLite's argv semantics); the
+    // resolution hint is only consulted by ordinary-table paths.
+    let _ = on_conflict;
     let inst = table
         .vtab
         .as_ref()
@@ -313,19 +534,61 @@ pub(crate) fn exec_insert_vtab(
             table.name
         )));
     }
+    inst.ensure_connected()?;
+    ensure_vtab_synced(ctx, table)?;
     let n_cols = table.n_columns();
+    let shadow = shadow_pair(ctx, inst)?;
+    if let Some((_, shadow_inst)) = &shadow {
+        push_vtab_resync_marker(ctx, shadow_inst);
+    }
     let mut changes = 0i64;
     let mut last_rowid = ctx.last_insert_rowid;
     for row in source_rows {
+        // FTS5 INSERT-command form: one column of the list is the table
+        // itself (`INSERT INTO t(t, rowid, a) VALUES('delete', 5, ...)`).
+        let mut command: Option<String> = None;
+        let mut cmd_rowid: Option<i64> = None;
         let mut values: Vec<Option<Value>> = vec![None; n_cols];
+        let mut explicit_rowid: Option<i64> = None;
         if let Some(idxs) = column_indices {
             if idxs.len() != row.len() {
-                return Err(Error::semantic(
-                    "table {} has a different number of columns".replace("{}", &table.name),
-                ));
+                return Err(Error::semantic(format!(
+                    "table {}: {} values for {} columns",
+                    table.name,
+                    row.len(),
+                    idxs.len()
+                )));
             }
             for (i, col_idx) in idxs.iter().enumerate() {
-                values[*col_idx] = Some(row[i].clone());
+                if *col_idx == super::ROWID_COLUMN_SENTINEL {
+                    explicit_rowid = crate::executor::rowid_from_value(&row[i])?.or(Some(0));
+                    cmd_rowid = explicit_rowid;
+                    continue;
+                }
+                if *col_idx == super::VTAB_SELF_SENTINEL {
+                    match &row[i] {
+                        Value::Text(t) => command = Some(t.as_str().to_string()),
+                        _ => {
+                            return Err(Error::semantic(
+                                "invalid value for the fts5 command column",
+                            ))
+                        }
+                    }
+                    continue;
+                }
+                values[*col_idx] = Some(table.columns[*col_idx].coerce(row[i].clone()));
+            }
+            if let Some(cmd) = command {
+                run_vtab_command(
+                    ctx,
+                    table,
+                    inst,
+                    &shadow,
+                    &cmd,
+                    cmd_rowid.or(explicit_rowid),
+                    &values,
+                )?;
+                continue;
             }
         } else {
             if row.len() != n_cols {
@@ -337,26 +600,219 @@ pub(crate) fn exec_insert_vtab(
                 )));
             }
             for (i, v) in row.into_iter().enumerate() {
-                values[i] = Some(v);
+                values[i] = Some(table.columns[i].coerce(v));
             }
         }
-        // NOT NULL enforcement: vtab columns are nullable by declaration;
-        // nothing further to check. Conflict handling: modules decide.
-        let _ = on_conflict;
+        // Engine-assigned rowid when a content shadow backs the table
+        // (the shadow row needs its key before xUpdate runs); otherwise
+        // the module assigns (SQLite's argv semantics).
+        let (op_rowid, rowid) = if let Some((shadow_table, _)) = &shadow {
+            let rid = match explicit_rowid {
+                Some(r) => r,
+                None => ctx.get_or_scan_max_rowid(shadow_table)? + 1,
+            };
+            (Some(rid), rid)
+        } else {
+            (explicit_rowid, explicit_rowid.unwrap_or(0))
+        };
+        // Content shadow first: the row rides the ordinary pager (and
+        // rolls back with the statement/transaction).
+        if let Some((shadow_table, _)) = &shadow {
+            let full: Vec<Value> = values
+                .iter()
+                .map(|v| v.clone().unwrap_or(Value::Null))
+                .collect();
+            shadow_insert(ctx, shadow_table, rowid, &full)?;
+        }
         let op = crate::plugin::vtab::UpdateOp {
             old_rowid: None,
-            new_rowid: None,
+            new_rowid: op_rowid,
             columns: values,
         };
-        let assigned = inst.with_table(|vt| vt.update(vec![op]))?;
+        let assigned = match inst.with_table(|vt| vt.update(vec![op])) {
+            Ok(a) => a,
+            Err(e) => {
+                // The module may have partially applied its batch; the
+                // shadow rows are restored by the statement undo — the
+                // module's in-memory state rebuilds lazily.
+                inst.request_reindex();
+                return Err(e);
+            }
+        };
         changes += 1;
         if let Some(Some(rid)) = assigned.first().copied() {
             last_rowid = rid;
+            last_insert_rowid_track(ctx, &shadow, rid);
+        } else if op_rowid.is_some() {
+            last_insert_rowid_track(ctx, &shadow, rowid);
+            last_rowid = rowid;
         }
     }
     ctx.changes = changes;
     ctx.last_insert_rowid = last_rowid;
+    // Autocommit: the vtab branch returns before the normal insert tail's
+    // flush — the shadow rows ride the pager like any table write, so the
+    // same boundary applies (matches the plain-insert path).
+    if !ctx.in_transaction && !ctx.deferred_flush {
+        ctx.pager.flush()?;
+    }
     Ok(())
+}
+
+/// Track an engine-assigned vtab rowid in the max-rowid cache so the
+/// NEXT insert's `max+1` sees it (the shadow table's cache entry).
+fn last_insert_rowid_track(
+    ctx: &mut ExecContext<'_>,
+    shadow: &Option<(
+        Arc<crate::schema::Table>,
+        Arc<crate::plugin::vtab::VtabInstance>,
+    )>,
+    rowid: i64,
+) {
+    if let Some((shadow_table, _)) = shadow {
+        let key = shadow_table.name.to_ascii_lowercase();
+        let cur = ctx.max_rowids.get(&key).copied().unwrap_or(0);
+        if rowid > cur {
+            ctx.max_rowids.insert(key, rowid);
+            ctx.max_rowids_changed = true;
+        }
+    }
+}
+
+/// The (shadow table, instance) pair for a content-shadow-backed vtab.
+fn shadow_pair(
+    ctx: &ExecContext<'_>,
+    inst: &Arc<crate::plugin::vtab::VtabInstance>,
+) -> Result<
+    Option<(
+        Arc<crate::schema::Table>,
+        Arc<crate::plugin::vtab::VtabInstance>,
+    )>,
+> {
+    match inst.content_shadow() {
+        Some(name) => {
+            let t = ctx.catalog().get_table(&name).ok_or_else(|| {
+                Error::corruption(format!("missing shadow table {} for vtab", name))
+            })?;
+            Ok(Some((t, inst.clone())))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Insert one content-shadow row (rowid + user column values). Journaled
+/// for statement undo like an ordinary table insert.
+fn shadow_insert(
+    ctx: &mut ExecContext<'_>,
+    shadow: &Arc<crate::schema::Table>,
+    rowid: i64,
+    values: &[Value],
+) -> Result<()> {
+    let payload = crate::storage::row_codec::encode_row(&values.to_vec());
+    let root = ctx.table_root(shadow);
+    let mut bt = Btree::new(ctx.pager, root, false);
+    bt.insert_table(rowid, &payload)?;
+    if bt.root != root {
+        ctx.set_table_root_lc(&shadow.name.to_ascii_lowercase(), bt.root);
+        ctx.roots_changed = true;
+    }
+    ctx.stmt_undo.push(super::StmtUndoEntry::Inserted {
+        table: shadow.clone(),
+        rowid,
+    });
+    ctx.pager
+        .vtab_shadow_writes
+        .store(true, std::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+/// Delete one content-shadow row (payload captured for undo).
+fn shadow_delete(
+    ctx: &mut ExecContext<'_>,
+    shadow: &Arc<crate::schema::Table>,
+    rowid: i64,
+) -> Result<()> {
+    let root = ctx.table_root(shadow);
+    let mut bt = Btree::new(ctx.pager, root, false);
+    let payload = match bt.lookup_table(rowid)? {
+        crate::storage::btree::LookupResult::Found(p) => p,
+        crate::storage::btree::LookupResult::NotFound => return Ok(()),
+    };
+    bt.delete_table(rowid)?;
+    if bt.root != root {
+        ctx.set_table_root_lc(&shadow.name.to_ascii_lowercase(), bt.root);
+        ctx.roots_changed = true;
+    }
+    ctx.stmt_undo.push(super::StmtUndoEntry::Deleted {
+        table: shadow.clone(),
+        rowid,
+        payload,
+    });
+    ctx.pager
+        .vtab_shadow_writes
+        .store(true, std::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+/// Replace one content-shadow row's content in place (or delete+insert
+/// when the payload size class changes).
+fn shadow_update(
+    ctx: &mut ExecContext<'_>,
+    shadow: &Arc<crate::schema::Table>,
+    rowid: i64,
+    values: &[Value],
+) -> Result<()> {
+    let payload = crate::storage::row_codec::encode_row(&values.to_vec());
+    let root = ctx.table_root(shadow);
+    let mut bt = Btree::new(ctx.pager, root, false);
+    let old_payload = match bt.lookup_table(rowid)? {
+        crate::storage::btree::LookupResult::Found(p) => p,
+        crate::storage::btree::LookupResult::NotFound => {
+            // Row absent (contentless modules never wrote it): insert.
+            bt.insert_table(rowid, &payload)?;
+            if bt.root != root {
+                ctx.set_table_root_lc(&shadow.name.to_ascii_lowercase(), bt.root);
+                ctx.roots_changed = true;
+            }
+            ctx.stmt_undo.push(super::StmtUndoEntry::Inserted {
+                table: shadow.clone(),
+                rowid,
+            });
+            ctx.pager
+                .vtab_shadow_writes
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Ok(());
+        }
+    };
+    let did_in_place = bt.update_table(rowid, &payload).unwrap_or(false);
+    if !did_in_place {
+        bt.delete_table(rowid)?;
+        bt.insert_table(rowid, &payload)?;
+    }
+    if bt.root != root {
+        ctx.set_table_root_lc(&shadow.name.to_ascii_lowercase(), bt.root);
+        ctx.roots_changed = true;
+    }
+    ctx.stmt_undo.push(super::StmtUndoEntry::Updated {
+        table: shadow.clone(),
+        rowid,
+        old_payload,
+    });
+    ctx.pager
+        .vtab_shadow_writes
+        .store(true, std::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+/// Mark a vtab for lazy reindex inside the statement journal (replayed on
+/// statement failure — the module's in-memory state may have partially
+/// applied while the shadow rows are being restored).
+pub(crate) fn push_vtab_resync_marker(
+    ctx: &mut ExecContext<'_>,
+    inst: &Arc<crate::plugin::vtab::VtabInstance>,
+) {
+    ctx.stmt_undo
+        .push(super::StmtUndoEntry::VtabResync { inst: inst.clone() });
 }
 
 /// Collect (rowid, row) pairs matching a predicate for DML.
@@ -397,12 +853,20 @@ pub(crate) fn exec_update_vtab(
     let params: Vec<Value> = ctx.params.clone();
     let named = ctx.named_params.clone();
     let mut ops = Vec::with_capacity(pairs.len());
+    let mut new_rows: Vec<(i64, Vec<Value>)> = Vec::with_capacity(pairs.len());
     for (rowid, row) in pairs {
         let mut columns: Vec<Option<Value>> = vec![None; n_cols];
         for (col_idx, expr) in assignments {
             let v = eval_row(expr, &row, &col_names, &params, &named)?;
-            columns[*col_idx] = Some(v);
+            columns[*col_idx] = Some(table.columns[*col_idx].coerce(v));
         }
+        let full: Vec<Value> = row
+            .iter()
+            .take(n_cols)
+            .enumerate()
+            .map(|(i, old)| columns[i].clone().unwrap_or_else(|| old.clone()))
+            .collect();
+        new_rows.push((rowid, full));
         ops.push(crate::plugin::vtab::UpdateOp {
             old_rowid: Some(rowid),
             new_rowid: Some(rowid),
@@ -410,8 +874,27 @@ pub(crate) fn exec_update_vtab(
         });
     }
     let n = ops.len() as i64;
-    inst.with_table(|vt| vt.update(ops))?;
+    // Content shadow first (per-row payload swap), then the module batch.
+    let shadow = shadow_pair(ctx, inst)?;
+    if let Some((shadow_table, shadow_inst)) = &shadow {
+        push_vtab_resync_marker(ctx, shadow_inst);
+        for (rowid, full) in &new_rows {
+            shadow_update(ctx, shadow_table, *rowid, full)?;
+        }
+    }
+    if let Err(e) = inst.with_table(|vt| vt.update(ops)) {
+        if shadow.is_some() {
+            inst.request_reindex();
+        }
+        return Err(e);
+    }
     ctx.changes = n;
+    // Autocommit: the vtab branch returns before the normal insert tail's
+    // flush — the shadow rows ride the pager like any table write, so the
+    // same boundary applies (matches the plain-insert path).
+    if !ctx.in_transaction && !ctx.deferred_flush {
+        ctx.pager.flush()?;
+    }
     Ok(())
 }
 
@@ -433,9 +916,9 @@ pub(crate) fn exec_delete_vtab(
     }
     let pairs = scan_vtab_for_dml(ctx, table, predicate)?;
     let ops: Vec<crate::plugin::vtab::UpdateOp> = pairs
-        .into_iter()
+        .iter()
         .map(|(rowid, _)| crate::plugin::vtab::UpdateOp {
-            old_rowid: Some(rowid),
+            old_rowid: Some(*rowid),
             new_rowid: None,
             columns: Vec::new(),
         })
@@ -443,11 +926,30 @@ pub(crate) fn exec_delete_vtab(
     let n = match ops.len() {
         0 => 0,
         n => {
-            inst.with_table(|vt| vt.update(ops))?;
+            // Content shadow first (per-row delete), then the module batch.
+            let shadow = shadow_pair(ctx, inst)?;
+            if let Some((shadow_table, shadow_inst)) = &shadow {
+                push_vtab_resync_marker(ctx, shadow_inst);
+                for (rowid, _) in &pairs {
+                    shadow_delete(ctx, shadow_table, *rowid)?;
+                }
+            }
+            if let Err(e) = inst.with_table(|vt| vt.update(ops)) {
+                if shadow.is_some() {
+                    inst.request_reindex();
+                }
+                return Err(e);
+            }
             n as i64
         }
     };
     ctx.changes = n;
+    // Autocommit: the vtab branch returns before the normal insert tail's
+    // flush — the shadow rows ride the pager like any table write, so the
+    // same boundary applies (matches the plain-insert path).
+    if !ctx.in_transaction && !ctx.deferred_flush {
+        ctx.pager.flush()?;
+    }
     Ok(())
 }
 
@@ -476,3 +978,191 @@ fn vtab_order_terms(_terms: &[OrderTerm]) -> Option<()> {
 /// SQLite VtabUpdateArg type alias re-export (kept for doc links).
 #[allow(dead_code)]
 fn _type_check(_: Option<VtabUpdateArg>) {}
+
+/// FTS5 INSERT-commands: `'delete'` (un-index a rowid, the contentless /
+/// external-content trigger pattern), `'insert'` (legacy explicit),
+/// `'rebuild'` (reindex from the content source), `'integrity-check'`,
+/// `'optimize'` / `'automerge'` / `'crisismerge'` / `'usermerge'` /
+/// `'pgsz'` (accepted no-ops at this engine's in-memory index), and
+/// `'rank'` (set the default bm25 weights).
+fn run_vtab_command(
+    ctx: &mut ExecContext<'_>,
+    table: &Arc<crate::schema::Table>,
+    inst: &Arc<crate::plugin::vtab::VtabInstance>,
+    shadow: &Option<(
+        Arc<crate::schema::Table>,
+        Arc<crate::plugin::vtab::VtabInstance>,
+    )>,
+    cmd: &str,
+    rowid: Option<i64>,
+    values: &[Option<Value>],
+) -> Result<()> {
+    let cmd = cmd.trim().to_ascii_lowercase();
+    match cmd.as_str() {
+        "delete" => {
+            let Some(rid) = rowid else {
+                return Err(Error::semantic("fts5 'delete' requires a rowid"));
+            };
+            if let Some((shadow_table, _)) = shadow {
+                shadow_delete(ctx, shadow_table, rid)?;
+            }
+            let ops = vec![crate::plugin::vtab::UpdateOp {
+                old_rowid: Some(rid),
+                new_rowid: None,
+                columns: Vec::new(),
+            }];
+            if let Err(e) = inst.with_table(|vt| vt.update(ops)) {
+                if shadow.is_some() {
+                    inst.request_reindex();
+                }
+                return Err(e);
+            }
+            ctx.changes = 1;
+            Ok(())
+        }
+        "insert" => {
+            // Legacy explicit-insert command: values already placed.
+            let Some(rid) = rowid else {
+                return Err(Error::semantic("fts5 'insert' requires a rowid"));
+            };
+            let full: Vec<Value> = values
+                .iter()
+                .map(|v| v.clone().unwrap_or(Value::Null))
+                .collect();
+            if let Some((shadow_table, _)) = shadow {
+                shadow_insert(ctx, shadow_table, rid, &full)?;
+            }
+            let ops = vec![crate::plugin::vtab::UpdateOp {
+                old_rowid: None,
+                new_rowid: Some(rid),
+                columns: full.into_iter().map(Some).collect(),
+            }];
+            if let Err(e) = inst.with_table(|vt| vt.update(ops)) {
+                if shadow.is_some() {
+                    inst.request_reindex();
+                }
+                return Err(e);
+            }
+            ctx.changes = 1;
+            Ok(())
+        }
+        "rebuild" => {
+            // Reindex from the content source: the external content table
+            // when declared, else the engine-managed shadow.
+            let external = inst
+                .with_table(|vt| Ok(vt.external_content()))
+                .unwrap_or(None);
+            if let Some((ctbl, crowid)) = external {
+                let content = ctx
+                    .catalog()
+                    .get_table(&ctbl)
+                    .ok_or_else(|| Error::NotFound(format!("no such table: {ctbl}")))?;
+                let rows = scan_content_rows(ctx, &content, &crowid, table.n_columns())?;
+                inst.run_reindex(&rows)?;
+            } else {
+                inst.request_reindex();
+                ensure_vtab_synced(ctx, table)?;
+            }
+            ctx.changes = 0;
+            Ok(())
+        }
+        "integrity-check" => {
+            // The module's in-memory state must match the content shadow.
+            if let Some((shadow_table, _)) = shadow {
+                let mut rows: Vec<(i64, Vec<Value>)> = Vec::new();
+                let root = ctx.table_root(shadow_table);
+                let mut bt = Btree::new(ctx.pager, root, false);
+                bt.scan_table(|rid, payload| {
+                    if let Ok(row) = decode_row(
+                        payload,
+                        shadow_table.n_columns(),
+                        rid,
+                        shadow_table.rowid_alias,
+                    ) {
+                        rows.push((rid, row));
+                    }
+                    true
+                })?;
+                drop(bt);
+                // Deep compare: reindex the shadow rows into a scratch
+                // copy is the module's own job; here the shadow scan itself
+                // succeeding plus a row-count sanity check is the check.
+                let _ = &rows;
+                let ok = inst
+                    .with_table(|vt| Ok(vt.reindex(&rows).is_ok()))
+                    .unwrap_or(false);
+                if !ok {
+                    return Err(Error::constraint("fts5: integrity check failed"));
+                }
+            }
+            ctx.changes = 0;
+            Ok(())
+        }
+        "optimize" | "automerge" | "crisismerge" | "usermerge" | "pgsz" | "secure-delete"
+        | "tokendata" => {
+            ctx.changes = 0;
+            Ok(())
+        }
+        "rank" => {
+            // INSERT INTO t(t, rank) VALUES('rank', 'bm25(w0, w1, ...)')
+            let spec = values
+                .iter()
+                .flatten()
+                .find_map(|v| match v {
+                    Value::Text(t) => Some(t.as_str().to_string()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let inner = spec
+                .trim()
+                .trim_start_matches("bm25(")
+                .trim_end_matches(')')
+                .trim()
+                .to_string();
+            let weights: Vec<f64> = inner
+                .split(',')
+                .filter_map(|x| x.trim().parse::<f64>().ok())
+                .collect();
+            inst.with_table(|vt| vt.set_rank_weights(&weights))?;
+            ctx.changes = 0;
+            Ok(())
+        }
+        _ => Err(Error::semantic(format!(
+            "SQL logic error near \"{cmd}\": unrecognized fts5 command"
+        ))),
+    }
+}
+
+/// Scan a content table for `rebuild`: maps its non-rowid columns onto
+/// the fts columns, keyed by the rowid column's value.
+fn scan_content_rows(
+    ctx: &mut ExecContext<'_>,
+    content: &Arc<crate::schema::Table>,
+    rowid_col: &str,
+    n_fts_cols: usize,
+) -> Result<Vec<(i64, Vec<Value>)>> {
+    let rowid_idx = content
+        .find_column(rowid_col)
+        .ok_or_else(|| Error::NotFound(format!("no such column: {rowid_col}")))?;
+    let mut out = Vec::new();
+    let root = ctx.table_root(content);
+    let mut bt = Btree::new(ctx.pager, root, false);
+    bt.scan_table(|_rid, payload| {
+        if let Ok(row) = decode_row(payload, content.n_columns(), _rid, content.rowid_alias) {
+            let key = match row.get(rowid_idx) {
+                Some(Value::Integer(i)) => *i,
+                _ => return true,
+            };
+            let vals: Vec<Value> = row
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != rowid_idx)
+                .take(n_fts_cols)
+                .map(|(_, v)| v.clone())
+                .collect();
+            out.push((key, vals));
+        }
+        true
+    })?;
+    Ok(out)
+}

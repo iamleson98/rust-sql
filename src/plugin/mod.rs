@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 pub mod abi;
 pub mod codec;
+pub mod fts5;
 pub mod vtab;
 
 pub use abi::{CAggregate, CCollation, CScalar};
@@ -305,6 +306,16 @@ impl PluginRegistry {
         }
     }
 
+    /// A registry pre-seeded with the engine's built-in virtual-table
+    /// modules (FTS5) — they appear in `PRAGMA module_list` and resolve
+    /// through the ordinary module registry, exactly like SQLite's
+    /// compiled-in fts5.
+    pub fn with_builtins() -> Self {
+        let mut r = Self::new();
+        r.set_module(fts5::module());
+        r
+    }
+
     pub fn scalar(&self, name: &str) -> Option<Arc<dyn ScalarFunction>> {
         self.scalars.get(&name.to_ascii_lowercase()).cloned()
     }
@@ -456,7 +467,24 @@ pub(crate) fn lookup_aggregate(name: &str) -> Option<Arc<dyn AggregateFunction>>
 
 /// Resolve a virtual-table module for the current statement scope.
 pub(crate) fn lookup_module(name: &str) -> Option<Arc<dyn VirtualTableModule>> {
-    scope::current().and_then(|r| r.module(name))
+    scope::current()
+        .and_then(|r| r.module(name))
+        .or_else(|| lookup_builtin_module(name))
+}
+
+/// The engine's compiled-in virtual-table modules — resolvable OUTSIDE a
+/// statement scope too (schema load at open time connects pending fts5
+/// instances before any statement runs).
+fn lookup_builtin_module(name: &str) -> Option<Arc<dyn VirtualTableModule>> {
+    static BUILTINS: std::sync::OnceLock<HashMap<String, Arc<dyn VirtualTableModule>>> =
+        std::sync::OnceLock::new();
+    let m = BUILTINS.get_or_init(|| {
+        let mut m: HashMap<String, Arc<dyn VirtualTableModule>> = HashMap::new();
+        let f: Arc<dyn VirtualTableModule> = fts5::module();
+        m.insert(f.name().to_ascii_lowercase(), f);
+        m
+    });
+    m.get(&name.to_ascii_lowercase()).cloned()
 }
 
 /// Whether a name collides with a built-in scalar (prevents accidental

@@ -634,6 +634,12 @@ pub struct Pager {
     /// Lives on the pager so both Database (api.rs) and the executor's
     /// static statement dispatcher can reach it through a shared &Pager.
     foreign_keys_enabled: AtomicBool,
+    /// True while a virtual-table content-shadow write is in flight (set
+    /// by vtab DML, cleared at statement/transaction boundaries). When a
+    /// ROLLBACK happens with this set, the engine marks every
+    /// content-shadow vtab for reindex — the module's in-memory state was
+    /// built from rows the pager just restored.
+    pub(crate) vtab_shadow_writes: std::sync::atomic::AtomicBool,
     /// Advisory PRAGMA locking_mode ("exclusive" vs "normal"). The
     /// engine's actual cross-connection locking is the transaction slot;
     /// this flag makes the pragma round-trip observable (SQLite: the write
@@ -1805,6 +1811,7 @@ impl Pager {
             skip_fsync: AtomicBool::new(skip_sync),
             memory_wal: AtomicBool::new(false),
             foreign_keys_enabled: AtomicBool::new(false),
+            vtab_shadow_writes: std::sync::atomic::AtomicBool::new(false),
             locking_mode_exclusive: AtomicBool::new(false),
             recursive_triggers_enabled: AtomicBool::new(false),
             lazy_writeback: AtomicBool::new(false),

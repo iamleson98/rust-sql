@@ -807,18 +807,21 @@ impl<'a> Planner<'a> {
                         return Err(Error::NotFound(format!("no such table: {}", name)));
                     }
                 };
-                // Pending virtual table (module not registered yet): the
-                // column list is unknown until xConnect, so planning
-                // would produce a wrong schema. Modules must be
-                // registered with `Database::create_module` first (the
-                // registration connects pending vtabs) — same rule as
-                // SQLite's runtime module linkage.
+                // Pending virtual table (first use after reopen): the
+                // column list is unknown until xConnect. The plugin scope
+                // installed by the surrounding statement carries the
+                // registry (built-ins like fts5 are always there), so
+                // CONNECT now — the common case succeeds and the plan
+                // sees the real schema. A module that resolves to nothing
+                // keeps SQLite's runtime-linkage error.
                 if let Some(vt) = &table.vtab {
                     if vt.is_pending() {
-                        return Err(Error::semantic(format!(
-                            "no such module: {} (register it with Database::create_module before use)",
-                            vt.module_name
-                        )));
+                        if let Err(e) = vt.ensure_connected() {
+                            return Err(Error::semantic(format!(
+                                "no such module: {} ({}; register it with Database::create_module before use)",
+                                vt.module_name, e
+                            )));
+                        }
                     }
                 }
                 let index = if let Some(IndexedHint::Indexed(idx_name)) = indexed {
@@ -5815,7 +5818,9 @@ fn resolve_ref_window(
         for (i, cols) in atom_cols.get(lo..hi).unwrap_or(&[]).iter().enumerate() {
             let i = i + lo;
             for c in cols {
-                if is_hidden_rowid(c.as_str()) {
+                if is_hidden_rowid(c.as_str())
+                    || crate::executor::vtab_exec::is_aux_slot(c.as_str())
+                {
                     continue;
                 }
                 if let Some(pos) = c.rfind('.') {
@@ -5828,7 +5833,9 @@ fn resolve_ref_window(
         for (i, cols) in atom_cols.get(lo..hi).unwrap_or(&[]).iter().enumerate() {
             let i = i + lo;
             for c in cols {
-                if is_hidden_rowid(c.as_str()) {
+                if is_hidden_rowid(c.as_str())
+                    || crate::executor::vtab_exec::is_aux_slot(c.as_str())
+                {
                     continue;
                 }
                 if c.eq_ignore_ascii_case(name) {
@@ -5841,7 +5848,7 @@ fn resolve_ref_window(
     for (i, cols) in atom_cols.get(lo..hi).unwrap_or(&[]).iter().enumerate() {
         let i = i + lo;
         for c in cols {
-            if is_hidden_rowid(c.as_str()) {
+            if is_hidden_rowid(c.as_str()) || crate::executor::vtab_exec::is_aux_slot(c.as_str()) {
                 continue;
             }
             if c.eq_ignore_ascii_case(name) {
@@ -5852,7 +5859,7 @@ fn resolve_ref_window(
     for (i, cols) in atom_cols.get(lo..hi).unwrap_or(&[]).iter().enumerate() {
         let i = i + lo;
         for c in cols {
-            if is_hidden_rowid(c.as_str()) {
+            if is_hidden_rowid(c.as_str()) || crate::executor::vtab_exec::is_aux_slot(c.as_str()) {
                 continue;
             }
             if let Some(pos) = c.rfind('.') {
@@ -6185,7 +6192,7 @@ fn try_reorder_spine(catalog: &Catalog, spine: &Plan, top_filter: Option<&Expr>)
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for cols in &atom_cols {
             for c in cols {
-                if is_hidden_rowid(c) {
+                if is_hidden_rowid(c) || crate::executor::vtab_exec::is_aux_slot(c) {
                     continue; // name-unresolvable by design
                 }
                 if !seen.insert(c.to_ascii_lowercase()) {

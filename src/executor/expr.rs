@@ -427,6 +427,14 @@ impl<'a> EvalContext<'a> {
                     }
                 }
             }
+            // Hidden vtab aux slot (FTS5's `rank` / table-self column):
+            // the marked name `t.\u{1}rank` answers `t.rank` after every
+            // real column failed.
+            for (i, n) in self.column_names.iter().enumerate() {
+                if crate::executor::vtab_exec::aux_slot_matches(n, Some(t), name) {
+                    return self.row.get(i).cloned().unwrap_or(Value::Null);
+                }
+            }
             // Qualified ref that doesn't match a local qualified name: if an
             // outer scope knows "qual.column", it is a correlated reference
             // (SQL scope rules — the qualifier names an outer table). This
@@ -477,6 +485,14 @@ impl<'a> EvalContext<'a> {
                 if suffix.eq_ignore_ascii_case(name) {
                     return self.row.get(i).cloned().unwrap_or(Value::Null);
                 }
+            }
+        }
+        // Hidden vtab aux slot (FTS5's `rank` / table-self column): the
+        // marked name answers the bare reference after every real column
+        // failed.
+        for (i, n) in self.column_names.iter().enumerate() {
+            if crate::executor::vtab_exec::aux_slot_matches(n, None, name) {
+                return self.row.get(i).cloned().unwrap_or(Value::Null);
             }
         }
         // Not found locally — correlated-subquery outer scope (innermost
@@ -925,6 +941,31 @@ fn evaluate_in(
 
 fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext<'_>) -> Result<Value> {
     let fname = name.to_ascii_lowercase();
+    // Virtual-table aux functions (FTS5's bm25 / highlight / snippet):
+    // the call resolves against the statement's driving vtab scan when
+    // one is installed. The first argument is the table reference — it
+    // evaluates to the row's rowid through the table-self hidden column.
+    if matches!(fname.as_str(), "bm25" | "highlight" | "snippet") {
+        if let Some(inst) = crate::executor::vtab_exec::aux_tls_get() {
+            let supported = inst
+                .with_table(|vt| Ok(vt.aux_functions().contains(&fname.as_str())))
+                .unwrap_or(false);
+            if supported {
+                let argvals: Result<Vec<Value>> = args.iter().map(|e| evaluate(e, ctx)).collect();
+                let argvals = argvals?;
+                let rowid = match argvals.first() {
+                    Some(Value::Integer(r)) => *r,
+                    _ => {
+                        return Err(Error::semantic(format!(
+                            "unable to use function {}: first argument must be the table",
+                            fname
+                        )))
+                    }
+                };
+                return inst.with_table(|vt| vt.eval_aux(&fname, rowid, &argvals[1..]));
+            }
+        }
+    }
     // Scalar functions only here; aggregates are handled by the Aggregate operator.
     let argvals: Result<Vec<Value>> = args.iter().map(|e| evaluate(e, ctx)).collect();
     let argvals = argvals?;
