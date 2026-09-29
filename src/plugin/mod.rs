@@ -28,6 +28,7 @@ use std::sync::Arc;
 pub mod abi;
 pub mod codec;
 pub mod fts5;
+pub mod rtree;
 pub mod vtab;
 
 pub use abi::{CAggregate, CCollation, CScalar};
@@ -313,6 +314,8 @@ impl PluginRegistry {
     pub fn with_builtins() -> Self {
         let mut r = Self::new();
         r.set_module(fts5::module());
+        r.set_module(rtree::rtree_module());
+        r.set_module(rtree::rtree_i32_module());
         r
     }
 
@@ -482,6 +485,10 @@ fn lookup_builtin_module(name: &str) -> Option<Arc<dyn VirtualTableModule>> {
         let mut m: HashMap<String, Arc<dyn VirtualTableModule>> = HashMap::new();
         let f: Arc<dyn VirtualTableModule> = fts5::module();
         m.insert(f.name().to_ascii_lowercase(), f);
+        let r: Arc<dyn VirtualTableModule> = rtree::rtree_module();
+        m.insert(r.name().to_ascii_lowercase(), r);
+        let r32: Arc<dyn VirtualTableModule> = rtree::rtree_i32_module();
+        m.insert(r32.name().to_ascii_lowercase(), r32);
         m
     });
     m.get(&name.to_ascii_lowercase()).cloned()
