@@ -115,12 +115,15 @@ fn rebuild_and(mut conjuncts: Vec<Expr>) -> Option<Expr> {
 }
 
 /// Extract vtab constraints from a predicate: conjuncts of the shape
-/// `<vtab-column> <op> <expr>` (or mirrored). Returns the constraints and,
-/// for each conjunct, whether it was consumed.
-fn extract_constraints(
+/// `<vtab-column> <op> <expr>` (or mirrored), plus module-overloaded
+/// function calls `fn(<vtab-column>, <expr>)` (SQLite's xFindFunction
+/// constraints). Returns the constraints and, for each conjunct, whether
+/// it was consumed.
+pub(crate) fn extract_constraints(
     predicate: &Expr,
     table: &Arc<crate::schema::Table>,
     alias: Option<&str>,
+    overloads: &[&'static str],
 ) -> (Vec<VtabConstraint>, Vec<bool>) {
     let mut conjuncts = Vec::new();
     split_conjuncts(predicate, &mut conjuncts);
@@ -179,6 +182,33 @@ fn extract_constraints(
                 });
                 matched = true;
             }
+        } else if let Expr::Function { name, args, .. } = c {
+            // Module-overloaded function constraints (geopoly's
+            // geopoly_overlap / geopoly_within): SQLite's xFindFunction —
+            // the FIRST argument must be a column of this table (the
+            // mirrored order falls back to a plain residual, exactly
+            // like SQLite's planner).
+            if args.len() == 2
+                && overloads
+                    .iter()
+                    .any(|f| f.eq_ignore_ascii_case(name.as_str()))
+            {
+                if let Some(Some(col)) = column_of(&args[0], table, prefix, &aux) {
+                    if column_of(&args[1], table, prefix, &aux).is_none() {
+                        if let Some(f) = overloads
+                            .iter()
+                            .find(|f| f.eq_ignore_ascii_case(name.as_str()))
+                        {
+                            constraints.push(VtabConstraint {
+                                column: Some(col),
+                                op: VtabConstraintOp::Function(f),
+                                expr: args[1].clone(),
+                            });
+                            matched = true;
+                        }
+                    }
+                }
+            }
         }
         consumed.push(matched);
     }
@@ -225,7 +255,15 @@ fn column_of(
             }
         }
         let lower = name.to_ascii_lowercase();
-        if ["rowid", "oid", "_rowid_"].contains(&lower.as_str()) {
+        // Rowid spellings, including the planner's hidden-slot rewrite
+        // ("prefix.\0rowid" — the executor resolves it positionally
+        // against the vtab scan's trailing rowid slot).
+        let hidden_slot_of_this =
+            name.contains(".\u{0}rowid") && name.starts_with(&format!("{}.", prefix));
+        if ["rowid", "oid", "_rowid_"].contains(&lower.as_str())
+            || crate::planner::is_rowid_spelling(name)
+            || hidden_slot_of_this
+        {
             return Some(None);
         }
         if let Some(idx) = table.find_column(name) {
@@ -307,12 +345,31 @@ pub(crate) fn ensure_vtab_synced(
         .catalog()
         .get_table(&shadow_name)
         .ok_or_else(|| Error::corruption(format!("missing shadow table {}", shadow_name)))?;
+    // Shadow layouts can differ from the vtab's column order (geopoly's
+    // SQLite-layout t_rowid: rowid, nodeno, a0, a1, ...). Map the shadow
+    // columns back onto the vtab's column order for reindex.
+    let content_map = inst
+        .shadow_tables()
+        .into_iter()
+        .find(|s| s.content)
+        .and_then(|s| s.content_map);
+    let n_shadow_cols = shadow.n_columns();
     let root = ctx.table_root(&shadow);
     let mut bt = Btree::new(ctx.pager, root, false);
     let mut rows: Vec<(i64, Vec<Value>)> = Vec::new();
     bt.scan_table(|rowid, payload| {
-        if let Ok(row) = decode_row(payload, shadow.n_columns(), rowid, shadow.rowid_alias) {
-            rows.push((rowid, row));
+        if let Ok(row) = decode_row(payload, n_shadow_cols, rowid, shadow.rowid_alias) {
+            let vals = match &content_map {
+                Some(map) => {
+                    let mut v = vec![Value::Null; map.len()];
+                    for (vi, &si) in map.iter().enumerate() {
+                        v[vi] = row.get(si).cloned().unwrap_or(Value::Null);
+                    }
+                    v
+                }
+                None => row,
+            };
+            rows.push((rowid, vals));
         }
         true
     })?;
@@ -343,16 +400,21 @@ pub(crate) fn scan_vtab(
     struct Prepared {
         info: IndexInfo,
         filter_args: Vec<Value>,
+        overloads: Vec<&'static str>,
     }
     let prepared: Prepared = inst.with_table(|vt| {
+        let overloads: Vec<&'static str> = vt.overloaded_functions().to_vec();
         let (constraints, _consumed) = match predicate {
-            Some(p) => extract_constraints(p, table, alias),
+            Some(p) => extract_constraints(p, table, alias, &overloads),
             None => (Vec::new(), Vec::new()),
         };
         let mut info = vt.best_index(&constraints)?;
         if info.handled.len() != constraints.len() {
             // Defensive: modules must return one flag per constraint.
             info.handled.resize(constraints.len(), false);
+        }
+        if info.recheck.len() != constraints.len() {
+            info.recheck.resize(constraints.len(), false);
         }
         // Evaluate the RHS of handled constraints with the statement's
         // parameters (no row context — these are constants/params).
@@ -365,17 +427,26 @@ pub(crate) fn scan_vtab(
                 filter_args.push(evaluate(&c.expr, &eval_ctx)?);
             }
         }
-        Ok(Prepared { info, filter_args })
+        Ok(Prepared {
+            info,
+            filter_args,
+            overloads,
+        })
     })?;
 
     // 2. Residual predicate: conjuncts the module did NOT handle. A
     // conjunct "handled" = extracted as a constraint AND marked handled by
-    // best_index (info.handled). Conjuncts that never extracted are always
-    // residual. Constraint j corresponds to the j-th MATCHED conjunct.
+    // best_index (info.handled) AND NOT marked recheck (the module wants
+    // the value at filter time but does not promise exactness — geopoly's
+    // bbox prefilter, re-verified by the re-applied function). Conjuncts
+    // that never extracted are always residual. Constraint j corresponds
+    // to the j-th MATCHED conjunct.
     let residual: Option<Expr> = match predicate {
         Some(p) => {
-            let (_constraints, consumed) = extract_constraints(p, table, alias);
+            let (_constraints, consumed) =
+                extract_constraints(p, table, alias, &prepared.overloads);
             let handled_flags = &prepared.info.handled;
+            let recheck_flags = &prepared.info.recheck;
             let module_handles_any = handled_flags.iter().any(|h| *h);
             if !module_handles_any {
                 // Nothing handled: whole predicate is the residual.
@@ -390,8 +461,9 @@ pub(crate) fn scan_vtab(
                     .filter_map(|(i, e)| {
                         if consumed.get(i).copied().unwrap_or(false) {
                             let handled = handled_flags.get(ci).copied().unwrap_or(false);
+                            let recheck = recheck_flags.get(ci).copied().unwrap_or(false);
                             ci += 1;
-                            if handled {
+                            if handled && !recheck {
                                 None
                             } else {
                                 Some(e.clone())
@@ -522,8 +594,9 @@ pub(crate) fn exec_insert_vtab(
     on_conflict: crate::sql::ast::ConflictResolution,
 ) -> Result<()> {
     // Modules own their conflict policy (SQLite's argv semantics); the
-    // resolution hint is only consulted by ordinary-table paths.
-    let _ = on_conflict;
+    // resolution hint only participates through the module's
+    // rowid_unique_error opt-in below (geopoly/rtree: SQLite's
+    // rtreeConstraintError + OR REPLACE / OR IGNORE policies).
     let inst = table
         .vtab
         .as_ref()
@@ -538,8 +611,15 @@ pub(crate) fn exec_insert_vtab(
     ensure_vtab_synced(ctx, table)?;
     let n_cols = table.n_columns();
     let shadow = shadow_pair(ctx, inst)?;
-    if let Some((_, shadow_inst)) = &shadow {
-        push_vtab_resync_marker(ctx, shadow_inst);
+    // Modules that declare a rowid-conflict error (SQLite's rtree/
+    // geopoly UNIQUE-constraint discipline): the engine checks the
+    // content shadow BEFORE writing and applies the conflict policy.
+    let rowid_conflict_error: Option<String> = inst
+        .with_table(|vt| Ok(vt.rowid_unique_error()))
+        .unwrap_or(None);
+    let rowid_col: Option<usize> = inst.with_table(|vt| Ok(vt.rowid_column())).unwrap_or(None);
+    if let Some(sc) = &shadow {
+        push_vtab_resync_marker(ctx, &sc.inst);
     }
     let mut changes = 0i64;
     let mut last_rowid = ctx.last_insert_rowid;
@@ -576,7 +656,10 @@ pub(crate) fn exec_insert_vtab(
                     }
                     continue;
                 }
-                values[*col_idx] = Some(table.columns[*col_idx].coerce(row[i].clone()));
+                // SQLite passes vtab column values through UNCOERCED
+                // (geopoly's typed aux columns keep raw values: '5' into
+                // an INTEGER-declared aux column stays TEXT).
+                values[*col_idx] = Some(row[i].clone());
             }
             if let Some(cmd) = command {
                 run_vtab_command(
@@ -599,30 +682,75 @@ pub(crate) fn exec_insert_vtab(
                     row.len()
                 )));
             }
+            // Uncoerced, like the column-list path above.
             for (i, v) in row.into_iter().enumerate() {
-                values[i] = Some(table.columns[i].coerce(v));
+                values[i] = Some(v);
+            }
+        }
+        // Modules whose rowid IS a column (rtree's id): the column value
+        // is the rowid (shadow key, max-rowid tracking, dup checks).
+        if explicit_rowid.is_none() {
+            if let Some(c) = rowid_col {
+                if let Some(Some(v)) = values.get(c) {
+                    if !v.is_null() {
+                        explicit_rowid = crate::executor::rowid_from_value(v)?;
+                    }
+                }
             }
         }
         // Engine-assigned rowid when a content shadow backs the table
         // (the shadow row needs its key before xUpdate runs); otherwise
         // the module assigns (SQLite's argv semantics).
-        let (op_rowid, rowid) = if let Some((shadow_table, _)) = &shadow {
+        let (op_rowid, rowid) = if let Some(sc) = &shadow {
             let rid = match explicit_rowid {
                 Some(r) => r,
-                None => ctx.get_or_scan_max_rowid(shadow_table)? + 1,
+                None => ctx.get_or_scan_max_rowid(&sc.table)? + 1,
             };
             (Some(rid), rid)
         } else {
             (explicit_rowid, explicit_rowid.unwrap_or(0))
         };
+        // Duplicate explicit rowid: modules with a declared conflict
+        // error reject (or delete-then-insert under OR REPLACE, or skip
+        // under OR IGNORE) — SQLite's rtreeConstraintError path.
+        if let (Some(err), Some(sc), Some(rid)) = (&rowid_conflict_error, &shadow, explicit_rowid) {
+            let exists = {
+                let root = ctx.table_root(&sc.table);
+                let mut bt = Btree::new(ctx.pager, root, false);
+                matches!(
+                    bt.lookup_table(rid)?,
+                    crate::storage::btree::LookupResult::Found(_)
+                )
+            };
+            if exists {
+                match on_conflict {
+                    crate::sql::ast::ConflictResolution::Replace => {
+                        shadow_delete(ctx, &sc.table, rid)?;
+                        let ops = vec![crate::plugin::vtab::UpdateOp {
+                            old_rowid: Some(rid),
+                            new_rowid: None,
+                            columns: Vec::new(),
+                        }];
+                        inst.with_table(|vt| vt.update(ops))?;
+                    }
+                    crate::sql::ast::ConflictResolution::Ignore => {
+                        continue;
+                    }
+                    _ => return Err(Error::constraint(err.clone())),
+                }
+            }
+        }
         // Content shadow first: the row rides the ordinary pager (and
         // rolls back with the statement/transaction).
-        if let Some((shadow_table, _)) = &shadow {
+        if let Some(sc) = &shadow {
             let full: Vec<Value> = values
                 .iter()
                 .map(|v| v.clone().unwrap_or(Value::Null))
                 .collect();
-            shadow_insert(ctx, shadow_table, rowid, &full)?;
+            let full = inst
+                .with_table(|vt| Ok(vt.shadow_normalize(&full)))
+                .unwrap_or(full);
+            shadow_insert(ctx, &sc.table, &sc.content_map, rowid, &full)?;
         }
         let op = crate::plugin::vtab::UpdateOp {
             old_rowid: None,
@@ -661,16 +789,9 @@ pub(crate) fn exec_insert_vtab(
 
 /// Track an engine-assigned vtab rowid in the max-rowid cache so the
 /// NEXT insert's `max+1` sees it (the shadow table's cache entry).
-fn last_insert_rowid_track(
-    ctx: &mut ExecContext<'_>,
-    shadow: &Option<(
-        Arc<crate::schema::Table>,
-        Arc<crate::plugin::vtab::VtabInstance>,
-    )>,
-    rowid: i64,
-) {
-    if let Some((shadow_table, _)) = shadow {
-        let key = shadow_table.name.to_ascii_lowercase();
+fn last_insert_rowid_track(ctx: &mut ExecContext<'_>, shadow: &Option<ShadowCtx>, rowid: i64) {
+    if let Some(sc) = shadow {
+        let key = sc.table.name.to_ascii_lowercase();
         let cur = ctx.max_rowids.get(&key).copied().unwrap_or(0);
         if rowid > cur {
             ctx.max_rowids.insert(key, rowid);
@@ -679,36 +800,51 @@ fn last_insert_rowid_track(
     }
 }
 
-/// The (shadow table, instance) pair for a content-shadow-backed vtab.
+/// The (shadow table, instance) pair for a content-shadow-backed vtab,
+/// plus the shadow's column mapping when its layout is not the engine
+/// default (see [`crate::plugin::vtab::ShadowTable::content_map`]).
+struct ShadowCtx {
+    table: Arc<crate::schema::Table>,
+    inst: Arc<crate::plugin::vtab::VtabInstance>,
+    content_map: Option<Vec<usize>>,
+}
+
 fn shadow_pair(
     ctx: &ExecContext<'_>,
     inst: &Arc<crate::plugin::vtab::VtabInstance>,
-) -> Result<
-    Option<(
-        Arc<crate::schema::Table>,
-        Arc<crate::plugin::vtab::VtabInstance>,
-    )>,
-> {
+) -> Result<Option<ShadowCtx>> {
     match inst.content_shadow() {
         Some(name) => {
             let t = ctx.catalog().get_table(&name).ok_or_else(|| {
                 Error::corruption(format!("missing shadow table {} for vtab", name))
             })?;
-            Ok(Some((t, inst.clone())))
+            let content_map = inst
+                .shadow_tables()
+                .into_iter()
+                .find(|s| s.content)
+                .and_then(|s| s.content_map);
+            Ok(Some(ShadowCtx {
+                table: t,
+                inst: inst.clone(),
+                content_map,
+            }))
         }
         None => Ok(None),
     }
 }
 
 /// Insert one content-shadow row (rowid + user column values). Journaled
-/// for statement undo like an ordinary table insert.
+/// for statement undo like an ordinary table insert. Applies the shadow's
+/// column mapping when its layout differs.
 fn shadow_insert(
     ctx: &mut ExecContext<'_>,
     shadow: &Arc<crate::schema::Table>,
+    content_map: &Option<Vec<usize>>,
     rowid: i64,
     values: &[Value],
 ) -> Result<()> {
-    let payload = crate::storage::row_codec::encode_row(&values.to_vec());
+    let row = map_shadow_row(content_map, shadow.n_columns(), values);
+    let payload = crate::storage::row_codec::encode_row(&row);
     let root = ctx.table_root(shadow);
     let mut bt = Btree::new(ctx.pager, root, false);
     bt.insert_table(rowid, &payload)?;
@@ -724,6 +860,29 @@ fn shadow_insert(
         .vtab_shadow_writes
         .store(true, std::sync::atomic::Ordering::Release);
     Ok(())
+}
+
+/// Build the shadow-shaped row from vtab column values: identity when no
+/// map, else `map[i]` positions (unmapped shadow columns NULL).
+fn map_shadow_row(
+    content_map: &Option<Vec<usize>>,
+    n_shadow_cols: usize,
+    values: &[Value],
+) -> Vec<Value> {
+    match content_map {
+        None => values.to_vec(),
+        Some(map) => {
+            let mut row = vec![Value::Null; n_shadow_cols];
+            for (vi, v) in values.iter().enumerate() {
+                if let Some(&si) = map.get(vi) {
+                    if si < n_shadow_cols {
+                        row[si] = v.clone();
+                    }
+                }
+            }
+            row
+        }
+    }
 }
 
 /// Delete one content-shadow row (payload captured for undo).
@@ -759,10 +918,12 @@ fn shadow_delete(
 fn shadow_update(
     ctx: &mut ExecContext<'_>,
     shadow: &Arc<crate::schema::Table>,
+    content_map: &Option<Vec<usize>>,
     rowid: i64,
     values: &[Value],
 ) -> Result<()> {
-    let payload = crate::storage::row_codec::encode_row(&values.to_vec());
+    let row = map_shadow_row(content_map, shadow.n_columns(), values);
+    let payload = crate::storage::row_codec::encode_row(&row);
     let root = ctx.table_root(shadow);
     let mut bt = Btree::new(ctx.pager, root, false);
     let old_payload = match bt.lookup_table(rowid)? {
@@ -858,7 +1019,8 @@ pub(crate) fn exec_update_vtab(
         let mut columns: Vec<Option<Value>> = vec![None; n_cols];
         for (col_idx, expr) in assignments {
             let v = eval_row(expr, &row, &col_names, &params, &named)?;
-            columns[*col_idx] = Some(table.columns[*col_idx].coerce(v));
+            // Uncoerced (SQLite vtab UPDATE path - see the INSERT note).
+            columns[*col_idx] = Some(v);
         }
         let full: Vec<Value> = row
             .iter()
@@ -876,10 +1038,19 @@ pub(crate) fn exec_update_vtab(
     let n = ops.len() as i64;
     // Content shadow first (per-row payload swap), then the module batch.
     let shadow = shadow_pair(ctx, inst)?;
-    if let Some((shadow_table, shadow_inst)) = &shadow {
-        push_vtab_resync_marker(ctx, shadow_inst);
-        for (rowid, full) in &new_rows {
-            shadow_update(ctx, shadow_table, *rowid, full)?;
+    if let Some(sc) = &shadow {
+        push_vtab_resync_marker(ctx, &sc.inst);
+        let normalized: Vec<(i64, Vec<Value>)> = new_rows
+            .iter()
+            .map(|(rid, full)| {
+                let n = inst
+                    .with_table(|vt| Ok(vt.shadow_normalize(full)))
+                    .unwrap_or_else(|_| full.clone());
+                (*rid, n)
+            })
+            .collect();
+        for (rowid, full) in &normalized {
+            shadow_update(ctx, &sc.table, &sc.content_map, *rowid, full)?;
         }
     }
     if let Err(e) = inst.with_table(|vt| vt.update(ops)) {
@@ -928,10 +1099,10 @@ pub(crate) fn exec_delete_vtab(
         n => {
             // Content shadow first (per-row delete), then the module batch.
             let shadow = shadow_pair(ctx, inst)?;
-            if let Some((shadow_table, shadow_inst)) = &shadow {
-                push_vtab_resync_marker(ctx, shadow_inst);
+            if let Some(sc) = &shadow {
+                push_vtab_resync_marker(ctx, &sc.inst);
                 for (rowid, _) in &pairs {
-                    shadow_delete(ctx, shadow_table, *rowid)?;
+                    shadow_delete(ctx, &sc.table, *rowid)?;
                 }
             }
             if let Err(e) = inst.with_table(|vt| vt.update(ops)) {
@@ -989,10 +1160,7 @@ fn run_vtab_command(
     ctx: &mut ExecContext<'_>,
     table: &Arc<crate::schema::Table>,
     inst: &Arc<crate::plugin::vtab::VtabInstance>,
-    shadow: &Option<(
-        Arc<crate::schema::Table>,
-        Arc<crate::plugin::vtab::VtabInstance>,
-    )>,
+    shadow: &Option<ShadowCtx>,
     cmd: &str,
     rowid: Option<i64>,
     values: &[Option<Value>],
@@ -1003,8 +1171,8 @@ fn run_vtab_command(
             let Some(rid) = rowid else {
                 return Err(Error::semantic("fts5 'delete' requires a rowid"));
             };
-            if let Some((shadow_table, _)) = shadow {
-                shadow_delete(ctx, shadow_table, rid)?;
+            if let Some(sc) = shadow {
+                shadow_delete(ctx, &sc.table, rid)?;
             }
             let ops = vec![crate::plugin::vtab::UpdateOp {
                 old_rowid: Some(rid),
@@ -1029,8 +1197,8 @@ fn run_vtab_command(
                 .iter()
                 .map(|v| v.clone().unwrap_or(Value::Null))
                 .collect();
-            if let Some((shadow_table, _)) = shadow {
-                shadow_insert(ctx, shadow_table, rid, &full)?;
+            if let Some(sc) = shadow {
+                shadow_insert(ctx, &sc.table, &sc.content_map, rid, &full)?;
             }
             let ops = vec![crate::plugin::vtab::UpdateOp {
                 old_rowid: None,
@@ -1068,7 +1236,8 @@ fn run_vtab_command(
         }
         "integrity-check" => {
             // The module's in-memory state must match the content shadow.
-            if let Some((shadow_table, _)) = shadow {
+            if let Some(sc) = shadow {
+                let shadow_table = &sc.table;
                 let mut rows: Vec<(i64, Vec<Value>)> = Vec::new();
                 let root = ctx.table_root(shadow_table);
                 let mut bt = Btree::new(ctx.pager, root, false);

@@ -1236,6 +1236,9 @@ impl crate::plugin::VirtualTable for CVtab {
                     crate::plugin::vtab::VtabConstraintOp::Glob => 74,
                     // SQLITE_INDEX_CONSTRAINT_MATCH
                     crate::plugin::vtab::VtabConstraintOp::Match => 82,
+                    // SQLITE_INDEX_CONSTRAINT_FUNCTION (the xFindFunction
+                    // mechanism, geopoly's overlap/within)
+                    crate::plugin::vtab::VtabConstraintOp::Function(_) => 150,
                 };
                 RqlIndexConstraint {
                     column: c.column.map(|i| i as c_int).unwrap_or(-1),

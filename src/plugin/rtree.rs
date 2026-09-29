@@ -550,7 +550,24 @@ impl VirtualTable for RtTable {
             name: format!("{}_content", st.cfg.table),
             create_sql: format!("CREATE TABLE \"{}_content\"({})", st.cfg.table, cols),
             content: true,
+            content_map: None,
         }]
+    }
+
+    fn rowid_column(&self) -> Option<usize> {
+        // The id column IS the rowid (SQLite's cell.iRowid).
+        Some(0)
+    }
+
+    fn rowid_unique_error(&self) -> Option<String> {
+        // SQLite rtreeConstraintError(0): UNIQUE constraint failed on the
+        // id column (the first declared column).
+        let st = self.state.lock();
+        Some(format!(
+            "UNIQUE constraint failed: {}.{}",
+            st.cfg.table,
+            col_name(&st.cfg, 0)
+        ))
     }
 
     fn best_index(&self, constraints: &[VtabConstraint]) -> Result<IndexInfo> {

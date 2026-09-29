@@ -2414,6 +2414,19 @@ struct IdxCandidate {
 }
 
 pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> Plan {
+    if let Plan::Scan { table, .. } = &plan {
+        // Virtual tables have NO B+tree: the rowid lookup/range/in plans
+        // below would btree-seek the vtab's non-existent root (garbage
+        // rows). The rowid predicate rides the ordinary Filter → vtab
+        // scan path, where best_index turns it into the rowid strategy
+        // (geopoly/rtree INDEX 1:rowid, fts5's rowid constraint).
+        if table.vtab.is_some() {
+            return Plan::Filter {
+                input: Box::new(plan),
+                predicate: predicate.clone(),
+            };
+        }
+    }
     if let Plan::Scan { table, alias, .. } = &plan {
         // Split AND-chains so we can pick the best access path per-conjunct.
         let conjuncts = split_and_chain(predicate);

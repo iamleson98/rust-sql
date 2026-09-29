@@ -28,6 +28,7 @@ use std::sync::Arc;
 pub mod abi;
 pub mod codec;
 pub mod fts5;
+pub mod geopoly;
 pub mod rtree;
 pub mod vtab;
 
@@ -316,6 +317,10 @@ impl PluginRegistry {
         r.set_module(fts5::module());
         r.set_module(rtree::rtree_module());
         r.set_module(rtree::rtree_i32_module());
+        r.set_module(geopoly::geopoly_module());
+        // The geopoly aggregate family is core-registered (SQLite's
+        // sqlite3_geopoly_init) — available on every connection.
+        r.set_aggregate(geopoly::group_bbox_function());
         r
     }
 
@@ -489,6 +494,8 @@ fn lookup_builtin_module(name: &str) -> Option<Arc<dyn VirtualTableModule>> {
         m.insert(r.name().to_ascii_lowercase(), r);
         let r32: Arc<dyn VirtualTableModule> = rtree::rtree_i32_module();
         m.insert(r32.name().to_ascii_lowercase(), r32);
+        let g: Arc<dyn VirtualTableModule> = geopoly::geopoly_module();
+        m.insert(g.name().to_ascii_lowercase(), g);
         m
     });
     m.get(&name.to_ascii_lowercase()).cloned()

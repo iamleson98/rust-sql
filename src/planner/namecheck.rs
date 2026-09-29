@@ -54,6 +54,8 @@ struct Source {
     /// upsert `excluded.` pseudo-table — SQLite resolves bare names in
     /// DO UPDATE to the original row only).
     qualified_only: bool,
+    /// The source is a virtual table (rowid spellings are legal in SET).
+    vtable: bool,
     /// Pending virtual table (module not yet registered): the column
     /// list is unknown until xConnect — every name is accepted here so
     /// the RUNTIME's `no such module: <name>` fires (SQLite's own
@@ -388,6 +390,7 @@ impl TriggerScope {
                 qualified_only: false,
                 pending_vtab: false,
                 aux_columns: Vec::new(),
+                vtable: false,
             });
             level.sources.push(Source {
                 qualifier: Some("new".to_string()),
@@ -396,6 +399,7 @@ impl TriggerScope {
                 qualified_only: true,
                 pending_vtab: false,
                 aux_columns: Vec::new(),
+                vtable: false,
             });
             level.sources.push(Source {
                 qualifier: Some("old".to_string()),
@@ -404,6 +408,7 @@ impl TriggerScope {
                 qualified_only: true,
                 pending_vtab: false,
                 aux_columns: Vec::new(),
+                vtable: false,
             });
         }
         TriggerScope { scope }
@@ -836,6 +841,7 @@ fn build_from_expr(
                 // outputs — every name accepted.
                 pending_vtab: wildcard,
                 aux_columns,
+                vtable: false,
             });
             Ok(n)
         }
@@ -935,6 +941,7 @@ fn build_from_expr(
                 qualified_only: false,
                 pending_vtab: false,
                 aux_columns: Vec::new(),
+                vtable: false,
             });
             Ok(n)
         }
@@ -957,6 +964,7 @@ fn subquery_source(
             columns,
             rowid_table: false,
             qualified_only: false,
+            vtable: false,
             pending_vtab: false,
             aux_columns: Vec::new(),
         },
@@ -968,6 +976,7 @@ fn subquery_source(
             columns: Vec::new(),
             rowid_table: false,
             qualified_only: false,
+            vtable: false,
             pending_vtab: true,
             aux_columns: Vec::new(),
         },
@@ -1148,6 +1157,7 @@ fn dml_target_source(ctx: &Ctx<'_>, name: &str, alias: Option<&String>) -> Resul
             columns: t.columns.iter().map(|c| c.name.clone()).collect(),
             rowid_table: !t.without_rowid,
             qualified_only: false,
+            vtable: t.vtab.is_some(),
             pending_vtab: pending,
             aux_columns: aux,
         });
@@ -1158,6 +1168,7 @@ fn dml_target_source(ctx: &Ctx<'_>, name: &str, alias: Option<&String>) -> Resul
             columns: view_output_names(ctx, &v).unwrap_or_default(),
             rowid_table: false,
             qualified_only: false,
+            vtable: false,
             // Uncomputable view outputs: every name accepted.
             pending_vtab: view_output_names(ctx, &v).is_none(),
             aux_columns: Vec::new(),
@@ -1234,6 +1245,7 @@ fn validate_insert(ctx: &Ctx<'_>, ins: &InsertStatement, scope: &mut Scope) -> R
                     qualified_only: true,
                     pending_vtab: false,
                     aux_columns: Vec::new(),
+                    vtable: false,
                 });
             }
             for (name, e) in set {
@@ -1303,7 +1315,11 @@ fn validate_update(ctx: &Ctx<'_>, upd: &UpdateStatement, scope: &mut Scope) -> R
     // SET names (plain columns only — qualified is a parse error the
     // parser already rejects).
     for (name, e) in &upd.set {
-        if !target.has_column(name) {
+        // Virtual tables accept the rowid spellings in SET (SQLite's
+        // vtab UPDATE argv semantics; geopoly's rowid move then errors
+        // at xUpdate with its own message).
+        let is_vtab_rowid = crate::planner::is_rowid_spelling(name) && target.vtable;
+        if !target.has_column(name) && !is_vtab_rowid {
             if has_from {
                 scope.pop_level();
             }
@@ -1444,6 +1460,7 @@ fn validate_create(ctx: &Ctx<'_>, c: &CreateStatement, scope: &mut Scope) -> Res
                 qualified_only: false,
                 pending_vtab: false,
                 aux_columns: Vec::new(),
+                vtable: false,
             });
             for def in columns {
                 for con in &def.constraints {
@@ -1520,6 +1537,7 @@ fn validate_create(ctx: &Ctx<'_>, c: &CreateStatement, scope: &mut Scope) -> Res
                         qualified_only: false,
                         pending_vtab: false,
                         aux_columns: Vec::new(),
+                        vtable: false,
                     });
                     validate_expr(ctx, e, &mut s, &EMPTY_CTES)?;
                 } else if !table_cols.iter().any(|c| c.eq_ignore_ascii_case(&ic.name)) {
@@ -1544,6 +1562,7 @@ fn validate_create(ctx: &Ctx<'_>, c: &CreateStatement, scope: &mut Scope) -> Res
                     qualified_only: false,
                     pending_vtab: false,
                     aux_columns: Vec::new(),
+                    vtable: false,
                 });
                 validate_expr(ctx, w, &mut s, &EMPTY_CTES)?;
             }
@@ -1615,6 +1634,7 @@ fn validate_alter(ctx: &Ctx<'_>, a: &AlterStatement) -> Result<()> {
                 qualified_only: false,
                 pending_vtab: false,
                 aux_columns: Vec::new(),
+                vtable: false,
             });
             for con in &column.constraints {
                 match con {

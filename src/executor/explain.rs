@@ -38,9 +38,41 @@ fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64) {
             table,
             alias,
             index,
-            ..
+            predicate,
         } => {
             let a = alias_of(alias, &table.name);
+            // Virtual tables render SQLite's "SCAN t VIRTUAL TABLE INDEX
+            // n:s" — the strategy comes from best_index at explain time
+            // (planning only; the bound values are not evaluated).
+            if table.vtab.is_some() {
+                if let Some(inst) = table.vtab.as_ref() {
+                    let detail = inst
+                        .with_table(|vt| {
+                            let overloads: Vec<&'static str> = vt.overloaded_functions().to_vec();
+                            let cons = match predicate {
+                                Some(p) => {
+                                    let (c, _) = crate::executor::vtab_exec::extract_constraints(
+                                        p,
+                                        table,
+                                        alias.as_deref(),
+                                        &overloads,
+                                    );
+                                    c
+                                }
+                                None => Vec::new(),
+                            };
+                            let info = vt.best_index(&cons)?;
+                            Ok(format!(
+                                "SCAN {a} VIRTUAL TABLE INDEX {}:{}",
+                                info.idx_num,
+                                info.idx_str.as_deref().unwrap_or("")
+                            ))
+                        })
+                        .unwrap_or_else(|_| format!("SCAN {a} VIRTUAL TABLE"));
+                    push_row(parent, rows, next_id, detail);
+                    return;
+                }
+            }
             let detail = match index {
                 Some(idx) => format!("SCAN {a} USING INDEX {}", idx.name),
                 None => format!("SCAN {a}"),
@@ -208,7 +240,56 @@ fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64) {
         Plan::Values { .. } => {
             push_row(parent, rows, next_id, "SCAN 1 CONSTANT ROW".to_string());
         }
-        Plan::Filter { input, .. } => walk(input, parent, rows, next_id),
+        Plan::Filter { input, predicate } => {
+            // A Filter wrapping a bare vtab Scan carries the predicate the
+            // executor pushes into best_index (apply_where's vtab path) —
+            // fold it into the scan's constraint extraction so the
+            // INDEX n:s wording matches the executed plan.
+            if let Plan::Scan {
+                table,
+                alias,
+                predicate: scan_pred,
+                index: None,
+            } = &**input
+            {
+                if table.vtab.is_some() {
+                    if let Some(inst) = table.vtab.as_ref() {
+                        let combined = match scan_pred {
+                            Some(sp) => crate::sql::ast::Expr::Binary {
+                                op: crate::sql::ast::BinaryOp::And,
+                                left: Box::new(sp.clone()),
+                                right: Box::new(predicate.clone()),
+                            },
+                            None => predicate.clone(),
+                        };
+                        let detail = inst
+                            .with_table(|vt| {
+                                let overloads: Vec<&'static str> =
+                                    vt.overloaded_functions().to_vec();
+                                let (cons, _) = crate::executor::vtab_exec::extract_constraints(
+                                    &combined,
+                                    table,
+                                    alias.as_deref(),
+                                    &overloads,
+                                );
+                                let info = vt.best_index(&cons)?;
+                                Ok(format!(
+                                    "SCAN {} VIRTUAL TABLE INDEX {}:{}",
+                                    alias_of(alias, &table.name),
+                                    info.idx_num,
+                                    info.idx_str.as_deref().unwrap_or("")
+                                ))
+                            })
+                            .unwrap_or_else(|_| {
+                                format!("SCAN {} VIRTUAL TABLE", alias_of(alias, &table.name))
+                            });
+                        push_row(parent, rows, next_id, detail);
+                        return;
+                    }
+                }
+            }
+            walk(input, parent, rows, next_id)
+        }
         Plan::Project { input, columns } => {
             // Covering-index detection (SQLite's "USING COVERING INDEX"
             // wording): a rowid-only projection over an index access node

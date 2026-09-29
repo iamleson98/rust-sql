@@ -124,6 +124,7 @@ mod build_bundled {
             .flag("-DSQLITE_ENABLE_API_ARMOR")
             .flag("-DSQLITE_ENABLE_COLUMN_METADATA")
             .flag("-DSQLITE_ENABLE_DBSTAT_VTAB")
+            .flag("-DSQLITE_ENABLE_GEOPOLY")
             .flag("-DSQLITE_ENABLE_FTS3")
             .flag("-DSQLITE_ENABLE_FTS3_PARENTHESIS")
             .flag("-DSQLITE_ENABLE_FTS5")

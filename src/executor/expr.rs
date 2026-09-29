@@ -1870,10 +1870,17 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
                                 match crate::executor::trgm::call_trgm_function(&fname, args)? {
                                     Some(v) => v,
                                     None => {
-                                        return Err(Error::NotFound(format!(
-                                            "no such function: {}",
-                                            name
-                                        )));
+                                        match crate::plugin::geopoly::call_geopoly_function(
+                                            &fname, args,
+                                        )? {
+                                            Some(v) => v,
+                                            None => {
+                                                return Err(Error::NotFound(format!(
+                                                    "no such function: {}",
+                                                    name
+                                                )));
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1910,6 +1917,19 @@ pub(crate) fn is_builtin_scalar(name: &str) -> bool {
         "exp",
         "false",
         "floor",
+        "geopoly_area",
+        "geopoly_bbox",
+        "geopoly_blob",
+        "geopoly_ccw",
+        "geopoly_contains_point",
+        "geopoly_debug",
+        "geopoly_group_bbox",
+        "geopoly_json",
+        "geopoly_overlap",
+        "geopoly_regular",
+        "geopoly_svg",
+        "geopoly_within",
+        "geopoly_xform",
         "glob",
         "group_concat",
         "hex",

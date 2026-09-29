@@ -2008,6 +2008,7 @@ impl VirtualTable for Fts5Table {
                     .join(", ")
             ),
             content: true,
+            content_map: None,
         }]
     }
 

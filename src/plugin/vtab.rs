@@ -290,6 +290,13 @@ pub enum VtabConstraintOp {
     /// query string; `as_str` matches SQLite's
     /// SQLITE_INDEX_CONSTRAINT_MATCH rendering.
     Match,
+    /// A module-overloaded function call used as a WHERE term — SQLite's
+    /// `xFindFunction` mechanism (`SQLITE_INDEX_CONSTRAINT_FUNCTION`):
+    /// `WHERE geopoly_overlap(geom, ?)` becomes a constraint on `geom`
+    /// whose value is the OTHER argument. Only produced when the module
+    /// lists the function in [`VirtualTable::overloaded_functions`] and
+    /// the FIRST argument is a column of this table.
+    Function(&'static str),
 }
 
 /// One WHERE constraint on a virtual-table column (or the rowid, `column ==
@@ -315,6 +322,7 @@ impl VtabConstraintOp {
             VtabConstraintOp::Like => "LIKE",
             VtabConstraintOp::Glob => "GLOB",
             VtabConstraintOp::Match => "MATCH",
+            VtabConstraintOp::Function(f) => f,
         }
     }
 }
@@ -329,6 +337,12 @@ pub struct IndexInfo {
     /// handle it in `filter` (the engine then does NOT re-apply it);
     /// `false` = leave it as a residual predicate the engine applies.
     pub handled: Vec<bool>,
+    /// For each constraint: `true` = the module wants the value at
+    /// `filter` time but does NOT promise exactness — SQLite's
+    /// `omit=0` (geopoly's overlap/within are bbox PREFILTERS; the
+    /// re-applied function does the exact test). The conjunct stays a
+    /// residual too.
+    pub recheck: Vec<bool>,
     /// Estimated scan cost (arbitrary units; lower = better). The engine
     /// compares full-table vtab scans only (0.0 = free).
     pub estimated_cost: f64,
@@ -343,6 +357,7 @@ impl IndexInfo {
             idx_num: 0,
             idx_str: None,
             handled: vec![false; n_constraints],
+            recheck: vec![false; n_constraints],
             estimated_cost: 1e9,
             estimated_rows: 0,
         }
@@ -465,6 +480,42 @@ pub trait VirtualTable: Send {
         &[]
     }
 
+    /// Function names this module OVERLOADS as index constraints —
+    /// SQLite's `xFindFunction` protocol (`SQLITE_INDEX_CONSTRAINT_FUNCTION`).
+    /// A WHERE conjunct `fn(col, expr)` whose name matches (case-insensitive)
+    /// and whose FIRST argument is a column of this table is offered to
+    /// `best_index` as a [`VtabConstraintOp::Function`] constraint on that
+    /// column with `expr` as the value (geopoly's overlap/within).
+    fn overloaded_functions(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// The error message for an INSERT whose explicit rowid already
+    /// exists — SQLite's `rtreeConstraintError`: "UNIQUE constraint
+    /// failed: <table>.<first column>". `None` (default) = the module
+    /// handles rowid conflicts itself (fts5) or allows duplicates.
+    /// When Some, the engine checks the content shadow BEFORE writing
+    /// and rejects (or applies OR REPLACE / OR IGNORE) with this text.
+    fn rowid_unique_error(&self) -> Option<String> {
+        None
+    }
+
+    /// The column whose INTEGER value is the table's rowid (rtree's `id`
+    /// column — SQLite's cell.iRowid). When Some(c), the engine uses
+    /// that column's value as the vtab rowid (shadow key, max-rowid
+    /// tracking, and the duplicate-rowid conflict check).
+    fn rowid_column(&self) -> Option<usize> {
+        None
+    }
+
+    /// Normalize the vtab column values before the engine writes them
+    /// to the content shadow (geopoly stores the canonical BLOB form of
+    /// a JSON _shape in its t_rowid.a0, exactly like SQLite). Default:
+    /// identity.
+    fn shadow_normalize(&self, values: &[Value]) -> Vec<Value> {
+        values.to_vec()
+    }
+
     /// External-content tables (FTS5 `content='other_table'`): the module
     /// stores no content of its own — user-column reads are served from
     /// `(table, rowid_column)` of the named table, fetched by the engine
@@ -538,6 +589,14 @@ pub struct ShadowTable {
     /// the shadow before the module sees them; `reindex` receives the
     /// shadow's rows.
     pub content: bool,
+    /// Column mapping when the shadow's layout is NOT the engine default
+    /// (vtab column i → shadow column i): `map[i]` is the shadow column
+    /// index holding vtab column i's value. Shadow columns not in the
+    /// map are skipped on read and written NULL. Used by geopoly, whose
+    /// content shadow is SQLite-layout `t_rowid(rowid, nodeno, a0, a1,
+    /// ...)` — the same table real SQLite creates, so geopoly tables in
+    /// real SQLite files reindex transparently.
+    pub content_map: Option<Vec<usize>>,
 }
 
 /// Build the catalog `Table` schema from a module's declared columns.
