@@ -358,6 +358,14 @@ pub use statement::{Statement, StepResult};
 pub use storage::sqlitefmt;
 pub use types::{Affinity, Row, Value};
 
+/// Debug instrumentation: cumulative commit-path timers —
+/// `[can_splice_ns, guard_probe_ns, append_fast_ns, append_slow_ns,
+/// publish_splice_ns, publish_count]`. Always-on (the atomic adds are
+/// single-digit ns); used by the per-commit probes and CI comparisons.
+pub fn commit_timer_snapshot() -> [u64; 6] {
+    storage::sqlitefmt::container::commit_timer_snapshot()
+}
+
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(all(test, feature = "mimalloc"))]
@@ -413,4 +421,16 @@ mod mimalloc_tuning_tests {
             "unknown mimalloc option layout (last={last}): re-derive positions",
         );
     }
+}
+
+/// Debug instrumentation: reader-path counters —
+/// `[overlay_hits, cache_hits, file_opens, file_reads]`.
+pub fn reader_counter_snapshot() -> [u64; 4] {
+    storage::sqlitefmt::container::reader_counter_snapshot()
+}
+
+/// Debug instrumentation: publish sub-phase timers —
+/// `[mutate_ns, splice_ns, tail_ns, commit_ns, checkpoint_ns]`.
+pub fn publish_phase_snapshot() -> [u64; 5] {
+    storage::sqlitefmt::container::publish_phase_snapshot()
 }

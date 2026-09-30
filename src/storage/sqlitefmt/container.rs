@@ -55,11 +55,12 @@ use super::header::build_header_enc;
 use super::mutator::{self, MutateOps, MutateOutcome};
 use super::reader::wal_path_of;
 use super::record::TextEnc;
-use super::wal::{append_wal, checkpoint, WalWriter};
+use super::wal::{append_wal_open, checkpoint, WalWriter};
 use super::writer::{
     build_freelist, splice_object, splice_schema_tree, write_image_atomic, BuiltImage, OutObject,
     SchemaRowCell, SpanKey, SpanRec, SpliceBuild,
 };
+use std::sync::atomic::Ordering::Relaxed;
 
 /// Session-provided header inputs for one publish (full or splice).
 #[derive(Clone, Debug)]
@@ -192,6 +193,133 @@ pub struct ContainerState {
     guard: (u64, u32, u32),
     /// Live sessions (attach count); the last detach checkpoints.
     attached: usize,
+    /// Cached open READ handle on the main file — the guard probe's
+    /// fast path (one path stat + one positioned 100-byte read instead
+    /// of open/stat/read/close per commit). Dropped whenever a protocol
+    /// step rewrites the main file (its identity goes stale by
+    /// construction).
+    main_io: Option<FileIo>,
+    /// Cached open APPEND handle on the WAL sidecar — the per-commit
+    /// fast path (one path stat + one positioned write, SQLite's own
+    /// discipline: the sidecar descriptor stays open for the session's
+    /// life). Dropped after checkpoints, full publishes, adopts and
+    /// journal-mode switches — everything that rewrites or retires the
+    /// sidecar.
+    wal_io: Option<FileIo>,
+}
+
+/// An open file handle plus the identity (length, and on unix the
+/// inode) it was validated against — the cheap per-commit
+/// revalidation compares a fresh `stat(path)` against these; any
+/// mismatch (replacement, truncation, growth) demotes to the fully
+/// verified slow path.
+#[derive(Debug)]
+struct FileIo {
+    file: std::fs::File,
+    len: u64,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+impl FileIo {
+    fn of(meta: &std::fs::Metadata, file: std::fs::File) -> Self {
+        FileIo {
+            file,
+            len: meta.len(),
+            #[cfg(unix)]
+            ino: {
+                use std::os::unix::fs::MetadataExt;
+                meta.ino()
+            },
+        }
+    }
+
+    /// Whether a path stat's metadata still describes the file this
+    /// handle was validated against. Unix compares the inode (a
+    /// temp+rename replacement shows a different one even at equal
+    /// length); non-unix compares length only.
+    fn matches(&self, meta: &std::fs::Metadata) -> bool {
+        if self.len != meta.len() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            self.ino == meta.ino()
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
+}
+
+/// Positioned read that does not move a shared cursor (pread on unix,
+/// seek_read on windows) — the cached handles are shared by every
+/// session of the container, so cursor moves would race.
+fn pread_exact(f: &mut std::fs::File, buf: &mut [u8], off: u64) -> std::io::Result<()> {
+    let mut done = 0usize;
+    while done < buf.len() {
+        let n = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileExt;
+                f.read_at(&mut buf[done..], off + done as u64)?
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::FileExt;
+                f.seek_read(&mut buf[done..], off + done as u64)?
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                use std::io::{Read, Seek, SeekFrom};
+                f.seek(SeekFrom::Start(off + done as u64))?;
+                f.read(&mut buf[done..])?
+            }
+        };
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "positioned read hit EOF",
+            ));
+        }
+        done += n;
+    }
+    Ok(())
+}
+
+/// Positioned write (pwrite / seek_write) — see [`pread_exact`].
+fn pwrite_all(f: &mut std::fs::File, buf: &[u8], off: u64) -> std::io::Result<()> {
+    let mut done = 0usize;
+    while done < buf.len() {
+        let n = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileExt;
+                f.write_at(&buf[done..], off + done as u64)?
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::FileExt;
+                f.seek_write(&buf[done..], off + done as u64)?
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                use std::io::{Seek, SeekFrom, Write};
+                f.seek(SeekFrom::Start(off + done as u64))?;
+                f.write(&buf[done..])?
+            }
+        };
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "positioned write wrote nothing",
+            ));
+        }
+        done += n;
+    }
+    Ok(())
 }
 
 /// Page reads over the committed view: the WAL overlay first, then
@@ -218,15 +346,19 @@ impl<'a> PageReader<'a> {
         cache: &mut HashMap<u32, Vec<u8>>,
     ) -> Option<Vec<u8>> {
         if let Some(p) = overlay.get(&pgno) {
+            READER_OVERLAY_HITS.fetch_add(1, Relaxed);
             return Some(p.clone());
         }
         if let Some(p) = cache.get(&pgno) {
+            READER_CACHE_HITS.fetch_add(1, Relaxed);
             return Some(p.clone());
         }
         use std::io::{Read, Seek};
         if self.file.is_none() {
+            READER_FILE_OPENS.fetch_add(1, Relaxed);
             self.file = Some(std::fs::File::open(self.path).ok()?);
         }
+        READER_FILE_READS.fetch_add(1, Relaxed);
         let file = self.file.as_mut()?;
         let off = (pgno as u64 - 1) * page_size as u64;
         file.seek(std::io::SeekFrom::Start(off)).ok()?;
@@ -580,6 +712,7 @@ impl Container {
         } else {
             None
         };
+        st.wal_io = None;
         st.record_guard(&self.path);
         Ok(())
     }
@@ -588,7 +721,14 @@ impl Container {
     /// geometry the session expects, and no sign the main file was
     /// touched by anyone but this coordinator since the last commit.
     pub fn can_splice(&self, params: &PublishParams) -> bool {
-        let st = self.state.lock();
+        let t0 = std::time::Instant::now();
+        let r = self.can_splice_inner(params);
+        CAN_SPLICE_NS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+        r
+    }
+
+    fn can_splice_inner(&self, params: &PublishParams) -> bool {
+        let mut st = self.state.lock();
         if st.force_full {
             trace_decline(&st, params, "forced full publish");
             return false;
@@ -616,24 +756,20 @@ impl Container {
         }
         // External-touch guard: the main file must be exactly as the
         // coordinator last left it (length + header counter + size).
-        let meta = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
-        if meta != st.guard.0 {
+        // Fast path: one path stat (a replaced file shows a different
+        // identity, a truncated/grown one a different length) + one
+        // positioned 100-byte read through the cached handle.
+        let Some((len, counter, size)) = main_guard_probe(&mut st, &self.path) else {
+            trace_decline(&st, params, "header unreadable");
+            return false;
+        };
+        if len != st.guard.0 {
             trace_decline(&st, params, "file length moved");
             return false;
         }
-        match read_header_prefix(&self.path) {
-            Some(head) => {
-                if u32::from_be_bytes(head[24..28].try_into().unwrap()) != st.guard.1
-                    || u32::from_be_bytes(head[28..32].try_into().unwrap()) != st.guard.2
-                {
-                    trace_decline(&st, params, "header counter/size moved");
-                    return false;
-                }
-            }
-            None => {
-                trace_decline(&st, params, "header unreadable");
-                return false;
-            }
+        if counter != st.guard.1 || size != st.guard.2 {
+            trace_decline(&st, params, "header counter/size moved");
+            return false;
         }
         true
     }
@@ -673,6 +809,7 @@ impl Container {
         } else {
             None
         };
+        st.wal_io = None;
         st.epoch += 1;
         st.established = true;
         st.record_guard(&self.path);
@@ -692,6 +829,7 @@ impl Container {
         st.overlay.clear();
         st.page_cache.clear();
         st.wal = None;
+        st.wal_io = None;
         st.epoch += 1;
     }
 
@@ -703,6 +841,29 @@ impl Container {
     /// when nothing changed (a byte-identical rebuild: no frames, no
     /// counter bump — SQLite's own no-op-transaction shape).
     pub fn publish_splice(
+        &self,
+        items: &[SpliceItem],
+        mutates: &[MutateItem],
+        dropped: &[SpanKey],
+        schema_changed: bool,
+        schema_rows_of: &dyn Fn() -> Vec<SpliceSchemaRow>,
+        params: &PublishParams,
+    ) -> Result<bool, SpliceError> {
+        let t0 = std::time::Instant::now();
+        let r = self.publish_splice_inner(
+            items,
+            mutates,
+            dropped,
+            schema_changed,
+            schema_rows_of,
+            params,
+        );
+        PUBLISH_NS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+        PUBLISH_COUNT.fetch_add(1, Relaxed);
+        r
+    }
+
+    fn publish_splice_inner(
         &self,
         items: &[SpliceItem],
         mutates: &[MutateItem],
@@ -768,6 +929,7 @@ impl Container {
         let mut mut_free: BTreeSet<u32> = st.free.clone();
         let mut mut_tail = st.n_pages + 1;
         let mut mut_pending: HashMap<u32, Vec<u8>> = HashMap::new();
+        let phase_t0 = std::time::Instant::now();
         for item in mutates {
             match self.run_mutation(
                 &st,
@@ -848,6 +1010,8 @@ impl Container {
         }
 
         // ---- 1. Splice each object ----
+        PHASE_MUTATE_NS.fetch_add(phase_t0.elapsed().as_nanos() as u64, Relaxed);
+        let phase_t0 = std::time::Instant::now();
         for item in items {
             let old_span = st.spans.get(&item.key).cloned();
             let mut reuse: Vec<u32> = Vec::new();
@@ -978,6 +1142,8 @@ impl Container {
         }
 
         // ---- 2. Freelist structure ----
+        PHASE_SPLICE_NS.fetch_add(phase_t0.elapsed().as_nanos() as u64, Relaxed);
+        let phase_t0 = std::time::Instant::now();
         let free_vec: Vec<u32> = st.free.iter().copied().collect();
         let fl = build_freelist(&free_vec, ps);
         for (pgno, bytes) in &fl.pages {
@@ -1061,6 +1227,8 @@ impl Container {
         st.schema_cookie = params.schema_cookie;
 
         // ---- 4. Commit protocol ----
+        PHASE_TAIL_NS.fetch_add(phase_t0.elapsed().as_nanos() as u64, Relaxed);
+        let phase_t0 = std::time::Instant::now();
         let frames: Vec<(u32, Vec<u8>)> = changed.into_iter().collect();
         if std::env::var_os("RSQL_SPLICE_TRACE").is_some() {
             eprintln!(
@@ -1078,7 +1246,8 @@ impl Container {
             let wal_path = wal_path_of(&self.path);
             // The append fsyncs only under synchronous=FULL/EXTRA.
             let sync = params.synchronous >= 2;
-            append_wal(&wal_path, &writer, pre_len, &bytes, sync).map_err(SpliceError::Other)?;
+            append_wal_cached(&mut st, &wal_path, &writer, pre_len, &bytes, sync)
+                .map_err(SpliceError::Other)?;
             for (pgno, page) in &frames {
                 st.overlay.insert(*pgno, page.clone());
                 // Page ownership moves to the overlay (the sidecar is
@@ -1095,11 +1264,16 @@ impl Container {
                         writer.n_frames()
                     );
                 }
+                let ck_t0 = std::time::Instant::now();
                 checkpoint(&self.path, ps, params.synchronous != 0).map_err(SpliceError::Other)?;
+                // The sidecar was just retired: the cached append
+                // handle is a ghost until the slow path re-opens it.
+                st.wal_io = None;
                 fold_overlay_into_cache(&mut st, &mut cache);
                 let seq = writer.ckpt_seq() + 1;
                 writer = WalWriter::new(ps, seq);
                 st.record_guard(&self.path);
+                PHASE_CHECKPOINT_NS.fetch_add(ck_t0.elapsed().as_nanos() as u64, Relaxed);
             }
             st.wal = Some(writer);
         } else {
@@ -1137,6 +1311,7 @@ impl Container {
         }
         st.epoch += 1;
         st.page_cache = cache;
+        PHASE_COMMIT_NS.fetch_add(phase_t0.elapsed().as_nanos() as u64, Relaxed);
         Ok(true)
     }
 
@@ -1202,6 +1377,7 @@ impl Container {
         }
         let r = checkpoint(&self.path, ps, sync)?;
         let mut st = self.state.lock();
+        st.wal_io = None;
         let mut cache = std::mem::take(&mut st.page_cache);
         fold_overlay_into_cache(&mut st, &mut cache);
         st.page_cache = cache;
@@ -1301,6 +1477,7 @@ impl Container {
             match checkpoint(&self.path, ps, sync) {
                 Ok(_) => {
                     let mut st = self.state.lock();
+                    st.wal_io = None;
                     let mut cache = std::mem::take(&mut st.page_cache);
                     fold_overlay_into_cache(&mut st, &mut cache);
                     st.page_cache = cache;
@@ -1333,8 +1510,13 @@ impl Container {
 impl ContainerState {
     /// Record the main-file identity (length, header counter, header
     /// size) after any protocol step that wrote it, so later splices
-    /// can detect an external touch.
+    /// can detect an external touch. The step just rewrote the file:
+    /// the cached read handle's identity is stale by construction, so
+    /// it drops here and the next probe re-validates (once per
+    /// checkpoint / rollback commit / full publish — never per WAL
+    /// commit).
     fn record_guard(&mut self, path: &Path) {
+        self.main_io = None;
         let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let (counter, size) = read_header_prefix(path)
             .map(|h| {
@@ -1348,6 +1530,54 @@ impl ContainerState {
     }
 }
 
+/// The external-touch guard's file probe: the main file's current
+/// `(length, change counter, db size)`, taken through the cached read
+/// handle when the path still names the same file (one stat + one
+/// positioned read), or a fresh open otherwise (which then becomes the
+/// cached handle).
+fn main_guard_probe(st: &mut ContainerState, path: &Path) -> Option<(u64, u32, u32)> {
+    let t0 = std::time::Instant::now();
+    let r = main_guard_probe_inner(st, path);
+    GUARD_PROBE_NS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+    r
+}
+
+fn main_guard_probe_inner(st: &mut ContainerState, path: &Path) -> Option<(u64, u32, u32)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let head = match st.main_io.as_mut() {
+        Some(io) if io.matches(&meta) => {
+            let mut buf = [0u8; 100];
+            match pread_exact(&mut io.file, &mut buf, 0) {
+                Ok(()) => buf,
+                // The handle went bad under us (unlinked and evicted,
+                // I/O error): reopen through the verified path.
+                Err(_) => {
+                    let mut f = std::fs::File::open(path).ok()?;
+                    let mut buf = [0u8; 100];
+                    pread_exact(&mut f, &mut buf, 0).ok()?;
+                    st.main_io = Some(FileIo::of(&meta, f));
+                    buf
+                }
+            }
+        }
+        _ => {
+            // Cold cache, or the path no longer names the cached file
+            // (replacement / truncation / growth): open the CURRENT
+            // file, read through it, and re-cache.
+            let mut f = std::fs::File::open(path).ok()?;
+            let mut buf = [0u8; 100];
+            pread_exact(&mut f, &mut buf, 0).ok()?;
+            st.main_io = Some(FileIo::of(&meta, f));
+            buf
+        }
+    };
+    Some((
+        meta.len(),
+        u32::from_be_bytes(head[24..28].try_into().unwrap()),
+        u32::from_be_bytes(head[28..32].try_into().unwrap()),
+    ))
+}
+
 /// The first 100 header bytes of a SQLite file (best effort).
 fn read_header_prefix(path: &Path) -> Option<[u8; 100]> {
     use std::io::Read;
@@ -1355,6 +1585,140 @@ fn read_header_prefix(path: &Path) -> Option<[u8; 100]> {
     let mut buf = [0u8; 100];
     f.read_exact(&mut buf).ok()?;
     Some(buf)
+}
+
+/// Debug/CI kill switch: force every WAL append through the fully
+/// verified slow path (open/stat/salt-check per commit) — an A/B
+/// switch for the cached-handle fast path's contribution.
+fn wal_fastpath_disabled() -> bool {
+    static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *D.get_or_init(|| std::env::var_os("RSQL_WAL_SLOWPATH").is_some())
+}
+
+/// Debug instrumentation: cumulative ns in the commit hot spots,
+/// readable via `rustqlite::commit_timer_snapshot()`. Always-on —
+/// the atomic adds are single-digit ns against µs-scale paths.
+pub static CAN_SPLICE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static GUARD_PROBE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static APPEND_FAST_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static APPEND_SLOW_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PUBLISH_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PUBLISH_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Sub-phase timers inside publish_splice (mutation collection, the
+/// splice/verify loop, schema+freelist+header rebuild, the commit
+/// protocol block, the autocheckpoint itself).
+pub static PHASE_MUTATE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PHASE_SPLICE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PHASE_TAIL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PHASE_COMMIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PHASE_CHECKPOINT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Cumulative commit-path instrumentation (see the statics above):
+/// `[can_splice_ns, guard_probe_ns, append_fast_ns, append_slow_ns,
+/// publish_splice_ns, publish_count]`.
+pub fn commit_timer_snapshot() -> [u64; 6] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [
+        CAN_SPLICE_NS.load(Relaxed),
+        GUARD_PROBE_NS.load(Relaxed),
+        APPEND_FAST_NS.load(Relaxed),
+        APPEND_SLOW_NS.load(Relaxed),
+        PUBLISH_NS.load(Relaxed),
+        PUBLISH_COUNT.load(Relaxed),
+    ]
+}
+
+/// Reader-path counters for the per-commit probes:
+/// `[overlay_hits, cache_hits, file_opens, file_reads]`.
+pub static READER_OVERLAY_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static READER_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static READER_FILE_OPENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static READER_FILE_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The reader-path counters (see the statics above).
+pub fn reader_counter_snapshot() -> [u64; 4] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [
+        READER_OVERLAY_HITS.load(Relaxed),
+        READER_CACHE_HITS.load(Relaxed),
+        READER_FILE_OPENS.load(Relaxed),
+        READER_FILE_READS.load(Relaxed),
+    ]
+}
+
+/// Sub-phase timers inside publish_splice — `[mutate_ns, splice_ns,
+/// tail_ns (schema+freelist+header), commit_ns (protocol block,
+/// incl. checkpoint), checkpoint_ns (the autocheckpoint alone)]`.
+pub fn publish_phase_snapshot() -> [u64; 5] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [
+        PHASE_MUTATE_NS.load(Relaxed),
+        PHASE_SPLICE_NS.load(Relaxed),
+        PHASE_TAIL_NS.load(Relaxed),
+        PHASE_COMMIT_NS.load(Relaxed),
+        PHASE_CHECKPOINT_NS.load(Relaxed),
+    ]
+}
+
+/// Append a WAL commit through the cached sidecar handle: one path stat
+/// (an external replacement / truncation / growth trips the fully
+/// verified slow path) + one positioned write at the writer's tracked
+/// length — SQLite's own discipline (the sidecar descriptor stays open
+/// for the session's life; the engine never re-opens, re-stats and
+/// re-verifies the salts per commit). Falls back to `append_wal_open`
+/// whenever the cache is cold or the identity moved, then keeps the
+/// handle it used warm for the next commit.
+fn append_wal_cached(
+    st: &mut ContainerState,
+    path: &Path,
+    writer: &WalWriter,
+    pre_commit_len: u32,
+    bytes: &[u8],
+    sync: bool,
+) -> Result<(), String> {
+    let identity_ok = !wal_fastpath_disabled()
+        && std::fs::metadata(path)
+            .map(|m| st.wal_io.as_ref().map(|io| io.matches(&m)).unwrap_or(false))
+            .unwrap_or(false);
+    if identity_ok {
+        let t0 = std::time::Instant::now();
+        let io = st.wal_io.as_mut().expect("checked above");
+        if io.len == pre_commit_len as u64 {
+            let r = (|| -> Result<(), String> {
+                pwrite_all(&mut io.file, bytes, io.len)
+                    .map_err(|e| format!("write {}: {e}", path.display()))?;
+                io.len += bytes.len() as u64;
+                if sync {
+                    io.file
+                        .sync_all()
+                        .map_err(|e| format!("fsync {}: {e}", path.display()))?;
+                }
+                Ok(())
+            })();
+            APPEND_FAST_NS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+            return r;
+        }
+    }
+    // Slow path: cold cache, the sidecar's identity moved under us, or
+    // the writer was reset (post-checkpoint generation). The full
+    // open/verify/recover append, then keep its handle warm.
+    if std::env::var_os("RSQL_WAL_FASTPATH_TRACE").is_some() {
+        eprintln!(
+            "[wal] slow path: identity_ok={} cached_len={:?} pre_len={}",
+            identity_ok,
+            st.wal_io.as_ref().map(|io| io.len),
+            pre_commit_len
+        );
+    }
+    st.wal_io = None;
+    let t0 = std::time::Instant::now();
+    let f = append_wal_open(path, writer, pre_commit_len, bytes, sync)?;
+    let meta = f
+        .metadata()
+        .map_err(|e| format!("stat {}: {e}", path.display()))?;
+    st.wal_io = Some(FileIo::of(&meta, f));
+    APPEND_SLOW_NS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+    Ok(())
 }
 
 /// Trace a declined splice (diagnostics under `RSQL_SPLICE_TRACE`).

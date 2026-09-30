@@ -29,7 +29,43 @@
 //! fold 8-byte chunks as two u32 words `(w0, w1)` with
 //! `s1 += w0 + s2; s2 += w1 + s1` (all modulo 2^32).
 
+use std::collections::HashMap;
 use std::path::Path;
+
+/// Positioned full write that does not move a shared cursor (pwrite on
+/// unix, seek_write on windows) — the checkpoint writes many pages
+/// through one handle, one syscall each.
+fn pwrite_page(f: &mut std::fs::File, buf: &[u8], off: u64) -> std::io::Result<()> {
+    let mut done = 0usize;
+    while done < buf.len() {
+        let n = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileExt;
+                f.write_at(&buf[done..], off + done as u64)?
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::FileExt;
+                f.seek_write(&buf[done..], off + done as u64)?
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                use std::io::{Seek, SeekFrom, Write};
+                f.seek(SeekFrom::Start(off + done as u64))?;
+                f.write(&buf[done..])?
+            }
+        };
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "positioned write wrote nothing",
+            ));
+        }
+        done += n;
+    }
+    Ok(())
+}
 
 /// WAL magic with LSB clear: checksums interpret data as 32-bit
 /// little-endian words (native on every realistic target).
@@ -204,8 +240,16 @@ impl WalWriter {
 /// sidecar already holds exactly the changed pages, so folding it back
 /// costs O(frames), never O(database).
 pub fn checkpoint(path: &Path, page_size: u32, sync: bool) -> Result<(usize, u32), String> {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static READ_NS: AtomicU64 = AtomicU64::new(0);
+    static WRITE_NS: AtomicU64 = AtomicU64::new(0);
+    static RETIRE_NS: AtomicU64 = AtomicU64::new(0);
+    static N: AtomicU64 = AtomicU64::new(0);
+    let t_all = std::time::Instant::now();
     let wal_path = crate::storage::sqlitefmt::reader::wal_path_of(path);
+    let t0 = std::time::Instant::now();
     let wal = std::fs::read(&wal_path).map_err(|e| format!("read {}: {e}", wal_path.display()))?;
+    READ_NS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
     if wal.len() < 32 {
         // No header: nothing committed. Remove the husk so a later open
         // never mistakes it for state.
@@ -258,22 +302,36 @@ pub fn checkpoint(path: &Path, page_size: u32, sync: bool) -> Result<(usize, u32
         let _ = std::fs::remove_file(&wal_path);
         return Ok((0, 0));
     }
+    // DEDUP: only the LAST version of each page needs to reach the
+    // main file — a long run of single-frame commits rewrites the same
+    // hot page hundreds of times, and copying every intermediate
+    // version is pure I/O waste (the file result is byte-identical
+    // either way, since later frames overwrite earlier ones).
+    let mut last_of: HashMap<u32, (u64, &[u8])> = HashMap::with_capacity(committed.len());
+    for (i, (pgno, frame)) in committed.iter().enumerate() {
+        last_of.insert(*pgno, (i as u64, frame));
+    }
+    let mut writes: Vec<(u64, u32, &[u8])> = last_of
+        .into_iter()
+        .map(|(pgno, (i, frame))| (i, pgno, frame))
+        .collect();
+    // In-order (matching the sequential-copy byte result exactly);
+    // writing page-order would also be correct, but the deterministic
+    // order keeps differential tests stable.
+    writes.sort_by_key(|(i, _, _)| *i);
     // Copy the committed pages back into the main file. Positioned
-    // writes (seek + write): the caller holds the session lock, so the
-    // file offset is uncontended.
-    use std::io::{Seek, Write};
+    // writes (pwrite / seek_write): one syscall per page, no shared
+    // cursor to move.
+    let t0 = std::time::Instant::now();
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .open(path)
         .map_err(|e| format!("open {}: {e}", path.display()))?;
     let ps = page_size as usize;
     let mut written = 0usize;
-    for (pgno, page) in &committed {
+    for (_, pgno, page) in &writes {
         let off = (*pgno as u64 - 1) * ps as u64;
-        f.seek(std::io::SeekFrom::Start(off))
-            .map_err(|e| format!("seek {}: {e}", path.display()))?;
-        f.write_all(page)
-            .map_err(|e| format!("write page {pgno}: {e}"))?;
+        pwrite_page(&mut f, page, off).map_err(|e| format!("write page {pgno}: {e}"))?;
         written += 1;
     }
     if commit_db_size > 0 {
@@ -290,9 +348,24 @@ pub fn checkpoint(path: &Path, page_size: u32, sync: bool) -> Result<(usize, u32
         f.sync_all()
             .map_err(|e| format!("fsync {}: {e}", path.display()))?;
     }
+    WRITE_NS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
     // Retire the sidecar: a zero-length WAL is an empty WAL to every
     // reader; removal keeps the at-rest file set minimal.
+    let t0 = std::time::Instant::now();
     let _ = std::fs::remove_file(&wal_path);
+    RETIRE_NS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+    N.fetch_add(1, Relaxed);
+    if std::env::var_os("RSQL_WAL_FASTPATH_TRACE").is_some() {
+        eprintln!(
+            "[ckpt] {:.2} ms: read {:.2} write {:.2} retire {:.2} (frames {}, pages {})",
+            t_all.elapsed().as_secs_f64() * 1e3,
+            READ_NS.load(Relaxed) as f64 / 1e6,
+            WRITE_NS.load(Relaxed) as f64 / 1e6,
+            RETIRE_NS.load(Relaxed) as f64 / 1e6,
+            wal.len() / (24 + page_size as usize),
+            written,
+        );
+    }
     Ok((written, commit_db_size))
 }
 
@@ -324,13 +397,18 @@ pub fn diff_pages(base: &[u8], image: &[u8], page_size: u32) -> Vec<(u32, Vec<u8
 /// recoverable while the writer has no frames yet (the commit bytes
 /// then include the header); with frames in flight the history is gone
 /// and the caller must fall back to a full rewrite.
-pub fn append_wal(
+///
+/// Returns the still-open, read/write handle positioned just past the
+/// appended bytes — the container caches it for the per-commit fast
+/// path (one stat + one positioned write, SQLite's own discipline of
+/// keeping the sidecar descriptor open for the session's life).
+pub fn append_wal_open(
     path: &Path,
     writer: &WalWriter,
     pre_commit_len: u32,
     bytes: &[u8],
     sync: bool,
-) -> Result<(), String> {
+) -> Result<std::fs::File, String> {
     use std::io::{Read, Seek, Write};
     // `pre_commit_len`: the sidecar length BEFORE this commit's frames
     // were encoded (the caller captures writer.wal_len() first — the
@@ -393,7 +471,19 @@ pub fn append_wal(
         f.sync_all()
             .map_err(|e| format!("fsync {}: {e}", path.display()))?;
     }
-    Ok(())
+    Ok(f)
+}
+
+/// The one-shot append (opens, verifies, writes, closes) — callers that
+/// do not keep the handle across commits.
+pub fn append_wal(
+    path: &Path,
+    writer: &WalWriter,
+    pre_commit_len: u32,
+    bytes: &[u8],
+    sync: bool,
+) -> Result<(), String> {
+    append_wal_open(path, writer, pre_commit_len, bytes, sync).map(|_| ())
 }
 
 #[cfg(test)]
