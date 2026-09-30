@@ -41,6 +41,8 @@ pub enum Statement {
     /// object to be reindexed`) — validated at prepare time.
     Reindex {
         target: Option<String>,
+        /// Schema qualifier (`REINDEX aux.x`).
+        schema: Option<String>,
     },
     /// Legacy no-op marker (no longer produced by the parser; kept for
     /// statement-match exhaustiveness during the transition).
@@ -53,6 +55,8 @@ pub enum Statement {
     /// index target analyzes its owning table — SQLite semantics).
     Analyze {
         target: Option<String>,
+        /// Schema qualifier (`ANALYZE aux.x`).
+        schema: Option<String>,
     },
 }
 
@@ -91,6 +95,10 @@ pub enum CreateStatement {
         /// `CREATE TEMP INDEX` — or an index on a temp table (SQLite: the
         /// index follows its table's scope).
         temp: bool,
+        /// Schema qualifier on the INDEX name (`CREATE INDEX aux.ix ON
+        /// t(...)`). SQLite applies this schema to BOTH the index and the
+        /// table lookup; `main`/`temp` are the local schema.
+        schema: Option<String>,
         name: String,
         table: String,
         columns: Vec<IndexedColumn>,
@@ -229,6 +237,9 @@ pub struct IndexedColumn {
 pub struct DropStatement {
     pub if_exists: bool,
     pub kind: DropKind,
+    /// Schema qualifier (`DROP TABLE aux.x`). `None` / `main` / `temp`
+    /// are the local schema; anything else must be an attached database.
+    pub schema: Option<String>,
     pub name: String,
 }
 
@@ -243,6 +254,8 @@ pub enum DropKind {
 /// `ALTER TABLE <table> <action>`.
 #[derive(Clone, Debug)]
 pub struct AlterStatement {
+    /// Schema qualifier (`ALTER TABLE aux.x ...`).
+    pub schema: Option<String>,
     pub table: String,
     pub action: AlterAction,
 }
@@ -285,6 +298,9 @@ impl TableName {
 #[derive(Clone, Debug)]
 pub struct InsertStatement {
     pub or: Option<ConflictResolution>,
+    /// Schema qualifier on the target (`INSERT INTO aux.t`). `None` =
+    /// local (main/temp) resolution.
+    pub schema: Option<String>,
     pub table: String,
     pub alias: Option<String>,
     pub columns: Option<Vec<String>>,
@@ -529,6 +545,8 @@ pub enum FrameExclude {
 #[derive(Clone, Debug)]
 pub struct UpdateStatement {
     pub or: Option<ConflictResolution>,
+    /// Schema qualifier on the target (`UPDATE aux.t`).
+    pub schema: Option<String>,
     pub table: String,
     pub alias: Option<String>,
     pub set: Vec<(String, Expr)>,
@@ -545,6 +563,8 @@ pub struct UpdateStatement {
 
 #[derive(Clone, Debug)]
 pub struct DeleteStatement {
+    /// Schema qualifier on the target (`DELETE FROM aux.t`).
+    pub schema: Option<String>,
     pub from: String,
     pub alias: Option<String>,
     pub where_clause: Option<Expr>,

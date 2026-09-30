@@ -306,6 +306,9 @@ fn engine_init() {
     disable_thp_for_process();
 }
 
+/// ATTACH / DETACH — real attached databases (engine federation):
+/// routing, the foreign-rows channel, cross-schema transactions.
+pub mod attach;
 /// SCRAM-SHA-256 authentication (Postgres's exact SASL mechanism,
 /// RFC 7677) for `rustqlite-server`, plus the client side used by
 /// `rustqlite-cli --connect`: verifiers, the handshake state machines,

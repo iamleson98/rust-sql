@@ -189,6 +189,13 @@ struct Ctx<'a> {
     extra_collations: &'a [String],
     /// Recursion guard for view-in-view validation.
     view_depth: usize,
+    /// ATTACHED engines (schema name, engine) in ATTACH order — see
+    /// `src/attach.rs`. Empty for plain single-db statements (the borrow
+    /// of an empty slice costs nothing).
+    attached: &'a [(
+        String,
+        std::sync::Arc<parking_lot::RwLock<crate::api::Database>>,
+    )],
 }
 
 /// Builtin collation set + connection-registered names.
@@ -421,6 +428,7 @@ pub(crate) fn validate_expr_in_scope(catalog: &Catalog, e: &Expr, ts: &TriggerSc
         catalog,
         extra_collations: &[],
         view_depth: 0,
+        attached: &[],
     };
     let mut scope = ts.scope.clone();
     validate_expr(&ctx, e, &mut scope, &EMPTY_CTES)
@@ -436,6 +444,7 @@ pub(crate) fn validate_stmt_in_scope(
         catalog,
         extra_collations: &[],
         view_depth: 0,
+        attached: &[],
     };
     let mut scope = ts.scope.clone();
     validate_stmt(&ctx, stmt, &mut scope)
@@ -452,13 +461,72 @@ pub fn validate_statement(
     extra_collations: &[String],
     stmt: &Statement,
 ) -> Result<()> {
+    validate_statement_with_attached(catalog, extra_collations, stmt, &[])
+}
+
+/// [`validate_statement`] with the connection's ATTACHED databases in
+/// scope: `aux.t` references and the unqualified fallback (main misses
+/// first) validate against the attached engines' catalogs.
+pub fn validate_statement_with_attached(
+    catalog: &Catalog,
+    extra_collations: &[String],
+    stmt: &Statement,
+    attached: &[(
+        String,
+        std::sync::Arc<parking_lot::RwLock<crate::api::Database>>,
+    )],
+) -> Result<()> {
     let ctx = Ctx {
         catalog,
         extra_collations,
         view_depth: 0,
+        attached,
     };
     let mut scope = Scope::default();
     validate_stmt(&ctx, stmt, &mut scope)
+}
+
+/// Resolve a table's exposed columns on an ATTACHED engine (prepare-time
+/// validation only — rows are never pulled here). Handles tables, views,
+/// and the sqlite_master pseudo-table; returns (columns, rowid_table,
+/// pending) like `table_source`.
+fn attached_table_source(
+    ctx: &Ctx<'_>,
+    schema: &str,
+    name: &str,
+) -> Option<(Vec<String>, bool, bool)> {
+    let lc = schema.to_ascii_lowercase();
+    let engine = ctx
+        .attached
+        .iter()
+        .find(|(n, _)| n.to_ascii_lowercase() == lc)
+        .map(|(_, e)| e.clone())?;
+    let aux = engine.read();
+    let name_lc = name.to_ascii_lowercase();
+    if name_lc == "sqlite_master" || name_lc == "sqlite_schema" {
+        let cols = ["type", "name", "tbl_name", "rootpage", "sql"]
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        return Some((cols, false, false));
+    }
+    if let Some(t) = aux.catalog.get_table(name) {
+        if t.vtab.as_ref().map(|vt| vt.is_pending()).unwrap_or(false) {
+            return Some((Vec::new(), false, true));
+        }
+        return Some((
+            t.columns.iter().map(|c| c.name.clone()).collect(),
+            !t.without_rowid,
+            false,
+        ));
+    }
+    if let Some(v) = aux.catalog.get_view(name) {
+        if let Some(list) = &v.columns {
+            return Some((list.clone(), false, false));
+        }
+        return Some((Vec::new(), false, true));
+    }
+    None
 }
 
 fn validate_stmt(ctx: &Ctx<'_>, stmt: &Statement, scope: &mut Scope) -> Result<()> {
@@ -471,7 +539,7 @@ fn validate_stmt(ctx: &Ctx<'_>, stmt: &Statement, scope: &mut Scope) -> Result<(
         Statement::Drop(d) => validate_drop(ctx, d),
         Statement::Alter(a) => validate_alter(ctx, a),
         Statement::Explain { inner, .. } => validate_stmt(ctx, inner, scope),
-        Statement::Analyze { target } => {
+        Statement::Analyze { target, .. } => {
             if let Some(name) = target {
                 // ANALYZE accepts a TABLE or INDEX name (an index target
                 // analyzes its owning table); the unknown-name text is
@@ -482,7 +550,7 @@ fn validate_stmt(ctx: &Ctx<'_>, stmt: &Statement, scope: &mut Scope) -> Result<(
             }
             Ok(())
         }
-        Statement::Reindex { target } => {
+        Statement::Reindex { target, .. } => {
             if let Some(name) = target {
                 let known =
                     ctx.catalog.get_table(name).is_some() || ctx.catalog.get_index(name).is_some();
@@ -799,7 +867,38 @@ fn build_from_expr(
                     return Err(Error::NotFound(format!("no such index: {}", idx)));
                 }
             }
-            let Some((cols, rowid_table, wildcard)) = table_source(ctx, name, ctes) else {
+            // ATTACHED-database reference: resolve the columns on the
+            // attached engine's catalog (SQLite validates prepare-time).
+            if let Some(s) = schema {
+                let lc = s.to_ascii_lowercase();
+                if lc != "main" && lc != "temp" {
+                    return match attached_table_source(ctx, s, name) {
+                        Some((cols, rowid_table, wildcard)) => {
+                            let n = scope.cur().sources.len();
+                            let qualifier = alias.clone().or_else(|| Some(name.clone()));
+                            scope.cur().sources.push(Source {
+                                qualifier,
+                                columns: cols,
+                                rowid_table,
+                                qualified_only: false,
+                                pending_vtab: wildcard,
+                                aux_columns: Vec::new(),
+                                vtable: false,
+                            });
+                            Ok(n)
+                        }
+                        None => Err(Error::NotFound(format!("no such table: {}.{}", s, name))),
+                    };
+                }
+            }
+            let source = table_source(ctx, name, ctes).or_else(|| {
+                // Unqualified fallback: attached databases in ATTACH order
+                // (main and temp already missed above).
+                ctx.attached
+                    .iter()
+                    .find_map(|(sn, _)| attached_table_source(ctx, sn, name))
+            });
+            let Some((cols, rowid_table, wildcard)) = source else {
                 let full = match schema {
                     Some(s) => format!("{}.{}", s, name),
                     None => name.clone(),
@@ -994,6 +1093,7 @@ fn validate_view_body(ctx: &Ctx<'_>, v: &crate::schema::View, scope: &mut Scope)
     let _ = scope;
     let mut fresh = Scope::default();
     let inner_ctx = Ctx {
+        attached: &[],
         catalog: ctx.catalog,
         extra_collations: ctx.extra_collations,
         view_depth: ctx.view_depth + 1,

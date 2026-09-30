@@ -1146,6 +1146,13 @@ struct SavepointLevel {
 impl Pager {
     /// Create a savepoint. Must be called while `in_transaction` is true
     /// (the caller ensures a transaction is open, starting one if needed).
+    /// Current savepoint-stack depth (0 = no savepoints). Used by the
+    /// ATTACH detach-lock rule (`database aux is locked`).
+    pub fn savepoint_depth(&self) -> usize {
+        self.savepoint_depth
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub fn savepoint(&self, name: &str) {
         let mut sp = self.savepoints.lock();
         sp.push(SavepointLevel {

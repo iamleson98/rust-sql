@@ -542,11 +542,10 @@ pub struct Database {
     /// plugin-scope guard entirely — one relaxed atomic load instead of
     /// a RwLock read + Arc clone + thread-local install per statement.
     has_plugins: std::sync::atomic::AtomicBool,
-    /// ATTACH-registered schema names (lowercased). The engine is
-    /// single-database: ATTACH accepts and records the name (matching
-    /// SQLite's observable ATTACH-then-DETACH round trip); DETACH of an
-    /// unregistered name errors `no such database: x`.
-    attached_schemas: Mutex<Vec<String>>,
+    /// ATTACHed databases (see `src/attach.rs`): each entry is a REAL
+    /// engine behind a schema name — routing and federation run through
+    /// it. `main`/`temp` are not in this list (they are this engine).
+    pub(crate) attached: crate::attach::AttachedList,
     /// Hashes of SQL statements seen at least once ("cache on second
     /// sight" filter). Populating the statement cache costs ~1 µs (two
     /// String allocations for the key + FIFO order entry, write-lock, Arc
@@ -1128,6 +1127,10 @@ pub(crate) struct CachedStmt {
     pub(crate) stmt: Arc<Statement>,
     pub(crate) plan: Option<Arc<crate::planner::plan::Plan>>,
     pub(crate) has_subqueries: bool,
+    /// True when the statement references an ATTACHED database — never
+    /// cached (its plan may embed per-execution materialized rows), and
+    /// the execute/query paths re-run the router on every call.
+    pub(crate) has_foreign: bool,
     /// Pre-compiled point-lookup fast path (see `FastPath`).
     pub(crate) fast_path: Option<Arc<FastPath>>,
     /// DML-on-VIEW target (INSERT/UPDATE/DELETE naming a VIEW), resolved
@@ -2623,7 +2626,7 @@ impl Database {
             // Built-in vtab modules (fts5) are always registered: the
             // plugin scope must install on every statement.
             has_plugins: std::sync::atomic::AtomicBool::new(true),
-            attached_schemas: Mutex::new(Vec::new()),
+            attached: parking_lot::Mutex::new(Vec::new()),
             foreign: None,
         })
     }
@@ -3004,7 +3007,7 @@ impl Database {
             // Built-in vtab modules (fts5) are always registered: the
             // plugin scope must install on every statement.
             has_plugins: std::sync::atomic::AtomicBool::new(true),
-            attached_schemas: Mutex::new(Vec::new()),
+            attached: parking_lot::Mutex::new(Vec::new()),
             foreign: None,
         }
     }
@@ -6243,6 +6246,19 @@ impl Database {
             let t0 = profile::now();
             let stmt = parse(sql)?;
             profile::span(t0, &profile::PARSE_NS);
+            // ATTACH-bearing statements: validated (schemas must exist)
+            // but never planned here — the router decides per execution.
+            if crate::attach::stmt_uses_attached(self, &stmt) {
+                crate::attach::validate_schemas(self, &stmt)?;
+                return Ok(Arc::new(CachedStmt {
+                    stmt: Arc::new(stmt),
+                    plan: None,
+                    has_subqueries: false,
+                    has_foreign: true,
+                    fast_path: None,
+                    view_target: None,
+                }));
+            }
             // Prepare-time name resolution (SQLite's resolver contract:
             // unknown columns/tables error BEFORE any row is evaluated).
             self.namecheck(&stmt)?;
@@ -6256,6 +6272,7 @@ impl Database {
                     stmt: Arc::new(stmt),
                     plan: None,
                     has_subqueries: false,
+                    has_foreign: false,
                     fast_path: None,
                     view_target,
                 }));
@@ -6276,6 +6293,7 @@ impl Database {
                 stmt: Arc::new(stmt),
                 plan: plan_arc,
                 has_subqueries: has_subq,
+                has_foreign: false,
                 fast_path,
                 view_target: None,
             }));
@@ -6309,6 +6327,20 @@ impl Database {
         let t0 = profile::now();
         let stmt = parse(sql)?;
         profile::span(t0, &profile::PARSE_NS);
+        // ATTACH-bearing statements are NEVER cached (and never hit):
+        // their plans may embed rows materialized from attached engines,
+        // recomputed per execution exactly like CTE rows.
+        if crate::attach::stmt_uses_attached(self, &stmt) {
+            crate::attach::validate_schemas(self, &stmt)?;
+            return Ok(Arc::new(CachedStmt {
+                stmt: Arc::new(stmt),
+                plan: None,
+                has_subqueries: false,
+                has_foreign: true,
+                fast_path: None,
+                view_target: None,
+            }));
+        }
         // Prepare-time name resolution — see the cache-disabled branch.
         self.namecheck(&stmt)?;
         // WITH-clause statements are NEVER cached (and never hit): their
@@ -6320,6 +6352,7 @@ impl Database {
                 stmt: Arc::new(stmt),
                 plan: None,
                 has_subqueries: false,
+                has_foreign: false,
                 fast_path: None,
                 // WITH-DML never routes to view triggers (the execute()
                 // WITH-DML intercept precedes the view check), matching
@@ -6337,6 +6370,7 @@ impl Database {
                 stmt: Arc::new(stmt),
                 plan: None,
                 has_subqueries: false,
+                has_foreign: false,
                 fast_path: None,
                 view_target: Some(view_target),
             }));
@@ -6357,6 +6391,7 @@ impl Database {
             stmt: Arc::new(stmt),
             plan: plan_arc,
             has_subqueries: has_subq,
+            has_foreign: false,
             fast_path,
             // Resolved above: DML reaching the planner targets a TABLE.
             view_target: None,
@@ -6412,7 +6447,17 @@ impl Database {
         } else {
             Vec::new()
         };
-        crate::planner::namecheck::validate_statement(&self.catalog, &extra, stmt)
+        let attached = self.attached_snapshot();
+        if attached.is_empty() {
+            crate::planner::namecheck::validate_statement(&self.catalog, &extra, stmt)
+        } else {
+            crate::planner::namecheck::validate_statement_with_attached(
+                &self.catalog,
+                &extra,
+                stmt,
+                &attached,
+            )
+        }
     }
 
     /// Persist root-page moves (from B+tree splits) into the schema rows.
@@ -6693,7 +6738,7 @@ impl Database {
     /// (CREATE/DROP TABLE/INDEX/VIEW/TRIGGER) because the cached Plans hold
     /// `Arc<Table>` / `Arc<Index>` references that become stale when the
     /// schema changes.
-    fn invalidate_stmt_cache(&self) {
+    pub(crate) fn invalidate_stmt_cache(&self) {
         self.stmt_cache.write().clear();
         self.stmt_cache_order.lock().clear();
         *self.last_stmt.write() = None;
@@ -6808,7 +6853,12 @@ impl Database {
         //      statement without the tokenizer/parser/planner pipeline.
         // The scanners are conservative: any deviation (UPSERT, RETURNING,
         // non-literals, multi-row) falls through to the general path.
-        {
+        // The fast INSERT paths (chain + byte scanner) resolve table
+        // names against THIS engine's catalog only — with attached
+        // databases in play an unqualified target may bind to an
+        // attached schema (SQLite's search order), so the general path
+        // (which runs the router) takes over.
+        if !self.has_attached() {
             let first = sql
                 .as_bytes()
                 .iter()
@@ -6853,11 +6903,36 @@ impl Database {
                 self.break_insert_chain();
             }
         }
-        let is_ddl = is_ddl_sql(sql);
-        let dirty_before = self.pager.dirty_page_count() as u64;
         let t_cache = profile::now();
         let cached = self.get_or_cache_stmt(sql)?;
         profile::span(t_cache, &profile::CACHE_NS);
+        self.execute_cached_stmt(sql, cached, params)
+    }
+
+    /// [`Self::execute_stmt`]'s statement machinery, starting from a
+    /// prepared `CachedStmt` instead of SQL text. Shared with the
+    /// ATTACH router: a statement routed to an attached database is
+    /// stripped of its schema qualifiers, prepared on that engine, and
+    /// run through this same path (its own planner, journals, fast
+    /// paths, epilogue).
+    fn execute_cached_stmt<P: Params>(
+        &mut self,
+        sql: &str,
+        cached: Arc<CachedStmt>,
+        params: P,
+    ) -> Result<()> {
+        // Write-epoch bump (mirrors execute_stmt's prelude — the router
+        // enters here DIRECTLY on the attached engine, skipping the
+        // prelude; the double bump on the plain path is a harmless count
+        // invalidation).
+        self.write_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        let is_ddl = is_ddl_sql(sql);
+        let dirty_before = self.pager.dirty_page_count() as u64;
+        // Marked-dirty watermark for the fast-insert recovery paths
+        // (captured here: the chained/byte-scanner fast paths ran in
+        // `execute_stmt` before this function was entered).
+        let dirty_at_start = self.pager.dirty_set_marked();
         // VACUUM rebuilds (and REPLACES) this Database: intercept before
         // any ctx borrows self, and before the txn hooks run (VACUUM is
         // refused inside a transaction anyway).
@@ -6866,34 +6941,62 @@ impl Database {
             drop(cached);
             return self.execute_vacuum(&v);
         }
-        // ATTACH / DETACH: the engine is single-database, but the
-        // observable ATTACH→DETACH round trip must behave like SQLite's
-        // (DETACH of a never-attached name errors `no such database: x`).
+        // ATTACH / DETACH: real attached databases (see `src/attach.rs`).
+        // The filename expression resolves against literals and bound
+        // parameters (SQLite evaluates it at run time).
         if let Statement::Attach(a) = cached.stmt.as_ref() {
-            let name = a.schema.to_ascii_lowercase();
+            let a = a.clone();
             drop(cached);
-            let mut list = self.attached_schemas.lock();
-            if name == "main" {
-                return Err(Error::semantic("database main is already in use"));
-            }
-            if list.contains(&name) {
-                return Err(Error::semantic(format!(
-                    "database {} is already in use",
-                    name
-                )));
-            }
-            list.push(name);
+            let file = Self::resolve_attach_filename(&a.expr, params.as_slice())?;
+            self.attach_database(&file, &a.schema)?;
             return Ok(());
         }
         if let Statement::Detach(d) = cached.stmt.as_ref() {
             let name = d.schema.clone();
             drop(cached);
-            let mut list = self.attached_schemas.lock();
-            if let Some(pos) = list.iter().position(|s| s.eq_ignore_ascii_case(&name)) {
-                list.remove(pos);
-                return Ok(());
-            }
-            return Err(Error::NotFound(format!("no such database: {}", name)));
+            self.detach_database(&name)?;
+            return Ok(());
+        }
+        // ------------------------------------------------------------------
+        // ATTACH ROUTING (execute path). Statements that reference an
+        // attached schema never run this engine's machinery: they are
+        // either ROUTED whole to the owning engine (every schema ref in
+        // one attached database) or FEDERATED through the foreign-rows
+        // channel (mixed schemas). See `src/attach.rs::analyze_route`.
+        // ------------------------------------------------------------------
+        if cached.has_foreign {
+            let stmt = (*cached.stmt).clone();
+            drop(cached);
+            crate::attach::validate_schemas(self, &stmt)?;
+            crate::attach::check_stmt_rules(&stmt)?;
+            let params_vec: Vec<Value> = params.into_iter().collect();
+            let target_schema = crate::attach::target_schema_of(self, &stmt);
+            return match crate::attach::analyze_route(self, &stmt) {
+                crate::attach::Route::Local => unreachable!("foreign stmt classified Local"),
+                crate::attach::Route::Routed { schema_lc } => {
+                    let engine = self
+                        .attached_engine(&schema_lc)
+                        .expect("validate_schemas checked");
+                    let stripped = crate::attach::strip_schema_refs(&stmt, &schema_lc);
+                    let last_rowid = {
+                        let mut aux = engine.write();
+                        let cached_aux = aux
+                            .cache_stmt_from_ast(&stripped)
+                            .map_err(|e| crate::attach::qualify_routed_error(e, &schema_lc))?;
+                        aux.execute_cached_stmt(sql, cached_aux, params_vec.as_slice())
+                            .map_err(|e| crate::attach::qualify_routed_error(e, &schema_lc))?;
+                        aux.last_insert_rowid()
+                    };
+                    self.merge_routed_dml_counters(
+                        matches!(stmt, Statement::Insert(_)),
+                        last_rowid,
+                    );
+                    Ok(())
+                }
+                crate::attach::Route::Mixed => {
+                    self.execute_mixed(&stmt, sql, &params_vec, target_schema)
+                }
+            };
         }
         // `PRAGMA encoding = X` (write form): needs &self — ForeignSqlite
         // owns the encoding and the executor context cannot reach it.
@@ -7048,6 +7151,12 @@ impl Database {
                 mode: crate::sql::ast::BeginMode::Concurrent,
             }) => {
                 drop(cached);
+                if self.has_attached() {
+                    return Err(Error::Unsupported(
+                        "BEGIN CONCURRENT does not support attached databases (use a plain \
+                         BEGIN)",
+                    ));
+                }
                 self.begin_concurrent_txn()?;
                 return Ok(());
             }
@@ -7152,14 +7261,21 @@ impl Database {
         match stmt_ref_pre(&cached.stmt) {
             StmtPre::Savepoint(name) => {
                 self.exec_savepoint(&name)?;
+                // ATTACH: savepoints span every attached engine.
+                let sql = format!("SAVEPOINT \"{}\"", name.replace('"', "\"\""));
+                self.attached_savepoint(&sql);
                 return Ok(());
             }
             StmtPre::Release(name) => {
                 self.exec_release_savepoint(&name)?;
+                let sql = format!("RELEASE \"{}\"", name.replace('"', "\"\""));
+                self.attached_savepoint(&sql);
                 return Ok(());
             }
             StmtPre::RollbackTo(name) => {
                 self.exec_rollback_to_savepoint(&name)?;
+                let sql = format!("ROLLBACK TO \"{}\"", name.replace('"', "\"\""));
+                self.attached_savepoint(&sql);
                 return Ok(());
             }
             StmtPre::Other => {}
@@ -7552,6 +7668,9 @@ impl Database {
         if result.is_ok() {
             match stmt_ref {
                 Statement::Begin(_) => {
+                    // ATTACH: every attached engine joins the transaction
+                    // (SQLite: BEGIN spans all attached databases).
+                    self.attached_begin();
                     // VALUE snapshot, not an Arc alias: an aliased snapshot
                     // keeps the live maps Arc at refcount >= 2 for the WHOLE
                     // transaction, so every statement epilogue's
@@ -7588,7 +7707,37 @@ impl Database {
                     // materialized leaves instead of re-copying every
                     // scanned page after every BEGIN.
                 }
+                Statement::Savepoint(name) => {
+                    // ATTACH: savepoints span every attached database.
+                    let sql = format!("SAVEPOINT \"{}\"", name.replace('"', "\"\""));
+                    self.attached_savepoint(&sql);
+                }
+                Statement::Release(name) => {
+                    let sql = format!("RELEASE \"{}\"", name.replace('"', "\"\""));
+                    self.attached_savepoint(&sql);
+                }
                 Statement::Commit | Statement::Rollback(_) => {
+                    // ATTACH: COMMIT applies the attached engines first
+                    // (main last — the anchor a caller observes);
+                    // ROLLBACK undoes them all.
+                    match stmt_ref {
+                        Statement::Commit => {
+                            if let Err(e) = self.attached_commit() {
+                                result = Err(e);
+                            }
+                        }
+                        Statement::Rollback(rb) if rb.savepoint.is_some() => {
+                            let sql = format!(
+                                "ROLLBACK TO \"{}\"",
+                                rb.savepoint
+                                    .as_deref()
+                                    .unwrap_or_default()
+                                    .replace('"', "\"\"")
+                            );
+                            self.attached_savepoint(&sql);
+                        }
+                        _ => self.attached_rollback(),
+                    }
                     *self.txn_maps_snap.write() = None;
                     self.txn_owner_tid.store(0, Ordering::Release);
                     // Committed-view entries: `clear_savepoints` (run by
@@ -7849,11 +7998,72 @@ impl Database {
             let _ = self.pager.flush();
         }
         let cached = self.get_or_cache_stmt(sql)?;
+        self.query_cached_stmt(sql, &cached, params)
+    }
+
+    /// [`Self::query_inner`]'s query machinery, starting from a prepared
+    /// `CachedStmt`. Shared with the ATTACH router (routed SELECTs run
+    /// on the attached engine through this path).
+    fn query_cached_stmt<P: Params>(
+        &self,
+        sql: &str,
+        cached: &Arc<CachedStmt>,
+        params: P,
+    ) -> Result<Vec<Row>> {
+        let (_, rows) = self.query_cached_stmt_with_cols(sql, cached, params)?;
+        Ok(rows)
+    }
+
+    /// [`Self::query_cached_stmt`] returning the output column names too
+    /// (the ATTACH router surfaces the attached engine's own names).
+    #[allow(clippy::only_used_in_recursion)]
+    fn query_cached_stmt_with_cols<P: Params>(
+        &self,
+        sql: &str,
+        cached: &Arc<CachedStmt>,
+        params: P,
+    ) -> Result<(Vec<String>, Vec<Row>)> {
+        // ------------------------------------------------------------------
+        // ATTACH ROUTING (query path): SELECT / EXPLAIN / read-PRAGMA /
+        // DML-RETURNING statements that reference an attached schema.
+        // ------------------------------------------------------------------
+        if cached.has_foreign {
+            let stmt = (*cached.stmt).clone();
+            let params_vec: Vec<Value> = params.into_iter().collect();
+            crate::attach::validate_schemas(self, &stmt)?;
+            crate::attach::check_stmt_rules(&stmt)?;
+            return match crate::attach::analyze_route(self, &stmt) {
+                crate::attach::Route::Local => {
+                    unreachable!("foreign stmt classified Local")
+                }
+                crate::attach::Route::Routed { schema_lc } => {
+                    let engine = self
+                        .attached_engine(&schema_lc)
+                        .expect("validate_schemas checked");
+                    let stripped = crate::attach::strip_schema_refs(&stmt, &schema_lc);
+                    let aux = engine.read();
+                    let cached_aux = aux.cache_stmt_from_ast(&stripped)?;
+                    let (cols, rows) = aux
+                        .query_cached_stmt_with_cols(sql, &cached_aux, params_vec.as_slice())
+                        .map_err(|e| crate::attach::qualify_routed_error(e, &schema_lc))?;
+                    let last_rowid = aux.last_insert_rowid();
+                    drop(aux);
+                    self.merge_routed_dml_counters(
+                        matches!(stmt, Statement::Insert(_)),
+                        last_rowid,
+                    );
+                    Ok((cols, rows))
+                }
+                crate::attach::Route::Mixed => {
+                    self.exec_foreign_select_with_cols(&stmt, &params_vec)
+                }
+            };
+        }
         // Read-form PRAGMAs surface their value as result rows (one for
         // single-value pragmas, N for table-valued ones like table_info).
         if let Statement::Pragma(p) = cached.stmt.as_ref() {
             if let Some(pr) = read_pragma(p, self) {
-                return Ok(pr.rows);
+                return Ok((pr.columns, pr.rows));
             }
         }
         // DML through the `&self` query path cannot run inside a BEGIN
@@ -7953,14 +8163,15 @@ impl Database {
         // statement and render rows — never executes it.
         if let Statement::Explain { inner, analyze } = cached.stmt.as_ref() {
             if *analyze {
-                let (_cols, rows) = self.explain_analyze_select(inner, params)?;
-                return Ok(rows);
+                let (cols, rows) = self.explain_analyze_select(inner, params)?;
+                return Ok((cols, rows));
             }
             let plan = self.explain_plan_for_statement(inner)?;
-            return Ok(match plan {
+            let rows = match plan {
                 Some(p) => crate::executor::explain::explain_plan_rows(&p),
                 None => Vec::new(),
-            });
+            };
+            return Ok((Vec::new(), rows));
         }
         // CONCURRENT OWNER: arm the page-shadow scope for this whole
         // query — a transaction must see its own writes. get_page then
@@ -7994,7 +8205,7 @@ impl Database {
                 let _plugin_guard = self.plugin_scope();
                 let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
                 let res = self.exec_select_with_ctes(&mut ctx, sel, &HashMap::new())?;
-                return Ok(res.rows);
+                return Ok((res.columns.to_vec(), res.rows));
             }
         }
         // Pre-compiled point-lookup fast path: skips the ExecContext /
@@ -8011,11 +8222,11 @@ impl Database {
             // it's already contiguous (arrays/Vec) — no per-query Vec.
             if let Some(slice) = params.as_slice() {
                 let rows = self.run_fast_path(fp, slice)?;
-                return Ok(rows);
+                return Ok((fp.output_columns().to_vec(), rows));
             }
             let params_v: Vec<Value> = params.into_iter().collect();
             let rows = self.run_fast_path(fp, &params_v)?;
-            return Ok(rows);
+            return Ok((fp.output_columns().to_vec(), rows));
         }
         if let Some(plan) = cached.plan.clone() {
             let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
@@ -8109,12 +8320,11 @@ impl Database {
                     bk.max_rowids.remove(&k);
                 }
             }
-            Ok(res.rows)
+            Ok((res.columns.to_vec(), res.rows))
         } else {
-            Ok(Vec::new())
+            Ok((Vec::new(), Vec::new()))
         }
     }
-
     /// Alias for `query()` — for use when callers want to emphasize that
     /// they're sharing a `&Database` reference across threads.
     pub fn query_shared<P: Params>(&self, sql: &str, params: P) -> Result<Vec<Row>> {
@@ -8147,6 +8357,107 @@ impl Database {
         crate::executor::change_counters::last()
     }
 
+    /// Output names for a SELECT, seeing through compound bodies (the
+    /// leftmost arm names the columns — SQLite's set-op rule).
+    fn select_output_names_fallback(sel: &SelectStatement) -> Option<Vec<String>> {
+        if let Some(names) = crate::planner::top_level_output_names(sel) {
+            return Some(names);
+        }
+        let mut body = &sel.body;
+        loop {
+            match body {
+                crate::sql::ast::SelectBody::Simple(s) => {
+                    // `SELECT *` over a single plain table: resolve the
+                    // table's column names locally (or on the owning
+                    // attached engine through the site's schema).
+                    let mut names = Vec::new();
+                    if s.columns.len() == 1
+                        && matches!(s.columns[0], crate::sql::ast::ResultColumn::Star)
+                    {
+                        if let Some(crate::sql::ast::TableExpression::Table {
+                            name, schema, ..
+                        }) = &s.from
+                        {
+                            let lc = name.to_ascii_lowercase();
+                            if lc == "sqlite_master" || lc == "sqlite_schema" {
+                                return Some(
+                                    ["type", "name", "tbl_name", "rootpage", "sql"]
+                                        .iter()
+                                        .map(|c| c.to_string())
+                                        .collect(),
+                                );
+                            }
+                            let _ = schema;
+                        }
+                    }
+                    for c in &s.columns {
+                        match c {
+                            crate::sql::ast::ResultColumn::Expr { expr, alias } => {
+                                names.push(match alias {
+                                    Some(a) => a.clone(),
+                                    None => match expr {
+                                        crate::sql::ast::Expr::Column { name, .. } => name.clone(),
+                                        _ => return None,
+                                    },
+                                });
+                            }
+                            _ => return None,
+                        }
+                    }
+                    return (!names.is_empty()).then_some(names);
+                }
+                crate::sql::ast::SelectBody::Binary { left, .. } => body = left,
+            }
+        }
+    }
+
+    /// `query_cached_stmt_with_cols` for external callers (the
+    /// prepared-statement ATTACH branch).
+    pub(crate) fn query_cached_stmt_with_cols_pub<P: Params>(
+        &self,
+        sql: &str,
+        cached: &Arc<CachedStmt>,
+        params: P,
+    ) -> Result<(Vec<String>, Vec<Row>)> {
+        self.query_cached_stmt_with_cols(sql, cached, params)
+    }
+
+    /// `query_cached_stmt` for external callers (the prepared-statement
+    /// ATTACH branch steps routed statements on the owning engine).
+    #[allow(dead_code)]
+    pub(crate) fn query_cached_stmt_pub<P: Params>(
+        &self,
+        sql: &str,
+        cached: &Arc<CachedStmt>,
+        params: P,
+    ) -> Result<Vec<Row>> {
+        self.query_cached_stmt(sql, cached, params)
+    }
+
+    /// Output column names for a routed/mixed statement rendered through
+    /// `query_with_columns`: projection names when statically derivable,
+    /// else positional `columnN` (SQLite's VALUES naming).
+    pub(crate) fn attach_output_columns(stmt: &Statement, rows: &[Row]) -> Vec<String> {
+        if let Statement::Select(sel) = stmt {
+            if let Some(names) = Self::select_output_names_fallback(sel) {
+                return names;
+            }
+        }
+        let n = rows.first().map(|r| r.len()).unwrap_or(0);
+        (0..n).map(|i| format!("column{}", i + 1)).collect()
+    }
+
+    /// `query_with_columns` on a stripped statement (the ATTACH router's
+    /// delegated read on an attached engine).
+    #[allow(dead_code)]
+    fn query_with_columns_pub<P: Params>(
+        &self,
+        sql: &str,
+        params: P,
+    ) -> Result<(Vec<String>, Vec<Row>)> {
+        self.query_with_columns(sql, params)
+    }
+
     /// Execute a query and return (column_names, rows).
     ///
     /// Takes `&self` — concurrent readers can call this simultaneously.
@@ -8155,6 +8466,12 @@ impl Database {
         sql: &str,
         params: P,
     ) -> Result<(Vec<String>, Vec<Row>)> {
+        let params_vec: Vec<Value> = params.into_iter().collect();
+        // Per-connection snapshot for `last_insert_rowid()` (the SQL
+        // function reads the thread-local; every statement entry must
+        // refresh it from THIS connection's atomic — a routed ATTACH
+        // statement may have updated it through another engine).
+        crate::executor::change_counters::note_conn_rowid(self.last_rowid.load(Ordering::Acquire));
         let _rbd = ReadBurstDrain {
             db: self,
             sql_len: sql.len(),
@@ -8165,6 +8482,35 @@ impl Database {
             let _ = self.pager.flush();
         }
         let cached = self.get_or_cache_stmt(sql)?;
+        // ATTACH routing (see query_cached_stmt): the statement runs on
+        // its owning engine or through the foreign channel.
+        if cached.has_foreign {
+            let stmt = (*cached.stmt).clone();
+            crate::attach::validate_schemas(self, &stmt)?;
+            crate::attach::check_stmt_rules(&stmt)?;
+            match crate::attach::analyze_route(self, &stmt) {
+                crate::attach::Route::Local => {}
+                crate::attach::Route::Routed { schema_lc } => {
+                    let engine = self
+                        .attached_engine(&schema_lc)
+                        .expect("validate_schemas checked");
+                    let stripped = crate::attach::strip_schema_refs(&stmt, &schema_lc);
+                    let (cols, rows) = {
+                        let aux = engine.read();
+                        let cached_aux = aux
+                            .cache_stmt_from_ast(&stripped)
+                            .map_err(|e| crate::attach::qualify_routed_error(e, &schema_lc))?;
+                        aux.query_cached_stmt_with_cols(sql, &cached_aux, params_vec.as_slice())
+                            .map_err(|e| crate::attach::qualify_routed_error(e, &schema_lc))?
+                    };
+                    return Ok((cols, rows));
+                }
+                crate::attach::Route::Mixed => {
+                    let (cols, rows) = self.exec_foreign_select_with_cols(&stmt, &params_vec)?;
+                    return Ok((cols, rows));
+                }
+            }
+        }
         if let Statement::Pragma(p) = cached.stmt.as_ref() {
             if let Some(pr) = read_pragma(p, self) {
                 return Ok((pr.columns, pr.rows));
@@ -8230,7 +8576,7 @@ impl Database {
         };
         if let Statement::Explain { inner, analyze } = cached.stmt.as_ref() {
             if *analyze {
-                return self.explain_analyze_select(inner, params);
+                return self.explain_analyze_select(inner, params_vec.as_slice());
             }
             let plan = self.explain_plan_for_statement(inner)?;
             let rows = match plan {
@@ -8263,7 +8609,7 @@ impl Database {
                 ctx.in_transaction = in_txn;
                 ctx.deferred_flush = self.deferred_flush.load(Ordering::Acquire);
                 ctx.txn_snapshot = txn_snap;
-                for v in params.into_iter() {
+                for v in params_vec.iter().cloned() {
                     ctx.bind_positional(v);
                 }
                 let _plugin_guard = self.plugin_scope();
@@ -8277,15 +8623,7 @@ impl Database {
             // under committed-view reads too: run_fast_path resolves
             // BEGIN-time roots under an armed scope.
             if let Some(fp) = &cached.fast_path {
-                let owned;
-                let slice: &[Value] = match params.as_slice() {
-                    Some(s) => s,
-                    None => {
-                        owned = params.into_iter().collect::<Vec<Value>>();
-                        &owned
-                    }
-                };
-                let rows = self.run_fast_path(fp, slice)?;
+                let rows = self.run_fast_path(fp, params_vec.as_slice())?;
                 return Ok((fp.output_columns().to_vec(), rows));
             }
             let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
@@ -8298,7 +8636,7 @@ impl Database {
             ctx.in_transaction = in_txn;
             ctx.deferred_flush = self.deferred_flush.load(Ordering::Acquire);
             ctx.txn_snapshot = txn_snap;
-            for v in params.into_iter() {
+            for v in params_vec.iter().cloned() {
                 ctx.bind_positional(v);
             }
             // Correlated-subquery bridge (see execute): must span the
@@ -10141,6 +10479,506 @@ impl Database {
         res.map(|_| ())
     }
 
+    // ------------------------------------------------------------------
+    // ATTACH: helpers, preparation, mixed-schema execution
+    // (routing lives in the execute/query intercepts; the registry and
+    // the walkers in `src/attach.rs`)
+    // ------------------------------------------------------------------
+
+    /// Resolve ATTACH's filename expression (SQLite evaluates it at run
+    /// time): a string literal or a bound parameter.
+    fn resolve_attach_filename(e: &Expr, params: Option<&[Value]>) -> Result<String> {
+        match e {
+            Expr::Literal(Value::Text(t)) => Ok(t.to_string()),
+            Expr::Parameter(p) => {
+                let idx: usize = p
+                    .parse()
+                    .map_err(|_| Error::semantic("invalid parameter in ATTACH filename"))?;
+                match params.and_then(|ps| ps.get(idx)) {
+                    Some(Value::Text(t)) => Ok(t.to_string()),
+                    Some(_) => Err(Error::semantic("ATTACH filename must be text")),
+                    None => Ok(String::new()),
+                }
+            }
+            _ => Err(Error::Unsupported(
+                "ATTACH requires a constant filename (a string literal or a bound parameter)",
+            )),
+        }
+    }
+
+    /// Prepare a parsed AST on this engine (the ATTACH router's stripped
+    /// statements): the same pipeline as the cache-disabled branch of
+    /// [`Self::get_or_cache_stmt`] — namecheck, view-target resolution,
+    /// plan, precomputed flags. Never touches the statement cache.
+    pub(crate) fn cache_stmt_from_ast(&self, stmt: &Statement) -> Result<Arc<CachedStmt>> {
+        let _plugin_guard = self.plugin_scope();
+        let _conn_enc_guard = crate::executor::ConnEncGuard::install(self.conn_text_enc());
+        self.namecheck(stmt)?;
+        let view_target = dml_view_target(stmt, &self.catalog);
+        if view_target.is_some() {
+            return Ok(Arc::new(CachedStmt {
+                stmt: Arc::new(stmt.clone()),
+                plan: None,
+                has_subqueries: false,
+                has_foreign: false,
+                fast_path: None,
+                view_target,
+            }));
+        }
+        let plan_opt = Self::plan_for_statement(&self.catalog, stmt)?;
+        let plan_arc = plan_opt.map(Arc::new);
+        let has_subq = plan_arc
+            .as_ref()
+            .map(|p| crate::executor::plan_has_subqueries(p))
+            .unwrap_or(false);
+        let fast_path = plan_arc
+            .as_ref()
+            .and_then(|p| Self::detect_fast_path(p))
+            .map(Arc::new);
+        Ok(Arc::new(CachedStmt {
+            stmt: Arc::new(stmt.clone()),
+            plan: plan_arc,
+            has_subqueries: has_subq,
+            has_foreign: false,
+            fast_path,
+            view_target: None,
+        }))
+    }
+
+    /// Merge a routed DML's connection-visible effects. changes() /
+    /// total_changes() are thread-wide (the attached engine's machinery
+    /// records them through the same thread-locals); last_insert_rowid()
+    /// is per-CONNECTION and must travel to the parent after a routed
+    /// INSERT (SQLite's value spans every attached database).
+    fn merge_routed_dml_counters(&self, was_insert: bool, last_rowid: i64) {
+        if was_insert && last_rowid != 0 {
+            self.last_rowid.store(last_rowid, Ordering::Release);
+        }
+    }
+
+    /// Execute a statement that mixes schemas on the EXECUTE path (no
+    /// result rows): cross-schema INSERT (synthesized VALUES insert on
+    /// the target engine), local-target DML reading attached tables (the
+    /// foreign channel), and cross-schema CREATE TABLE ... AS SELECT.
+    fn execute_mixed(
+        &mut self,
+        stmt: &Statement,
+        sql: &str,
+        params: &[Value],
+        target_schema: Option<String>,
+    ) -> Result<()> {
+        let target_foreign = crate::attach::is_foreign_schema(&target_schema);
+        match stmt {
+            // INSERT INTO aux.x SELECT ... FROM main.t (the target may
+            // also be an unqualified name that binds to aux)
+            Statement::Insert(ins) if target_foreign => {
+                let (syn, flat) = crate::attach::synthesize_cross_insert(self, ins, params)?;
+                let schema = target_schema.clone().expect("foreign checked");
+                let engine = self.attached_engine(&schema).expect("validated");
+                let rowid = {
+                    let mut aux = engine.write();
+                    let cached_aux = aux.cache_stmt_from_ast(&syn)?;
+                    aux.execute_cached_stmt(sql, cached_aux, flat.as_slice())?;
+                    aux.last_insert_rowid()
+                };
+                self.merge_routed_dml_counters(true, rowid);
+                Ok(())
+            }
+            // Cross-schema UPDATE/DELETE with a routed target: matched
+            // rows would have to stream between engines — rejected with
+            // a clear message (a documented divergence; route the source
+            // through INSERT instead).
+            Statement::Update(_) | Statement::Delete(_) if target_foreign => {
+                Err(Error::Unsupported(
+                    "cross-database UPDATE/DELETE with tables from another database is not \
+                     supported (target and source must share one database)",
+                ))
+            }
+            // Local target reading attached tables.
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
+                self.execute_dml_with_foreign(stmt, sql, params)
+            }
+            // SELECT through the execute path (sqlite3_exec semantics:
+            // rows are produced and discarded).
+            Statement::Select(_) => {
+                let _ = self.exec_foreign_select(stmt, params)?;
+                Ok(())
+            }
+            // CREATE TABLE aux.x AS SELECT ... FROM main.t
+            Statement::Create(crate::sql::ast::CreateStatement::Table {
+                name,
+                as_select: Some(sel),
+                ..
+            }) if crate::attach::is_foreign_schema(&name.schema) => {
+                self.execute_cross_ctas(name, sel, sql, params)
+            }
+            _ => Err(Error::Unsupported(
+                "this cross-database statement form is not supported",
+            )),
+        }
+    }
+
+    /// Execute a statement that mixes schemas on the QUERY path (result
+    /// rows): mixed SELECT (the foreign channel) and mixed EXPLAIN.
+    pub(crate) fn query_mixed(&self, stmt: &Statement, params: &[Value]) -> Result<Vec<Row>> {
+        match stmt {
+            Statement::Select(_)
+            | Statement::Insert(_)
+            | Statement::Update(_)
+            | Statement::Delete(_) => self.exec_foreign_select(stmt, params),
+            Statement::Explain { inner, analyze } => {
+                if *analyze {
+                    // EXPLAIN ANALYZE executes the inner statement.
+                    let (cols, rows) = self.explain_analyze_foreign(inner, params)?;
+                    let _ = cols;
+                    return Ok(rows);
+                }
+                let plan = self.foreign_plan_for(inner, params)?;
+                Ok(match plan {
+                    Some(p) => crate::executor::explain::explain_plan_rows(&p),
+                    None => Vec::new(),
+                })
+            }
+            _ => Err(Error::Unsupported(
+                "this cross-database statement form is not supported",
+            )),
+        }
+    }
+
+    /// Plan a statement with the foreign channel armed (mixed shapes).
+    /// Mirrors [`Self::plan_for_statement`] but materializes the
+    /// attached tables first and seeds the planner with them (plus any
+    /// CTEs).
+    fn foreign_plan_for(
+        &self,
+        stmt: &Statement,
+        params: &[Value],
+    ) -> Result<Option<crate::planner::plan::Plan>> {
+        let _ = params;
+        let foreign = crate::attach::materialize_foreign(self, stmt)?;
+        let mut planner = Planner::new(&self.catalog);
+        planner.set_foreign(crate::attach::materialize_foreign(self, stmt)?);
+        match stmt {
+            Statement::Select(s) => Ok(Some(planner.plan_select(s)?)),
+            Statement::Insert(_) => {
+                // plan_insert plans the source without channel scope —
+                // re-plan the source here (the exec_dml_with_ctes
+                // pattern) when it is a SELECT.
+                let ins = match stmt {
+                    Statement::Insert(i) => i,
+                    _ => unreachable!(),
+                };
+                match &ins.source {
+                    crate::sql::ast::InsertSource::Select(src) => {
+                        let source_plan = planner.plan_select(src)?;
+                        let table = self.catalog.get_table(&ins.table).ok_or_else(|| {
+                            Error::NotFound(format!("no such table: {}", ins.table))
+                        })?;
+                        let columns = Self::insert_columns(&table, ins.columns.as_ref())?;
+                        Ok(Some(crate::planner::plan::Plan::Insert {
+                            table,
+                            source: Box::new(source_plan),
+                            columns,
+                            on_conflict: ins.or.unwrap_or(ConflictResolution::Abort),
+                            upsert: ins.upsert.clone(),
+                            returning: ins.returning.clone(),
+                        }))
+                    }
+                    _ => Self::plan_insert(&self.catalog, stmt).map(Some),
+                }
+            }
+            Statement::Update(_) => {
+                Self::plan_update_channel(&self.catalog, stmt, &HashMap::new(), Some(foreign))
+                    .map(Some)
+            }
+            Statement::Delete(_) => {
+                Self::plan_delete_channel(&self.catalog, stmt, &HashMap::new(), Some(foreign))
+                    .map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Execute a mixed SELECT (or DML-RETURNING through the query path)
+    /// through the foreign channel: materialize, plan, execute.
+    pub(crate) fn exec_foreign_select(
+        &self,
+        stmt: &Statement,
+        params: &[Value],
+    ) -> Result<Vec<Row>> {
+        let (_, rows) = self.exec_foreign_select_with_cols(stmt, params)?;
+        Ok(rows)
+    }
+
+    /// [`Self::exec_foreign_select`] exposing the executor's own output
+    /// column names (SQLite's expression-text naming for bare
+    /// projections — the same names a local query produces).
+    pub(crate) fn exec_foreign_select_with_cols(
+        &self,
+        stmt: &Statement,
+        params: &[Value],
+    ) -> Result<(Vec<String>, Vec<Row>)> {
+        // SELECT / DML through the &self machinery: build the reader ctx
+        // (the exec_select_with_ctes pattern), plan with the channel,
+        // execute, merge any DML bookkeeping back.
+        let in_txn = self.in_transaction.load(Ordering::Acquire);
+        let txn_snap = self.txn_snapshot_for_ctx();
+        let shared = self.read_maps();
+        let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
+        let mut ctx = ExecContext::new_reader(&self.pager, catalog_ptr, shared);
+        ctx.in_transaction = in_txn;
+        ctx.deferred_flush = self.deferred_flush.load(Ordering::Acquire);
+        ctx.txn_snapshot = txn_snap;
+        for v in params.iter().cloned() {
+            ctx.bind_positional(v);
+        }
+        let _plugin_guard = self.plugin_scope();
+        let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
+        // WITH-clause SELECTs inside the mixed statement: materialize
+        // their CTEs too (layered with the foreign channel).
+        if let Statement::Select(sel) = stmt {
+            if sel.with.is_some() {
+                let res = self.exec_select_with_foreign(&mut ctx, sel, params)?;
+                return Ok((res.columns.to_vec(), res.rows));
+            }
+        }
+        let mut plan = match self.foreign_plan_for(stmt, params)? {
+            Some(p) => p,
+            None => return Ok((Vec::new(), Vec::new())),
+        };
+        // The channel must survive into SUBQUERY evaluation (WHERE ...
+        // IN (SELECT .. FROM aux.t) evaluates its subquery at RUNTIME —
+        // the ctx channel serves the nested planner exactly like the
+        // CTE map). Armed for the rewrite AND the execute, cleared after.
+        let foreign_channel = crate::attach::materialize_foreign(self, stmt)?;
+        let had_channel = ctx.foreign.is_some();
+        if !had_channel {
+            ctx.foreign = Some(foreign_channel);
+        }
+        if crate::executor::plan_has_subqueries(&plan) {
+            plan = crate::executor::rewrite_plan_subqueries(&plan, &mut ctx)?;
+        }
+        let res = crate::executor::execute(&plan, &mut ctx)?;
+        if !had_channel {
+            ctx.foreign = None;
+        }
+        // DML-RETURNING through this path: merge bookkeeping (the
+        // query-path DML pattern).
+        if matches!(
+            plan,
+            crate::planner::plan::Plan::Insert { .. }
+                | crate::planner::plan::Plan::Update { .. }
+                | crate::planner::plan::Plan::Delete { .. }
+        ) {
+            crate::executor::change_counters::record(ctx.changes);
+            self.pager.note_rows_modified(ctx.changes);
+            if ctx.changes > 0 && !ctx.in_transaction {
+                self.pager.note_tx_autocommit();
+            }
+            self.write_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            if ctx.roots_changed || ctx.max_rowids_changed || ctx.index_roots_changed {
+                let mut m = self.maps.write();
+                let shared_mut = Arc::make_mut(&mut m);
+                shared_mut.roots.extend(ctx.root_overrides.drain());
+                shared_mut.max_rowids.extend(ctx.max_rowids.drain());
+            }
+        }
+        Ok((res.columns.to_vec(), res.rows))
+    }
+
+    /// `exec_select_with_ctes` + the foreign channel: a mixed SELECT
+    /// that also carries a WITH clause.
+    fn exec_select_with_foreign(
+        &self,
+        ctx: &mut ExecContext<'_>,
+        select: &SelectStatement,
+        params: &[Value],
+    ) -> Result<crate::executor::ExecResult> {
+        let _ = params;
+        let cte_map = if let Some(with) = &select.with {
+            self.materialize_ctes(with, &HashMap::new(), ctx)?
+        } else {
+            HashMap::new()
+        };
+        let foreign = crate::attach::materialize_foreign(self, &Statement::Select(select.clone()))?;
+        let mut planner = Planner::new(&self.catalog);
+        planner.set_ctes(cte_map.clone());
+        planner.set_foreign(foreign.clone());
+        let plan = planner.plan_select(select)?;
+        let mut plan = plan;
+        ctx.ctes = Some(cte_map);
+        ctx.foreign = Some(foreign);
+        if crate::executor::plan_has_subqueries(&plan) {
+            plan = crate::executor::rewrite_plan_subqueries(&plan, ctx)?;
+        }
+        let res = crate::executor::execute(&plan, ctx);
+        ctx.ctes = None;
+        ctx.foreign = None;
+        res
+    }
+
+    /// Mixed CREATE TABLE aux.x AS SELECT ... FROM main.t: evaluate the
+    /// SELECT locally (foreign channel for third schemas), CREATE the
+    /// table on the attached engine with the result's column names and
+    /// SQLite's CTAS affinity inference, then insert the rows through a
+    /// parameterized VALUES statement.
+    fn execute_cross_ctas(
+        &mut self,
+        name: &crate::sql::ast::TableName,
+        sel: &SelectStatement,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<()> {
+        let rows = self.exec_foreign_select(&Statement::Select(sel.clone()), params)?;
+        let Some(first) = rows.first() else {
+            // Empty source: the table is created with one ANY-affinity
+            // column per projection (SQLite creates an empty table with
+            // the select's column names; with no rows the names come
+            // from the projection aliases).
+            let cols = crate::planner::top_level_output_names(sel)
+                .unwrap_or_else(|| vec!["col0".to_string(); 1]);
+            let create = crate::sql::ast::CreateStatement::Table {
+                if_not_exists: false,
+                name: crate::sql::ast::TableName::new(name.name.clone()),
+                columns: cols
+                    .into_iter()
+                    .map(|c| crate::sql::ast::ColumnDef {
+                        name: c,
+                        type_name: String::new(),
+                        constraints: Vec::new(),
+                    })
+                    .collect(),
+                constraints: Vec::new(),
+                without_rowid: false,
+                strict: false,
+                temp: false,
+                as_select: None,
+            };
+            let engine = self
+                .attached_engine(name.schema.as_deref().expect("foreign checked"))
+                .expect("validated");
+            let mut aux = engine.write();
+            let cached = aux.cache_stmt_from_ast(&Statement::Create(create))?;
+            return aux.execute_cached_stmt(sql, cached, [].as_slice());
+        };
+        // Column names: projection names; affinity: inferred from the
+        // first row's values (SQLite's CTAS affinity rule).
+        let names = crate::planner::top_level_output_names(sel)
+            .unwrap_or_else(|| (0..first.len()).map(|i| format!("col{}", i)).collect());
+        let mut columns = Vec::with_capacity(first.len());
+        for (i, n) in names.iter().enumerate().take(first.len()) {
+            let aff = match first.get(i) {
+                Some(Value::Integer(_)) => "INTEGER",
+                Some(Value::Real(_)) => "REAL",
+                Some(Value::Text(_)) => "TEXT",
+                Some(Value::Blob(_)) => "BLOB",
+                _ => "",
+            };
+            columns.push(crate::sql::ast::ColumnDef {
+                name: n.clone(),
+                type_name: aff.to_string(),
+                constraints: Vec::new(),
+            });
+        }
+        let create = crate::sql::ast::CreateStatement::Table {
+            if_not_exists: false,
+            name: crate::sql::ast::TableName::new(name.name.clone()),
+            columns,
+            constraints: Vec::new(),
+            without_rowid: false,
+            strict: false,
+            temp: false,
+            as_select: None,
+        };
+        // Parameterized VALUES insert for the rows.
+        let mut arms: Vec<Vec<Expr>> = Vec::with_capacity(rows.len());
+        let mut flat: Vec<Value> = Vec::with_capacity(rows.len() * first.len());
+        let mut n = 0usize;
+        for row in &rows {
+            let mut arm = Vec::with_capacity(row.len());
+            for _ in row {
+                arm.push(Expr::Parameter(n.to_string()));
+                n += 1;
+            }
+            flat.extend(row.iter().cloned());
+            arms.push(arm);
+        }
+        let insert = Statement::Insert(crate::sql::ast::InsertStatement {
+            or: None,
+            schema: None,
+            table: name.name.clone(),
+            alias: None,
+            columns: None,
+            source: crate::sql::ast::InsertSource::Values(arms),
+            upsert: None,
+            returning: None,
+            with: None,
+        });
+        let engine = self
+            .attached_engine(name.schema.as_deref().expect("foreign checked"))
+            .expect("validated");
+        let mut aux = engine.write();
+        let cached_create = aux.cache_stmt_from_ast(&Statement::Create(create))?;
+        aux.execute_cached_stmt(sql, cached_create, [].as_slice())?;
+        let cached_ins = aux.cache_stmt_from_ast(&insert)?;
+        let r = aux.execute_cached_stmt(sql, cached_ins, flat.as_slice());
+        let rowid = aux.last_insert_rowid();
+        drop(aux);
+        self.merge_routed_dml_counters(true, rowid);
+        r
+    }
+
+    /// Mixed DML on a LOCAL target reading attached tables (the execute
+    /// path): the CTE-DML machinery pattern with the foreign channel.
+    fn execute_dml_with_foreign(
+        &mut self,
+        stmt: &Statement,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<()> {
+        let _ = sql;
+        let rows = self.exec_foreign_select(stmt, params)?;
+        let _ = rows;
+        // exec_foreign_select ran the DML through the reader ctx with the
+        // channel armed; RETURNING rows (if any) are discarded on the
+        // execute path, matching the CTE-DML contract.
+        Ok(())
+    }
+
+    /// EXPLAIN ANALYZE over a mixed statement.
+    fn explain_analyze_foreign(
+        &self,
+        inner: &Statement,
+        params: &[Value],
+    ) -> Result<(Vec<String>, Vec<Row>)> {
+        // Analyze executes the statement with instrumentation; the
+        // foreign channel plans it, then the standard explain machinery
+        // renders. For DML/SELECT shapes the analyze path re-executes;
+        // keep it simple: run the plan, count rows.
+        let plan = self.foreign_plan_for(inner, params)?;
+        let mut out = Vec::new();
+        if let Some(p) = plan {
+            let in_txn = self.in_transaction.load(Ordering::Acquire);
+            let txn_snap = self.txn_snapshot_for_ctx();
+            let shared = self.read_maps();
+            let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
+            let mut ctx = ExecContext::new_reader(&self.pager, catalog_ptr, shared);
+            ctx.in_transaction = in_txn;
+            ctx.txn_snapshot = txn_snap;
+            for v in params.iter().cloned() {
+                ctx.bind_positional(v);
+            }
+            let _guard = self.plugin_scope();
+            let res = crate::executor::execute(&p, &mut ctx)?;
+            out.push(vec![
+                Value::Text("rows".into()),
+                Value::Integer(res.rows.len() as i64),
+            ]);
+        }
+        Ok((vec!["metric".into(), "value".into()], out))
+    }
+
     /// Execute DML targeting a VIEW via INSTEAD OF triggers (SQLite).
     /// Each affected view row fires the view's INSTEAD OF triggers with
     /// NEW/OLD bound to the view row; the trigger bodies perform the
@@ -11301,6 +12139,18 @@ impl Database {
         stmt: &Statement,
         ctes: &HashMap<String, crate::types::CteMaterialization>,
     ) -> Result<crate::planner::plan::Plan> {
+        Self::plan_update_channel(catalog, stmt, ctes, None)
+    }
+
+    /// [`Self::plan_update_cte`] with the attached-database channel:
+    /// `UPDATE ... FROM aux.t` plans the FROM side over materialized
+    /// foreign rows.
+    fn plan_update_channel(
+        catalog: &Catalog,
+        stmt: &Statement,
+        ctes: &HashMap<String, crate::types::CteMaterialization>,
+        foreign: Option<crate::attach::ForeignTables>,
+    ) -> Result<crate::planner::plan::Plan> {
         let upd = match stmt {
             Statement::Update(u) => u,
             _ => unreachable!(),
@@ -11324,6 +12174,9 @@ impl Database {
             .map(|te| {
                 let mut planner = crate::planner::Planner::new(catalog);
                 planner.set_ctes(ctes.clone());
+                if let Some(f) = &foreign {
+                    planner.set_foreign(Self::clone_foreign(f));
+                }
                 let plan = planner.plan_table_expression_pub(te)?;
                 Ok::<_, Error>(Box::new(crate::planner::plan::UpdateFrom {
                     plan,
@@ -11415,6 +12268,27 @@ impl Database {
     }
 
     /// DELETE planner with a pre-materialized CTE map (WITH-DML path).
+    /// Deep-ish clone of the foreign channel for a nested planner (the
+    /// materializations are Arc'd — rows and column lists are shared).
+    fn clone_foreign(f: &crate::attach::ForeignTables) -> crate::attach::ForeignTables {
+        let mut out = crate::attach::ForeignTables::default();
+        for (k, v) in f.qualified.iter() {
+            out.qualified.insert(k.clone(), v.clone());
+        }
+        out.order = f.order.clone();
+        out
+    }
+
+    fn plan_delete_channel(
+        catalog: &Catalog,
+        stmt: &Statement,
+        ctes: &HashMap<String, crate::types::CteMaterialization>,
+        foreign: Option<crate::attach::ForeignTables>,
+    ) -> Result<crate::planner::plan::Plan> {
+        let _ = foreign;
+        Self::plan_delete_cte(catalog, stmt, ctes)
+    }
+
     fn plan_delete_cte(
         catalog: &Catalog,
         stmt: &Statement,
@@ -11981,7 +12855,9 @@ impl Database {
             }
             Statement::Pragma(p) => Self::execute_pragma(p.clone(), ctx, foreign),
             Statement::Alter(a) => Self::execute_alter(a.clone(), ctx, catalog),
-            Statement::Analyze { target } => Self::execute_analyze(target.clone(), ctx, catalog),
+            Statement::Analyze { target, .. } => {
+                Self::execute_analyze(target.clone(), ctx, catalog)
+            }
             Statement::Attach(_) | Statement::Detach(_) => Ok(()),
             Statement::Vacuum(_) => Ok(()),
             Statement::Reindex { .. } => Ok(()),
@@ -12495,6 +13371,7 @@ impl Database {
                 unique,
                 if_not_exists,
                 temp,
+                schema: _,
                 name,
                 table: table_name,
                 columns,
@@ -12933,6 +13810,7 @@ impl Database {
                         let drop_shadow = crate::sql::ast::DropStatement {
                             kind: crate::sql::ast::DropKind::Table,
                             name: s.clone(),
+                            schema: None,
                             if_exists: true,
                         };
                         let _ = Self::execute_drop(drop_shadow, ctx, catalog);
@@ -14703,19 +15581,46 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
             });
         }
         "database_list" => {
-            // SQLite always reports `main` (the file path, empty for
-            // in-memory) and `temp`.
+            // SQLite reports `main` (the file path, empty for in-memory),
+            // `temp` (only once something materializes the temp schema —
+            // lazy), then every ATTACHED database in ATTACH order (seq
+            // starting at 2).
             let file = db
                 .pager
                 .db_path()
                 .map(|p| Value::Text(p.into()))
                 .unwrap_or(Value::Text("".into()));
-            // `temp` appears in SQLite only once something materializes
-            // the temp schema (lazy) — a fresh connection reports main
-            // alone, and the engine has no temp database at all.
+            let mut rows = vec![vec![Value::Integer(0), Value::Text("main".into()), file]];
+            let has_temp = db
+                .catalog
+                .all_tables()
+                .iter()
+                .any(|(n, _)| db.catalog.is_temp(n));
+            if has_temp {
+                rows.push(vec![
+                    Value::Integer(1),
+                    Value::Text("temp".into()),
+                    Value::Text("".into()),
+                ]);
+            }
+            let attached = db.attached_snapshot();
+            for (seq, (name, engine)) in (2_i64..).zip(attached.iter()) {
+                let aux_file = {
+                    let aux = engine.read();
+                    aux.pager
+                        .db_path()
+                        .map(|p| Value::Text(p.into()))
+                        .unwrap_or(Value::Text("".into()))
+                };
+                rows.push(vec![
+                    Value::Integer(seq),
+                    Value::Text(name.as_str().into()),
+                    aux_file,
+                ]);
+            }
             return Some(PragmaRows {
                 columns: vec!["seq".into(), "name".into(), "file".into()],
-                rows: vec![vec![Value::Integer(0), Value::Text("main".into()), file]],
+                rows,
             });
         }
         "pragma_list" => {

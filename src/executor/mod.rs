@@ -1028,6 +1028,11 @@ pub struct ExecContext<'a> {
     /// the 99% case of purely positional `?` placeholders.
     pub named_params: HashMap<String, Value>,
     pub last_insert_rowid: i64,
+    /// Materialized ATTACHED-database tables for MIXED-schema
+    /// statements (see `src/attach.rs`): subquery planning inside the
+    /// statement resolves `aux.t` refs and unqualified fallbacks through
+    /// this channel, exactly like the top-level planner.
+    pub(crate) foreign: Option<crate::attach::ForeignTables>,
     pub changes: i64,
     /// When true (inside BEGIN..COMMIT), DML operators skip per-statement flushes.
     pub in_transaction: bool,
@@ -1166,6 +1171,7 @@ impl<'a> ExecContext<'a> {
             params: Vec::new(),
             named_params: HashMap::new(),
             last_insert_rowid: 0,
+            foreign: None,
             changes: 0,
             in_transaction: false,
             rolled_back: false,
@@ -1212,6 +1218,7 @@ impl<'a> ExecContext<'a> {
             params: Vec::new(),
             named_params: HashMap::new(),
             last_insert_rowid: 0,
+            foreign: None,
             changes: 0,
             in_transaction: false,
             rolled_back: false,
@@ -4150,6 +4157,9 @@ fn exec_select_statement(
         if let Some(ctes) = ctx.ctes.clone() {
             planner.set_ctes(ctes);
         }
+        if let Some(f) = ctx.foreign.clone() {
+            planner.set_foreign(f);
+        }
         let plan = if limit_one {
             let mut cloned = sel.clone();
             clamp_select_limit_to_one(&mut cloned);
@@ -4184,6 +4194,9 @@ fn exec_select_statement(
             let mut planner = crate::planner::Planner::new(catalog);
             if let Some(ctes) = ctx.ctes.clone() {
                 planner.set_ctes(ctes);
+            }
+            if let Some(f) = ctx.foreign.clone() {
+                planner.set_foreign(f);
             }
             // The binding slots start past the CURRENT parameter tail —
             // the statement's own positional arity PLUS any ancestor
@@ -5653,6 +5666,13 @@ fn resolve_column_index<T: AsRef<str>>(
 /// SQLite-style output-column naming (alias or expression text), shared
 /// with the C ABI compatibility layer for `sqlite3_column_name` at
 /// PREPARE time (before the first step materializes the result).
+///
+/// Naming rules verified against SQLite 3.53: a top-level bare column
+/// reference renders UNQUALIFIED (`SELECT t.v` names the column `v`),
+/// while column references INSIDE compound expressions keep their
+/// qualifier (`t.v*10`); SQLite echoes the expression's original source
+/// text — this renderer produces the canonical single-space spelling,
+/// which matches for SQL written in that style.
 pub fn expr_display_name(e: &Expr) -> String {
     match e {
         Expr::Column { table: _, name } => {
@@ -5675,31 +5695,367 @@ pub fn expr_display_name(e: &Expr) -> String {
                 name.clone()
             }
         }
-        Expr::Literal(v) => format!("{}", v),
+        _ => render_expr_canonical(e, false),
+    }
+}
+
+/// Canonical single-space SQL rendering of an expression (column-header
+/// naming; SQLite echoes the original text — this is the closest
+/// reproduction an AST allows).
+fn render_expr_canonical(e: &Expr, _nested: bool) -> String {
+    match e {
+        Expr::Column { table, name } => {
+            if name.starts_with("__agg_") || crate::planner::is_hidden_rowid(name) {
+                return expr_display_name(e);
+            }
+            match table {
+                Some(t) => format!("{}.{}", t, name),
+                None => name.clone(),
+            }
+        }
+        Expr::Literal(v) => render_literal_canonical(v),
+        Expr::Parameter(p) => {
+            if p.parse::<usize>().is_ok() {
+                "?".to_string()
+            } else {
+                p.clone()
+            }
+        }
+        Expr::Unary { op, expr } => format!(
+            "{}{}",
+            render_unary_op(op),
+            render_expr_canonical(expr, true)
+        ),
+        Expr::Binary { op, left, right } => format!(
+            "{} {} {}",
+            render_expr_canonical(left, true),
+            render_binary_op(op),
+            render_expr_canonical(right, true)
+        ),
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => format!(
+            "{} {}BETWEEN {} AND {}",
+            render_expr_canonical(expr, true),
+            if *negated { "NOT " } else { "" },
+            render_expr_canonical(low, true),
+            render_expr_canonical(high, true)
+        ),
+        Expr::In {
+            expr,
+            source,
+            negated,
+        } => {
+            let src = match source {
+                crate::sql::ast::InSource::List(list) => list
+                    .iter()
+                    .map(|x| render_expr_canonical(x, false))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                crate::sql::ast::InSource::Subquery(s) => render_select_canonical(s),
+                crate::sql::ast::InSource::Table(t) => t.clone(),
+            };
+            format!(
+                "{} {}IN ({})",
+                render_expr_canonical(expr, true),
+                if *negated { "NOT " } else { "" },
+                src
+            )
+        }
+        Expr::Like {
+            op,
+            expr,
+            pattern,
+            escape,
+            negated,
+        } => {
+            let mut out = format!(
+                "{} {} {} {}",
+                render_expr_canonical(expr, true),
+                if *negated { "NOT" } else { "" },
+                render_like_op(op),
+                render_expr_canonical(pattern, true)
+            );
+            if out.contains("  ") {
+                out = out.replace(" NOT  ", " NOT ").replace("  ", " ");
+            }
+            if let Some(esc) = escape {
+                out = format!("{} ESCAPE {}", out, render_expr_canonical(esc, true));
+            }
+            out
+        }
+        Expr::IsNull { expr, negated } => format!(
+            "{} IS {}NULL",
+            render_expr_canonical(expr, true),
+            if *negated { "NOT " } else { "" }
+        ),
+        Expr::Is {
+            left,
+            right,
+            negated,
+        } => format!(
+            "{} IS {}{}",
+            render_expr_canonical(left, true),
+            if *negated { "NOT " } else { "" },
+            render_expr_canonical(right, true)
+        ),
         Expr::Function {
             name,
             distinct,
             args,
-            ..
+            filter,
+            over,
         } => {
             let rendered: Vec<String> = args
                 .iter()
                 .map(|a| match a {
                     Expr::Column { name, .. } if name == "*" => "*".to_string(),
-                    Expr::Column { name, .. } => name.clone(),
-                    Expr::Literal(v) => format!("{}", v),
-                    _ => "?".to_string(),
+                    _ => render_expr_canonical(a, false),
                 })
                 .collect();
-            if rendered.is_empty() {
+            let mut out = if rendered.is_empty() {
                 format!("{}()", name)
             } else if *distinct {
                 format!("{}(DISTINCT {})", name, rendered.join(", "))
             } else {
                 format!("{}({})", name, rendered.join(", "))
+            };
+            if let Some(f) = filter {
+                out = format!("{} FILTER (WHERE {})", out, render_expr_canonical(f, false));
+            }
+            if let Some(spec) = over {
+                match spec.as_ref() {
+                    crate::sql::ast::WindowSpec::Named(w) => {
+                        out = format!("{} OVER {}", out, w);
+                    }
+                    crate::sql::ast::WindowSpec::Inline(def) => {
+                        let mut parts = Vec::new();
+                        if !def.partition_by.is_empty() {
+                            parts.push(format!(
+                                "PARTITION BY {}",
+                                def.partition_by
+                                    .iter()
+                                    .map(|x| render_expr_canonical(x, false))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ));
+                        }
+                        if !def.order_by.is_empty() {
+                            parts.push(format!(
+                                "ORDER BY {}",
+                                def.order_by
+                                    .iter()
+                                    .map(|ot| format!(
+                                        "{}{}",
+                                        render_expr_canonical(&ot.expr, false),
+                                        if ot.order == crate::sql::ast::Order::Desc {
+                                            " DESC"
+                                        } else {
+                                            ""
+                                        }
+                                    ))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ));
+                        }
+                        out = format!("{} OVER ({})", out, parts.join(" "));
+                    }
+                }
+            }
+            out
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            let mut out = "CASE".to_string();
+            if let Some(op) = operand {
+                out = format!("{} {}", out, render_expr_canonical(op, false));
+            }
+            for (w, t) in whens {
+                out = format!(
+                    "{} WHEN {} THEN {}",
+                    out,
+                    render_expr_canonical(w, false),
+                    render_expr_canonical(t, false)
+                );
+            }
+            if let Some(el) = else_ {
+                out = format!("{} ELSE {}", out, render_expr_canonical(el, false));
+            }
+            format!("{} END", out)
+        }
+        Expr::Row(items) => format!(
+            "({})",
+            items
+                .iter()
+                .map(|x| render_expr_canonical(x, false))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Expr::Subquery(s) => render_select_canonical(s),
+        Expr::Exists(s) => format!("EXISTS {}", render_select_canonical(s)),
+        Expr::Cast { expr, type_name } => {
+            format!(
+                "CAST({} AS {})",
+                render_expr_canonical(expr, false),
+                type_name
+            )
+        }
+        Expr::Collate { expr, collation } => {
+            format!(
+                "{} COLLATE {}",
+                render_expr_canonical(expr, true),
+                collation
+            )
+        }
+        Expr::Raise { action, message } => {
+            let a = match action {
+                crate::sql::ast::RaiseAction::Ignore => "IGNORE",
+                crate::sql::ast::RaiseAction::Rollback => "ROLLBACK",
+                crate::sql::ast::RaiseAction::Abort => "ABORT",
+                crate::sql::ast::RaiseAction::Fail => "FAIL",
+            };
+            match message {
+                Some(m) => format!("RAISE({}, {})", a, render_expr_canonical(m, false)),
+                None => format!("RAISE({})", a),
             }
         }
-        _ => "?".to_string(),
+    }
+}
+
+fn render_literal_canonical(v: &crate::types::Value) -> String {
+    match v {
+        crate::types::Value::Null => "NULL".to_string(),
+        crate::types::Value::Integer(i) => i.to_string(),
+        crate::types::Value::Real(f) => format!("{}", f),
+        crate::types::Value::Text(t) => format!("'{}'", t.to_string().replace('\'', "''")),
+        crate::types::Value::Blob(b) => {
+            let hex: String = b.iter().map(|x| format!("{:02X}", x)).collect();
+            format!("X'{}'", hex)
+        }
+    }
+}
+
+fn render_unary_op(op: &crate::sql::ast::UnaryOp) -> &'static str {
+    use crate::sql::ast::UnaryOp::*;
+    match op {
+        Neg => "-",
+        Pos => "+",
+        Not => "NOT ",
+        BitNot => "~",
+    }
+}
+
+fn render_binary_op(op: &crate::sql::ast::BinaryOp) -> &'static str {
+    use crate::sql::ast::BinaryOp::*;
+    match op {
+        Add => "+",
+        Sub => "-",
+        Mul => "*",
+        Div => "/",
+        Mod => "%",
+        Concat => "||",
+        BitAnd => "&",
+        BitOr => "|",
+        BitXor => "^",
+        ShiftLeft => "<<",
+        ShiftRight => ">>",
+        Eq => "=",
+        NotEq => "!=",
+        Lt => "<",
+        LtEq => "<=",
+        Gt => ">",
+        GtEq => ">=",
+        And => "AND",
+        Or => "OR",
+        Arrow => "->",
+        ArrowText => "->>",
+        FtsMatch => "MATCH",
+        Distance => "<->",
+    }
+}
+
+fn render_like_op(op: &crate::sql::ast::LikeOp) -> &'static str {
+    use crate::sql::ast::LikeOp::*;
+    match op {
+        Like => "LIKE",
+        Glob => "GLOB",
+        Regexp => "REGEXP",
+        Match => "MATCH",
+    }
+}
+
+/// Canonical rendering of a scalar subquery (the parenthesized SELECT
+/// text — best-effort: the common SELECT/FROM/WHERE/GROUP/HAVING/
+/// LIMIT shape).
+fn render_select_canonical(s: &crate::sql::ast::SelectStatement) -> String {
+    let mut out = String::from("(SELECT");
+    let mut parts = Vec::new();
+    match &s.body {
+        crate::sql::ast::SelectBody::Simple(b) => {
+            let cols: Vec<String> = b
+                .columns
+                .iter()
+                .map(|c| match c {
+                    crate::sql::ast::ResultColumn::Star => "*".to_string(),
+                    crate::sql::ast::ResultColumn::TableStar(t) => format!("{}.*", t),
+                    crate::sql::ast::ResultColumn::Expr { expr, alias } => match alias {
+                        Some(a) => format!("{} AS {}", render_expr_canonical(expr, false), a),
+                        None => render_expr_canonical(expr, false),
+                    },
+                })
+                .collect();
+            parts.push(cols.join(", "));
+            if let Some(from) = &b.from {
+                let f = render_table_expr_canonical(from);
+                if !f.is_empty() {
+                    parts.push(format!("FROM {}", f));
+                }
+            }
+            if let Some(w) = &b.where_clause {
+                parts.push(format!("WHERE {}", render_expr_canonical(w, false)));
+            }
+            if !b.group_by.is_empty() {
+                parts.push(format!(
+                    "GROUP BY {}",
+                    b.group_by
+                        .iter()
+                        .map(|x| render_expr_canonical(x, false))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if let Some(h) = &b.having {
+                parts.push(format!("HAVING {}", render_expr_canonical(h, false)));
+            }
+        }
+        crate::sql::ast::SelectBody::Binary { .. } => {
+            parts.push(" ...".to_string());
+        }
+    }
+    for p in parts {
+        out = format!("{} {}", out, p);
+    }
+    if let Some(l) = &s.limit {
+        out = format!("{} LIMIT {}", out, render_expr_canonical(l, false));
+    }
+    format!("{})", out)
+}
+
+fn render_table_expr_canonical(te: &crate::sql::ast::TableExpression) -> String {
+    match te {
+        crate::sql::ast::TableExpression::Table { name, schema, .. } => match schema {
+            Some(s) => format!("{}.{}", s, name),
+            None => name.clone(),
+        },
+        crate::sql::ast::TableExpression::Subquery { .. } => "(...)".to_string(),
+        crate::sql::ast::TableExpression::Join { .. } => "... JOIN ...".to_string(),
+        crate::sql::ast::TableExpression::Function { .. } => "func(...)".to_string(),
     }
 }
 

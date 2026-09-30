@@ -779,6 +779,44 @@ impl<'a> Statement<'a> {
             return Ok(());
         }
 
+        // ATTACH-bearing statements: never cached, never pre-planned —
+        // each execution routes (whole to the owning engine) or
+        // federates (materialized attached tables) through the
+        // database-level machinery. Runs BEFORE the CTE branch: a mixed
+        // WITH-clause SELECT materializes both channels.
+        if crate::attach::stmt_uses_attached(self.db, self.stmt.as_ref()) {
+            let db = self.db;
+            let stmt = (*self.stmt).clone();
+            crate::attach::validate_schemas(db, &stmt)?;
+            crate::attach::check_stmt_rules(&stmt)?;
+            match crate::attach::analyze_route(db, &stmt) {
+                crate::attach::Route::Local => {}
+                crate::attach::Route::Routed { schema_lc } => {
+                    let engine = db
+                        .attached_engine(&schema_lc)
+                        .expect("validate_schemas checked");
+                    let stripped = crate::attach::strip_schema_refs(&stmt, &schema_lc);
+                    let (cols, rows) = {
+                        let aux = engine.read();
+                        let cached_aux = aux
+                            .cache_stmt_from_ast(&stripped)
+                            .map_err(|e| crate::attach::qualify_routed_error(e, &schema_lc))?;
+                        aux.query_cached_stmt_with_cols_pub("", &cached_aux, self.params.clone())
+                            .map_err(|e| crate::attach::qualify_routed_error(e, &schema_lc))?
+                    };
+                    self.columns = Some(Arc::from(cols));
+                    self.stream = StreamState::Materialized(rows.into_iter());
+                    return Ok(());
+                }
+                crate::attach::Route::Mixed => {
+                    let rows = db.query_mixed(&stmt, &self.params)?;
+                    self.columns = Some(Arc::from(Database::attach_output_columns(&stmt, &rows)));
+                    self.stream = StreamState::Materialized(rows.into_iter());
+                    return Ok(());
+                }
+            }
+        }
+
         // WITH-clause SELECTs: re-materialize per execution.
         let cte_select: Option<crate::sql::ast::SelectStatement> = match self.stmt.as_ref() {
             AstStatement::Select(sel) if sel.with.is_some() => Some(sel.clone()),

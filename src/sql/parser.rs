@@ -145,6 +145,7 @@ impl Parser {
                     // model reads it back through the catalog).
                     self.advance();
                     let mut target: Option<String> = None;
+                    let mut schema: Option<String> = None;
                     if !self.peek().is_punct(';') && !matches!(self.peek().token, Token::Eof) {
                         if self.peek().is_keyword("DATABASE") {
                             // ANALYZE DATABASE name — SQLite's ATTACHed-db
@@ -157,12 +158,13 @@ impl Parser {
                             if self.peek().is_punct('.') {
                                 self.advance();
                                 target = Some(self.parse_ident_or_keyword()?);
+                                schema = Some(first);
                             } else {
                                 target = Some(first);
                             }
                         }
                     }
-                    Ok(Statement::Analyze { target })
+                    Ok(Statement::Analyze { target, schema })
                 }
                 "REINDEX" => {
                     // REINDEX [collation | table | index]... — rebuilds
@@ -173,6 +175,7 @@ impl Parser {
                     // reindexed`).
                     self.advance();
                     let mut target = None;
+                    let mut schema = None;
                     if !self.peek().is_punct(';') && !matches!(self.peek().token, Token::Eof) {
                         let first = self.parse_ident_or_keyword()?;
                         if self.peek().is_punct('.') {
@@ -181,11 +184,12 @@ impl Parser {
                             self.advance();
                             let obj = self.parse_ident_or_keyword()?;
                             target = Some(obj);
+                            schema = Some(first);
                         } else {
                             target = Some(first);
                         }
                     }
-                    Ok(Statement::Reindex { target })
+                    Ok(Statement::Reindex { target, schema })
                 }
                 _ => Err(Error::parse(
                     t.line,
@@ -915,8 +919,11 @@ impl Parser {
         } else {
             false
         };
-        let name = self.parse_ident()?;
+        let (schema, name) = self.parse_qualified_name()?;
         self.expect_keyword("ON")?;
+        // SQLite's grammar: the indexed table after ON is UNQUALIFIED
+        // (`ON aux.x` is a syntax error — the index's schema qualifies
+        // the NAME and also scopes the table lookup).
         let table = self.parse_ident()?;
         // PostgreSQL's `USING <method>` clause (borrowed):
         //   CREATE INDEX ... ON t USING gin(to_tsvector('english', body))
@@ -956,6 +963,7 @@ impl Parser {
             unique,
             if_not_exists,
             temp,
+            schema,
             name,
             table,
             columns,
@@ -1197,10 +1205,11 @@ impl Parser {
         } else {
             false
         };
-        let name = self.parse_ident()?;
+        let (schema, name) = self.parse_qualified_name()?;
         Ok(Statement::Drop(DropStatement {
             if_exists,
             kind,
+            schema,
             name,
         }))
     }
@@ -1248,7 +1257,7 @@ impl Parser {
             }
         };
         self.expect_keyword("INTO")?;
-        let table = self.parse_dml_table_name()?;
+        let (dml_schema, table) = self.parse_dml_table_name()?;
         let alias = if self.peek().is_keyword("AS") {
             self.advance();
             Some(self.parse_ident()?)
@@ -1351,6 +1360,7 @@ impl Parser {
         };
         Ok(Statement::Insert(InsertStatement {
             or,
+            schema: dml_schema,
             table,
             alias,
             columns,
@@ -1411,7 +1421,7 @@ impl Parser {
         } else {
             None
         };
-        let table = self.parse_dml_table_name()?;
+        let (dml_schema, table) = self.parse_dml_table_name()?;
         let alias = if self.peek().is_keyword("AS") {
             self.advance();
             Some(self.parse_ident()?)
@@ -1462,6 +1472,7 @@ impl Parser {
         };
         Ok(Statement::Update(UpdateStatement {
             or,
+            schema: dml_schema,
             table,
             alias,
             set,
@@ -1477,7 +1488,7 @@ impl Parser {
     fn parse_delete(&mut self) -> Result<Statement> {
         self.advance(); // DELETE
         self.expect_keyword("FROM")?;
-        let from = self.parse_dml_table_name()?;
+        let (dml_schema, from) = self.parse_dml_table_name()?;
         let alias = if self.peek().is_keyword("AS") {
             self.advance();
             Some(self.parse_ident()?)
@@ -1522,6 +1533,7 @@ impl Parser {
             None
         };
         Ok(Statement::Delete(DeleteStatement {
+            schema: dml_schema,
             from,
             alias,
             where_clause,
@@ -1646,7 +1658,7 @@ impl Parser {
     fn parse_alter(&mut self) -> Result<Statement> {
         self.advance(); // ALTER
         self.expect_keyword("TABLE")?;
-        let table = self.parse_ident()?;
+        let (alter_schema, table) = self.parse_qualified_name()?;
         if self.peek().is_keyword("RENAME") {
             self.advance();
             // RENAME TO x  |  RENAME COLUMN a TO b  |  RENAME a TO b
@@ -1654,7 +1666,8 @@ impl Parser {
                 self.advance();
                 let new_name = self.parse_ident()?;
                 return Ok(Statement::Alter(AlterStatement {
-                    table,
+                    schema: alter_schema.clone(),
+                    table: table.clone(),
                     action: AlterAction::RenameTable { new_name },
                 }));
             }
@@ -1665,7 +1678,8 @@ impl Parser {
             self.expect_keyword("TO")?;
             let new = self.parse_ident()?;
             Ok(Statement::Alter(AlterStatement {
-                table,
+                schema: alter_schema.clone(),
+                table: table.clone(),
                 action: AlterAction::RenameColumn { old, new },
             }))
         } else if self.peek().is_keyword("ADD") {
@@ -1675,7 +1689,8 @@ impl Parser {
             }
             let column = self.parse_column_def()?;
             Ok(Statement::Alter(AlterStatement {
-                table,
+                schema: alter_schema.clone(),
+                table: table.clone(),
                 action: AlterAction::AddColumn { column },
             }))
         } else if self.peek().is_keyword("DROP") {
@@ -1685,7 +1700,8 @@ impl Parser {
             }
             let name = self.parse_ident()?;
             Ok(Statement::Alter(AlterStatement {
-                table,
+                schema: alter_schema.clone(),
+                table: table.clone(),
                 action: AlterAction::DropColumn { name },
             }))
         } else {
@@ -2076,13 +2092,34 @@ impl Parser {
                     self.advance();
                     out.push(ResultColumn::Star);
                 } else {
-                    // Could be `table.*` or an expression.
+                    // Could be `table.*`, `db.table.*` or an expression.
                     let next = self.peek_n(1);
                     if next.is_punct('.') && self.peek_n(2).is_op("*") {
                         let table = s.clone();
                         self.advance();
                         self.advance();
                         self.advance();
+                        out.push(ResultColumn::TableStar(table));
+                    } else if next.is_punct('.')
+                        && matches!(
+                            self.peek_n(2).token,
+                            Token::Ident(_) | Token::QuotedIdent(_)
+                        )
+                        && self.peek_n(3).is_punct('.')
+                        && self.peek_n(4).is_op("*")
+                    {
+                        // `db.table.*` — a three-part star over an
+                        // attached-database table.
+                        let mut table = s.clone();
+                        self.advance(); // name
+                        self.advance(); // .
+                        if let Token::Ident(p) | Token::QuotedIdent(p) = &self.peek().token {
+                            table.push('.');
+                            table.push_str(p);
+                        }
+                        self.advance(); // part2
+                        self.advance(); // .
+                        self.advance(); // *
                         out.push(ResultColumn::TableStar(table));
                     } else {
                         let e = self.parse_expr()?;
@@ -3123,6 +3160,17 @@ impl Parser {
                         ));
                     }
                     let col = self.parse_ident_or_keyword()?;
+                    // Three-part reference `db.table.column` (attached
+                    // databases): the two leading parts form the
+                    // qualifier, exactly like SQLite's resolution.
+                    if self.peek().is_punct('.') {
+                        self.advance();
+                        let col2 = self.parse_ident_or_keyword()?;
+                        return Ok(Expr::Column {
+                            table: Some(format!("{}.{}", name, col)),
+                            name: col2,
+                        });
+                    }
                     return Ok(Expr::Column {
                         table: Some(name),
                         name: col,
@@ -3136,6 +3184,16 @@ impl Parser {
                 if self.peek().is_punct('.') {
                     self.advance();
                     let col = self.parse_ident()?;
+                    // Three-part reference `db.table.column` (attached
+                    // databases).
+                    if self.peek().is_punct('.') {
+                        self.advance();
+                        let col2 = self.parse_ident()?;
+                        return Ok(Expr::Column {
+                            table: Some(format!("{}.{}", name, col)),
+                            name: col2,
+                        });
+                    }
                     return Ok(Expr::Column {
                         table: Some(name),
                         name: col,
@@ -3392,30 +3450,25 @@ impl Parser {
         }
     }
 
-    /// Parse a schema-qualified DML target name (`main.t`, `temp.t`, or
-    /// bare `t`) for INSERT/UPDATE/DELETE. A single-file engine has
-    /// exactly the `main` and `temp` namespaces, and both live in one
-    /// catalog (a main/temp name collision is impossible by
-    /// construction), so a KNOWN qualifier is validated and dropped —
-    /// the same resolution SELECT's FROM clause already applies. An
-    /// unknown schema is SQLite's prepare-time error, message included:
-    /// `UPDATE nosuch.t ...` -> "no such table: nosuch.t" (verified
-    /// against the real engine).
-    fn parse_dml_table_name(&mut self) -> Result<String> {
+    /// Parse a schema-qualified DML target name (`main.t`, `temp.t`,
+    /// `aux.t`, or bare `t`) for INSERT/UPDATE/DELETE. `main`/`temp` are
+    /// the LOCAL schema (normalized to `None` — one catalog holds both);
+    /// any other qualifier is preserved for the attached-database router
+    /// (unknown schemas error at prepare time with SQLite's message when
+    /// no such database is attached: `UPDATE nosuch.t ...` -> "no such
+    /// table: nosuch.t").
+    fn parse_dml_table_name(&mut self) -> Result<(Option<String>, String)> {
         let first = self.parse_ident()?;
         if self.peek().is_punct('.') {
             self.advance();
             let second = self.parse_ident()?;
             let schema_lc = first.to_ascii_lowercase();
-            if schema_lc != "main" && schema_lc != "temp" {
-                return Err(Error::semantic(format!(
-                    "no such table: {}.{}",
-                    first, second
-                )));
+            if schema_lc == "main" || schema_lc == "temp" {
+                return Ok((None, second));
             }
-            Ok(second)
+            Ok((Some(first), second))
         } else {
-            Ok(first)
+            Ok((None, first))
         }
     }
 

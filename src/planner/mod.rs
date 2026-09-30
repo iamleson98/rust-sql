@@ -32,6 +32,12 @@ pub struct Planner<'a> {
     /// Parent planner's CTE map, merged when a nested SELECT is planned
     /// (CTEs stay visible inside subqueries in the same statement).
     outer_ctes: Option<HashMap<String, crate::types::CteMaterialization>>,
+    /// Materialized ATTACHED-database tables (see `src/attach.rs`):
+    /// qualified refs (`aux.t`) and the unqualified fallback (main misses
+    /// first — SQLite's temp → main → attached search order) resolve to
+    /// `CteRows` plans through this channel. Populated per statement by
+    /// api.rs; never cached.
+    foreign: Option<crate::attach::ForeignTables>,
     /// View-expansion recursion depth. Guards against circular view
     /// definitions (`CREATE VIEW t AS SELECT ... FROM t`) and absurdly
     /// deep view nesting, both of which would otherwise recurse until the
@@ -52,8 +58,16 @@ impl<'a> Planner<'a> {
             scopes: vec![HashMap::new()],
             ctes: HashMap::new(),
             outer_ctes: None,
+            foreign: None,
             view_depth: 0,
         }
+    }
+
+    /// Install the attached-database channel (see `src/attach.rs`).
+    /// Mixed-schema statements materialize their attached tables and
+    /// resolve them here.
+    pub(crate) fn set_foreign(&mut self, foreign: crate::attach::ForeignTables) {
+        self.foreign = Some(foreign);
     }
 
     /// Plan a SELECT statement.
@@ -699,10 +713,46 @@ impl<'a> Planner<'a> {
         match te {
             TableExpression::Table {
                 name,
+                schema,
                 alias,
                 indexed,
                 ..
             } => {
+                // ATTACHED-database reference (`aux.t`): resolve through
+                // the foreign channel BEFORE any local name resolution —
+                // a qualified attached name never touches CTEs (they
+                // cannot be qualified), views, or the local catalog.
+                // Local spellings (`main.t`, `temp.t`, unqualified) fall
+                // through to the normal path below.
+                if let Some(s) = schema {
+                    let lc = s.to_ascii_lowercase();
+                    if lc != "main" && lc != "temp" {
+                        if let Some(foreign) = &self.foreign {
+                            if let Some((rows, cols)) =
+                                foreign.get_qualified(&lc, &name.to_ascii_lowercase())
+                            {
+                                let prefix = alias.clone().unwrap_or_else(|| name.clone());
+                                let ql: Arc<[String]> = cols
+                                    .iter()
+                                    .map(|c| {
+                                        format!("{}.{}", prefix, c.rsplit('.').next().unwrap_or(c))
+                                    })
+                                    .collect::<Vec<String>>()
+                                    .into();
+                                return Ok(Plan::CteRows {
+                                    rows: Arc::clone(rows),
+                                    columns: ql,
+                                });
+                            }
+                        }
+                        // No materialization for the pair: the materializer
+                        // errors for unknown schema/table pairs, so reaching
+                        // here means a planner path the pre-walk missed
+                        // (nested view bodies). SQLite's error carries the
+                        // schema prefix.
+                        return Err(Error::NotFound(format!("no such table: {}.{}", s, name)));
+                    }
+                }
                 // CTE reference? (WITH ... name AS (...)). CTEs shadow real
                 // tables of the same name.
                 if indexed.is_none() {
@@ -803,6 +853,34 @@ impl<'a> Planner<'a> {
                                 args: Vec::new(),
                                 alias: alias.clone(),
                             });
+                        }
+                        // ATTACHED-database fallback (SQLite's unqualified
+                        // search order: temp → main → attached, in ATTACH
+                        // order). Main missed; a materialized attached
+                        // table of this name serves the scan.
+                        if indexed.is_none() {
+                            if let Some(foreign) = &self.foreign {
+                                if let Some((rows, cols)) =
+                                    foreign.get_unqualified(&name.to_ascii_lowercase())
+                                {
+                                    let prefix = alias.clone().unwrap_or_else(|| name.clone());
+                                    let ql: Arc<[String]> = cols
+                                        .iter()
+                                        .map(|c| {
+                                            format!(
+                                                "{}.{}",
+                                                prefix,
+                                                c.rsplit('.').next().unwrap_or(c)
+                                            )
+                                        })
+                                        .collect::<Vec<String>>()
+                                        .into();
+                                    return Ok(Plan::CteRows {
+                                        rows: Arc::clone(rows),
+                                        columns: ql,
+                                    });
+                                }
+                            }
                         }
                         return Err(Error::NotFound(format!("no such table: {}", name)));
                     }
