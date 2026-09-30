@@ -11586,6 +11586,45 @@ fn exec_aggregate(
             });
         }
     }
+    // Fast path #3e: COUNT(*) over an INNER HASH JOIN of two bare table
+    // scans — the fused streaming join's COUNT-ONLY mode. The join's
+    // cardinality IS the answer: key columns decode on both sides, the
+    // open-addressing table counts chain lengths, and the 8.33M-row
+    // `SELECT COUNT(*) FROM a JOIN b ON a.x = b.x` shape never builds a
+    // single output row (was: one Vec<Value> per match, then thrown
+    // away). Declines (outer joins, residual conditions, cross-affinity
+    // keys, non-scan sides) fall through to the general path unchanged.
+    if group_by.is_empty()
+        && aggregates.len() == 1
+        && aggregates[0].func == "count"
+        && aggregates[0].arg.is_none()
+        && !aggregates[0].distinct
+        && aggregates[0].filter.is_none()
+    {
+        let join_input = match input {
+            Plan::Project { input: inner, .. } => inner.as_ref(),
+            other => other,
+        };
+        if let Plan::Join {
+            left,
+            right,
+            join_type,
+            condition,
+            algorithm: crate::planner::plan::JoinAlgorithm::Hash,
+        } = join_input
+        {
+            if matches!(
+                join_type,
+                crate::sql::ast::JoinType::Inner | crate::sql::ast::JoinType::Cross
+            ) {
+                if let Some(res) =
+                    try_fused_scan_hash_join(ctx, left, right, *join_type, condition, None, true)?
+                {
+                    return Ok(res);
+                }
+            }
+        }
+    }
     let mut inner = execute(input, ctx)?;
     // ---- MATERIALIZED-ROW parallel split (no GROUP BY) ------------------
     // The input is not a bare scan (a compound body, subquery/CTE, join,
@@ -13978,7 +14017,23 @@ fn try_fused_scan_hash_join(
     join_type: crate::sql::ast::JoinType,
     condition: &Option<Expr>,
     projection: Option<&[crate::planner::plan::ProjectExpr]>,
+    count_only: bool,
 ) -> Result<Option<ExecResult>> {
+    // COUNT-ONLY MODE: the consumer is a bare `COUNT(*)` aggregate —
+    // the join's cardinality is the answer, so the machine decodes ONLY
+    // the key columns and never builds an output row (8.33M-row
+    // `SELECT COUNT(*) FROM a JOIN b ON a.x = b.x` shapes stop paying
+    // one Vec<Value> per match). INNER/CROSS only — OUTER joins emit
+    // NULL-extended rows the count must still classify, and the emit
+    // path already handles them cheaply enough.
+    if count_only
+        && !matches!(
+            join_type,
+            crate::sql::ast::JoinType::Inner | crate::sql::ast::JoinType::Cross
+        )
+    {
+        return Ok(None);
+    }
     // ---- Shape gates -------------------------------------------------
     let (l_table, l_alias) = match left {
         Plan::Scan {
@@ -14020,45 +14075,53 @@ fn try_fused_scan_hash_join(
     // (every column of both sides, left then right — exactly the
     // materialized path's combined layout, minus materializing the sides).
     let synthesized: Vec<crate::planner::plan::ProjectExpr>;
-    let columns: &[crate::planner::plan::ProjectExpr] = match projection {
-        Some(c) => c,
-        None => {
-            let synth_cols = |cols: &std::sync::Arc<[String]>, slot: &Option<String>| {
-                let mut v: Vec<crate::planner::plan::ProjectExpr> = cols
-                    .iter()
-                    .map(|s| crate::planner::plan::ProjectExpr {
-                        expr: Expr::Column {
-                            table: None,
-                            name: s.to_string(),
-                        },
-                        // The synthesized rows must be scope-compatible with the
-                        // materialized path's combined columns: QUALIFIED names
-                        // ("u.id", "o.id"). Without the alias, the display-name
-                        // pass strips the qualifier and downstream nodes (a WHERE
-                        // with a correlated subquery binding `o.id`, an outer
-                        // Project, ORDER BY) resolve same-named columns to the
-                        // FIRST match — users.id instead of orders.id.
-                        alias: Some(s.to_string()),
-                    })
-                    .collect();
-                if let Some(sn) = slot {
-                    v.push(crate::planner::plan::ProjectExpr {
-                        expr: Expr::Column {
-                            table: None,
-                            name: sn.clone(),
-                        },
-                        alias: Some(sn.clone()),
-                    });
-                }
-                v
-            };
-            let mut v = synth_cols(&l_cols, &l_slot_name);
-            v.extend(synth_cols(&r_cols, &r_slot_name));
-            synthesized = v;
-            &synthesized
+    let columns: &[crate::planner::plan::ProjectExpr] = if count_only {
+        // No projection in count mode: the emit machinery is skipped,
+        // the wanted lists carry the key columns only, and the empty-
+        // projection decline below must not fire.
+        synthesized = Vec::new();
+        &synthesized
+    } else {
+        match projection {
+            Some(c) => c,
+            None => {
+                let synth_cols = |cols: &std::sync::Arc<[String]>, slot: &Option<String>| {
+                    let mut v: Vec<crate::planner::plan::ProjectExpr> = cols
+                        .iter()
+                        .map(|s| crate::planner::plan::ProjectExpr {
+                            expr: Expr::Column {
+                                table: None,
+                                name: s.to_string(),
+                            },
+                            // The synthesized rows must be scope-compatible with the
+                            // materialized path's combined columns: QUALIFIED names
+                            // ("u.id", "o.id"). Without the alias, the display-name
+                            // pass strips the qualifier and downstream nodes (a WHERE
+                            // with a correlated subquery binding `o.id`, an outer
+                            // Project, ORDER BY) resolve same-named columns to the
+                            // FIRST match — users.id instead of orders.id.
+                            alias: Some(s.to_string()),
+                        })
+                        .collect();
+                    if let Some(sn) = slot {
+                        v.push(crate::planner::plan::ProjectExpr {
+                            expr: Expr::Column {
+                                table: None,
+                                name: sn.clone(),
+                            },
+                            alias: Some(sn.clone()),
+                        });
+                    }
+                    v
+                };
+                let mut v = synth_cols(&l_cols, &l_slot_name);
+                v.extend(synth_cols(&r_cols, &r_slot_name));
+                synthesized = v;
+                &synthesized
+            }
         }
     };
-    if columns.is_empty() {
+    if columns.is_empty() && !count_only {
         return Ok(None);
     }
     // One or more pure equi-join keys (an AND chain of `l.c = r.c`
@@ -14188,27 +14251,32 @@ fn try_fused_scan_hash_join(
     if let Some(sn) = &l_slot_name {
         combined.push(sn.as_str());
     }
-    combined.extend(r_cols.iter().map(|s| s.as_str()));
+    combined.extend(r_cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
     if let Some(sn) = &r_slot_name {
         combined.push(sn.as_str());
     }
     let mut out_combined: Vec<usize> = Vec::with_capacity(columns.len());
     let mut out_names: Vec<String> = Vec::with_capacity(columns.len());
-    for c in columns {
-        match &c.expr {
-            Expr::Column { table, name } => {
-                match resolve_column_index(&combined, table.as_deref(), name) {
-                    Some(p) => {
-                        out_combined.push(p);
-                        out_names.push(match &c.alias {
-                            Some(a) => a.clone(),
-                            None => expr_display_name(&c.expr),
-                        });
+    if count_only {
+        // No emit: out_combined/out_names stay EMPTY (the wanted lists
+        // below then carry the key columns only).
+    } else {
+        for c in columns {
+            match &c.expr {
+                Expr::Column { table, name } => {
+                    match resolve_column_index(&combined, table.as_deref(), name) {
+                        Some(p) => {
+                            out_combined.push(p);
+                            out_names.push(match &c.alias {
+                                Some(a) => a.clone(),
+                                None => expr_display_name(&c.expr),
+                            });
+                        }
+                        None => return Ok(None),
                     }
-                    None => return Ok(None),
                 }
+                _ => return Ok(None), // non-bare projection: materialized path
             }
-            _ => return Ok(None), // non-bare projection: materialized path
         }
     }
 
@@ -14639,35 +14707,46 @@ fn try_fused_scan_hash_join(
     // the multi-table parallelism the single-table paths already have.
     // Range-ordered partial concatenation reproduces the serial probe
     // scan's row order exactly; any gate decline or worker error falls
-    // through to the serial walk below, unchanged.
-    {
-        let out_slots_plain: Vec<(bool, usize)> =
-            out_slots.iter().map(|s| (s.from_build, s.pos)).collect();
-        if let Some(rows) = crate::executor::parallel::try_parallel_join_probe(
-            ctx,
-            probe.root,
-            probe.n_cols,
-            &probe_wanted,
-            probe_alias,
-            &probe_key_pos,
-            &built,
-            &out_slots_plain,
-            out_combined.len(),
-            left_outer,
-            build_unmatched_tail,
-            rowid_seek_join.then_some(gated_is_probe),
-        )? {
-            let columns_out: std::sync::Arc<[String]> = out_names.into();
-            return Ok(Some(ExecResult {
-                columns: columns_out,
-                rows,
-            }));
+    // through to the serial walk below, unchanged. COUNT-ONLY mode
+    // skips the split: the serial count loop is already allocation-
+    // free, and the parallel emitter would rebuild the row-per-match
+    // cost the mode exists to skip.
+    if !count_only {
+        {
+            let out_slots_plain: Vec<(bool, usize)> =
+                out_slots.iter().map(|s| (s.from_build, s.pos)).collect();
+            if let Some(rows) = crate::executor::parallel::try_parallel_join_probe(
+                ctx,
+                probe.root,
+                probe.n_cols,
+                &probe_wanted,
+                probe_alias,
+                &probe_key_pos,
+                &built,
+                &out_slots_plain,
+                out_combined.len(),
+                left_outer,
+                build_unmatched_tail,
+                rowid_seek_join.then_some(gated_is_probe),
+            )? {
+                let columns_out: std::sync::Arc<[String]> = out_names.into();
+                return Ok(Some(ExecResult {
+                    columns: columns_out,
+                    rows,
+                }));
+            }
         }
-    }
-    // ---- PROBE: stream scan + selective decode + emit -------------------
+    } // !count_only
+      // ---- PROBE: stream scan + selective decode + emit -------------------
     let n_out = out_combined.len();
     let built_key_slots: &[usize] = &built.key_slots;
-    let mut out_rows: Vec<Row> = Vec::with_capacity(probe.count.max(1));
+    let mut out_rows: Vec<Row> = if count_only {
+        Vec::new()
+    } else {
+        Vec::with_capacity(probe.count.max(1))
+    };
+    // COUNT-ONLY accumulator: matches in chain order, no rows built.
+    let mut count_only_total: i64 = 0;
     let mut pbuf: Vec<Value> = Vec::new();
     let mut pks: Vec<u64> = vec![0u64; n_keys];
     // LEFT-outer scratch: the matched-build-ord chain, REVERSED to build
@@ -14801,6 +14880,13 @@ fn try_fused_scan_hash_join(
             if !left_outer && !build_unmatched_tail {
                 // INNER: emit the matches in chain order (the established
                 // fused-path discipline — INNER row order is unspecified).
+                if count_only {
+                    while next != u32::MAX {
+                        count_only_total += 1;
+                        next = chain[next as usize];
+                    }
+                    return true;
+                }
                 while next != u32::MAX {
                     let ord = next as usize;
                     let mut out: Row = Vec::with_capacity(n_out);
@@ -14885,6 +14971,14 @@ fn try_fused_scan_hash_join(
         }
     }
 
+    if count_only {
+        // INNER/CROSS only (gated at the top): the answer is the
+        // accumulated chain length — one integer row, nothing else.
+        return Ok(Some(ExecResult {
+            columns: std::sync::Arc::from(vec!["__agg_0".to_string()]),
+            rows: vec![vec![Value::Integer(count_only_total)]],
+        }));
+    }
     let columns_out: std::sync::Arc<[String]> = out_names.into();
     Ok(Some(ExecResult {
         columns: columns_out,
@@ -14972,7 +15066,7 @@ fn exec_hash_join(
         // with NULL left values — exactly the materialized path's
         // left-driven order.
         if let Some(res) =
-            try_fused_scan_hash_join(ctx, left, right, join_type, condition, projection)?
+            try_fused_scan_hash_join(ctx, left, right, join_type, condition, projection, false)?
         {
             return Ok(res);
         }

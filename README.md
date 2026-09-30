@@ -114,6 +114,7 @@ rustqlite splits scans across worker threads; SQLite's executor is single-thread
 | ORDER BY INT DESC (unbounded) | 188.4 ms | 261.1 ms | **1.4x** |
 | 2-table equi-JOIN (1M × 1M, 3M out) | 451.6 ms | 624.2 ms | **1.38x** |
 | 3-table adversarial ORDER (50k×50k×5) | 5.3 ms | 0.7 ms | 0.13x (**~90x engine-side** from the join reorder) |
+| COUNT(\*) over 8.3M-row hash join | 18.7 ms | 263.2 ms | **14.1x** (was 0.17x — the fused count-only mode) |
 
 ### Specialized index access methods (engine-vs-engine, 100k rows)
 
@@ -237,7 +238,7 @@ The honest ledger — verifiable absence (`module_list` / `function_list` / `com
 
 - **SQLite-format per-commit residual**: the publish machinery now runs SQLite's own descriptor discipline — one open handle per file for the session's life, one path stat + one positioned write per WAL commit (was: open/stat/salt-verify/read/seek/write/close per commit), the guard probe reads page 1 through a cached handle, and the autocheckpoint copies only each page's LAST version (a 1000-frame run of single-page commits folds in ~17 page writes, not 1000; positioned writes, one syscall per page). Per-commit timers and reader-path counters ship as `rustqlite::commit_timer_snapshot()` / `reader_counter_snapshot()` / `publish_phase_snapshot()`, with an `RSQL_WAL_SLOWPATH=1` A/B kill switch. The page-level mutator itself is O(changed pages) with stable rootpages. Bulk-growth commits (a transaction whose growth moves engine rootpages) still route through the whole-object splice path. The native container (the default, and what the 54 CI-gated rows measure) is unaffected — its per-commit path is page-granular WAL. See the [per-commit table](#sqlite-format-container-per-commit-cost-on-large-files).
 - **One serial row at parity**: the unfiltered 2-table PK join (1.18x warm in the latest CI table; 1.38x at 1M-row parallel scale).
-- **3-table adversarial ORDER** (tiny synthetic): 0.13x vs SQLite's native plan for the already-reordered shape — the reorder itself won ~90x engine-side; the residual is the point-lookup chain.
+- **3-table adversarial ORDER** (tiny synthetic): 1.3–2.1x in the latest local draws (the covering-INLJ count path + the join-reorder); the CI box's 0.13x draw predates the count-over-join fast path — the CI torture matrix tracks it.
 - **8-conn mixed R/W 80/20**: parity-class by construction — commit fsync sets the floor (host-dominated); reads inside stay 2.8x. An explicitly-marked parity guard in CI.
 - **S06 range-scan materialization** (~0.92x linux / 0.72–0.87x macOS-ARM draws): the fused drivers serve raw record bytes per step; the CI torture matrix tracks the residual.
 
