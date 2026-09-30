@@ -588,3 +588,259 @@ fn import_sql_script_via_dot_read() {
     assert!(ok, "{} {}", out, err);
     assert!(out.contains("| 2"), "{}", out);
 }
+
+// ---------------------------------------------------------------------------
+// Dot-command expansion (sqlite3-shell surface)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cli_shell_toggles_and_listings() {
+    let dir = std::env::temp_dir().join(format!("rqlcli-shell-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let db = dir.join("s.db");
+    let _ = std::fs::remove_file(&db);
+    let script = "CREATE TABLE t(a INT, b TEXT);\n\
+                  INSERT INTO t VALUES (1,'one'),(2,NULL);\n\
+                  CREATE INDEX ixt ON t(a);\n\
+                  CREATE VIEW vt AS SELECT a FROM t;\n\
+                  .tables\n\
+                  .tables t%\n\
+                  .indexes\n\
+                  .indexes ix%\n\
+                  .indexes nope%\n\
+                  .databases\n\
+                  ATTACH ':memory:' AS aux;\n\
+                  CREATE TABLE aux.z(v INT);\n\
+                  .databases\n\
+                  .dbinfo\n\
+                  .headers off\n\
+                  SELECT * FROM t;\n\
+                  .headers on\n\
+                  .nullvalue NULLVAL\n\
+                  SELECT * FROM t WHERE a=2;\n\
+                  .mode csv\n\
+                  .headers off\n\
+                  SELECT * FROM t;\n\
+                  .separator ;\n\
+                  SELECT * FROM t;\n\
+                  .mode table\n\
+                  .timer on\n\
+                  .changes on\n\
+                  INSERT INTO t VALUES (3,'three');\n\
+                  .eqp on\n\
+                  SELECT a FROM t WHERE a=1;\n\
+                  .print done here\n\
+                  .quit\n";
+    let (out, err, ok) = run_cli(&[db.to_str().unwrap()], Some(script));
+    assert!(ok, "stdout: {}\nstderr: {}", out, err);
+    // .tables / pattern filter
+    assert!(
+        out.contains("\nt\nv\n") || out.contains("t\nvt\n"),
+        "{}",
+        out
+    );
+    assert!(out.contains("ixt"), "{}", out);
+    // .databases pre/post attach
+    assert!(out.contains("main"), "{}", out);
+    assert!(out.contains("aux"), "{}", out);
+    // .dbinfo
+    assert!(out.contains("page_size:"), "{}", out);
+    assert!(out.contains("journal_mode:"), "{}", out);
+    // headers off: no header row
+    assert!(out.contains("| 1 | one |"), "{}", out);
+    // nullvalue rendering
+    assert!(out.contains("NULLVAL"), "{}", out);
+    // csv + separator
+    assert!(out.contains("1;one"), "{}", out);
+    // timer + changes
+    assert!(out.contains("Run Time (s): real"), "{}", out);
+    assert!(out.contains("changes: 1   total_changes: 3"), "{}", out);
+    // eqp renders the plan before results (the indexed lookup shows a
+    // SEARCH on ixt — assert the plan detail row appears at all).
+    assert!(out.contains("SEARCH t USING INDEX ixt"), "{}", out);
+    // .print
+    assert!(out.contains("done here"), "{}", out);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cli_save_restore_open_once_output() {
+    let dir = std::env::temp_dir().join(format!("rqlcli-sro-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let db = dir.join("a.db");
+    let saved = dir.join("saved.db");
+    let once_file = dir.join("once.txt");
+    let _ = std::fs::remove_file(&db);
+    let _ = std::fs::remove_file(&saved);
+    let _ = std::fs::remove_file(&once_file);
+
+    // Populate, save a byte-copy, then wreck and restore.
+    let script = format!(
+        "CREATE TABLE t(a INT);\n\
+         INSERT INTO t VALUES (1),(2);\n\
+         CREATE VIEW v AS SELECT a FROM t;\n\
+         CREATE TRIGGER trg AFTER INSERT ON t BEGIN INSERT INTO t VALUES (new.a + 100); END;\n\
+         .save {saved}\n\
+         DROP VIEW v;\n\
+         DROP TRIGGER trg;\n\
+         DELETE FROM t;\n\
+         SELECT count(*) FROM t;\n\
+         .restore {saved}\n\
+         SELECT count(*) FROM t;\n\
+         SELECT count(*) FROM v;\n\
+         .once {once}\n\
+         SELECT 'redirected';\n\
+         SELECT 'visible';\n\
+         .quit\n",
+        saved = saved.display(),
+        once = once_file.display(),
+    );
+    let (out, err, ok) = run_cli(&[db.to_str().unwrap()], Some(&script));
+    assert!(ok, "stdout: {}\nstderr: {}", out, err);
+    // Before restore: 0 rows.
+    assert!(out.contains("| 0"), "{}", out);
+    // After restore: 2 rows + the view back.
+    assert!(out.contains("| 2"), "{}", out);
+    assert!(saved.exists(), "save produced no file");
+    // The .once statement's output went to the file, not stdout.
+    let once_content = std::fs::read_to_string(&once_file).unwrap_or_default();
+    assert!(once_content.contains("redirected"), "{}", once_content);
+    assert!(!once_content.contains("visible"), "{}", once_content);
+    assert!(out.contains("visible"), "{}", out);
+
+    // .open: switch to the saved file in-session.
+    let script2 = format!(
+        ".open {}\n.tables\nSELECT count(*) FROM t;\n.quit\n",
+        saved.display()
+    );
+    let (out2, err2, ok2) = run_cli(&[], Some(&script2));
+    assert!(ok2, "stdout: {}\nstderr: {}", out2, err2);
+    assert!(out2.contains("t"), "{}", out2);
+    assert!(out2.contains("v"), "{}", out2);
+    assert!(out2.contains("| 2"), "{}", out2);
+
+    // The restored database is a REAL file: the library opens it and
+    // real SQLite (rusqlite) reads it back.
+    let reopened = Database::open(&saved).unwrap();
+    let (cols, rows) = reopened
+        .query_with_columns("SELECT count(*) FROM t", [])
+        .unwrap();
+    assert_eq!(rows[0][0], Value::Integer(2));
+    let _ = cols;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cli_output_persists_across_statements() {
+    // sqlite3's `.output FILE` keeps ONE handle open: every subsequent
+    // statement's output APPENDS to the file. A per-statement
+    // File::create would truncate it each time, leaving only the last
+    // statement's output — this test pins the fix.
+    let dir = std::env::temp_dir().join(format!("rqlcli-out-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let db = dir.join("o.db");
+    let file = dir.join("out.txt");
+    let _ = std::fs::remove_file(&db);
+    let _ = std::fs::remove_file(&file);
+    let script = format!(
+        "CREATE TABLE t(a);\n\
+         .output {f}\n\
+         SELECT 'first';\n\
+         SELECT 'second';\n\
+         SELECT 'third';\n\
+         .output\n\
+         SELECT 'back-on-stdout';\n\
+         .quit\n",
+        f = file.display(),
+    );
+    let (out, err, ok) = run_cli(&[db.to_str().unwrap()], Some(&script));
+    assert!(ok, "stdout: {}\nstderr: {}", out, err);
+    let content = std::fs::read_to_string(&file).unwrap_or_default();
+    assert!(content.contains("first"), "file: {}", content);
+    assert!(content.contains("second"), "file: {}", content);
+    assert!(content.contains("third"), "file: {}", content);
+    // Order is preserved: first comes before second before third.
+    let (i, j, k) = (
+        content.find("first").unwrap(),
+        content.find("second").unwrap(),
+        content.find("third").unwrap(),
+    );
+    assert!(i < j && j < k, "order lost: {}", content);
+    // After `.output` with no argument, results return to stdout.
+    assert!(out.contains("back-on-stdout"), "stdout: {}", out);
+    // And nothing from the redirected statements leaked to stdout.
+    assert!(!out.contains("first"), "stdout: {}", out);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cli_once_interlude_preserves_output_file() {
+    // `.once g` between `.output f` statements must not disturb f: the
+    // interlude goes to g and f keeps receiving (with everything
+    // written before the interlude intact — sqlite3 keeps f's handle
+    // open the whole time).
+    let dir = std::env::temp_dir().join(format!("rqlcli-once-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let db = dir.join("o.db");
+    let main = dir.join("main.txt");
+    let side = dir.join("side.txt");
+    let _ = std::fs::remove_file(&db);
+    let _ = std::fs::remove_file(&main);
+    let _ = std::fs::remove_file(&side);
+    let script = format!(
+        "CREATE TABLE t(a);\n\
+         .output {m}\n\
+         SELECT 'before';\n\
+         .once {s}\n\
+         SELECT 'interlude';\n\
+         SELECT 'after';\n\
+         .quit\n",
+        m = main.display(),
+        s = side.display(),
+    );
+    let (out, err, ok) = run_cli(&[db.to_str().unwrap()], Some(&script));
+    assert!(ok, "stdout: {}\nstderr: {}", out, err);
+    let m = std::fs::read_to_string(&main).unwrap_or_default();
+    let s = std::fs::read_to_string(&side).unwrap_or_default();
+    assert!(m.contains("before"), "main: {}", m);
+    assert!(m.contains("after"), "main: {}", m);
+    assert!(!m.contains("interlude"), "main: {}", m);
+    assert!(s.contains("interlude"), "side: {}", s);
+    assert!(!s.contains("before"), "side: {}", s);
+    assert!(!s.contains("after"), "side: {}", s);
+    // stdout saw none of the redirected statements.
+    assert!(!out.contains("before"), "stdout: {}", out);
+    assert!(!out.contains("interlude"), "stdout: {}", out);
+    assert!(!out.contains("after"), "stdout: {}", out);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cli_output_captures_dot_command_output() {
+    // sqlite3: while `.output` is active, dot-command output (.tables,
+    // .schema) follows the redirect too; prompts stay on the console.
+    let dir = std::env::temp_dir().join(format!("rqlcli-dot-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let db = dir.join("d.db");
+    let file = dir.join("cap.txt");
+    let _ = std::fs::remove_file(&db);
+    let _ = std::fs::remove_file(&file);
+    let script = format!(
+        "CREATE TABLE captbl(a);\n\
+         .output {f}\n\
+         .tables\n\
+         .schema captbl\n\
+         SELECT 'stmt';\n\
+         .quit\n",
+        f = file.display(),
+    );
+    let (out, err, ok) = run_cli(&[db.to_str().unwrap()], Some(&script));
+    assert!(ok, "stdout: {}\nstderr: {}", out, err);
+    let content = std::fs::read_to_string(&file).unwrap_or_default();
+    assert!(content.contains("captbl"), "file: {}", content);
+    assert!(content.contains("CREATE TABLE captbl"), "file: {}", content);
+    assert!(content.contains("stmt"), "file: {}", content);
+    // Dot-command output did not leak to stdout.
+    assert!(!out.contains("captbl"), "stdout: {}", out);
+    let _ = std::fs::remove_dir_all(&dir);
+}

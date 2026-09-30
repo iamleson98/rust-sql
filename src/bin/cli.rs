@@ -241,32 +241,65 @@ fn main() {
     let stdin = io::stdin();
     let mut runner = runner;
     let mut buffer = String::new();
-    let mut mode = OutputMode::Table;
+    let mut state = ShellState::default();
+    let mut out = ShellOut::stdout();
+    // `.output`'s persistent handle. It is opened (truncated) once when
+    // the directive names a NEW file and then kept open: sqlite3 never
+    // re-truncates the redirect target between statements, so a naive
+    // `File::create` per statement would wipe everything but the last
+    // statement's output. A `.once` interlude borrows a different handle
+    // and returns this one untouched.
+    let mut persist_path: Option<String> = None;
+    let mut persist_file: Option<std::fs::File> = None;
 
     loop {
-        write!(
-            stdout,
-            "{}> ",
-            if buffer.is_empty() {
-                if runner.is_remote() {
-                    "rustqlite-remote"
-                } else {
-                    "rustqlite"
-                }
-            } else {
-                "  ..."
-            }
-        )
-        .unwrap();
-        stdout.flush().unwrap();
+        let main_prompt = if runner.is_remote() {
+            "rustqlite-remote".to_string()
+        } else {
+            state.prompt_main.clone()
+        };
+        let prompt = if buffer.is_empty() {
+            main_prompt
+        } else {
+            state.prompt_cont.clone()
+        };
+        // Prompts always go to the console, even while output is
+        // redirected (sqlite3 keeps the prompt on screen).
+        write!(stdout, "{}> ", prompt).unwrap();
+        let _ = stdout.flush();
         let mut line = String::new();
         if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 {
             break; // EOF
         }
         let line = line.trim();
         if buffer.is_empty() && line.starts_with('.') {
-            if let Err(e) = handle_dot_command(&mut runner, line, &mut mode, &mut stdout) {
+            // Dot-command output follows a persistent `.output` (as in
+            // sqlite3); `.once` does not apply to dot-commands. The
+            // writer is resolved BEFORE the directive runs, so the
+            // `.output` line itself reports to the previous target.
+            sync_persist(
+                &mut persist_path,
+                &mut persist_file,
+                state.output_file.as_deref(),
+            );
+            let mut persist_in_out = false;
+            if let Some(fh) = persist_file.take() {
+                let _ = out.flush();
+                out = ShellOut::File(fh);
+                persist_in_out = true;
+            } else if !matches!(out, ShellOut::Stdout(_)) {
+                let _ = out.flush();
+                out = ShellOut::stdout();
+            }
+            if let Err(e) = handle_dot_command(&mut runner, line, &mut state, &mut out) {
                 eprintln!("error: {}", e);
+            }
+            // Hand the handle back so the next unit reuses it.
+            if persist_in_out {
+                let _ = out.flush();
+                if let ShellOut::File(fh) = std::mem::replace(&mut out, ShellOut::stdout()) {
+                    persist_file = Some(fh);
+                }
             }
             continue;
         }
@@ -278,13 +311,77 @@ fn main() {
         if buffer.trim_end().ends_with(';') {
             let sql = buffer.trim().to_string();
             buffer.clear();
-            match execute_sql(&mut runner, &sql, &mode, &mut stdout) {
-                Ok(_) => {}
-                Err(e) => eprintln!("error: {}", e),
+            // Resolve this statement's writer: `.once` (a fresh file,
+            // this statement only) takes priority; else the persistent
+            // `.output` handle; else stdout.
+            sync_persist(
+                &mut persist_path,
+                &mut persist_file,
+                state.output_file.as_deref(),
+            );
+            let once_here = state.once_file.is_some();
+            let mut persist_in_out = false;
+            if let Some(p) = state.once_file.clone() {
+                let _ = out.flush();
+                out = match std::fs::File::create(&p) {
+                    Ok(fh) => ShellOut::File(fh),
+                    Err(e) => {
+                        eprintln!("error: cannot open {}: {}", p, e);
+                        ShellOut::stdout()
+                    }
+                };
+            } else if let Some(fh) = persist_file.take() {
+                let _ = out.flush();
+                out = ShellOut::File(fh);
+                persist_in_out = true;
+            } else if !matches!(out, ShellOut::Stdout(_)) {
+                let _ = out.flush();
+                out = ShellOut::stdout();
+            }
+            if let Err(e) = execute_sql(&mut runner, &sql, &state, &mut out) {
+                eprintln!("error: {}", e);
+            }
+            if once_here {
+                // `.once` is consumed. A still-active `.output` resumes
+                // on the next unit — its handle was never touched, so
+                // the file keeps everything written before the interlude.
+                state.once_file = None;
+                let _ = out.flush();
+                out = ShellOut::stdout();
+            } else if persist_in_out {
+                let _ = out.flush();
+                if let ShellOut::File(fh) = std::mem::replace(&mut out, ShellOut::stdout()) {
+                    persist_file = Some(fh);
+                }
             }
         }
     }
     println!();
+}
+
+/// Reconcile the persistent `.output` handle with the current directive:
+/// a changed path closes the old handle and opens the new file (empty);
+/// an unchanged path keeps the handle open. Opening failures are
+/// reported once (the path is remembered so we do not retry every unit).
+fn sync_persist(
+    persist_path: &mut Option<String>,
+    persist_file: &mut Option<std::fs::File>,
+    want: Option<&str>,
+) {
+    if persist_path.as_deref() == want {
+        return;
+    }
+    *persist_file = None; // close the old handle
+    *persist_path = want.map(str::to_string);
+    if let Some(p) = persist_path.as_deref() {
+        *persist_file = match std::fs::File::create(p) {
+            Ok(fh) => Some(fh),
+            Err(e) => {
+                eprintln!("error: cannot open {}: {}", p, e);
+                None
+            }
+        };
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -384,6 +481,14 @@ impl Runner {
     fn total_changes(&self) -> i64 {
         match self {
             Runner::Local(db) => db.total_changes(),
+            #[cfg(feature = "auth")]
+            Runner::Remote { .. } => 0,
+        }
+    }
+
+    fn changes(&self) -> i64 {
+        match self {
+            Runner::Local(db) => db.changes(),
             #[cfg(feature = "auth")]
             Runner::Remote { .. } => 0,
         }
@@ -596,11 +701,88 @@ fn error_from_json(body: &str) -> String {
 // Dot commands
 // ---------------------------------------------------------------------------
 
+/// Session state for the shell (sqlite3's dot-command toggles).
+struct ShellState {
+    mode: OutputMode,
+    /// `.headers on|off` — column headers in table/csv output.
+    headers: bool,
+    /// `.nullvalue STRING` — how SQL NULL renders.
+    nullvalue: String,
+    /// `.timer on|off` — per-statement wall time.
+    timer: bool,
+    /// `.changes on|off` — per-statement change counts.
+    changes: bool,
+    /// `.echo on|off` — echo each SQL statement before running it.
+    echo: bool,
+    /// `.eqp on|off` — EXPLAIN QUERY PLAN before each statement.
+    eqp: bool,
+    /// `.width N...` — fixed table-mode column widths (0 = auto).
+    widths: Vec<usize>,
+    /// `.separator COL [ROW]` — csv-mode separators.
+    col_sep: String,
+    row_sep: String,
+    /// `.output FILE` — persistent redirection (None = stdout).
+    output_file: Option<String>,
+    /// `.once FILE` — next statement only.
+    once_file: Option<String>,
+    /// `.prompt MAIN [CONT]`
+    prompt_main: String,
+    prompt_cont: String,
+}
+
+impl Default for ShellState {
+    fn default() -> Self {
+        Self {
+            mode: OutputMode::Table,
+            headers: true,
+            nullvalue: String::new(),
+            timer: false,
+            changes: false,
+            echo: false,
+            eqp: false,
+            widths: Vec::new(),
+            col_sep: ",".to_string(),
+            row_sep: "\n".to_string(),
+            output_file: None,
+            once_file: None,
+            prompt_main: "rustqlite".to_string(),
+            prompt_cont: "  ...".to_string(),
+        }
+    }
+}
+
+/// The shell's writer: stdout (pipe-tolerant) or a redirected file.
+enum ShellOut {
+    Stdout(PipeTolerant<io::Stdout>),
+    File(std::fs::File),
+}
+
+impl ShellOut {
+    fn stdout() -> Self {
+        ShellOut::Stdout(PipeTolerant(io::stdout()))
+    }
+}
+
+impl Write for ShellOut {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            ShellOut::Stdout(w) => w.write(buf),
+            ShellOut::File(f) => f.write(buf),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            ShellOut::Stdout(w) => w.flush(),
+            ShellOut::File(f) => f.flush(),
+        }
+    }
+}
+
 fn handle_dot_command(
     runner: &mut Runner,
     line: &str,
-    mode: &mut OutputMode,
-    out: &mut impl Write,
+    state: &mut ShellState,
+    out: &mut ShellOut,
 ) -> Result<(), String> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.is_empty() {
@@ -609,43 +791,200 @@ fn handle_dot_command(
     match parts[0] {
         ".help" => {
             writeln!(out, "Commands:").unwrap();
-            writeln!(out, "  .help                Show this help.").unwrap();
-            writeln!(out, "  .tables              List all tables and views.").unwrap();
+            writeln!(out, "  .help                     Show this help.").unwrap();
             writeln!(
                 out,
-                "  .schema [pattern]    Show CREATE statements (filtered by pattern)."
+                "  .tables [pattern]         List tables and views (LIKE pattern)."
             )
             .unwrap();
             writeln!(
                 out,
-                "  .dump [FILE]         Full SQL dump: schema + data (default: stdout)."
+                "  .indexes [pattern]        List indexes (LIKE pattern)."
             )
             .unwrap();
-            writeln!(out, "  .export-schema [FILE]  CREATE statements only.").unwrap();
-            writeln!(out, "  .export-data [FILE]    INSERT statements only.").unwrap();
-            writeln!(out, "  .read FILE           Execute an SQL script.").unwrap();
+            writeln!(out, "  .schema [pattern]         Show CREATE statements.").unwrap();
             writeln!(
                 out,
-                "  .import FILE [TABLE] Execute an SQL script, or import CSV into TABLE."
+                "  .databases                List open databases (incl. ATTACHed)."
             )
             .unwrap();
             writeln!(
                 out,
-                "  .backup FILE         Physical byte-copy backup of the database."
+                "  .dbinfo                   Database file header info."
             )
             .unwrap();
-            writeln!(out, "  .mode json|table|csv|line  Output mode.").unwrap();
-            writeln!(out, "  .quit / .exit        Exit the shell.").unwrap();
+            writeln!(out, "  .stats [on|off]           Page/schema statistics.").unwrap();
+            writeln!(
+                out,
+                "  .dump [FILE]              Full SQL dump: schema + data."
+            )
+            .unwrap();
+            writeln!(out, "  .export-schema [FILE]     CREATE statements only.").unwrap();
+            writeln!(out, "  .export-data [FILE]       INSERT statements only.").unwrap();
+            writeln!(out, "  .read FILE                Execute an SQL script.").unwrap();
+            writeln!(
+                out,
+                "  .import FILE [TABLE]      Run a script, or import CSV into TABLE."
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "  .backup FILE              Physical byte-copy backup."
+            )
+            .unwrap();
+            writeln!(out, "  .save FILE                Alias for .backup.").unwrap();
+            writeln!(
+                out,
+                "  .clone NEWDB              Copy the database to a new file."
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "  .restore FILE             Replace this database's content with FILE's."
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "  .open FILE                Close and reopen on a different database."
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "  .output [FILE]            Redirect output (no arg: back to stdout)."
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "  .once FILE                Redirect the NEXT statement's output."
+            )
+            .unwrap();
+            writeln!(out, "  .mode json|table|csv|line Output mode.").unwrap();
+            writeln!(
+                out,
+                "  .headers on|off           Column headers in table/csv output."
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "  .nullvalue STRING         Render SQL NULL as STRING (default: empty)."
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "  .width N ...              Fixed table-mode column widths (0 = auto)."
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "  .separator COL [ROW]      CSV separators (default: comma / newline)."
+            )
+            .unwrap();
+            writeln!(out, "  .timer on|off             Per-statement wall time.").unwrap();
+            writeln!(
+                out,
+                "  .changes on|off           Per-statement change counts."
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "  .echo on|off              Echo each statement before running it."
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "  .eqp on|off               EXPLAIN QUERY PLAN before each statement."
+            )
+            .unwrap();
+            writeln!(out, "  .print TEXT...            Print literal text.").unwrap();
+            writeln!(out, "  .prompt MAIN [CONT]       Change the shell prompts.").unwrap();
+            writeln!(
+                out,
+                "  .shell CMD / .system CMD  Run a shell command (local only)."
+            )
+            .unwrap();
+            writeln!(out, "  .quit / .exit             Exit the shell.").unwrap();
         }
         ".tables" => {
-            let (_, rows) = runner.query(
-                "SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY name",
-            )?;
+            // sqlite3: the optional argument is a LIKE pattern.
+            let sql = match parts.get(1) {
+                Some(p) => format!(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' AND name LIKE '{}' ORDER BY name",
+                    p
+                ),
+                None => "SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY name".to_string(),
+            };
+            let (_, rows) = runner.query(&sql)?;
             for row in rows {
                 if let Some(Value::Text(n)) = row.first() {
                     writeln!(out, "{}", n.as_str()).unwrap();
                 }
             }
+        }
+        ".indexes" => {
+            let sql = match parts.get(1) {
+                Some(p) => format!(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%' AND name LIKE '{}' ORDER BY name",
+                    p
+                ),
+                None => "SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name".to_string(),
+            };
+            let (_, rows) = runner.query(&sql)?;
+            for row in rows {
+                if let Some(Value::Text(n)) = row.first() {
+                    writeln!(out, "{}", n.as_str()).unwrap();
+                }
+            }
+        }
+        ".databases" => {
+            let (_, rows) = runner.query("PRAGMA database_list")?;
+            for row in rows {
+                let seq = row.first().map(|v| v.to_string()).unwrap_or_default();
+                let name = row
+                    .get(1)
+                    .map(|v| match v {
+                        Value::Text(t) => t.as_str().to_string(),
+                        other => other.to_string(),
+                    })
+                    .unwrap_or_default();
+                let file = match row.get(2) {
+                    Some(Value::Text(t)) if !t.is_empty() => t.as_str().to_string(),
+                    _ => String::new(),
+                };
+                writeln!(out, "{}: {} {}", seq, name, file).unwrap();
+            }
+        }
+        ".dbinfo" => {
+            for pragma in [
+                "page_size",
+                "page_count",
+                "freelist_count",
+                "schema_version",
+                "journal_mode",
+                "encoding",
+                "auto_vacuum",
+                "user_version",
+            ] {
+                let (_, rows) = runner.query(&format!("PRAGMA {}", pragma))?;
+                let v = rows
+                    .first()
+                    .and_then(|r| r.first())
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "NULL".to_string());
+                writeln!(out, "{:<16} {}", format!("{}:", pragma), v).unwrap();
+            }
+        }
+        ".stats" => {
+            if let Some(arg) = parts.get(1) {
+                let on = !arg.eq_ignore_ascii_case("off");
+                if on {
+                    print_shell_stats(runner, out)?;
+                }
+                // No persistent stats stream in rustqlite; the toggle
+                // prints once (sqlite3 prints per-statement deltas).
+                let _ = on;
+                return Ok(());
+            }
+            print_shell_stats(runner, out)?;
         }
         ".schema" => {
             let pattern = parts.get(1).copied();
@@ -708,7 +1047,7 @@ fn handle_dot_command(
         }
         ".mode" => {
             if parts.len() >= 2 {
-                *mode = match parts[1] {
+                state.mode = match parts[1] {
                     "json" => OutputMode::Json,
                     "table" => OutputMode::Table,
                     "csv" => OutputMode::Csv,
@@ -719,16 +1058,287 @@ fn handle_dot_command(
                     }
                 };
             } else {
-                writeln!(out, "current mode: {:?}", mode).unwrap();
+                writeln!(out, "current mode: {:?}", state.mode).unwrap();
             }
         }
+        ".headers" => match parts.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
+            Some("on") => state.headers = true,
+            Some("off") => state.headers = false,
+            _ => writeln!(out, "usage: .headers on|off").unwrap(),
+        },
+        ".nullvalue" => {
+            state.nullvalue = parts
+                .get(1)
+                .map(|s| unquote_shell_word(s))
+                .unwrap_or_default();
+        }
+        ".timer" => match parts.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
+            Some("on") => state.timer = true,
+            Some("off") => state.timer = false,
+            _ => writeln!(out, "usage: .timer on|off").unwrap(),
+        },
+        ".changes" => match parts.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
+            Some("on") => state.changes = true,
+            Some("off") => state.changes = false,
+            _ => writeln!(out, "usage: .changes on|off").unwrap(),
+        },
+        ".echo" => match parts.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
+            Some("on") => state.echo = true,
+            Some("off") => state.echo = false,
+            _ => writeln!(out, "usage: .echo on|off").unwrap(),
+        },
+        ".eqp" => match parts.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
+            Some("on") => state.eqp = true,
+            Some("off") => state.eqp = false,
+            _ => writeln!(out, "usage: .eqp on|off").unwrap(),
+        },
+        ".width" => {
+            state.widths = parts[1..]
+                .iter()
+                .filter_map(|w| w.parse::<usize>().ok())
+                .collect();
+        }
+        ".separator" => {
+            if let Some(col) = parts.get(1) {
+                state.col_sep = unquote_shell_word(col);
+            }
+            if let Some(row) = parts.get(2) {
+                state.row_sep = unquote_shell_word(row);
+            }
+            if parts.len() == 1 {
+                writeln!(out, "col: {}  row: {}", state.col_sep, state.row_sep).unwrap();
+            }
+        }
+        ".output" => match parts.get(1) {
+            Some(file) => {
+                state.output_file = Some(file.to_string());
+                // Status to stderr, like sqlite3's silence on success:
+                // it must never pollute the redirected file or stdout.
+                eprintln!("output redirected to {}", file);
+            }
+            None => {
+                state.output_file = None;
+                eprintln!("output restored to stdout");
+            }
+        },
+        ".once" => {
+            let file = parts
+                .get(1)
+                .ok_or_else(|| "usage: .once FILE".to_string())?;
+            state.once_file = Some(file.to_string());
+        }
+        ".print" => {
+            let text = parts[1..].join(" ");
+            writeln!(out, "{}", text).unwrap();
+        }
+        ".prompt" => {
+            if let Some(main) = parts.get(1) {
+                state.prompt_main = main.to_string();
+            }
+            if let Some(cont) = parts.get(2) {
+                state.prompt_cont = cont.to_string();
+            }
+        }
+        ".save" | ".clone" => {
+            let file = parts
+                .get(1)
+                .ok_or_else(|| format!("usage: {} FILE", parts[0]))?;
+            let image = runner.backup_image()?;
+            std::fs::write(file, &image).map_err(|e| format!("cannot write {}: {}", file, e))?;
+            writeln!(out, "written: {} ({} bytes)", file, image.len()).unwrap();
+        }
+        ".open" => {
+            let file = parts
+                .get(1)
+                .ok_or_else(|| "usage: .open FILE".to_string())?;
+            if runner.is_remote() {
+                return Err(".open is not available in remote mode".to_string());
+            }
+            let db = Database::open(file).map_err(|e| e.to_string())?;
+            *runner = Runner::Local(Box::new(db));
+            writeln!(out, "opened: {}", file).unwrap();
+        }
+        ".restore" => {
+            let file = parts
+                .get(1)
+                .ok_or_else(|| "usage: .restore FILE".to_string())?;
+            restore_from_file(runner, file, out)?;
+        }
+        ".shell" | ".system" => {
+            let cmd = parts[1..].join(" ");
+            if cmd.is_empty() {
+                writeln!(out, "usage: {} COMMAND", parts[0]).unwrap();
+                return Ok(());
+            }
+            run_shell_command(&cmd, out)?;
+        }
+        ".log" | ".archive" | ".scanstats" | ".fullschema" | ".sha3sum" | ".excel" => {
+            writeln!(out, "{} is not supported in rustqlite's shell", parts[0]).unwrap();
+        }
         ".quit" | ".exit" => {
+            let _ = out.flush();
             std::process::exit(0);
         }
         _ => {
             writeln!(out, "unknown command: {} (try .help)", parts[0]).unwrap();
         }
     }
+    Ok(())
+}
+
+/// Strip one level of matching quotes from a shell word ('...' / "...").
+fn unquote_shell_word(w: &str) -> String {
+    let bytes = w.as_bytes();
+    if bytes.len() >= 2 {
+        let (first, last) = (bytes[0], bytes[bytes.len() - 1]);
+        if (first == b'\'' && last == b'\'') || (first == b'"' && last == b'"') {
+            return w[1..w.len() - 1].to_string();
+        }
+    }
+    w.to_string()
+}
+
+/// `.stats`: page + schema statistics (sqlite3's page-stats subset).
+fn print_shell_stats(runner: &mut Runner, out: &mut ShellOut) -> Result<(), String> {
+    let page_size: i64 = runner
+        .query("PRAGMA page_size")?
+        .1
+        .first()
+        .and_then(|r| r.first())
+        .and_then(|v| match v {
+            Value::Integer(i) => Some(*i),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let page_count: i64 = runner
+        .query("PRAGMA page_count")?
+        .1
+        .first()
+        .and_then(|r| r.first())
+        .and_then(|v| match v {
+            Value::Integer(i) => Some(*i),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let freelist: i64 = runner
+        .query("PRAGMA freelist_count")?
+        .1
+        .first()
+        .and_then(|r| r.first())
+        .and_then(|v| match v {
+            Value::Integer(i) => Some(*i),
+            _ => None,
+        })
+        .unwrap_or(0);
+    writeln!(out, "page size:        {}", page_size).unwrap();
+    writeln!(out, "page count:       {}", page_count).unwrap();
+    writeln!(out, "database size:    {} bytes", page_size * page_count).unwrap();
+    writeln!(out, "freelist pages:   {}", freelist).unwrap();
+    let (_, objects) =
+        runner.query("SELECT type, count(*) FROM sqlite_master GROUP BY type ORDER BY type")?;
+    for row in &objects {
+        let kind = row
+            .first()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let n = row.get(1).map(|v| v.to_string()).unwrap_or_default();
+        writeln!(out, "schema {}:   {}", kind, n).unwrap();
+    }
+    Ok(())
+}
+
+/// `.restore FILE`: replace this database's content with FILE's —
+/// driven entirely through ATTACH (the round's new engine surface):
+/// every schema object is recreated from the source's `sqlite_master`
+/// and its rows copied table by table, inside one transaction.
+fn restore_from_file(runner: &mut Runner, file: &str, out: &mut ShellOut) -> Result<(), String> {
+    if !std::path::Path::new(file).exists() {
+        return Err(format!("cannot read {}: no such file", file));
+    }
+    let quoted = file.replace(char::from(39), "''");
+    runner.execute(&format!("ATTACH '{}' AS __restore_src", quoted))?;
+    let result = (|| -> Result<(), String> {
+        // Drop current user objects (schema order preserved on rebuild).
+        let (_, current) = runner.query("SELECT type, name FROM sqlite_master ORDER BY rowid")?;
+        for row in current {
+            let (kind, name) = match (row.first(), row.get(1)) {
+                (Some(Value::Text(a)), Some(Value::Text(b))) => {
+                    (a.as_str().to_string(), b.as_str().to_string())
+                }
+                _ => continue,
+            };
+            if name.starts_with("sqlite_") {
+                continue;
+            }
+            let drop_sql = match kind.as_str() {
+                "table" => format!("DROP TABLE IF EXISTS main.\"{}\"", name),
+                "view" => format!("DROP VIEW IF EXISTS main.\"{}\"", name),
+                "index" => format!("DROP INDEX IF EXISTS main.\"{}\"", name),
+                "trigger" => format!("DROP TRIGGER IF EXISTS main.\"{}\"", name),
+                _ => continue,
+            };
+            runner.execute(&drop_sql)?;
+        }
+        // Recreate every object from the source, in creation order.
+        let (_, schema) = runner.query(
+            "SELECT type, name, sql FROM __restore_src.sqlite_master \
+             WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY rowid",
+        )?;
+        // Tables first (FKs and triggers reference them), then the rest.
+        for pass in 0..2 {
+            for row in &schema {
+                let kind = match row.first() {
+                    Some(Value::Text(t)) => t.as_str().to_string(),
+                    _ => continue,
+                };
+                let is_table = kind == "table";
+                if (pass == 0) != is_table {
+                    continue;
+                }
+                let sql = match row.get(2) {
+                    Some(Value::Text(t)) => t.as_str().to_string(),
+                    _ => continue,
+                };
+                runner.execute(&sql)?;
+            }
+        }
+        // Copy rows table by table.
+        let (_, tables) = runner.query(
+            "SELECT name FROM __restore_src.sqlite_master \
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY rowid",
+        )?;
+        let mut copied = 0usize;
+        for row in &tables {
+            let name = match row.first() {
+                Some(Value::Text(t)) => t.as_str().to_string(),
+                _ => continue,
+            };
+            runner.execute(&format!(
+                "INSERT INTO main.\"{}\" SELECT * FROM __restore_src.\"{}\"",
+                name, name
+            ))?;
+            copied += 1;
+        }
+        writeln!(out, "restored: {} tables from {}", copied, file).unwrap();
+        Ok(())
+    })();
+    let detach = runner.execute("DETACH __restore_src");
+    result?;
+    detach.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// `.shell` / `.system`: run a command through the platform shell.
+fn run_shell_command(cmd: &str, out: &mut ShellOut) -> Result<(), String> {
+    use std::process::Command;
+    let output = if cfg!(windows) {
+        Command::new("cmd").args(["/C", cmd]).output()
+    } else {
+        Command::new("sh").args(["-c", cmd]).output()
+    }
+    .map_err(|e| format!("cannot run shell: {}", e))?;
+    write!(out, "{}", String::from_utf8_lossy(&output.stdout)).unwrap();
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
     Ok(())
 }
 
@@ -1237,7 +1847,7 @@ fn sanitize_column_name(name: &str) -> String {
 fn execute_sql(
     runner: &mut Runner,
     sql: &str,
-    mode: &OutputMode,
+    state: &ShellState,
     out: &mut impl Write,
 ) -> Result<(), String> {
     // Determine if this is a query or a DML/DDL statement by the leading
@@ -1249,12 +1859,35 @@ fn execute_sql(
         &["SELECT", "WITH", "VALUES", "EXPLAIN", "PRAGMA", "TABLE"],
     );
 
+    if state.echo {
+        writeln!(out, "{}", sql).unwrap();
+    }
+    let started = std::time::Instant::now();
     if is_query {
+        if state.eqp {
+            // sqlite3's .eqp: the plan renders BEFORE the results.
+            if let Ok((pcols, prows)) = runner.query(&format!("EXPLAIN QUERY PLAN {}", sql)) {
+                print_rows(out, &pcols, &prows, state);
+            }
+        }
         let (cols, rows) = runner.query(sql)?;
-        print_rows(out, &cols, &rows, mode);
+        print_rows(out, &cols, &rows, state);
     } else {
         runner.execute(sql)?;
-        writeln!(out, "OK").unwrap();
+        if state.changes {
+            let (chg, total) = (runner.changes(), runner.total_changes());
+            writeln!(out, "changes: {}   total_changes: {}", chg, total).unwrap();
+        } else {
+            writeln!(out, "OK").unwrap();
+        }
+    }
+    if state.timer {
+        writeln!(
+            out,
+            "Run Time (s): real {:.3}",
+            started.elapsed().as_secs_f64()
+        )
+        .unwrap();
     }
     Ok(())
 }
@@ -1281,47 +1914,61 @@ enum OutputMode {
     Line,
 }
 
-fn print_rows(out: &mut impl Write, cols: &[String], rows: &[Vec<Value>], mode: &OutputMode) {
+fn print_rows(out: &mut impl Write, cols: &[String], rows: &[Vec<Value>], state: &ShellState) {
     if rows.is_empty() {
         writeln!(out, "(no rows)").unwrap();
         return;
     }
-    match mode {
-        OutputMode::Table => print_table(out, cols, rows),
+    match state.mode {
+        OutputMode::Table => print_table(out, cols, rows, state),
         OutputMode::Json => print_json(out, cols, rows),
-        OutputMode::Csv => print_csv(out, cols, rows),
-        OutputMode::Line => print_line(out, cols, rows),
+        OutputMode::Csv => print_csv(out, cols, rows, state),
+        OutputMode::Line => print_line(out, cols, rows, state),
     }
 }
 
-fn print_table(out: &mut impl Write, cols: &[String], rows: &[Vec<Value>]) {
-    // Compute column widths.
+fn cell_text(v: &Value, state: &ShellState) -> String {
+    match v {
+        Value::Null => state.nullvalue.clone(),
+        _ => format!("{}", v),
+    }
+}
+
+fn print_table(out: &mut impl Write, cols: &[String], rows: &[Vec<Value>], state: &ShellState) {
+    // Column widths: `.width` overrides (0 = auto), else content-driven.
     let mut widths: Vec<usize> = cols.iter().map(|c| c.len()).collect();
     for row in rows {
         for (i, v) in row.iter().enumerate() {
-            let len = format_value(v).len();
+            let len = cell_text(v, state).len();
             if i < widths.len() && len > widths[i] {
                 widths[i] = len;
             }
         }
     }
+    for (i, w) in state.widths.iter().enumerate() {
+        if i < widths.len() && *w > 0 {
+            widths[i] = *w;
+        }
+    }
     // Header
-    let header: Vec<String> = cols
-        .iter()
-        .enumerate()
-        .map(|(i, c)| format!("{:width$}", c, width = widths[i]))
-        .collect();
-    writeln!(out, "| {} |", header.join(" | ")).unwrap();
-    // Separator
-    let sep: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
-    writeln!(out, "|-{}-|", sep.join("-|-")).unwrap();
+    if state.headers {
+        let header: Vec<String> = cols
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{:width$}", c, width = widths[i]))
+            .collect();
+        writeln!(out, "| {} |", header.join(" | ")).unwrap();
+        // Separator
+        let sep: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
+        writeln!(out, "|-{}-|", sep.join("-|-")).unwrap();
+    }
     // Rows
     for row in rows {
         let cells: Vec<String> = row
             .iter()
             .enumerate()
             .map(|(i, v)| {
-                let s = format_value(v);
+                let s = cell_text(v, state);
                 format!("{:width$}", s, width = widths.get(i).copied().unwrap_or(0))
             })
             .collect();
@@ -1350,15 +1997,41 @@ fn print_json(out: &mut impl Write, cols: &[String], rows: &[Vec<Value>]) {
     writeln!(out, "]").unwrap();
 }
 
-fn print_csv(out: &mut impl Write, cols: &[String], rows: &[Vec<Value>]) {
-    let _ = cols;
+fn print_csv(out: &mut impl Write, cols: &[String], rows: &[Vec<Value>], state: &ShellState) {
+    if state.headers {
+        let header: Vec<String> = cols
+            .iter()
+            .map(|c| c.replace(state.col_sep.as_str(), " "))
+            .collect();
+        let line = header.join(state.col_sep.as_str());
+        if state.row_sep == "\n" {
+            writeln!(out, "{}", line).unwrap();
+        } else {
+            write!(out, "{}{}", line, state.row_sep).unwrap();
+        }
+    }
     for row in rows {
-        let cells: Vec<String> = row.iter().map(format_value).collect();
-        writeln!(out, "{}", cells.join(",")).unwrap();
+        let cells: Vec<String> = row
+            .iter()
+            .map(|v| {
+                let t = cell_text(v, state);
+                if t.contains(state.col_sep.as_str()) {
+                    format!("\"{}\"", t.replace('"', "\"\""))
+                } else {
+                    t
+                }
+            })
+            .collect();
+        let line = cells.join(state.col_sep.as_str());
+        if state.row_sep == "\n" {
+            writeln!(out, "{}", line).unwrap();
+        } else {
+            write!(out, "{}{}", line, state.row_sep).unwrap();
+        }
     }
 }
 
-fn print_line(out: &mut impl Write, cols: &[String], rows: &[Vec<Value>]) {
+fn print_line(out: &mut impl Write, cols: &[String], rows: &[Vec<Value>], state: &ShellState) {
     let max_col_len = cols.iter().map(|c| c.len()).max().unwrap_or(0);
     for row in rows {
         for (i, v) in row.iter().enumerate() {
@@ -1367,19 +2040,12 @@ fn print_line(out: &mut impl Write, cols: &[String], rows: &[Vec<Value>]) {
                 out,
                 "{:>width$} = {}",
                 name,
-                format_value(v),
+                cell_text(v, state),
                 width = max_col_len
             )
             .unwrap();
         }
         writeln!(out).unwrap();
-    }
-}
-
-fn format_value(v: &Value) -> String {
-    match v {
-        Value::Null => "".to_string(),
-        _ => format!("{}", v),
     }
 }
 
