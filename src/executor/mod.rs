@@ -11017,8 +11017,9 @@ fn exec_aggregate(
                     EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
                 let key_values: Vec<Value> = key_exprs
                     .iter()
-                    .map(|e| {
-                        evaluate(e, &eval_ctx).map(|v| probe_affinity_value(table, index, e, &v))
+                    .enumerate()
+                    .map(|(i, e)| {
+                        evaluate(e, &eval_ctx).map(|v| probe_affinity_value(table, index, i, e, &v))
                     })
                     .collect::<Result<_>>()?;
                 // NULL equality probes match nothing (SQL 3VL).
@@ -15777,7 +15778,18 @@ fn exec_rowid_lookup(
     let mut bt = Btree::new(ctx.pager, root, false);
     let row = match bt.lookup_table(rowid)? {
         LookupResult::Found(payload) => {
-            decode_row(&payload, table.n_columns(), rowid, table.rowid_alias)?
+            let mut row = decode_row(&payload, table.n_columns(), rowid, table.rowid_alias)?;
+            // The hidden rowid slot: `out_cols` advertises a trailing
+            // `prefix.\0rowid` column for alias-less rowid tables (the
+            // same `wants_rowid_slot` discipline as the scan paths) —
+            // append the cell key so the row matches its column list.
+            // Without it a projection over this lookup (SELECT rowid, *
+            // FROM t WHERE rowid = ?) resolved the rowid reference to
+            // the advertised slot and indexed past the row's end.
+            if crate::planner::wants_rowid_slot(&table) {
+                row.push(Value::Integer(rowid));
+            }
+            row
         }
         LookupResult::NotFound => {
             return Ok(ExecResult {
@@ -15904,7 +15916,7 @@ fn exec_index_in(
     // same way. Deduping on the encoded key is type-exact.
     let mut encoded_keys: Vec<Vec<u8>> = Vec::with_capacity(key_exprs.len());
     for e in key_exprs {
-        let v = evaluate(e, &eval_ctx).map(|v| probe_affinity_value(&table, &index, e, &v))?;
+        let v = evaluate(e, &eval_ctx).map(|v| probe_affinity_value(&table, &index, 0, e, &v))?;
         // NULL keys never match an index entry (SQLite semantics); other
         // types are encoded order-preservingly and simply miss.
         if v.is_null() {
@@ -16855,7 +16867,10 @@ fn exec_index_lookup_impl(
     let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
     let key_values: Vec<Value> = key_exprs
         .iter()
-        .map(|e| evaluate(e, &eval_ctx).map(|v| probe_affinity_value(&table, &index, e, &v)))
+        .enumerate()
+        .map(|(i, e)| {
+            evaluate(e, &eval_ctx).map(|v| probe_affinity_value(&table, &index, i, e, &v))
+        })
         .collect::<Result<_>>()?;
 
     // NULL equality probes match NOTHING (SQL 3VL: `v = NULL` is never
@@ -16882,7 +16897,6 @@ fn exec_index_lookup_impl(
     let mut index_bt = Btree::new(ctx.pager, index_root, true);
     let mut rowids: Vec<i64> = Vec::new();
     index_bt.lookup_index_into(&key_bytes, &mut rowids)?;
-
     // COVERING INDEX (SQLite's wording, PG's index-only scan idea): a
     // projection that consists ONLY of rowid spellings is answerable
     // from the INDEX alone — the rowid IS the index entry's B+tree key,
@@ -17011,8 +17025,22 @@ fn index_key_prefix_cmp(cell_key: &[u8], bound: &[u8]) -> std::cmp::Ordering {
 /// itself a column (the two-column rules are the residual predicate's
 /// job) and for expression index entries (expression keys carry no
 /// affinity).
-fn probe_affinity_value(table: &Table, index: &crate::schema::Index, e: &Expr, v: &Value) -> Value {
-    let ic = match index.columns.first() {
+/// Fold ONE probe value through its OWN index column's affinity
+/// (SQLite: each key expression compares against its corresponding
+/// indexed column, so the affinity applies per position). The old
+/// shape applied the FIRST column's affinity to EVERY value — a
+/// composite (TEXT, INT) index textified the INT literal's key
+/// ('1' encoded as TEXT), so mixed-affinity composite probes matched
+/// nothing (found via the session extension's WITHOUT ROWID (a,b) PK
+/// lookups; differential-pinned).
+fn probe_affinity_value(
+    table: &Table,
+    index: &crate::schema::Index,
+    pos: usize,
+    e: &Expr,
+    v: &Value,
+) -> Value {
+    let ic = match index.columns.get(pos) {
         Some(ic) => ic,
         None => return v.clone(),
     };
@@ -17044,7 +17072,7 @@ fn eval_index_bound(
     index: &crate::schema::Index,
 ) -> Result<Value> {
     let v = evaluate(e, eval_ctx)?;
-    let v = probe_affinity_value(table, index, e, &v);
+    let v = probe_affinity_value(table, index, 0, e, &v);
     Ok(match index.columns.first() {
         Some(ic) => crate::plugin::collation_fold_key_ref(&ic.collation, &v).into_owned(),
         None => v,
@@ -21843,7 +21871,10 @@ fn try_streaming_update(
                 EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
             let key_values: Vec<Value> = key_exprs
                 .iter()
-                .map(|e| evaluate(e, &eval_ctx).map(|v| probe_affinity_value(t, index, e, &v)))
+                .enumerate()
+                .map(|(i, e)| {
+                    evaluate(e, &eval_ctx).map(|v| probe_affinity_value(t, index, i, e, &v))
+                })
                 .collect::<Result<_>>()?;
             // NULL equality probe: matches nothing (SQL 3VL — see
             // exec_index_lookup_impl's guard).
@@ -21885,7 +21916,7 @@ fn try_streaming_update(
                 EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
             let mut keys: Vec<Vec<u8>> = Vec::with_capacity(key_exprs.len());
             for e in key_exprs.iter() {
-                let v = evaluate(e, &eval_ctx).map(|v| probe_affinity_value(t, index, e, &v))?;
+                let v = evaluate(e, &eval_ctx).map(|v| probe_affinity_value(t, index, 0, e, &v))?;
                 if v.is_null() {
                     continue;
                 }
@@ -23819,7 +23850,10 @@ fn try_streaming_delete(
                     EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
                 let key_values: Vec<Value> = key_exprs
                     .iter()
-                    .map(|e| evaluate(e, &eval_ctx).map(|v| probe_affinity_value(t, index, e, &v)))
+                    .enumerate()
+                    .map(|(i, e)| {
+                        evaluate(e, &eval_ctx).map(|v| probe_affinity_value(t, index, i, e, &v))
+                    })
                     .collect::<Result<_>>()?;
                 let probe_keys = if key_values.iter().any(|v| v.is_null()) {
                     Vec::new()
@@ -23855,7 +23889,7 @@ fn try_streaming_delete(
                 let mut keys: Vec<Vec<u8>> = Vec::with_capacity(key_exprs.len());
                 for e in key_exprs.iter() {
                     let v =
-                        evaluate(e, &eval_ctx).map(|v| probe_affinity_value(t, index, e, &v))?;
+                        evaluate(e, &eval_ctx).map(|v| probe_affinity_value(t, index, 0, e, &v))?;
                     if v.is_null() {
                         continue;
                     }
@@ -23956,7 +23990,7 @@ fn try_streaming_delete(
                 EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
             let mut keys: Vec<Vec<u8>> = Vec::with_capacity(key_exprs.len());
             for e in key_exprs.iter() {
-                let v = evaluate(e, &eval_ctx).map(|v| probe_affinity_value(t, index, e, &v))?;
+                let v = evaluate(e, &eval_ctx).map(|v| probe_affinity_value(t, index, 0, e, &v))?;
                 if v.is_null() {
                     continue;
                 }
@@ -23992,7 +24026,10 @@ fn try_streaming_delete(
                 EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
             let key_values: Vec<Value> = key_exprs
                 .iter()
-                .map(|e| evaluate(e, &eval_ctx).map(|v| probe_affinity_value(t, index, e, &v)))
+                .enumerate()
+                .map(|(i, e)| {
+                    evaluate(e, &eval_ctx).map(|v| probe_affinity_value(t, index, i, e, &v))
+                })
                 .collect::<Result<_>>()?;
             // NULL equality probe: matches nothing (SQL 3VL — see
             // exec_index_lookup_impl's guard).
@@ -24684,9 +24721,30 @@ fn exec_delete(
     let mut deleted = 0i64;
     let mut returning_rows: Vec<Vec<Value>> = Vec::new();
     let mut max_deleted: i64 = i64::MIN;
+    // Alias-less rowid tables: the source scan carries the rowid in
+    // its HIDDEN rowid slot (`prefix.\0rowid` — the wants_rowid_slot
+    // discipline; RowidLookup/RowidIn/scan sources all append it).
+    // Resolve that slot's index once, outside the row loop.
+    let hidden_rowid_idx: Option<usize> = if table.rowid_alias.is_none() && !table.without_rowid {
+        source_res
+            .columns
+            .iter()
+            .position(|c| crate::planner::is_hidden_rowid(c))
+    } else {
+        None
+    };
     for row in &source_res.rows {
-        let rowid = if let Some(idx) = table.rowid_alias {
+        let rowid: i64 = if let Some(idx) = table.rowid_alias {
             row[idx].as_integer()
+        } else if let Some(h) = hidden_rowid_idx {
+            match row.get(h) {
+                Some(Value::Integer(r)) => *r,
+                _ => {
+                    return Err(Error::Unsupported(
+                        "DELETE on a table without INTEGER PRIMARY KEY",
+                    ))
+                }
+            }
         } else {
             return Err(Error::Unsupported(
                 "DELETE on a table without INTEGER PRIMARY KEY",

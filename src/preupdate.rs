@@ -108,6 +108,17 @@ thread_local! {
     static DELTA_ARMED: Cell<bool> = const { Cell::new(false) };
 }
 
+/// The session-capture sink: the sessions registered for the CURRENT
+/// connection identity, armed per statement (engine `Database::execute`
+/// / the streaming paths; the C-ABI layer rides the same list through
+/// its `ConnIdentityGuard` arming). One TLS load when unset.
+pub type SessionTarget =
+    std::sync::Arc<[std::sync::Arc<std::sync::Mutex<crate::session::SessionCore>>]>;
+thread_local! {
+    static SESSIONS: RefCell<Option<SessionTarget>> = const { RefCell::new(None) };
+    static SESSIONS_ARMED: Cell<bool> = const { Cell::new(false) };
+}
+
 /// Install the delta journal target for one statement. Fails (returns
 /// false, arming nothing) when a target is already armed — a nested
 /// `execute` — which the caller treats as a poison (the journal cannot
@@ -146,6 +157,39 @@ impl Drop for DeltaGuard {
             DELTA_ARMED.with(|a| a.set(false));
         }
     }
+}
+
+/// The session sink's unwind-safe guard (pops / restores on drop).
+pub struct SessionSinkGuard {
+    prev: Option<SessionTarget>,
+}
+
+impl Drop for SessionSinkGuard {
+    fn drop(&mut self) {
+        SESSIONS.with(|s| *s.borrow_mut() = self.prev.take());
+        SESSIONS_ARMED.with(|a| a.set(false));
+    }
+}
+
+/// Arm the session-capture list for one statement. Public: the C-ABI
+/// compatibility layer and the engine's statement scope both call this
+/// with their connection's session list.
+pub fn arm_session_sink(target: SessionTarget) -> SessionSinkGuard {
+    let prev = SESSIONS.with(|s| s.borrow_mut().replace(target));
+    SESSIONS_ARMED.with(|a| a.set(true));
+    SessionSinkGuard { prev }
+}
+
+#[inline]
+fn sessions_armed() -> bool {
+    SESSIONS_ARMED.with(|a| a.get())
+}
+
+/// True while a session-capture sink is installed (the engine's
+/// nested-statement check).
+#[inline]
+pub fn session_sink_armed() -> bool {
+    sessions_armed()
 }
 
 /// Wrap an armed sink into its guard (called only after a successful
@@ -248,6 +292,18 @@ pub(crate) fn fire(
             }
         });
     }
+    if sessions_armed() {
+        let depth = DEPTH.with(|d| d.get());
+        SESSIONS.with(|s| {
+            if let Some(list) = s.borrow().as_ref() {
+                for handle in list.iter() {
+                    if let Ok(mut core) = handle.lock() {
+                        core.record(op, table, rowid, old, new, depth);
+                    }
+                }
+            }
+        });
+    }
     if !hook_installed() {
         return;
     }
@@ -289,9 +345,9 @@ pub(crate) fn fire(
 /// decodes the old values first (cold path — runs only when a hook is
 /// installed).
 pub(crate) fn fire_delete_payload(table: &Table, rowid: i64, payload: &[u8]) {
-    // The delta journal needs the decoded old row too (page-level
-    // splicing capture) — decode when EITHER consumer is listening.
-    if !hook_installed() && !delta_armed() {
+    // The delta journal and the session sinks need the decoded old row
+    // too (capture) — decode when ANY consumer is listening.
+    if !hook_installed() && !delta_armed() && !sessions_armed() {
         return;
     }
     if let Ok(old_row) =
@@ -315,5 +371,5 @@ pub fn enabled() -> bool {
 /// hook does, and it arms without installing a hook.
 #[inline]
 pub(crate) fn events_needed() -> bool {
-    hook_installed() || delta_armed()
+    hook_installed() || delta_armed() || sessions_armed()
 }

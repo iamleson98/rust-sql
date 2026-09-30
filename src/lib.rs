@@ -331,6 +331,7 @@ pub mod plugin;
 /// `Database::set_preupdate_hook` and [`preupdate::PreupdateEvent`].
 pub mod preupdate;
 pub mod schema;
+pub mod session;
 pub mod sql;
 /// Native sqlx driver: sqlx-core's `Database` traits implemented directly
 /// against the engine, so `rustqlite` works as a sqlx backend with **no C
@@ -348,6 +349,7 @@ pub mod executor;
 
 pub use api::{ConnIdentityGuard, Database, Params};
 pub use error::{Error, Result};
+pub use session::{ChangesetIter, Session};
 pub use statement::{Statement, StepResult};
 /// SQLite disk-format interop surface (see `storage::sqlitefmt`).
 pub use storage::sqlitefmt;

@@ -28,6 +28,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 // ---------------------------------------------------------------------------
 // READ-VIEW IDENTITY (committed-view reads, WAL-grade concurrency)
@@ -395,6 +396,16 @@ pub struct Database {
     /// loads/stores suffice; Release/Acquire anyway for documentation.
     has_preupdate_hook: AtomicBool,
     /// Thread id (see `current_tid`) that owns the open write
+
+    /// The session-extension registry: (connection identity, weak
+    /// session core) pairs. Sessions register under the creating
+    /// connection's identity (the C-ABI layer arms per-handle
+    /// identities through `ConnIdentityGuard`); each statement arms the
+    /// current identity's live sessions into the preupdate TLS sink.
+    sessions: StdMutex<crate::session::SessionRegistry>,
+    /// Mirror of "sessions registry non-empty" — one relaxed atomic
+    /// load per statement; false only when every session has dropped.
+    has_sessions: AtomicBool,
     /// transaction — the thread that executed BEGIN. READ entry points
     /// (`query`, statement `step` on selects) compare it against the
     /// CURRENT thread: a foreign thread arms the pager's committed-view
@@ -2581,6 +2592,9 @@ impl Database {
             savepoint_txn: AtomicBool::new(false),
             preupdate_hook: crate::preupdate::HookSlot::new(None),
             has_preupdate_hook: AtomicBool::new(false),
+
+            sessions: StdMutex::new(Vec::new()),
+            has_sessions: AtomicBool::new(false),
             txn_owner_tid: AtomicU64::new(0),
             txn_has_ddl: AtomicBool::new(false),
             schema_epoch: AtomicU64::new(0),
@@ -2959,6 +2973,9 @@ impl Database {
             savepoint_txn: AtomicBool::new(false),
             preupdate_hook: crate::preupdate::HookSlot::new(None),
             has_preupdate_hook: AtomicBool::new(false),
+
+            sessions: StdMutex::new(Vec::new()),
+            has_sessions: AtomicBool::new(false),
             txn_owner_tid: AtomicU64::new(0),
             txn_has_ddl: AtomicBool::new(false),
             schema_epoch: AtomicU64::new(0),
@@ -5485,6 +5502,49 @@ impl Database {
     /// already installed THIS Database's slot (nested `execute` on the
     /// same connection — the outer scope is still active). The guard
     /// restores the previous sink on drop, including on unwind.
+    /// Create a session-extension change recorder
+    /// (`sqlite3session_create`) registered under the CURRENT
+    /// connection identity (see `ConnIdentityGuard`; the plain Rust
+    /// path is identity 0). The session records nothing until
+    /// `Session::attach(None)` or `set_table_filter`.
+    pub fn create_session(&mut self) -> crate::session::Session {
+        use std::sync::Mutex;
+        let core = std::sync::Arc::new(Mutex::new(crate::session::SessionCore::new()));
+        let conn = conn_identity();
+        self.sessions
+            .lock()
+            .unwrap()
+            .push((conn, std::sync::Arc::downgrade(&core)));
+        self.has_sessions.store(true, Ordering::Release);
+        crate::session::Session::from_core(core)
+    }
+
+    /// Arm the current connection's session-capture sink for ONE
+    /// statement (see `session::state` — the capture side of the
+    /// session extension). One atomic load when no session was ever
+    /// registered; a nested arming (a sink already installed — a
+    /// re-entrant execute) keeps the OUTER list: the engine scope must
+    /// not capture another connection's sessions.
+    pub(crate) fn session_stmt_scope(&self) -> Option<crate::preupdate::SessionSinkGuard> {
+        if !self.has_sessions.load(Ordering::Acquire) {
+            return None;
+        }
+        if crate::preupdate::session_sink_armed() {
+            return None; // nested: the outer statement owns the sink
+        }
+        let conn = conn_identity();
+        let mut reg = self.sessions.lock().unwrap();
+        let live = crate::session::prune_and_collect(&mut reg, conn);
+        if live.is_empty() {
+            if reg.is_empty() {
+                self.has_sessions.store(false, Ordering::Release);
+            }
+            return None;
+        }
+        let list: crate::preupdate::SessionTarget = live.into();
+        Some(crate::preupdate::arm_session_sink(list))
+    }
+
     pub(crate) fn preupdate_scope(&self) -> Option<crate::preupdate::SinkGuard> {
         // One relaxed atomic load when no hook was ever registered: the
         // scope install probes the hook-slot MUTEX, and with N parallel
@@ -6707,6 +6767,9 @@ impl Database {
         // Delta-journal scope (page-level splicing capture): armed for
         // the statement's duration on foreign-backed databases.
         let _delta_guard = self.delta_stmt_scope();
+        // Session-extension capture scope: the current connection's
+        // sessions ride the preupdate TLS sink for the statement.
+        let _session_guard = self.session_stmt_scope();
         // Write-epoch bump: `execute` is the gateway for every mutating
         // statement (DML, DDL, transaction control, fast-path inserts),
         // so ONE bump here invalidates the memoized COUNT(*) answers for

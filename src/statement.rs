@@ -1035,6 +1035,9 @@ impl<'a> Statement<'a> {
         // journals too, so prepared DML through the C ABI / sqlx
         // accelerates exactly like `Database::execute` DML.
         let _delta_guard = db.delta_stmt_scope();
+        // Session-extension capture scope (the current connection's
+        // sessions) — the stepped-statement surface records too.
+        let _session_guard = db.session_stmt_scope();
         let out = f(&mut ctx);
         // CONCURRENT owner: NO schema-row rewrite here. The durable
         // schema row is a single HOT row under the concurrent regime

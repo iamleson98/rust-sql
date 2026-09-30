@@ -177,6 +177,9 @@ pub fn engine_source_id() -> &'static str {
 /// trade SQLite's own SQLITE_STATUS counters make. Read via
 /// [`engine_stats`] and served by consumers (the rust-be-template admin
 /// dashboard's `/api/admin/system` endpoint).
+mod session;
+pub use session::*;
+
 pub mod metrics {
     use std::sync::atomic::{AtomicU64, Ordering};
 

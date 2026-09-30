@@ -2,7 +2,7 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status**: CI fully green — 31/31 jobs on linux/windows/macos ([latest green run](https://github.com/iamleson98/rust-sql/actions/runs/36300524462) @ `aa382e7`): **1406 tests** in the default matrix plus sqlx / no-default / OOM-injection / compat-ABI / limit-stress matrices, and a dedicated **limit-stress** CI job (8 push-to-the-limit sections at 1M-row file scale) on every OS. Benchmarks vs real SQLite: **53 wins / 1 parity tie / 0 losses over 54 gated rows**. Byte-identical file sizes; peak RSS at or below SQLite on 14/18 torture sections. Three concurrency tiers beyond SQLite's envelope, plus `BEGIN CONCURRENT` multi-writer transactions. SQLite-format interop both directions, verified by real SQLite. sqlx 0.9 native driver and drop-in `libsqlite3` C ABI, sea-orm 2.0 verified end to end. The honest ledger of what is still missing: [Remaining gaps](#remaining-gaps-vs-sqlite).
+> **Status**: CI fully green — 31/31 jobs on linux/windows/macos ([latest green run](https://github.com/iamleson98/rust-sql/actions/runs/36300524462) @ `aa382e7`): **1456 tests** in the default matrix plus sqlx / no-default / OOM-injection / compat-ABI / limit-stress matrices, and a dedicated **limit-stress** CI job (8 push-to-the-limit sections at 1M-row file scale) on every OS. Benchmarks vs real SQLite: **53 wins / 1 parity tie / 0 losses over 54 gated rows**. Byte-identical file sizes; peak RSS at or below SQLite on 14/18 torture sections. Three concurrency tiers beyond SQLite's envelope, plus `BEGIN CONCURRENT` multi-writer transactions. SQLite-format interop both directions, verified by real SQLite. sqlx 0.9 native driver and drop-in `libsqlite3` C ABI, sea-orm 2.0 verified end to end. The honest ledger of what is still missing: [Remaining gaps](#remaining-gaps-vs-sqlite).
 
 This README is the single source of truth: feature surface, the latest performance / resource / concurrency / cold-start comparisons against SQLite, and the gap ledger.
 
@@ -49,6 +49,7 @@ let rows = db.query("SELECT name, age FROM users WHERE age > 28 ORDER BY age", [
 - **Geospatial (PostGIS-style)**: WKT geometry, constructors/accessors, OGC predicates, haversine + Vincenty distances, area/centroid, GeoJSON, GIST grid index (320x on KNN)
 - **PostgreSQL-borrowed typing**: real NUMERIC affinity (SQLite datatype3 §3.1), `DECIMAL(p,s)` scale enforcement
 - **Transactions**: `BEGIN [DEFERRED]`/`COMMIT`/`ROLLBACK`, savepoints (nested), `BEGIN CONCURRENT` (see [Concurrency](#concurrency-vs-sqlite))
+- **Session extension**: the full `sqlite3session_*` family — change recording into **byte-identical changesets/patchsets** (differential-pinned against real SQLite, including the hash-bucket iteration order and the `OBJCONFIG_ROWID` opt-in), `sqlite3changeset_apply[_v2]` with the complete conflict model (DATA/NOTFOUND/CONFLICT/CONSTRAINT/FOREIGN_KEY × OMIT/REPLACE/ABORT, deferred-constraint retries, rebase-blob production), `invert`/`concat`/`changegroup`, and the **rebaser** (SQLite's begin-concurrent merge workflow). Rust API (`Database::create_session`) and the C ABI both; per-connection capture semantics
 - **Planner**: stat1-driven cost search (Selinger subset DP ≤16 relations incl. bushy plans SQLite cannot generate), join reordering, ON-conjunct pushdown, LIKE/GLOB prefix pushdown, covering index scans, constant folding, `EXPLAIN QUERY PLAN` (SQLite wording) + PG-style `EXPLAIN ANALYZE`
 - **Prepare-time name resolution** — SQLite's resolver contract: unknown columns error at PREPARE with SQLite's exact text (no silent NULLs)
 
@@ -68,7 +69,7 @@ let rows = db.query("SELECT name, age FROM users WHERE age > 28 ORDER BY age", [
 ### sqlx & sea-orm
 
 - **Native Rust driver** (`features = ["sqlx"]`): implements sqlx-core's `Database` traits directly — `Pool`, `query()/query_as()`, transactions, `fetch` streaming, migrations, 100% safe Rust, no FFI, no C toolchain. URL: `rustqlite://app.db`
-- **Drop-in `libsqlite3`** (`compat/`): the real `sqlite3_*` C ABI (135 symbols) + a `libsqlite3-sys` replacement — **unmodified crates.io sqlx 0.9 and sea-orm 2.0 run on rustqlite** via one `[patch.crates-io]` line; schema discovery, codegen, and `sqlx::migrate!` verified end to end (`sqlx-interop/`)
+- **Drop-in `libsqlite3`** (`compat/`): the real `sqlite3_*` C ABI (169 symbols) + a `libsqlite3-sys` replacement — **unmodified crates.io sqlx 0.9 and sea-orm 2.0 run on rustqlite** via one `[patch.crates-io]` line; schema discovery, codegen, and `sqlx::migrate!` verified end to end (`sqlx-interop/`)
 
 ## Performance vs SQLite
 
@@ -222,11 +223,11 @@ let id: i64 = sqlx::query_scalar("INSERT INTO users (name) VALUES (?) RETURNING 
 
 Latest CI numbers vs sqlx-sqlite (same sqlx API and pool options): INSERT + 3 binds **3.15x**, PK point lookup **4.39x**, GROUP BY fetch_all **1.84x**, 8-task concurrent **4.24x**, 8-conn reads **10.6x**, 1W+7R **1.93x**, mixed 80/20 parity (fsync floor). The mechanism: sqlx-sqlite ferries every command/row across a worker thread + FFI; the native driver executes inline against the `Send + Sync` engine core with batch-at-a-time streaming. Full type surface (chrono, uuid, JSON, bool, blobs); snapshot isolation between connections; dropped connections roll back.
 
-**Drop-in C ABI**: `compat/` exports the `sqlite3_*` family (135 symbols) + a `libsqlite3-sys` replacement — unmodified sqlx 0.9 / sea-orm 2.0 / sea-orm-cli / `sqlx::migrate!` run via one `[patch.crates-io]` line; `sqlite3_serialize/deserialize` real; `sqlite3_backup_*` real (init/step/remaining/pagecount/finish — the destination file becomes an exact copy of the source, `:memory:` included); `sqlite3_blob_*` real (open/read/write/bytes/reopen/close — incremental I/O over BLOB and TEXT columns, writes riding the normal transaction machinery incl. the concurrent regime's implicit join); SQLite-exact error text + extended result codes; verified by the checked-in sea-orm app in `sqlx-interop/`.
+**Drop-in C ABI**: `compat/` exports the `sqlite3_*` family (169 symbols) + a `libsqlite3-sys` replacement — unmodified sqlx 0.9 / sea-orm 2.0 / sea-orm-cli / `sqlx::migrate!` run via one `[patch.crates-io]` line; `sqlite3_serialize/deserialize` real; `sqlite3_backup_*` real (init/step/remaining/pagecount/finish — the destination file becomes an exact copy of the source, `:memory:` included); `sqlite3_blob_*` real (open/read/write/bytes/reopen/close — incremental I/O over BLOB and TEXT columns, writes riding the normal transaction machinery incl. the concurrent regime's implicit join); the **session extension** (`sqlite3session_*`, `sqlite3changeset_*`, `sqlite3changegroup_*`, `sqlite3rebaser_*` — byte-identical changesets, differential-pinned); SQLite-exact error text + extended result codes; verified by the checked-in sea-orm app in `sqlx-interop/`.
 
 ## Remaining gaps vs SQLite
 
-The honest ledger — verifiable absence (`module_list` / `function_list` / `compile_options` report what is actually compiled in, the C ABI exports exactly its 135 symbols, and the fuzzers are seeded and reproducible). No open correctness items: every pinned divergence class is closed and re-verified per push (regression pins in `tests/stateful_fuzz.rs`, `tests/concurrent_reader_visibility.rs`, and the differential suites).
+The honest ledger — verifiable absence (`module_list` / `function_list` / `compile_options` report what is actually compiled in, the C ABI exports exactly its 169 symbols, and the fuzzers are seeded and reproducible). No open correctness items: every pinned divergence class is closed and re-verified per push (regression pins in `tests/stateful_fuzz.rs`, `tests/concurrent_reader_visibility.rs`, and the differential suites).
 
 ### Performance gaps
 
@@ -253,7 +254,6 @@ The honest ledger — verifiable absence (`module_list` / `function_list` / `com
 
 - **FTS3/FTS4/FTS5**: no `fts5` module/MATCH paths/tokenizers. Workaround: the tsvector/tsquery family + GIN indexes, `REGEXP`, prefix-`LIKE`/`GLOB`, or a trigger-maintained inverted table. The vtab callback protocol is complete — an FTS module can be a plugin.
 - **R*Tree / Geopoly**: not implemented. Workaround: B-tree-indexed `(min_x, max_x)` pairs + overlap predicates; GIST grid KNN for points.
-- **Session extension** (`sqlite3_session_*`/changesets/rebasing): not implemented. Workaround: the preupdate-hook event stream (fully real, differential-pinned).
 - **`sqlite_stat4`**: stat1 only (SQLite's own default recommendation set).
 - **`sqlite_dbdata` engine shape**: real, but pages are 0-based, fields follow the per-value-tag row codec (not SQLite's record header), and freed pages are ZEROED on free (cache hygiene) — deleted-row recovery from freelist pages is impossible by design; unallocated regions and orphaned overflow chains remain readable. `dbstat`, `PRAGMA integrity_check` and `VACUUM INTO` cover the rest of the forensic surface.
 - **ATTACH**: name-only round trip (single-database engine; no cross-database queries).
@@ -303,7 +303,7 @@ cargo bench --bench sqlite_comparison                             # criterion ma
 
 ## Testing
 
-The matrix is modeled on SQLite's own methodology ([sqlite.org/testing.html](https://www.sqlite.org/testing.html)) — 1406 tests in the default matrix + sqlx/no-default/oom-injection/compat-ABI/limit-stress matrices, all CI-green on ubuntu/windows/macos:
+The matrix is modeled on SQLite's own methodology ([sqlite.org/testing.html](https://www.sqlite.org/testing.html)) — 1456 tests in the default matrix + sqlx/no-default/oom-injection/compat-ABI/limit-stress matrices, all CI-green on ubuntu/windows/macos:
 
 | Technique | Harness | Verifies |
 |---|---|---|
