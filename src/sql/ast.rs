@@ -132,11 +132,21 @@ pub enum CreateStatement {
 
 #[derive(Clone, Debug)]
 pub struct CreateTrigger {
+    /// Schema qualifier on the trigger's name (`CREATE TRIGGER aux.tr`)
+    /// — the database the trigger is created in. `None` (unqualified,
+    /// non-TEMP) means MAIN, never the attached-database fallback
+    /// (SQLite resolves the trigger's database HERE, not by search
+    /// order).
+    pub schema: Option<String>,
     pub name: String,
-    /// `CREATE TEMP TRIGGER` — connection-scoped, never persisted.
+    /// `CREATE TEMP TRIGGER` — connection-scoped, never persisted. A
+    /// TEMP trigger may target a table in ANY database (SQLite).
     pub temp: bool,
     /// `CREATE TRIGGER IF NOT EXISTS` — silently skips a duplicate name.
     pub if_not_exists: bool,
+    /// The trigger's target table, BARE (the as-written qualifier was
+    /// validated against `schema` at parse time; the table resolves
+    /// within the trigger's database).
     pub table: String,
     pub when: TriggerWhen,
     pub events: Vec<TriggerEvent>,

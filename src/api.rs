@@ -8054,9 +8054,7 @@ impl Database {
                     );
                     Ok((cols, rows))
                 }
-                crate::attach::Route::Mixed => {
-                    self.exec_foreign_select_with_cols(&stmt, &params_vec)
-                }
+                crate::attach::Route::Mixed => self.query_mixed_with_cols(&stmt, &params_vec),
             };
         }
         // Read-form PRAGMAs surface their value as result rows (one for
@@ -8506,7 +8504,7 @@ impl Database {
                     return Ok((cols, rows));
                 }
                 crate::attach::Route::Mixed => {
-                    let (cols, rows) = self.exec_foreign_select_with_cols(&stmt, &params_vec)?;
+                    let (cols, rows) = self.query_mixed_with_cols(&stmt, &params_vec)?;
                     return Ok((cols, rows));
                 }
             }
@@ -10584,15 +10582,16 @@ impl Database {
                 self.merge_routed_dml_counters(true, rowid);
                 Ok(())
             }
-            // Cross-schema UPDATE/DELETE with a routed target: matched
-            // rows would have to stream between engines — rejected with
-            // a clear message (a documented divergence; route the source
-            // through INSERT instead).
+            // Cross-schema UPDATE/DELETE with a routed target: the
+            // statement is rewritten for the TARGET engine (foreign
+            // refs qualified into the channel, target refs localized)
+            // and executed there whole — the target's triggers, FKs,
+            // constraints and RETURNING fire natively, and cross-schema
+            // reads serve from materialized parent-side rows.
             Statement::Update(_) | Statement::Delete(_) if target_foreign => {
-                Err(Error::Unsupported(
-                    "cross-database UPDATE/DELETE with tables from another database is not \
-                     supported (target and source must share one database)",
-                ))
+                let schema = target_schema.clone().expect("foreign checked");
+                let _ = self.execute_cross_dml(stmt, params, &schema)?;
+                Ok(())
             }
             // Local target reading attached tables.
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
@@ -10612,6 +10611,17 @@ impl Database {
             }) if crate::attach::is_foreign_schema(&name.schema) => {
                 self.execute_cross_ctas(name, sel, sql, params)
             }
+            // A trigger whose body or target references another
+            // database (a TEMP trigger on an attached table, or a main
+            // trigger reading attached tables): the cross-engine firing
+            // machinery is not there yet — a clear message instead of
+            // the generic form error.
+            Statement::Create(crate::sql::ast::CreateStatement::Trigger(_)) => {
+                Err(Error::Unsupported(
+                    "cross-database triggers are not supported yet (create the trigger in \
+                     the same database as its table)",
+                ))
+            }
             _ => Err(Error::Unsupported(
                 "this cross-database statement form is not supported",
             )),
@@ -10621,22 +10631,45 @@ impl Database {
     /// Execute a statement that mixes schemas on the QUERY path (result
     /// rows): mixed SELECT (the foreign channel) and mixed EXPLAIN.
     pub(crate) fn query_mixed(&self, stmt: &Statement, params: &[Value]) -> Result<Vec<Row>> {
+        let (_, rows) = self.query_mixed_with_cols(stmt, params)?;
+        Ok(rows)
+    }
+
+    /// [`Self::query_mixed`] with the executor's output column names —
+    /// the routing sites' Mixed arm (RETURNING names ride through).
+    pub(crate) fn query_mixed_with_cols(
+        &self,
+        stmt: &Statement,
+        params: &[Value],
+    ) -> Result<(Vec<String>, Vec<Row>)> {
         match stmt {
-            Statement::Select(_)
-            | Statement::Insert(_)
-            | Statement::Update(_)
-            | Statement::Delete(_) => self.exec_foreign_select(stmt, params),
+            Statement::Select(_) => self.exec_foreign_select_with_cols(stmt, params),
+            // Mixed cross-DML with a FOREIGN target: rewrite + execute
+            // on the TARGET engine (never the parent's catalog — a
+            // same-named parent table must not capture the write; this
+            // arm closes the query-path wrong-table bug). RETURNING
+            // rows come from the target, where the statement ran.
+            Statement::Update(_) | Statement::Delete(_) => {
+                let target_schema = crate::attach::target_schema_of(self, stmt);
+                if crate::attach::is_foreign_schema(&target_schema) {
+                    let schema = target_schema.expect("foreign checked");
+                    return self.execute_cross_dml(stmt, params, &schema);
+                }
+                // LOCAL target reading attached tables.
+                self.exec_foreign_select_with_cols(stmt, params)
+            }
+            Statement::Insert(_) => self.exec_foreign_select_with_cols(stmt, params),
             Statement::Explain { inner, analyze } => {
                 if *analyze {
                     // EXPLAIN ANALYZE executes the inner statement.
                     let (cols, rows) = self.explain_analyze_foreign(inner, params)?;
                     let _ = cols;
-                    return Ok(rows);
+                    return Ok((Vec::new(), rows));
                 }
                 let plan = self.foreign_plan_for(inner, params)?;
                 Ok(match plan {
-                    Some(p) => crate::executor::explain::explain_plan_rows(&p),
-                    None => Vec::new(),
+                    Some(p) => (Vec::new(), crate::executor::explain::explain_plan_rows(&p)),
+                    None => (Vec::new(), Vec::new()),
                 })
             }
             _ => Err(Error::Unsupported(
@@ -10769,6 +10802,85 @@ impl Database {
             crate::planner::plan::Plan::Insert { .. }
                 | crate::planner::plan::Plan::Update { .. }
                 | crate::planner::plan::Plan::Delete { .. }
+        ) {
+            crate::executor::change_counters::record(ctx.changes);
+            self.pager.note_rows_modified(ctx.changes);
+            if ctx.changes > 0 && !ctx.in_transaction {
+                self.pager.note_tx_autocommit();
+            }
+            self.write_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            if ctx.roots_changed || ctx.max_rowids_changed || ctx.index_roots_changed {
+                let mut m = self.maps.write();
+                let shared_mut = Arc::make_mut(&mut m);
+                shared_mut.roots.extend(ctx.root_overrides.drain());
+                shared_mut.max_rowids.extend(ctx.max_rowids.drain());
+            }
+        }
+        Ok((res.columns.to_vec(), res.rows))
+    }
+
+    /// Execute a pre-rewritten cross-schema DML (or SELECT) with a
+    /// PREBUILT foreign channel — the reverse federation direction:
+    /// [`Self::exec_foreign_select_with_cols`] materializes THIS
+    /// engine's attachments; this entry runs a statement whose channel
+    /// tables come from an OUTER engine (the parent, for a cross-DML
+    /// executed on the target). Plans through the same channel-aware
+    /// planner, arms the ctx channel for runtime subqueries, and merges
+    /// the DML bookkeeping exactly like the local mixed path.
+    pub(crate) fn exec_with_injected_channel(
+        &self,
+        stmt: &Statement,
+        params: &[Value],
+        foreign: crate::attach::ForeignTables,
+    ) -> Result<(Vec<String>, Vec<Row>)> {
+        let in_txn = self.in_transaction.load(Ordering::Acquire);
+        let txn_snap = self.txn_snapshot_for_ctx();
+        let shared = self.read_maps();
+        let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
+        let mut ctx = ExecContext::new_reader(&self.pager, catalog_ptr, shared);
+        ctx.in_transaction = in_txn;
+        ctx.deferred_flush = self.deferred_flush.load(Ordering::Acquire);
+        ctx.txn_snapshot = txn_snap;
+        for v in params.iter().cloned() {
+            ctx.bind_positional(v);
+        }
+        let _plugin_guard = self.plugin_scope();
+        let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
+        let mut plan = match stmt {
+            Statement::Update(_) => Self::plan_update_channel(
+                &self.catalog,
+                stmt,
+                &HashMap::new(),
+                Some(Self::clone_foreign(&foreign)),
+            )?,
+            Statement::Delete(_) => Self::plan_delete_channel(
+                &self.catalog,
+                stmt,
+                &HashMap::new(),
+                Some(Self::clone_foreign(&foreign)),
+            )?,
+            Statement::Select(s) => {
+                let mut planner = Planner::new(&self.catalog);
+                planner.set_foreign(foreign.clone());
+                planner.plan_select(s)?
+            }
+            _ => {
+                return Err(Error::Unsupported(
+                    "injected-channel execution supports SELECT / UPDATE / DELETE",
+                ))
+            }
+        };
+        ctx.foreign = Some(foreign);
+        if crate::executor::plan_has_subqueries(&plan) {
+            plan = crate::executor::rewrite_plan_subqueries(&plan, &mut ctx)?;
+        }
+        let res = crate::executor::execute(&plan, &mut ctx)?;
+        ctx.foreign = None;
+        // DML bookkeeping (the exec_foreign_select_with_cols pattern).
+        if matches!(
+            plan,
+            crate::planner::plan::Plan::Update { .. } | crate::planner::plan::Plan::Delete { .. }
         ) {
             crate::executor::change_counters::record(ctx.changes);
             self.pager.note_rows_modified(ctx.changes);
@@ -10944,6 +11056,55 @@ impl Database {
         // channel armed; RETURNING rows (if any) are discarded on the
         // execute path, matching the CTE-DML contract.
         Ok(())
+    }
+
+    /// Mixed cross-schema UPDATE/DELETE (target on the ATTACHED engine
+    /// `schema`, reads from main / temp / other attached schemas):
+    /// rewrite the statement for the target engine
+    /// ([`crate::attach::prepare_cross_dml`] — foreign refs become
+    /// channel-qualified, target refs local), then execute it WHOLE on
+    /// the target with the parent-side tables injected through the
+    /// channel. One statement, one engine: the target's triggers, FK
+    /// enforcement, unique constraints, changes() counting and
+    /// RETURNING all fire natively, and statement atomicity is the
+    /// target engine's own (a parent transaction already spans it —
+    /// BEGIN propagated to every attached engine at the parent's BEGIN).
+    /// Returns (RETURNING column names, RETURNING rows) — empty when the
+    /// statement has no RETURNING clause.
+    fn execute_cross_dml(
+        &self,
+        stmt: &Statement,
+        params: &[Value],
+        schema: &str,
+    ) -> Result<(Vec<String>, Vec<Row>)> {
+        // WITH on a cross-DML: the CTE bodies would need the channel
+        // armed during materialization (a nested-planner ordering
+        // question) — rejected for now with a clear message.
+        let has_with = match stmt {
+            Statement::Update(u) => u.with.is_some(),
+            Statement::Delete(d) => d.with.is_some(),
+            _ => false,
+        };
+        if has_with {
+            return Err(Error::Unsupported(
+                "WITH is not supported on cross-database UPDATE/DELETE (inline the CTE)",
+            ));
+        }
+        let target_lc = schema.to_ascii_lowercase();
+        let (rewritten, channel) = crate::attach::prepare_cross_dml(self, stmt, &target_lc)?;
+        let engine = self
+            .attached_engine(&target_lc)
+            .ok_or_else(|| Error::NotFound(format!("unknown database {}", schema)))?;
+        let out = {
+            let aux = engine.write();
+            aux.exec_with_injected_channel(&rewritten, params, channel)
+                .map_err(|e| crate::attach::qualify_routed_error(e, &target_lc))?
+        };
+        // changes() / total_changes() are thread-wide and the target's
+        // machinery recorded them through the same thread-locals; an
+        // UPDATE/DELETE moves no last-insert rowid.
+        self.merge_routed_dml_counters(false, 0);
+        Ok(out)
     }
 
     /// EXPLAIN ANALYZE over a mixed statement.

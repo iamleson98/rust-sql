@@ -1095,7 +1095,10 @@ impl Parser {
         } else {
             false
         };
-        let name = self.parse_ident()?;
+        // [schema.]trigger-name — the database the trigger is created
+        // in (unqualified + non-TEMP = MAIN, never the attached
+        // fallback; SQLite resolves the trigger's database HERE).
+        let (schema, name) = self.parse_dml_table_name()?;
         let when = if self.peek().is_keyword("BEFORE") {
             self.advance();
             TriggerWhen::Before
@@ -1136,7 +1139,34 @@ impl Parser {
             }
         }
         self.expect_keyword("ON")?;
-        let table = self.parse_ident()?;
+        // ON [schema.]table — the table resolves WITHIN the trigger's
+        // database (bare names scope to it); an explicit cross-database
+        // qualifier is SQLite's error, except for TEMP triggers (which
+        // may target any database). Parsed RAW (no main/temp
+        // normalization): the qualifier is the cross-database signal.
+        let raw_first = self.parse_ident()?;
+        let (table_schema, table) = if self.peek().is_punct('.') {
+            self.advance();
+            let second = self.parse_ident()?;
+            (Some(raw_first), second)
+        } else {
+            (None, raw_first)
+        };
+        if !temp {
+            let trigger_schema = schema
+                .as_ref()
+                .map(|s| s.to_ascii_lowercase())
+                .unwrap_or_else(|| "main".to_string());
+            if let Some(ts) = &table_schema {
+                let ts_lc = ts.to_ascii_lowercase();
+                if ts_lc != trigger_schema {
+                    return Err(Error::semantic(format!(
+                        "trigger {} cannot reference objects in database {}",
+                        name, ts
+                    )));
+                }
+            }
+        }
         let for_each_row = if self.peek().is_keyword("FOR") {
             self.advance();
             self.expect_keyword("EACH")?;
@@ -1161,6 +1191,7 @@ impl Parser {
         }
         self.expect_keyword("END")?;
         Ok(Statement::Create(CreateStatement::Trigger(CreateTrigger {
+            schema,
             name,
             temp,
             if_not_exists,
@@ -3632,10 +3663,13 @@ pub fn split_script(src: &str) -> Vec<String> {
     let mut start = 0usize;
     let mut i = 0usize;
     let n = b.len();
-    // Word-level state for trigger-body detection: `CREATE` followed by
-    // `TRIGGER` within the current statement arms block scanning; the
-    // body's `BEGIN ... END` region then suppresses `;` splitting.
-    let mut prev_word: Option<String> = None;
+    // Word-level state for trigger-body detection: `CREATE` followed
+    // by `TRIGGER` (with only TEMP/TEMPORARY allowed between) arms
+    // block scanning; the body's `BEGIN ... END` region then suppresses
+    // `;` splitting. `CREATE TEMP TRIGGER ... ; ... END` needs the pair
+    // rule to span the TEMP keyword — the exact-pair form silently
+    // split the body's `;` and broke the parse.
+    let mut armed_create = false;
     let mut in_trigger_block = false;
     let mut block_depth = 0usize;
     while i < n {
@@ -3646,10 +3680,15 @@ pub fn split_script(src: &str) -> Vec<String> {
                 i += 1;
             }
             let word = src[w_start..i].to_ascii_uppercase();
-            if let Some(pw) = &prev_word {
-                if pw == "CREATE" && word == "TRIGGER" {
-                    in_trigger_block = true; // armed until END closes the body
+            if word == "CREATE" {
+                armed_create = true;
+            } else if word == "TRIGGER" {
+                if armed_create {
+                    in_trigger_block = true;
                 }
+                armed_create = false;
+            } else if word != "TEMP" && word != "TEMPORARY" {
+                armed_create = false;
             }
             if in_trigger_block || block_depth > 0 {
                 if word == "BEGIN" {
@@ -3661,7 +3700,6 @@ pub fn split_script(src: &str) -> Vec<String> {
                     }
                 }
             }
-            prev_word = Some(word);
             continue;
         }
         if c.is_ascii_whitespace() {
@@ -3670,7 +3708,7 @@ pub fn split_script(src: &str) -> Vec<String> {
             i += 1;
             continue;
         }
-        prev_word = None;
+        armed_create = false;
         match c {
             b'\'' => {
                 // Text literal (also the tail of an x'..' blob literal —

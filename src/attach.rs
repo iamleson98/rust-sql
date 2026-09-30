@@ -495,8 +495,26 @@ fn collect_create_refs(c: &CreateStatement, out: &mut Vec<RefSite>) {
             collect_select_refs(select, out);
         }
         CreateStatement::Trigger(t) => {
+            // The creation target: the trigger's NAME, carrying its
+            // schema (unqualified + non-TEMP = MAIN — never the
+            // attached fallback; SQLite resolves the trigger's database
+            // from the name alone).
             out.push(RefSite {
-                schema: None,
+                schema: t.schema.clone(),
+                name: t.name.clone(),
+                pragma: false,
+            });
+            // The ON table resolves WITHIN the trigger's database
+            // (bare names scope to it: `CREATE TRIGGER aux.tr ON m`
+            // looks up aux.m — SQLite). TEMP triggers may target any
+            // database (search order).
+            let scope = if t.temp {
+                None
+            } else {
+                Some(t.schema.clone().unwrap_or_else(|| "main".to_string()))
+            };
+            out.push(RefSite {
+                schema: scope,
                 name: t.table.clone(),
                 pragma: false,
             });
@@ -698,124 +716,127 @@ fn collect_expr_refs(e: &Expr, out: &mut Vec<RefSite>) {
 /// local (`None`), so the attached engine's own resolver sees plain
 /// names. Returns a deep-cloned, rewritten statement.
 pub(crate) fn strip_schema_refs(stmt: &Statement, schema_lc: &str) -> Statement {
+    rewrite_refs(stmt, &mut |schema, _name| {
+        if ref_matches(schema, schema_lc) {
+            *schema = None;
+        }
+    })
+}
+
+/// Deep-clone `stmt` and pass every schema-qualified table site (and
+/// every three-part column prefix) through `visit(schema_slot, name)`:
+/// `None` out of the slot strips the qualifier (a local name on the
+/// executing engine), `Some(s)` sets/renames it. The walk mirrors the
+/// reference collector exactly — every position `collect_table_refs`
+/// sees is a rewrite position.
+pub(crate) fn rewrite_refs<R: FnMut(&mut Option<String>, &str)>(
+    stmt: &Statement,
+    visit: &mut R,
+) -> Statement {
     let mut s = stmt.clone();
-    strip_statement(&mut s, schema_lc);
+    rewrite_statement(&mut s, visit);
     s
 }
 
-fn strip_statement(stmt: &mut Statement, schema_lc: &str) {
+fn rewrite_statement<R: FnMut(&mut Option<String>, &str)>(stmt: &mut Statement, visit: &mut R) {
     match stmt {
-        Statement::Select(s) => strip_select(s, schema_lc),
+        Statement::Select(s) => rewrite_select(s, visit),
         Statement::Insert(i) => {
-            if ref_matches(&i.schema, schema_lc) {
-                i.schema = None;
-            }
+            visit(&mut i.schema, &i.table);
             if let Some(w) = &mut i.with {
-                strip_with(w, schema_lc);
+                rewrite_with(w, visit);
             }
             match &mut i.source {
-                InsertSource::Select(s) => strip_select(s, schema_lc),
+                InsertSource::Select(s) => rewrite_select(s, visit),
                 InsertSource::Values(rows) => {
                     for row in rows {
                         for e in row {
-                            strip_expr(e, schema_lc);
+                            rewrite_expr(e, visit);
                         }
                     }
                 }
                 InsertSource::DefaultValues => {}
             }
             if let Some(u) = &mut i.upsert {
-                strip_opt_expr(&mut u.target_where, schema_lc);
+                rewrite_opt_expr(&mut u.target_where, visit);
                 if let UpsertAction::DoUpdate { set, where_clause } = &mut u.action {
                     for (_, e) in set {
-                        strip_expr(e, schema_lc);
+                        rewrite_expr(e, visit);
                     }
-                    strip_opt_expr(where_clause, schema_lc);
+                    rewrite_opt_expr(where_clause, visit);
                 }
             }
             if let Some(rcs) = &mut i.returning {
                 for rc in rcs {
-                    strip_result_column(rc, schema_lc);
+                    rewrite_result_column(rc, visit);
                 }
             }
         }
         Statement::Update(u) => {
-            if ref_matches(&u.schema, schema_lc) {
-                u.schema = None;
-            }
+            visit(&mut u.schema, &u.table);
             if let Some(w) = &mut u.with {
-                strip_with(w, schema_lc);
+                rewrite_with(w, visit);
             }
             if let Some(from) = &mut u.from {
-                strip_table_expr(from, schema_lc);
+                rewrite_table_expr(from, visit);
             }
-            strip_opt_expr(&mut u.where_clause, schema_lc);
+            rewrite_opt_expr(&mut u.where_clause, visit);
             for (_, e) in &mut u.set {
-                strip_expr(e, schema_lc);
+                rewrite_expr(e, visit);
             }
             if let Some(rcs) = &mut u.returning {
                 for rc in rcs {
-                    strip_result_column(rc, schema_lc);
+                    rewrite_result_column(rc, visit);
                 }
             }
-            strip_opt_expr(&mut u.limit, schema_lc);
+            rewrite_opt_expr(&mut u.limit, visit);
             for ot in &mut u.order_by {
-                strip_expr(&mut ot.expr, schema_lc);
+                rewrite_expr(&mut ot.expr, visit);
             }
         }
         Statement::Delete(d) => {
-            if ref_matches(&d.schema, schema_lc) {
-                d.schema = None;
-            }
+            visit(&mut d.schema, &d.from);
             if let Some(w) = &mut d.with {
-                strip_with(w, schema_lc);
+                rewrite_with(w, visit);
             }
-            strip_opt_expr(&mut d.where_clause, schema_lc);
+            rewrite_opt_expr(&mut d.where_clause, visit);
             if let Some(rcs) = &mut d.returning {
                 for rc in rcs {
-                    strip_result_column(rc, schema_lc);
+                    rewrite_result_column(rc, visit);
                 }
             }
-            strip_opt_expr(&mut d.limit, schema_lc);
+            rewrite_opt_expr(&mut d.limit, visit);
             for ot in &mut d.order_by {
-                strip_expr(&mut ot.expr, schema_lc);
+                rewrite_expr(&mut ot.expr, visit);
             }
         }
-        Statement::Create(c) => strip_create(c, schema_lc),
+        Statement::Create(c) => rewrite_create(c, visit),
         Statement::Drop(d) => {
-            if ref_matches(&d.schema, schema_lc) {
-                d.schema = None;
-            }
+            visit(&mut d.schema, &d.name);
         }
         Statement::Alter(a) => {
-            if ref_matches(&a.schema, schema_lc) {
-                a.schema = None;
-            }
+            visit(&mut a.schema, &a.table);
         }
-        Statement::Explain { inner, .. } => strip_statement(inner, schema_lc),
+        Statement::Explain { inner, .. } => rewrite_statement(inner, visit),
         Statement::Pragma(p) => {
-            if ref_matches(&p.schema, schema_lc) {
-                p.schema = None;
-            }
+            visit(&mut p.schema, &p.name);
         }
-        Statement::Vacuum(v) => strip_opt_schema(&mut v.schema, schema_lc),
+        Statement::Vacuum(v) => rewrite_opt_schema(&mut v.schema, visit),
         Statement::Reindex { schema, .. } | Statement::Analyze { schema, .. } => {
-            strip_opt_schema(schema, schema_lc)
+            rewrite_opt_schema(schema, visit)
         }
         _ => {}
     }
 }
 
-fn strip_create(c: &mut CreateStatement, schema_lc: &str) {
+fn rewrite_create<R: FnMut(&mut Option<String>, &str)>(c: &mut CreateStatement, visit: &mut R) {
     match c {
         CreateStatement::Table {
             name, as_select, ..
         } => {
-            if ref_matches(&name.schema, schema_lc) {
-                name.schema = None;
-            }
+            visit(&mut name.schema, &name.name);
             if let Some(sel) = as_select {
-                strip_select(sel, schema_lc);
+                rewrite_select(sel, visit);
             }
         }
         CreateStatement::Index {
@@ -824,146 +845,153 @@ fn strip_create(c: &mut CreateStatement, schema_lc: &str) {
             where_clause,
             ..
         } => {
-            if ref_matches(schema, schema_lc) {
-                *schema = None;
-            }
+            visit(schema, "");
             for ic in columns {
                 if let Some(e) = &mut ic.expr {
-                    strip_expr(e, schema_lc);
+                    rewrite_expr(e, visit);
                 }
             }
-            strip_opt_expr(where_clause, schema_lc);
+            rewrite_opt_expr(where_clause, visit);
         }
         CreateStatement::View { name, select, .. } => {
-            if ref_matches(&name.schema, schema_lc) {
-                name.schema = None;
-            }
-            strip_select(select, schema_lc);
+            visit(&mut name.schema, &name.name);
+            rewrite_select(select, visit);
         }
         CreateStatement::Trigger(t) => {
+            visit(&mut t.schema, &t.name);
             for s in &mut t.body {
-                strip_statement(s, schema_lc);
+                rewrite_statement(s, visit);
             }
-            strip_opt_expr(&mut t.when_clause, schema_lc);
+            rewrite_opt_expr(&mut t.when_clause, visit);
         }
         CreateStatement::VirtualTable { name, .. } => {
-            if ref_matches(&name.schema, schema_lc) {
-                name.schema = None;
-            }
+            visit(&mut name.schema, &name.name);
         }
     }
 }
 
-fn strip_with(w: &mut WithClause, schema_lc: &str) {
+fn rewrite_with<R: FnMut(&mut Option<String>, &str)>(w: &mut WithClause, visit: &mut R) {
     for cte in &mut w.ctes {
-        strip_select(&mut cte.select, schema_lc);
+        rewrite_select(&mut cte.select, visit);
     }
 }
 
-fn strip_select(s: &mut SelectStatement, schema_lc: &str) {
+fn rewrite_select<R: FnMut(&mut Option<String>, &str)>(s: &mut SelectStatement, visit: &mut R) {
     if let Some(w) = &mut s.with {
-        strip_with(w, schema_lc);
+        rewrite_with(w, visit);
     }
-    strip_body(&mut s.body, schema_lc);
+    rewrite_body(&mut s.body, visit);
     for ot in &mut s.order_by {
-        strip_expr(&mut ot.expr, schema_lc);
+        rewrite_expr(&mut ot.expr, visit);
     }
-    strip_opt_expr(&mut s.limit, schema_lc);
-    strip_opt_expr(&mut s.offset, schema_lc);
+    rewrite_opt_expr(&mut s.limit, visit);
+    rewrite_opt_expr(&mut s.offset, visit);
 }
 
-fn strip_body(b: &mut SelectBody, schema_lc: &str) {
+fn rewrite_body<R: FnMut(&mut Option<String>, &str)>(b: &mut SelectBody, visit: &mut R) {
     match b {
         SelectBody::Simple(s) => {
             for rc in &mut s.columns {
-                strip_result_column(rc, schema_lc);
+                rewrite_result_column(rc, visit);
             }
             if let Some(from) = &mut s.from {
-                strip_table_expr(from, schema_lc);
+                rewrite_table_expr(from, visit);
             }
-            strip_opt_expr(&mut s.where_clause, schema_lc);
+            rewrite_opt_expr(&mut s.where_clause, visit);
             for e in &mut s.group_by {
-                strip_expr(e, schema_lc);
+                rewrite_expr(e, visit);
             }
-            strip_opt_expr(&mut s.having, schema_lc);
+            rewrite_opt_expr(&mut s.having, visit);
             for wd in &mut s.window {
                 for e in &mut wd.partition_by {
-                    strip_expr(e, schema_lc);
+                    rewrite_expr(e, visit);
                 }
                 for ot in &mut wd.order_by {
-                    strip_expr(&mut ot.expr, schema_lc);
+                    rewrite_expr(&mut ot.expr, visit);
                 }
             }
         }
         SelectBody::Binary { left, right, .. } => {
-            strip_body(left, schema_lc);
-            strip_body(right, schema_lc);
+            rewrite_body(left, visit);
+            rewrite_body(right, visit);
         }
     }
 }
 
-fn strip_result_column(rc: &mut ResultColumn, schema_lc: &str) {
+fn rewrite_result_column<R: FnMut(&mut Option<String>, &str)>(
+    rc: &mut ResultColumn,
+    visit: &mut R,
+) {
     if let ResultColumn::Expr { expr, .. } = rc {
-        strip_expr(expr, schema_lc);
+        rewrite_expr(expr, visit);
     }
 }
 
-fn strip_table_expr(te: &mut TableExpression, schema_lc: &str) {
+fn rewrite_table_expr<R: FnMut(&mut Option<String>, &str)>(
+    te: &mut TableExpression,
+    visit: &mut R,
+) {
     match te {
-        TableExpression::Table { schema, .. } => {
-            if ref_matches(schema, schema_lc) {
-                *schema = None;
-            }
+        TableExpression::Table { schema, name, .. } => {
+            visit(schema, name);
         }
-        TableExpression::Subquery { select, .. } => strip_select(select, schema_lc),
+        TableExpression::Subquery { select, .. } => rewrite_select(select, visit),
         TableExpression::Join { left, right, .. } => {
-            strip_table_expr(left, schema_lc);
-            strip_table_expr(right, schema_lc);
+            rewrite_table_expr(left, visit);
+            rewrite_table_expr(right, visit);
         }
         TableExpression::Function { args, .. } => {
             for a in args {
-                strip_expr(a, schema_lc);
+                rewrite_expr(a, visit);
             }
         }
     }
 }
 
-fn strip_opt_expr(o: &mut Option<Expr>, schema_lc: &str) {
+fn rewrite_opt_expr<R: FnMut(&mut Option<String>, &str)>(o: &mut Option<Expr>, visit: &mut R) {
     if let Some(e) = o {
-        strip_expr(e, schema_lc);
+        rewrite_expr(e, visit);
     }
 }
 
-fn strip_expr(e: &mut Expr, schema_lc: &str) {
-    // Three-part column references (`aux.t.c`) lose their schema prefix:
-    // the routed engine sees plain `t.c`.
+fn rewrite_expr<R: FnMut(&mut Option<String>, &str)>(e: &mut Expr, visit: &mut R) {
+    // Three-part column references (`aux.t.c`) pass their schema
+    // prefix through the visitor: None drops the prefix (the routed
+    // engine sees plain `t.c`), Some(s) swaps it (`main.t.c` ->
+    // `<synthetic>.t.c` on the target engine).
     if let Expr::Column { table: Some(q), .. } = e {
         if let Some(dot) = q.find('.') {
             let (sch, rest) = q.split_at(dot);
-            if sch.to_ascii_lowercase() == schema_lc {
-                *q = rest[1..].to_string();
+            let rest = &rest[1..];
+            let tname = rest.split('.').next().unwrap_or(rest);
+            let mut slot = Some(sch.to_string());
+            visit(&mut slot, tname);
+            match slot {
+                Some(ns) if ns == sch => {} // unchanged
+                Some(ns) => *q = format!("{}.{}", ns, rest),
+                None => *q = rest.to_string(),
             }
         }
     }
     match e {
-        Expr::Subquery(s) => strip_select(s, schema_lc),
-        Expr::Exists(s) => strip_select(s, schema_lc),
+        Expr::Subquery(s) => rewrite_select(s, visit),
+        Expr::Exists(s) => rewrite_select(s, visit),
         Expr::Binary { left, right, .. } => {
-            strip_expr(left, schema_lc);
-            strip_expr(right, schema_lc);
+            rewrite_expr(left, visit);
+            rewrite_expr(right, visit);
         }
-        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => strip_expr(expr, schema_lc),
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => rewrite_expr(expr, visit),
         Expr::Between {
             expr, low, high, ..
         } => {
-            strip_expr(expr, schema_lc);
-            strip_expr(low, schema_lc);
-            strip_expr(high, schema_lc);
+            rewrite_expr(expr, visit);
+            rewrite_expr(low, visit);
+            rewrite_expr(high, visit);
         }
         Expr::In { expr, source, .. } => {
-            strip_expr(expr, schema_lc);
+            rewrite_expr(expr, visit);
             if let InSource::Subquery(s) = source {
-                strip_select(s, schema_lc);
+                rewrite_select(s, visit);
             }
         }
         Expr::Like {
@@ -972,31 +1000,31 @@ fn strip_expr(e: &mut Expr, schema_lc: &str) {
             escape,
             ..
         } => {
-            strip_expr(expr, schema_lc);
-            strip_expr(pattern, schema_lc);
+            rewrite_expr(expr, visit);
+            rewrite_expr(pattern, visit);
             if let Some(esc) = escape {
-                strip_expr(esc, schema_lc);
+                rewrite_expr(esc, visit);
             }
         }
         Expr::Is { left, right, .. } => {
-            strip_expr(left, schema_lc);
-            strip_expr(right, schema_lc);
+            rewrite_expr(left, visit);
+            rewrite_expr(right, visit);
         }
         Expr::Function {
             args, filter, over, ..
         } => {
             for a in args {
-                strip_expr(a, schema_lc);
+                rewrite_expr(a, visit);
             }
             if let Some(f) = filter {
-                strip_expr(f, schema_lc);
+                rewrite_expr(f, visit);
             }
             if let Some(WindowSpec::Inline(def)) = over.as_deref_mut() {
                 for e in &mut def.partition_by {
-                    strip_expr(e, schema_lc);
+                    rewrite_expr(e, visit);
                 }
                 for ot in &mut def.order_by {
-                    strip_expr(&mut ot.expr, schema_lc);
+                    rewrite_expr(&mut ot.expr, visit);
                 }
             }
         }
@@ -1007,34 +1035,36 @@ fn strip_expr(e: &mut Expr, schema_lc: &str) {
             ..
         } => {
             if let Some(op) = operand {
-                strip_expr(op, schema_lc);
+                rewrite_expr(op, visit);
             }
             for (w, t) in whens {
-                strip_expr(w, schema_lc);
-                strip_expr(t, schema_lc);
+                rewrite_expr(w, visit);
+                rewrite_expr(t, visit);
             }
             if let Some(el) = else_ {
-                strip_expr(el, schema_lc);
+                rewrite_expr(el, visit);
             }
         }
         Expr::Row(items) => {
             for e in items {
-                strip_expr(e, schema_lc);
+                rewrite_expr(e, visit);
             }
         }
-        Expr::Cast { expr, .. } | Expr::Collate { expr, .. } => strip_expr(expr, schema_lc),
+        Expr::Cast { expr, .. } | Expr::Collate { expr, .. } => rewrite_expr(expr, visit),
         Expr::Raise {
             message: Some(m), ..
-        } => strip_expr(m, schema_lc),
+        } => rewrite_expr(m, visit),
         _ => {}
     }
 }
 
-/// Strip a schema qualifier in place when it names the routed schema.
-fn strip_opt_schema(schema: &mut Option<String>, schema_lc: &str) {
-    if ref_matches(schema, schema_lc) {
-        *schema = None;
-    }
+/// Pass a bare schema slot (no table name at this position) through
+/// the visitor.
+fn rewrite_opt_schema<R: FnMut(&mut Option<String>, &str)>(
+    schema: &mut Option<String>,
+    visit: &mut R,
+) {
+    visit(schema, "");
 }
 
 fn ref_matches(schema: &Option<String>, schema_lc: &str) -> bool {
@@ -1586,6 +1616,163 @@ fn qualify_foreign_error(e: Error, schema: &str, name: &str) -> Error {
 // ---------------------------------------------------------------------------
 // Cross-schema DML synthesis (INSERT INTO aux.x SELECT ... FROM main.t)
 // ---------------------------------------------------------------------------
+
+/// Synthetic schema names that carry the PARENT's main/temp tables
+/// through the TARGET engine's foreign channel: the target's planner
+/// routes any schema qualifier that is neither its own main/temp nor a
+/// CTE through the channel, so `main.t` must ride under a name that can
+/// never be a real attachment (ATTACH schema names starting with
+/// `__rsql` are rejected by the parser's identifier rules the same way
+/// SQLite rejects impossible names — and no real attachment can produce
+/// them because attach names come from user SQL).
+pub(crate) const XSRC_MAIN: &str = "__rsqlsrc_main";
+pub(crate) const XSRC_TEMP: &str = "__rsqlsrc_temp";
+
+fn synthetic_for(schema_lc: &str) -> &'static str {
+    if schema_lc == "temp" {
+        XSRC_TEMP
+    } else {
+        XSRC_MAIN
+    }
+}
+
+/// Prepare a mixed cross-schema UPDATE/DELETE (target on an attached
+/// engine, reads from main / temp / other attached schemas) for
+/// execution ON the target engine: rewrite every non-target table
+/// reference to a channel-qualified name (main/temp under the synthetic
+/// schemas, other attached schemas under their own names — the target
+/// planner routes those through the channel), materialize those tables
+/// into a [`ForeignTables`], and strip the target's own qualifiers.
+///
+/// Rewrite order matters: the QUALIFY pass runs while target sites still
+/// carry their `aux.` qualifier (so they are never renamed), then the
+/// STRIP pass makes them local. The returned statement's unqualified
+/// foreign references are gone — every cross-schema read goes through
+/// the channel, so the target engine's own tables can never shadow the
+/// parent's (SQLite's connection-wide search order, preserved exactly).
+pub(crate) fn prepare_cross_dml(
+    parent: &Database,
+    stmt: &Statement,
+    target_lc: &str,
+) -> Result<(Statement, ForeignTables)> {
+    let sites = resolved_sites(parent, stmt);
+    let mut ctes = Vec::new();
+    collect_cte_names(stmt, &mut ctes);
+    let attached = parent.attached_snapshot();
+    // name_lc -> the schema qualifier the ref must carry on the target
+    // engine (synthetic for main/temp, the attached name otherwise).
+    let mut rename: HashMap<String, String> = HashMap::new();
+    // (source schema lc, source name) per entry, for materialization.
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for site in &sites {
+        if site.pragma {
+            continue;
+        }
+        let name_lc = site.name.to_ascii_lowercase();
+        if rename.contains_key(&name_lc) {
+            continue;
+        }
+        if ctes.iter().any(|c| c.eq_ignore_ascii_case(&site.name)) {
+            // A CTE shadows the name everywhere in this statement.
+            continue;
+        }
+        let src_lc = match &site.schema {
+            Some(s) => {
+                let lc = s.to_ascii_lowercase();
+                if lc == target_lc {
+                    continue; // the target side: stays native
+                }
+                if lc == "main" || lc == "temp" {
+                    lc
+                } else {
+                    // Another attached schema: the target's planner
+                    // routes its qualified refs through the channel.
+                    lc
+                }
+            }
+            None => {
+                // Unqualified and the parent resolved it to MAIN
+                // (resolved_sites stamps attached schemas onto their
+                // sites; a None schema here means main/temp won —
+                // SQLite's search order).
+                "main".to_string()
+            }
+        };
+        let channel_schema = if src_lc == "main" || src_lc == "temp" {
+            synthetic_for(&src_lc).to_string()
+        } else {
+            src_lc.clone()
+        };
+        rename.insert(name_lc, channel_schema);
+        sources.push((src_lc, site.name.clone()));
+    }
+
+    // Materialize every source table into the channel (rows + columns,
+    // evaluated by the OWNING engine so views / vtabs / sqlite_master
+    // resolve exactly as the parent sees them).
+    let mut channel = ForeignTables::default();
+    for (src_lc, name) in &sources {
+        let name_lc = name.to_ascii_lowercase();
+        let key = (rename[&name_lc].clone(), name_lc.clone());
+        if channel.qualified.contains_key(&key) {
+            continue;
+        }
+        let (cols, rows) = if src_lc == "main" || src_lc == "temp" {
+            let sql = match name_lc.as_str() {
+                "sqlite_master" | "sqlite_schema" => {
+                    "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master".to_string()
+                }
+                "sqlite_temp_master" | "sqlite_temp_schema" => {
+                    "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_temp_master".to_string()
+                }
+                _ => format!("SELECT * FROM {}.\"{}\"", src_lc, name.replace('"', "\"\"")),
+            };
+            parent
+                .query_with_columns(&sql, [])
+                .map_err(|e| qualify_foreign_error(e, src_lc, name))?
+        } else {
+            let Some((_, engine)) = attached
+                .iter()
+                .find(|(n, _)| n.to_ascii_lowercase() == *src_lc)
+            else {
+                return Err(Error::NotFound(format!(
+                    "no such table: {}.{}",
+                    src_lc, name
+                )));
+            };
+            let sql = format!("SELECT * FROM \"{}\"", name.replace('"', "\"\""));
+            {
+                let aux = engine.read();
+                aux.query_with_columns(&sql, [])
+                    .map_err(|e| qualify_foreign_error(e, src_lc, name))?
+            }
+        };
+        let columns: Arc<[String]> = cols.into();
+        let rows: Arc<Vec<Row>> = Arc::new(rows);
+        channel.qualified.insert(key.clone(), (rows, columns));
+        channel.order.push(key);
+    }
+
+    // Pass 1 — qualify foreign refs (target sites still aux-qualified,
+    // so the visitor never touches them).
+    let rewritten = rewrite_refs(stmt, &mut |schema, name| {
+        if let Some(dst) = rename.get(&name.to_ascii_lowercase()) {
+            let replace = match schema {
+                None => true,
+                Some(s) => {
+                    let lc = s.to_ascii_lowercase();
+                    lc == "main" || lc == "temp"
+                }
+            };
+            if replace {
+                *schema = Some(dst.clone());
+            }
+        }
+    });
+    // Pass 2 — strip the target's own qualifiers (local on the target).
+    let rewritten = strip_schema_refs(&rewritten, target_lc);
+    Ok((rewritten, channel))
+}
 
 /// Synthesize the VALUES-insert for a mixed INSERT: the SELECT source is
 /// evaluated on the PARENT engine (foreign channel for any other

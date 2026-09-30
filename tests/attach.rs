@@ -860,3 +860,82 @@ fn differential_attach_explain_shape() {
     assert!(!rows.is_empty());
     let _ = cols;
 }
+
+// ---------------------------------------------------------------------------
+// Schema-qualified triggers (SQLite-exact resolution rules)
+// ---------------------------------------------------------------------------
+
+/// The trigger's database comes from its NAME qualifier (or MAIN);
+/// the ON table resolves WITHIN that database. All rules verified
+/// against the python3 sqlite3 oracle (3.53).
+#[test]
+fn schema_qualified_trigger_rules() {
+    let mut db = mem();
+    db.execute("CREATE TABLE m (x)", []).unwrap();
+    db.execute("ATTACH ':memory:' AS aux", []).unwrap();
+    db.execute("CREATE TABLE aux.a (id INT)", []).unwrap();
+    db.execute("INSERT INTO aux.a VALUES (7)", []).unwrap();
+    db.execute("CREATE TABLE aux.audit (msg TEXT)", []).unwrap();
+
+    // Qualified name + same-db table: creates ON AUX.
+    db.execute(
+        "CREATE TRIGGER aux.tr AFTER UPDATE ON aux.a BEGIN INSERT INTO audit VALUES ('fired'); END",
+        [],
+    )
+    .unwrap();
+    db.execute("UPDATE aux.a SET id = id", []).unwrap();
+    assert_eq!(rows(&db, "SELECT msg FROM aux.audit"), vec![vec!["fired"]]);
+    // The trigger is visible in aux's catalog, not main's.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT count(*) FROM aux.sqlite_master WHERE type='trigger' AND name='tr'"
+        ),
+        vec![vec!["1"]]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT count(*) FROM main.sqlite_master WHERE type='trigger' AND name='tr'"
+        ),
+        vec![vec!["0"]]
+    );
+
+    // Unqualified name + table only in aux: MAIN answers (SQLite:
+    // "no such table: main.a" — the ON table never falls back to an
+    // attached schema).
+    let err = err_of(
+        &mut db,
+        "CREATE TRIGGER tr2 AFTER UPDATE ON a BEGIN SELECT 1; END",
+    );
+    assert!(err.contains("no such table"), "err: {err}");
+
+    // Explicit cross-database qualifier (SQLite: "trigger tr cannot
+    // reference objects in database main").
+    let err = err_of(
+        &mut db,
+        "CREATE TRIGGER aux.tr3 AFTER UPDATE ON main.m BEGIN SELECT 1; END",
+    );
+    assert_eq!(
+        err,
+        "semantic error: trigger tr3 cannot reference objects in database main"
+    );
+    // The other direction (main trigger, aux-qualified table).
+    let err = err_of(
+        &mut db,
+        "CREATE TRIGGER tr4 AFTER UPDATE ON aux.a BEGIN SELECT 1; END",
+    );
+    assert_eq!(
+        err,
+        "semantic error: trigger tr4 cannot reference objects in database aux"
+    );
+
+    // TEMP triggers may target any database (SQLite exemption). The
+    // cross-engine firing machinery is not there yet — pinned to the
+    // clear error (a documented gap, not a silent wrong-table write).
+    let err = err_of(
+        &mut db,
+        "CREATE TEMP TRIGGER ttr AFTER UPDATE ON aux.a BEGIN INSERT INTO audit VALUES ('temp'); END",
+    );
+    assert!(err.contains("cross-database triggers"), "err: {err}");
+}
