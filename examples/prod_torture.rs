@@ -465,6 +465,17 @@ fn s03_group_by_buckets(engine: Engine) {
                 }
             }
             let ms = t.elapsed().as_secs_f64() * 1000.0;
+            // EXACT answer check: one accumulated 1 per group row plus
+            // each group's COUNT(*) = n_groups + rows, where buckets are
+            // floor(i/10) for i in 1..=rows (n_groups = rows/10 + 1),
+            // summed over all `iters` rounds. S03 historically had NO
+            // answer check — a spilled-grouper chunk-reader bug once
+            // silently dropped 60-88% of the groups at this exact shape
+            // without anything firing.
+            check(
+                "s03_acc_exact",
+                acc == iters as i64 * (rows + rows / 10 + 1),
+            );
             metric("sink", (acc % 1000) as f64);
             metric("time_ms", ms);
         }
@@ -482,6 +493,10 @@ fn s03_group_by_buckets(engine: Engine) {
                 }
             }
             let ms = t.elapsed().as_secs_f64() * 1000.0;
+            check(
+                "s03_acc_exact",
+                acc == iters as i64 * (rows + rows / 10 + 1),
+            );
             metric("sink", (acc % 1000) as f64);
             metric("time_ms", ms);
         }

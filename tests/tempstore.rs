@@ -276,3 +276,186 @@ fn spill_files_are_cleaned_up() {
         "ephemeral spill files leaked (before {before}, after {after})"
     );
 }
+
+/// REGRESSION (the shared-offset chunk-reader bug): a spilled grouper
+/// whose chunks are LARGER than one reader buffer (64 KiB) with the
+/// k-way merge interleaving streams — `File::try_clone` (dup) shares the
+/// file offset, so a `BufReader` refill on one stream resumed at
+/// wherever the OTHER stream's reads had moved the shared offset,
+/// desynchronizing mid-record. Chunks at or under one buffer never
+/// refilled, which is why the small-chunk tests never caught it. This
+/// test drives FAT records (2 KiB TEXT keys) so each frozen chunk is
+/// several buffers deep, then verifies the EXACT group set.
+#[test]
+fn spill_multibuffer_chunks_exact() {
+    force_spill_env();
+    let _gate = spill_gate().lock().unwrap_or_else(|e| e.into_inner());
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT)", [])
+        .unwrap();
+    // 400 groups x 2 KiB keys: threshold 4 -> 100+ epochs, every chunk
+    // ~8 KiB x ... at 4 groups/chunk each chunk is ~8 KiB — TOO SMALL.
+    // Use a count threshold that still forces multi-chunk but leaves
+    // chunks over 64 KiB: the env is process-global (OnceLock), so the
+    // shape does it with ROWS: 4000 distinct 2 KiB keys spill 1000
+    // chunks of 4 groups (~8 KiB each) — the DANGER shape is one BIG
+    // chunk; reproduce it by keying on the whole row set with a high
+    // cardinality so each epoch's 4 groups hold big keys and the merge
+    // interleaves two >64 KiB streams via the ROW-BACKED query path
+    // (the serial scan path froze at 4389 groups/chunk in production).
+    //
+    // Simpler and just as deadly: 40_000 rows over 20_000 distinct
+    // 2 KiB keys -> 5_000 frozen chunks; the final k-way merge opens
+    // 5_000+ streams whose reads interleave constantly. The dup-offset
+    // bug corrupted this within the first two refills.
+    let mut seen = std::collections::HashSet::new();
+    db.execute("BEGIN", []).unwrap();
+    let mut i = 0i64;
+    while seen.len() < 20_000 {
+        let key = format!("key-{:06}-{}", i, "x".repeat(2048 - 12));
+        if seen.insert(key.clone()) {
+            db.execute("INSERT INTO t (k) VALUES (?)", [Value::Text(key.into())])
+                .unwrap();
+        }
+        i += 1;
+    }
+    // Second pass: +1 row per key (COUNT=2 per group).
+    let keys: Vec<String> = seen.into_iter().take(20_000).collect();
+    for k in &keys {
+        db.execute(
+            "INSERT INTO t (k) VALUES (?)",
+            [Value::Text(k.clone().into())],
+        )
+        .unwrap();
+    }
+    db.execute("COMMIT", []).unwrap();
+
+    let rows = db
+        .query("SELECT k, COUNT(*) FROM t GROUP BY k", [])
+        .unwrap();
+    assert_eq!(rows.len(), 20_000, "every distinct key must group");
+    for r in &rows {
+        assert_eq!(
+            r[1],
+            Value::Integer(2),
+            "each key groups exactly 2 rows: first={}",
+            match &r[0] {
+                Value::Text(t) => t.chars().take(12).collect::<String>(),
+                _ => String::new(),
+            }
+        );
+    }
+}
+
+/// REGRESSION (the dropped-frozen-chunks emission bug): the
+/// materialized-input GROUP BY path (joins / subqueries / CTEs) emitted
+/// through a RAW walk of the grouper's RAM table, silently dropping
+/// every frozen chunk when the grouper spilled — a 20k-group JOIN
+/// GROUP BY returned its 2.4k-group RAM tail as the whole answer.
+/// The path now emits through the group iterator (k-way merge). This
+/// test drives a JOIN shape big enough to spill the (now spill-armed)
+/// materialized grouper AND the parallel split's merged destination.
+#[test]
+fn spill_materialized_join_groupby_exact() {
+    force_spill_env();
+    let _gate = spill_gate().lock().unwrap_or_else(|e| e.into_inner());
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute(
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER, x INTEGER)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER, y INTEGER)",
+        [],
+    )
+    .unwrap();
+    db.execute("BEGIN", []).unwrap();
+    // 6_000 rows, k = i - (i % 3) -> 2_000 distinct keys; the join fans
+    // out 3x (18_000 rows). With the threshold at 4, the serial
+    // materialized grouper spills ~500 chunks and the parallel split's
+    // destination spills the same — both sides of the bug.
+    for i in 1..=6_000i64 {
+        db.execute(
+            "INSERT INTO a (id, k, x) VALUES (?, ?, ?)",
+            [
+                Value::Integer(i),
+                Value::Integer(i - (i % 3)),
+                Value::Integer(i * 3),
+            ],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO b (id, k, y) VALUES (?, ?, ?)",
+            [
+                Value::Integer(i),
+                Value::Integer(i - (i % 3)),
+                Value::Integer(i * 7),
+            ],
+        )
+        .unwrap();
+    }
+    db.execute("COMMIT", []).unwrap();
+    let sql = "SELECT a.k, COUNT(*), SUM(b.y), MIN(a.x), MAX(b.y) FROM a JOIN b ON a.k = b.k GROUP BY a.k";
+
+    // Serial (parallel off). k = i - (i % 3) for i in 1..=6000 gives
+    // 2001 distinct keys (0, 3, ..., 6000); the EDGE keys group fewer
+    // rows (key 0: i in {1,2}; key 6000: i in {6000}) — the exact
+    // per-key counts are pinned by the SQLite oracle below.
+    db.execute("PRAGMA parallel_scan=0", []).unwrap();
+    let ser = db.query(sql, []).unwrap();
+    assert_eq!(ser.len(), 2_001, "serial: every distinct key must group");
+
+    // Parallel (force the split on: 6k-row tables sit under the default
+    // 131k min-rows gate).
+    db.execute("PRAGMA parallel_scan=1000", []).unwrap();
+    let par = db.query(sql, []).unwrap();
+    assert_eq!(par.len(), 2_001, "parallel: every distinct key must group");
+
+    // Oracle: real SQLite.
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute(
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER, x INTEGER)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER, y INTEGER)",
+        [],
+    )
+    .unwrap();
+    for i in 1..=6_000i64 {
+        conn.execute(
+            "INSERT INTO a (id, k, x) VALUES (?1, ?2, ?3)",
+            rusqlite::params![i, i - (i % 3), i * 3],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO b (id, k, y) VALUES (?1, ?2, ?3)",
+            rusqlite::params![i, i - (i % 3), i * 7],
+        )
+        .unwrap();
+    }
+    let mut stmt = conn.prepare(sql).unwrap();
+    let mut it = stmt.query([]).unwrap();
+    let mut oracle = Vec::new();
+    while let Some(r) = it.next().unwrap() {
+        oracle.push(vec![
+            Value::Integer(r.get::<_, i64>(0).unwrap()),
+            Value::Integer(r.get::<_, i64>(1).unwrap()),
+            Value::Integer(r.get::<_, i64>(2).unwrap()),
+            Value::Integer(r.get::<_, i64>(3).unwrap()),
+            Value::Integer(r.get::<_, i64>(4).unwrap()),
+        ]);
+    }
+    let sortv = |v: Vec<Vec<Value>>| {
+        let mut v = v;
+        v.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+        v
+    };
+    let ser_sorted = sortv(ser);
+    let par_sorted = sortv(par);
+    let oracle_sorted = sortv(oracle);
+    assert_eq!(ser_sorted, oracle_sorted, "serial answer == SQLite");
+    assert_eq!(par_sorted, oracle_sorted, "parallel answer == SQLite");
+}

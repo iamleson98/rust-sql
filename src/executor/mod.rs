@@ -7480,6 +7480,8 @@ impl Default for HashGrouper {
             n_aggs: 0,
             agg_ctx: Vec::new(),
             spill_threshold: 0,
+            spill_budget: 0,
+            live_bytes: 0,
             spill: None,
             epoch_seq_base: 0,
         }
@@ -7530,6 +7532,20 @@ pub(crate) struct HashGrouper {
     agg_ctx: Vec<AggMergeCtx>,
     /// Groups at which an epoch freezes to disk. 0 = never.
     spill_threshold: usize,
+    /// Live-state BYTES at which an epoch freezes to disk (0 = no byte
+    /// budget). The PRIMARY freeze discipline: a group's footprint varies
+    /// 10x+ between fat TEXT keys and INTEGER keys, so a pure group-count
+    /// threshold either blows the memory budget on fat keys or freezes
+    /// tiny-key shapes far too early (measured: GROUP BY 100k INTEGER-key
+    /// buckets needed a 16k-group count for merge locality at full scale
+    /// while the 25k-bucket CI scale wanted <= 8k — no single count serves
+    /// both; a byte budget does, at every scale).
+    spill_budget: usize,
+    /// Incremental live-state estimate: per-group key storage (inline
+    /// `Value` slots + heap bytes + per-group `Vec` header in multi-key
+    /// mode), aggregate states, hash slots (rehash deltas), and display
+    /// keys when collated. Reset to 0 at each freeze.
+    live_bytes: usize,
     /// Backing ephemeral file, created lazily at the FIRST freeze (never-
     /// spilling queries pay zero file syscalls).
     spill: Option<crate::storage::tempstore::EphemeralFile>,
@@ -7564,6 +7580,30 @@ pub(crate) fn group_spill_threshold() -> usize {
     })
 }
 
+/// The byte budget companion to [`group_spill_threshold`] (KB; 0 = off).
+pub(crate) fn group_spill_budget() -> usize {
+    static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("RSQL_GROUP_SPILL_BUDGET_KB")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|kb| kb * 1024)
+            .unwrap_or(HashGrouper::GROUP_SPILL_BUDGET_BYTES)
+    })
+}
+
+/// Heap bytes a key value contributes to the grouper's live state
+/// (the inline `Value` slot is accounted separately — this is the
+/// variable part: TEXT/BLOB payload beyond small-string inline).
+#[inline]
+fn value_heap_bytes(v: &Value) -> usize {
+    match v {
+        Value::Text(t) => t.as_bytes().len(),
+        Value::Blob(b) => b.len(),
+        _ => 0,
+    }
+}
+
 impl HashGrouper {
     /// Prepare for `n_aggs` aggregates per group.
     fn with_aggs(n_aggs: usize) -> Self {
@@ -7574,12 +7614,30 @@ impl HashGrouper {
         }
     }
 
-    /// Groups an epoch holds before it freezes to the temp store
-    /// (≈6 MB of live group state: keys + 40 B states + hash slots).
-    /// SQLite's own ephemeral b-trees spill through their page cache at
-    /// a similar working-set scale. `RSQL_GROUP_SPILL_THRESHOLD` (env)
-    /// overrides — the knob tests and ops tuning use.
-    pub(crate) const GROUP_SPILL_THRESHOLD: usize = 1 << 16;
+    /// GROUP-COUNT safety cap for one epoch: the byte budget (below) is
+    /// the primary discipline, but pathological zero-byte-key shapes
+    /// (all-NULL keys) would grow the count unboundedly under a pure
+    /// byte budget, so the count still hard-caps the epoch. 1 MiB of
+    /// INTEGER-keyed groups is ~11k groups — this cap is a distant
+    /// backstop, not the operating point.
+    ///
+    /// `RSQL_GROUP_SPILL_THRESHOLD` (env) overrides — tests force
+    /// multi-chunk spills with tiny values, and spill-averse ops can
+    /// raise both knobs (setting it also disables the byte budget, see
+    /// `with_spill_for`).
+    pub(crate) const GROUP_SPILL_THRESHOLD: usize = 1 << 20;
+
+    /// Live-state BYTES one epoch holds before it freezes to the temp
+    /// store — SQLite's own discipline (its ephemeral b-trees spill
+    /// through the page cache at a byte working-set scale, not a row
+    /// count). Sized to the measured sweet spots: at the torture S03
+    /// shape (INTEGER keys, ~90 B/group) 1 MiB freezes at ~11k groups —
+    /// the merge-locality optimum at full scale (179-183 ms vs 208 ms
+    /// unspilled) AND the bounded-RSS point at reduced scale (hwm
+    /// 27.7 -> 21.3 MB); fat TEXT keys freeze proportionally earlier.
+    /// `RSQL_GROUP_SPILL_BUDGET_KB` (env) overrides; 0 disables the
+    /// budget (count-cap only).
+    pub(crate) const GROUP_SPILL_BUDGET_BYTES: usize = 1 << 20;
 
     /// Declare the GROUP BY terms' collations (None = BINARY). Must be
     /// called BEFORE the first `intern_*` — the fold shapes every key
@@ -7606,12 +7664,24 @@ impl HashGrouper {
     }
 
     /// Prepare a SPILL-ARMED grouper from the statement's aggregate
-    /// list: once [`GROUP_SPILL_THRESHOLD`] groups are live, the epoch
-    /// freezes to an [`EphemeralFile`] chunk and the table restarts
-    /// empty — bounded RSS for unbounded cardinality (SQLite's temp-store
-    /// behavior for its ephemeral b-trees). Declines to plain RAM for
-    /// plugin aggregates (`AggFunc::Other`) — their states are opaque.
+    /// list: an epoch freezes to an [`EphemeralFile`] chunk when its
+    /// live state crosses the BYTE budget (the primary discipline —
+    /// see [`GROUP_SPILL_BUDGET_BYTES`]) or the group-COUNT cap
+    /// (a distant backstop), and the table restarts empty — bounded
+    /// RSS for unbounded cardinality (SQLite's temp-store behavior for
+    /// its ephemeral b-trees). Declines to plain RAM for plugin
+    /// aggregates (`AggFunc::Other`) — their states are opaque.
     pub(crate) fn with_spill_for(aggregates: &[AggExpr], threshold: usize) -> Self {
+        Self::with_spill_for_budget(aggregates, threshold, group_spill_budget())
+    }
+
+    /// Budget-explicit constructor (the env knob can disable the byte
+    /// budget — count-cap only, the pre-budget behavior).
+    pub(crate) fn with_spill_for_budget(
+        aggregates: &[AggExpr],
+        threshold: usize,
+        budget: usize,
+    ) -> Self {
         let n_aggs = aggregates.len().max(1);
         let mut ctxs = Vec::with_capacity(n_aggs);
         for (i, a) in aggregates.iter().enumerate() {
@@ -7630,6 +7700,7 @@ impl HashGrouper {
             states: ChunkVec::new(7, AggState::default()),
             agg_ctx: ctxs,
             spill_threshold: threshold,
+            spill_budget: budget,
             ..Default::default()
         }
     }
@@ -7644,10 +7715,17 @@ impl HashGrouper {
         }
     }
 
-    /// Spill is armed and the cardinality has crossed the threshold.
+    /// Spill is armed and the epoch crossed the byte budget (primary;
+    /// 0 = no byte budget) or the group-count cap (backstop).
     #[inline]
     fn freeze_due(&self) -> bool {
-        self.spill_threshold > 0 && self.group_count() >= self.spill_threshold
+        if self.spill_threshold == 0 {
+            return false; // spill disarmed (plugin aggs / temp_store=MEMORY)
+        }
+        if self.spill_budget > 0 && self.live_bytes >= self.spill_budget {
+            return true;
+        }
+        self.group_count() >= self.spill_threshold
     }
 
     /// Freeze the current epoch to disk and restart the table empty.
@@ -7666,6 +7744,35 @@ impl HashGrouper {
         }
         let n = self.group_count();
         let n_aggs = self.n_aggs.max(1);
+        // KEY-SORTED chunk records: the k-way merge at read time is a
+        // SORTED-RUN merge — when the minimum key is at a stream's head,
+        // every stream containing that key has it at its head, so the
+        // head-only duplicate fold is exact. Chunks were historically
+        // written in FIRST-SEEN order, which made the merge correct only
+        // for shapes whose recurring keys stayed cohort-aligned across
+        // epochs (the temp-store test's cyclic keys) — an arbitrary
+        // interleaving put the same key at different depths in different
+        // streams and the merge emitted it once per occurrence (measured:
+        // a 6-key/2-pass GROUP BY returned 9-10 groups; 720/720 second-
+        // pass permutations failed at threshold 4). Sorting at freeze
+        // time is O(n log n) against the epoch's already-O(n) record
+        // encode, and it makes the documented "key order" output claim
+        // literally true (SQLite's ephemeral b-trees are key-ordered
+        // too).
+        let mut order: Vec<u32> = (0..n as u32).collect();
+        match (&self.keys_flat, &self.keys_multi) {
+            (Some(flat), _) => {
+                order.sort_by(|&a, &b| {
+                    cmp_keys(
+                        std::slice::from_ref(flat.get(a as usize)),
+                        std::slice::from_ref(flat.get(b as usize)),
+                    )
+                });
+            }
+            (None, multi) => {
+                order.sort_by(|&a, &b| cmp_keys(&multi[a as usize], &multi[b as usize]));
+            }
+        }
         // Field-destructure for disjoint borrows: the chunk writer holds
         // `&mut spill` while the encoder reads `keys_*` / `states`.
         let result = {
@@ -7682,8 +7789,8 @@ impl HashGrouper {
             (|| -> std::io::Result<()> {
                 let mut w = spill.begin_chunk()?;
                 let mut rec: Vec<u8> = Vec::with_capacity(128);
-                let mut gi = 0usize;
-                while gi < n {
+                for &gi in &order {
+                    let gi = gi as usize;
                     rec.clear();
                     let state_at = |i: usize| states.get(gi * n_aggs + i);
                     match keys_flat {
@@ -7703,7 +7810,6 @@ impl HashGrouper {
                         ),
                     }
                     w.write_record(&rec)?;
-                    gi += 1;
                 }
                 w.finish()
             })()
@@ -7724,6 +7830,9 @@ impl HashGrouper {
         self.display_keys.clear();
         self.states.clear();
         self.epoch_seq_base += n as u64;
+        // The fresh epoch's live state starts at the 16-slot table's
+        // footprint; the byte budget re-arms from zero.
+        self.live_bytes = 16 * 8;
     }
 
     #[inline]
@@ -7789,8 +7898,12 @@ impl HashGrouper {
     fn rehash(&mut self) {
         let n = self.group_count();
         let new_cap = (self.slots.len() * 2).max(16).next_power_of_two();
+        let old_cap = self.slots.len();
         self.slots = vec![(0u32, 0u32); new_cap];
         self.mask = new_cap - 1;
+        // Slot-array growth is live state too (8 B/slot; the fresh table
+        // after a freeze starts at 16 slots — accounted here on growth).
+        self.live_bytes += new_cap.saturating_sub(old_cap) * 8;
         // Re-insert every group by re-hashing its key.
         for gi in 0..n {
             let h = if let Some(keys) = &self.keys_flat {
@@ -7896,6 +8009,18 @@ impl HashGrouper {
         for _ in 0..self.n_aggs {
             self.states.push(AggState::default(), &init);
         }
+        // Live-state accounting: per-group Vec header + one inline Value
+        // slot per key term + key heap bytes + one AggState per aggregate
+        // (+ the display-key mirror when collated).
+        let mut added =
+            24 + std::mem::size_of_val(key) + self.n_aggs * std::mem::size_of::<AggState>();
+        for v in key {
+            added += value_heap_bytes(v);
+        }
+        if self.collated() {
+            added += 24 + std::mem::size_of_val(key);
+        }
+        self.live_bytes += added;
         self.insert_slot(h, gi);
         gi
     }
@@ -7937,6 +8062,16 @@ impl HashGrouper {
         for _ in 0..self.n_aggs {
             self.states.push(AggState::default(), &init);
         }
+        // Live-state accounting: one inline Value slot + key heap bytes
+        // + one AggState per aggregate (+ the display-key mirror when
+        // collated).
+        let mut added = std::mem::size_of::<Value>()
+            + self.n_aggs * std::mem::size_of::<AggState>()
+            + value_heap_bytes(key);
+        if self.collated() {
+            added += 24 + std::mem::size_of::<Value>() + value_heap_bytes(key);
+        }
+        self.live_bytes += added;
         self.insert_slot(h, gi);
         gi
     }
@@ -8333,9 +8468,87 @@ enum StreamSrc {
         /// keys as the emitted representative (see `next_group`).
         display_keys: Vec<Vec<Value>>,
         states: ChunkVec<AggState>,
+        /// KEY-SORTED emit order over the tail's groups (see the freeze-
+        /// time sort: the k-way merge is a sorted-run merge, so the RAM
+        /// tail must stream key-ordered too, or an equal key at depth in
+        /// the tail misses the head-time duplicate fold).
+        order: Vec<u32>,
         gi: usize,
         base: u64,
     },
+}
+
+/// Maximum concurrently-open chunk readers in ONE k-way merge. A
+/// pathological freeze count (an ops-forced `RSQL_GROUP_SPILL_THRESHOLD`
+/// of a few groups) can leave thousands of chunks; one reader per chunk
+/// would exhaust the process fd limit and the old "unreadable chunk
+/// contributes nothing" policy then SILENTLY DROPPED the unreadable
+/// chunks' groups (measured: 20k groups at 5k chunks returned 4084 —
+/// exactly the ~1021 readers that fit under the default 1024-fd limit).
+/// Above this bound the merge first consolidates in bounded-fan-in
+/// passes (see [`consolidate_spill_chunks`]).
+pub(crate) const MAX_MERGE_STREAMS: usize = 96;
+
+/// Bounded-fan-in pre-merge: while more than [`MAX_MERGE_STREAMS`]
+/// chunks exist, merge the first [`MAX_MERGE_STREAMS`] into ONE new
+/// appended chunk (key-ordered, equal keys re-merged through
+/// `merge_agg_state` exactly like the final merge) and retire the
+/// consumed offsets. Every pass opens at most [`MAX_MERGE_STREAMS`]
+/// readers plus the one writer handle — the fd footprint is constant
+/// regardless of the chunk count, and the total work is
+/// O(records x passes) with a ~96-way reduction per level.
+fn consolidate_spill_chunks(
+    ef: &mut crate::storage::tempstore::EphemeralFile,
+    n_aggs: usize,
+    agg_ctx: &[AggMergeCtx],
+) {
+    while ef.chunk_count() > MAX_MERGE_STREAMS {
+        let k = MAX_MERGE_STREAMS;
+        // Readers own cloned fds (no borrow of `ef`): open them all,
+        // then take the mutable borrow for the writer.
+        let mut streams = Vec::with_capacity(k);
+        for ci in 0..k {
+            if let Ok(r) = ef.reader(ci) {
+                streams.push(MergeStream {
+                    src: StreamSrc::Chunk(r),
+                    head: None,
+                });
+            }
+        }
+        if streams.is_empty() {
+            // Nothing readable (fd exhaustion at a bound no reachable
+            // workload should hit) — stop rather than destroy chunks.
+            return;
+        }
+        let mut iter = GroupIter {
+            mode: GroupIterMode::Spill { streams },
+            n_aggs,
+            agg_ctx: agg_ctx.to_vec(),
+            rec_buf: Vec::with_capacity(256),
+        };
+        let write = (|| -> std::io::Result<()> {
+            let mut w = ef.begin_chunk()?;
+            let mut rec: Vec<u8> = Vec::with_capacity(128);
+            while let Some((keys, states)) = iter.next_group() {
+                rec.clear();
+                // seq 0: the intermediate chunk is internally key-sorted
+                // and key-deduped; the final merge's (key, seq)
+                // tie-break only arbitrates EQUAL keys across streams,
+                // which re-merge regardless of order.
+                encode_group_into_multi(&mut rec, 0, &keys, |i| &states[i], n_aggs);
+                w.write_record(&rec)?;
+            }
+            w.finish()
+        })();
+        if write.is_err() {
+            // The consolidation pass failed mid-flight: the original
+            // chunks were NOT retired (retire happens only on success),
+            // so the final merge below still sees them — bounded memory
+            // is lost, correctness is not.
+            return;
+        }
+        ef.retire_front(k);
+    }
 }
 
 impl GroupIter {
@@ -8343,6 +8556,10 @@ impl GroupIter {
         let n_aggs = grouper.n_aggs.max(1);
         match grouper.spill {
             Some(ef) => {
+                let mut ef = ef;
+                if ef.chunk_count() > MAX_MERGE_STREAMS {
+                    consolidate_spill_chunks(&mut ef, n_aggs, &agg_ctx);
+                }
                 // Spill mode: one reader per chunk + the RAM tail.
                 let n_chunks = ef.chunk_count();
                 let mut streams = Vec::with_capacity(n_chunks + 1);
@@ -8360,12 +8577,35 @@ impl GroupIter {
                         });
                     }
                 }
+                // KEY-SORTED tail order (the merge is a sorted-run
+                // merge — the tail must stream in key order like the
+                // frozen chunks do).
+                let tail_order: Vec<u32> = {
+                    let n = match (&grouper.keys_flat, &grouper.keys_multi) {
+                        (Some(flat), _) => flat.len(),
+                        (None, multi) => multi.len(),
+                    };
+                    let mut ord: Vec<u32> = (0..n as u32).collect();
+                    match (&grouper.keys_flat, &grouper.keys_multi) {
+                        (Some(flat), _) => ord.sort_by(|&a, &b| {
+                            cmp_keys(
+                                std::slice::from_ref(flat.get(a as usize)),
+                                std::slice::from_ref(flat.get(b as usize)),
+                            )
+                        }),
+                        (None, multi) => {
+                            ord.sort_by(|&a, &b| cmp_keys(&multi[a as usize], &multi[b as usize]))
+                        }
+                    }
+                    ord
+                };
                 streams.push(MergeStream {
                     src: StreamSrc::RamTail {
                         keys_flat: grouper.keys_flat,
                         keys_multi: grouper.keys_multi,
                         display_keys: grouper.display_keys,
                         states: grouper.states,
+                        order: tail_order,
                         gi: 0,
                         base: grouper.epoch_seq_base,
                     },
@@ -8505,34 +8745,32 @@ fn fill_head_into(rec_buf: &mut Vec<u8>, s: &mut MergeStream, n_aggs: usize) {
             keys_multi,
             display_keys,
             states,
+            order,
             gi,
             base,
         } => {
-            let n = match keys_flat {
-                Some(flat) => flat.len(),
-                None => keys_multi.len(),
-            };
-            if *gi >= n {
+            if *gi >= order.len() {
                 return;
             }
+            let g = order[*gi] as usize;
             // Collated GROUP BY: the merge key stays the FOLDED stored
             // form (cross-stream equality below); the FIRST-SEEN ORIGINAL
             // rides along as the emitted representative.
-            let display = if !display_keys.is_empty() && *gi < display_keys.len() {
-                Some(display_keys[*gi].clone())
+            let display = if !display_keys.is_empty() && g < display_keys.len() {
+                Some(display_keys[g].clone())
             } else {
                 None
             };
             let keys = match keys_flat {
-                Some(flat) => vec![flat.get(*gi).clone()],
-                None => keys_multi[*gi].clone(),
+                Some(flat) => vec![flat.get(g).clone()],
+                None => keys_multi[g].clone(),
             };
             let mut st = Vec::with_capacity(n_aggs);
             for i in 0..n_aggs {
-                st.push(states.get(*gi * n_aggs + i).clone());
+                st.push(states.get(g * n_aggs + i).clone());
             }
             s.head = Some(SpilledGroup {
-                seq: *base + *gi as u64,
+                seq: *base + g as u64,
                 keys,
                 display,
                 states: st,
@@ -11671,7 +11909,18 @@ fn exec_aggregate(
         .collect();
 
     let n_aggs = aggregates.len();
-    let mut grouper = HashGrouper::with_aggs(n_aggs);
+    // SPILL-ARMED (byte budget + count cap, honoring PRAGMA
+    // temp_store=MEMORY): the materialized-input GROUP BY path
+    // historically ran RAM-only (`with_aggs`) — an unbounded live set for
+    // high-cardinality groups over joins / subqueries / CTEs (the scan
+    // path has been spill-armed since the temp-store landed; this path
+    // feeds rows from a materialized input, but the grouper machinery is
+    // shape-agnostic — intern / freeze / k-way merge work identically).
+    let mut grouper = if ctx.pager.temp_store_memory() {
+        HashGrouper::with_aggs(n_aggs)
+    } else {
+        HashGrouper::with_spill_for(aggregates, group_spill_threshold())
+    };
     let mut emit_only = false;
     let grouper_key_collations: Vec<Option<String>>;
     // Collated GROUP BY over non-scan inputs (filtered scans / joins /
@@ -11879,31 +12128,36 @@ fn exec_aggregate(
         grouper.push_implicit_group();
     }
 
-    let n_groups = grouper.len();
     let n_out = group_by.len() + aggregates.len();
-    let n_aggs = grouper.n_aggs;
-    let mut out_rows = Vec::with_capacity(n_groups);
-    for gi in 0..n_groups {
+    let mut out_rows = Vec::with_capacity(grouper.len().max(1));
+    // THE GROUP ITERATOR, not a raw table walk: a spilled grouper's live
+    // set is its frozen chunks plus the residual RAM epoch, and only
+    // `into_group_iter` runs the k-way chunk merge (key-ordered, equal
+    // keys re-merged). The historical raw walk indexed the RAM table
+    // alone (`grouper.len()` = the tail after the last freeze), so a
+    // spilled grouper silently DROPPED every frozen chunk's groups —
+    // found by the parallel split's merged destination spilling at 20k
+    // groups over a JOIN (2445 of 20001 rows emitted; the serial side
+    // never armed its spill, masking it). RAM-only groupers keep the
+    // exact first-seen-order walk of the old loop.
+    let mut grp_iter = grouper.into_group_iter();
+    while let Some((keys, states)) = grp_iter.next_group() {
         // Exact capacity: key width + one slot per aggregate.
         let mut row: Vec<Value> = Vec::with_capacity(n_out.max(1));
-        // Collated GROUP BY: emit the group's FIRST-SEEN ORIGINAL
-        // representative (SQLite's output), not the folded stored form.
-        if !grouper.display_keys.is_empty() && gi < grouper.display_keys.len() {
-            row.extend(grouper.display_keys[gi].iter().cloned());
-        } else if let Some(keys) = &grouper.keys_flat {
-            row.push(keys.get(gi).clone());
-        } else {
-            row.extend(grouper.keys_multi[gi].iter().cloned());
-        }
+        // Collated GROUP BY: the iterator already substitutes the
+        // FIRST-SEEN ORIGINAL representative (SQLite's output) for the
+        // folded stored form.
+        row.extend(keys.iter().cloned());
         for (i, agg) in aggregates.iter().enumerate() {
-            row.push(finalize_agg(
-                grouper.states.get(gi * n_aggs + i),
-                &agg.func,
-            )?);
+            if i < states.len() {
+                row.push(finalize_agg(&states[i], &agg.func)?);
+            } else {
+                row.push(Value::Null);
+            }
         }
         out_rows.push(row);
     }
-    drop(grouper);
+    drop(grp_iter);
 
     let mut out_cols = Vec::new();
     for (i, g) in group_by.iter().enumerate() {
