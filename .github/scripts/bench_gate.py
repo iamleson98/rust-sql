@@ -389,8 +389,22 @@ PARITY_GUARD_PCT = 45.0
 # real +11% margin to -16% overnight. The 25% band absorbs exactly that
 # cross-generation swing; a genuine bulk-path regression is multi-x
 # (the same row loses 2-4x when the append hints break) and still fails.
+#
+# Same class, macOS-ARM fleet, observed 2026-09-30: "INSERT (transaction,
+# 1k rows)" measured 1,602,393 vs 674,093 ops/s (2.38x WIN, run 36714687964
+# @ 8d6fb9d) and 973,220 vs 1,103,093 (0.88x, -11.8% LOSS, run 36728348599
+# @ 777eddf) two hours apart — a diff that touches only the COUNT-over-join
+# aggregate fast path (no INSERT-path code), while the SAME run's row was
+# green on ubuntu (1.52x) and windows (1.31x). rustqlite drew its worst of
+# four consecutive runs (-39% vs its 1.38-1.60M history) while SQLite drew
+# near its best (+64% vs 674K two runs prior) — both tails in one job
+# window, and the slow window persisted across all 3 best-of attempts.
+# The 25% band absorbs that cross-draw envelope; a genuine regression in
+# the transactional-insert path is multi-x (2-4x when the codec / journal
+# / append machinery breaks) and still fails on every platform.
 PARITY_ROW_PCT = {
     ("bench_full_vs_sqlite", "INSERT (multi-VALUES 100/batch)"): 25.0,
+    ("bench_full_vs_sqlite", "INSERT (transaction, 1k rows)"): 25.0,
 }
 
 
