@@ -151,17 +151,24 @@ jobs:
             no-default)  cargo test --lib --tests --no-default-features ;;
           esac
 
+  # The consolidation experiment is over: the single sequential job measured
+  # 100.4 min on a05f795 (47.5 default + 39 sqlx + ~23 no-default + 2x
+  # cold-ish compiles) and was killed by its own 100-min timeout mid-suite —
+  # the second consecutive timeout after the 60->100 bump. Windows runners
+  # pay ~100ms per fsync on the interop/durability suites, so the suite is
+  # I/O-bound there, not CPU-bound; running the three configs SEQUENTIALLY
+  # in one job just serializes three I/O-bound runs under one clock. The
+  # split restores the ubuntu layout (one job per config, fail-fast off,
+  # per-config cache keys): each leg measured ~50/39/23 min warm — well
+  # inside the 75-min bound with cold-compile headroom.
   test-windows:
-    name: test (windows-latest, all configs)
+    name: test (windows-latest, ${{ matrix.config }})
     runs-on: windows-latest
-    # 100 min: the job measured 31 min at 3a2e63b but the suite has
-    # roughly doubled since (session/attach/fts5/stat4/tempstore + the
-    # differential batteries), and fsync-heavy interop suites pay
-    # ~100ms per fsync on Windows runners — the 60-min bound was KILLING
-    # the job mid-matrix on deb3bb6 (two consecutive 60.3/61-min
-    # cancellations). 100 min restores headroom; if it grows past ~75 min
-    # measured, split the configs into parallel matrix jobs instead.
-    timeout-minutes: 100
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [default, sqlx, no-default]
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
@@ -171,25 +178,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: test-windows-latest
+          shared-key: test-windows-latest-${{ matrix.config }}
           cache-on-failure: true
       # cc is not reliably available in bash here; the plugin tests skip.
-      - name: cargo test (default, sqlx, no-default)
+      - name: cargo test (${{ matrix.config }})
         run: |
-          FAIL=0
-          echo "::group::cargo test (default)"
-          cargo test --lib --tests || FAIL=1
-          echo "::endgroup::"
-          echo "::group::cargo test (sqlx)"
-          cargo test --lib --tests --features sqlx || FAIL=1
-          echo "::endgroup::"
-          echo "::group::cargo test (no-default)"
-          cargo test --lib --tests --no-default-features || FAIL=1
-          echo "::endgroup::"
-          if [ "$FAIL" -ne 0 ]; then
-            echo "One or more feature configs failed on windows-latest."
-            exit 1
-          fi
+          case "${{ matrix.config }}" in
+            default)     cargo test --lib --tests ;;
+            sqlx)        cargo test --lib --tests --features sqlx ;;
+            no-default)  cargo test --lib --tests --no-default-features ;;
+          esac
 
   test-macos:
     name: test (macos-latest, all configs)
