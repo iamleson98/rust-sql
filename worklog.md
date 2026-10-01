@@ -1615,3 +1615,19 @@ Work Log:
 
 Stage Summary:
 - The README now leads with the better-than-SQLite story (evidence-linked), carries the same verifiable tables, and keeps a current, honest gap ledger with no day-by-day fix narrative.
+
+---
+Task ID: 72
+Agent: main (Super Z)
+Task: CI triage for 86c18c1/b42a716 — clippy red on every config; a toolchain-drift repair.
+
+Work Log:
+- The red: clippy (default/sqlx/no-default/workspace) all failed with `use of deprecated method Atomic::fetch_update: renamed to try_update` at three pager.rs sites (bump_schema_cookie + the two freelist_count decrements) — code this round never touched.
+- Root cause: CI pins dtolnay/rust-toolchain@stable; the runners moved to 1.99.0 (2026-09-28) between c1e602e's green run and this round, and 1.99 deprecates fetch_update. The local sandbox was on 1.98.1 (no deprecation), so local clippy passed while CI failed.
+- The trap: the rename is NOT a drop-in — try_update is stable only since 1.95, and the crate's MSRV is 1.75, so clippy's incompatible_msrv fires on the renamed form. Neither name is lint-clean unaided.
+- Fix: keep fetch_update under a scoped #[allow(deprecated)] at the three sites (with the drop-condition note for when the MSRV moves past 1.95); the two `?`-consumed sites needed the allow on a `let _ =` statement to place the attribute. Behavior unchanged (same arguments, same CAS loop).
+- Verification: rustup updated the sandbox to 1.99.0 (reproducing CI exactly); clippy -D warnings clean across default / no-default / sqlx / all-targets; fmt clean; lib 299/299.
+- Pushed as 42d1026; the b42a716 clippy reds are superseded (its windows/macos jobs cancelled by the push).
+
+Stage Summary:
+- Toolchain drift absorbed with the MSRV-compatible form; 42d1026 is the run to watch.
