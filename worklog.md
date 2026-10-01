@@ -1546,3 +1546,20 @@ Stage Summary:
 - Master moved 37ad3ba -> 2a62df4 (already remote, CI green 33/33) -> 62b2959 (pushed this session, CI in flight).
 - The correctness gap ledger is EMPTY; remaining ledger families: performance residuals (S06 range-scan, one serial-row join at parity), resource items (binary size deliberate, S17/S14 allocator floor, sqlite-format whole-image RAM), concurrency boundaries (native single-process by design, sqlite-format single-connection, BEGIN CONCURRENT restrictions), missing surface (.archive option surface, ATTACH boundaries, sqlite_dbdata forensic shape, loadable-extension ABI).
 - Next candidates, in value order: .archive (the last refused CLI dot-command), the sqlite-format streaming container (whole-image RAM load), ATTACH boundary items (cross-db triggers, parallel multi-db commits).
+
+---
+Task ID: 68
+Agent: main (Super Z)
+Task: CI triage for 62b2959 — limit-stress (ubuntu) red; durable disk-draw fix per the house noise-class pattern.
+
+Work Log:
+- The failure: tests/limit_stress.rs limit_million_row_file at line 727 — "insert throughput degraded: first-batches median 7.97ms vs last-batches median 49.33ms" against the ubuntu gate head*3+25 = 48.91ms (a 0.86% miss). All other 27 completed jobs green at triage time.
+- Evidence gathering: (a) the HEAD itself was ~7x the documented healthy ubuntu family (1.13-1.48ms) — the whole measurement ran inside a slow disk window, not a tail-only anomaly; (b) the COMMIT side inflated 1.94 -> 91.80ms (47x) over the same window — fsync corroborates the slow-disk draw; (c) the build already takes per-batch MINIMA across two fresh-file rounds and still drew it — the window spanned both rounds, so in-test re-sampling cannot dodge it; (d) cache misses 785258 = the documented healthy count for this exact shape (the windows 2026-09-25 episode's number) — the algorithm did the same work, only the per-miss latency drew badly; (e) 62b2959's diff (jsonb REAL rendering + the vendored oracle swap) does not touch the engine's insert path; the same code was green on 2a62df4's ubuntu limit-stress 40 minutes earlier.
+- Root cause class: the macOS-ARM fleet's documented physics (stable 46-51ms tails at 785k misses, heads shrinking on faster runners) drew ON UBUNTU — a whole-run slow-disk window on a shared runner. The tight 3x+25ms ubuntu gate is calibrated for healthy draws only.
+- Durable fix (the Task 22/23/24 pattern: observed draw -> structural fix -> gate unit tests -> documentation): the tight platform gate stays PRIMARY; when it fires on linux, the FSYNC series arbitrates. s2_insert_fails extracted: the re-classification (pass, flagged) requires BOTH an out-of-family head (> 4ms) AND commit-side corroboration (c_tail >= c_head*3) — the whole-run environmental signature — and only loosens to the macOS scale (head*10+80ms), which a genuine collapse (hundreds of ms) still trips. A genuine insert-side regression keeps a healthy head (early batches run against a near-empty database) and a flat commit side, so it fails the tight gate hard. S2Platform enum replaces the cfg! if-chain; commit gate values unchanged.
+- 7 unit tests (tests/limit_stress.rs mod s2_gate_tests) pin: the exact observed draw (7.97/49.33/1.94->91.80 re-classified PASS), the healthy family, the genuine-regression shapes (healthy head + flat commits FAILS; out-of-family head WITHOUT fsync corroboration FAILS; quadratic 400ms tail FAILS even with corroboration; marginal draw without corroboration FAILS), and the documented macOS/Windows draws passing via their own scales. The re-classification prints a [limit/S2] line with all numbers when it engages.
+- Verification: cargo test --test limit_stress s2_gate = 7/7; cargo fmt --all --check clean; cargo clippy --release --all-targets -D warnings clean.
+
+Stage Summary:
+- The ubuntu insert-throughput gate is now disk-draw-aware without loosening any verdict a genuine regression trips; the observed 0.86%-miss flake class is structurally absorbed (the fourth documented shared-runner noise class, each with its own structural fix).
+- Pushed with the Task-67 docs commit (README correctness-ledger closure + worklog 66/67).
