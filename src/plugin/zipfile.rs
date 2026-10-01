@@ -370,7 +370,7 @@ pub(crate) fn inflate_zlib(data: &[u8], size_hint: usize) -> Result<Vec<u8>> {
 
 /// One archive member.
 #[derive(Clone, Debug)]
-pub(crate) struct ZipEntry {
+pub struct ZipEntry {
     pub name: String,
     pub mode: i64,
     /// Unix mtime (seconds); from the `UT` extra when present, else
@@ -957,6 +957,14 @@ fn value_bytes(v: &Value) -> Vec<u8> {
         Value::Null => Vec::new(),
         other => other.to_string().into_bytes(),
     }
+}
+
+/// Parse helper for the cross-platform archive tests (the windows
+/// arm of cli_archive's byte-identity suite checks structure through
+/// our own reader).
+#[doc(hidden)]
+pub fn parse_zip_for_test(data: &[u8]) -> Result<Vec<ZipEntry>> {
+    parse_zip(data)
 }
 
 /// Register the module on a database handle.

@@ -250,7 +250,15 @@ impl ScalarFunction for WriteFileFn {
                 }
                 #[cfg(not(unix))]
                 {
-                    let _ = mode;
+                    // Windows: the only permission bit the platform
+                    // carries is read-only (sqlite's own win32
+                    // writefile maps the same way).
+                    if let Ok(meta) = std::fs::metadata(p) {
+                        let readonly = mode & 0o222 == 0;
+                        let mut perms = meta.permissions();
+                        perms.set_readonly(readonly);
+                        let _ = std::fs::set_permissions(p, perms);
+                    }
                 }
             }
         }
@@ -264,6 +272,21 @@ impl ScalarFunction for WriteFileFn {
 }
 
 fn set_mtime(p: &str, mtime: i64) {
+    #[cfg(windows)]
+    {
+        if let Ok(f) = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(false)
+            .open(p)
+        {
+            let t = if mtime >= 0 {
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime as u64)
+            } else {
+                std::time::UNIX_EPOCH
+            };
+            let _ = f.set_modified(t);
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;

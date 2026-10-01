@@ -120,10 +120,25 @@ fn create_zip_byte_identical_to_oracle_fixture() {
     assert!(stripped(&out).is_empty(), "create must be silent: {out}");
     let mine = std::fs::read(&zip).unwrap();
     let oracle = std::fs::read(fixture("arch-three-members.zip")).unwrap();
+    #[cfg(unix)]
     assert_eq!(
         mine, oracle,
         "our stored-member zip must be byte-identical to the oracle's"
     );
+    #[cfg(windows)]
+    {
+        // Windows stat modes are synthesized (0o100666 vs the linux
+        // fixture's 33204) and the DOS time is local-rendered: the
+        // writer's framing discipline is verified structurally — same
+        // length, same member names/data/crcs through our own reader.
+        assert_eq!(mine.len(), oracle.len());
+        let back = rustqlite::plugin::zipfile::parse_zip_for_test(&mine).unwrap();
+        assert_eq!(back.len(), 3);
+        assert_eq!(back[0].name, "a.txt");
+        assert_eq!(back[0].data().unwrap(), b"hello world\n");
+        assert_eq!(back[0].mode, 0o100666, "windows synthesized mode");
+        assert_eq!(back[0].mtime, 1790830394, "mtime pin (set_modified)");
+    }
 }
 
 #[test]

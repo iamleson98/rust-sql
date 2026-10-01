@@ -98,7 +98,10 @@ fn stat_row(
     let (mode, mtime) = {
         use std::os::windows::fs::MetadataExt;
         let _ = md.file_attributes();
-        let m = if md.is_dir() { 0o040000 } else { 0o100000 };
+        // No permission bits on the platform: synthesize fileio.c's
+        // win32 renderings (S_IFREG|0666 for files, S_IFDIR|0777 for
+        // directories) so archive members carry plausible modes.
+        let m = if md.is_dir() { 0o040777 } else { 0o100666 };
         let t = md
             .modified()
             .ok()
