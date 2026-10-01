@@ -1586,3 +1586,16 @@ Stage Summary:
 - The last refused dot-command is in, riding REAL engine SQL surface (the zipfile vtab + fsdir TVF + fileio functions are queryable from user SQL, like the sqlite3 shell's linked extensions).
 - Three pre-existing engine bugs fixed (DROP IF EXISTS, writefile parent dirs, lsmode types) — the DROP one was engine-wide and data-path-relevant.
 - Ready to push: c6e970c + e3a4968 + this commit (the archive round + the two limit-stress gate fixes).
+
+---
+Task ID: 69-fix
+Agent: main (Super Z)
+Task: Windows build repair for fca9540 (the archive round) — the fsdir unix import compiled on every platform.
+
+Work Log:
+- CI on fca9540: every windows job failed at compile with `cannot find unix in os` — fsdir's stat_row had a top-of-function `use std::os::unix::fs::MetadataExt` OUTSIDE any cfg gate (the #[cfg(unix)] let-bindings below it were fine; the import itself was not). The linux/macOS jobs were green or cancelled-by-supersession.
+- Fix: the import moved inside the unix block; stat_row now has three platform arms (unix: mode+mtime from MetadataExt; windows: AttributesExt + is_dir-based mode + modified(); other: the portable fallback). Cross-verified with `cargo check --target x86_64-pc-windows-msvc` — the engine lib AND both bins compile clean for windows (the --tests cross-check stops at the vendored sqlite3.c C-compiler step, environmental, not rust code).
+- Pushed as ef400d3; fmt/clippy clean locally before the push.
+
+Stage Summary:
+- The archive round rides again; ef400d3 is the run to watch.
