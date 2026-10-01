@@ -1515,3 +1515,34 @@ Stage Summary:
 - The Windows CI red is root-caused (shared kernel file position across try_clone'd handles) and fixed by making the temp store position-disciplined end to end; merge failures are loud errors, never partial answers.
 - Deliverables: scan_table_rows + order_rowids_by_pk_desc (executor), Column::pk_collation (schema), the tempstore I/O rewrite + 2 unit tests, 8 parallel gates, tests/without_rowid_order.rs (7), README ledger updates.
 - Next: push, track CI (the Windows jobs are the verdict on the tempstore theory), then the JSON REAL rendering gap (the vendored 3.46 oracle -> 3.53.4 upgrade).
+
+---
+Task ID: 66
+Agent: main (Super Z)
+Task: Close the JSON REAL rendering gap — SQLite 3.53.4's 17-digit conversion in json_quote/render_sql_f64 + the vendored differential oracle upgrade 3.46.0 -> 3.53.4 (the ledger's last open correctness item).
+
+Work Log:
+- render_sql_f64 (src/executor/jsonb.rs) now delegates to types::format_real — the FpDecode port of SQLite 3.48+'s %.17g round-trip-reduced conversion — instead of the 3.46-era %!.15g emulation: json_quote(2.0/3.0) -> '0.66666666666666663', 1e16 -> '10000000000000000.0', 1e15 -> '1000000000000000.0' (was '1.0e+15'), 123456789.12345678 keeps all 17 digits. +-inf stays '9.0e+999' (SQLite's JSON convention; json_quote(1.0/0.0) is NULL because division by zero yields NULL, not inf). Golden-pinned against the real 3.53.4 shell (json_array(1e999) included).
+- vendor/libsqlite3-sys: amalgamation upgraded 3.46.0 -> 3.53.4 (sqlite3.c 31376-line refresh, sqlite3.h, sqlite3ext.h). The whole 1584-test default matrix re-verified green against the upgraded oracle — the engine's pinned behaviors (REAL->TEXT via the 8481-double fixture, error text, session changesets, preupdate hooks, sqlite-format interop files, schema dumps, UTF-16, turso-compat pins) all agree with 3.53.4; the JSON REAL rendering was the last known 3.46-era divergence.
+- Unit pins updated to the 17-digit goldens; module docs refreshed.
+
+Stage Summary:
+- Landed as 62b2959 (on top of 2a62df4). The correctness ledger is now EMPTY: no open correctness items remain.
+- NOTE (recorded by the next session): this commit shipped without its README ledger update and without a worklog entry — both were written up retroactively in Task 67's docs commit.
+
+---
+Task ID: 67
+Agent: main (Super Z)
+Task: Session restore + CI triage of the 37ad3ba red run; land the prepared fixes; restore docs/worklog consistency. User loop: "continue with your work until finish, then push code" / "track CI and fix problems, repeat until done".
+
+Work Log:
+- Sandbox had been reset again (no rustup, no clones of record). Reconstructed state from the two worklog copies: /home/z/my-project/rust-sql-real (older clone at 37ad3ba + a PARTIAL uncommitted WITHOUT ROWID scan-order diff) and /home/z/my-project/rust-sql (the authoritative clone — 2 unpushed commits: 2a62df4 worow+tempstore, 62b2959 json/oracle). Removed the stale duplicate clone (its uncommitted diff was superseded by 2a62df4's completed scan_table_rows work).
+- CI triage of the 37ad3ba red run (36805314825): all three windows test configs FAILED tests/tempstore.rs — spill_multibuffer_chunks_exact (20004 != 20000 groups) and spill_materialized_join_groupby_exact (Err(Semantic("integer overflow")) at the serial query), both after 15-25 minutes vs 0.95s on ubuntu; ubuntu/macos green. Confirmed the two tests were BORN in deb3bb6 and every windows run between deb3bb6 and 37ad3ba was cancelled (the pre-split 60-min timeout), so the failures were a latent deb3bb6 bug surfaced by the Task-64 CI matrix split — not a regression of a05f795. Independent root-cause analysis (this session, before finding Task 65's write-up): try_clone'd handles share the kernel file-object position on Windows (DuplicateHandle) while the writer's append cursor rode stream_position/seek — matches Task 65's diagnosis.
+- Discovered 2a62df4 was ALREADY on the remote and fully green: 33/33 check runs SUCCESS on the commit that fixes exactly that red — including test (windows-latest, default/sqlx/no-default). The 37ad3ba red run was simply superseded before this session started; master's windows red is resolved.
+- Pushed 62b2959 (the only unpushed commit): CI run started (32 check runs, in flight at last poll: 5/32 completed, 0 failures).
+- Docs-consistency commit (this session): README "Correctness gaps" section now reads NONE OPEN with the JSON REAL item rewritten as closed under "Closed this round" (it had shipped in 62b2959 without its ledger update); the ledger intro notes the differential oracle itself is now the 3.53.4 amalgamation. Worklog gained this Task 66/67 pair (retroactive for 66). Status-line link/counts to be refreshed off the completed 62b2959 run once green.
+
+Stage Summary:
+- Master moved 37ad3ba -> 2a62df4 (already remote, CI green 33/33) -> 62b2959 (pushed this session, CI in flight).
+- The correctness gap ledger is EMPTY; remaining ledger families: performance residuals (S06 range-scan, one serial-row join at parity), resource items (binary size deliberate, S17/S14 allocator floor, sqlite-format whole-image RAM), concurrency boundaries (native single-process by design, sqlite-format single-connection, BEGIN CONCURRENT restrictions), missing surface (.archive option surface, ATTACH boundaries, sqlite_dbdata forensic shape, loadable-extension ABI).
+- Next candidates, in value order: .archive (the last refused CLI dot-command), the sqlite-format streaming container (whole-image RAM load), ATTACH boundary items (cross-db triggers, parallel multi-db commits).
