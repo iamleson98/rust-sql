@@ -2678,6 +2678,10 @@ impl Pager {
     }
 
     pub fn bump_schema_cookie(&self) -> Result<()> {
+        // fetch_update: deprecated (renamed try_update) on 1.99+ but
+        // try_update is stable only since 1.95 — under the 1.75 MSRV the
+        // rename cannot land; allow(deprecated) until the MSRV moves.
+        #[allow(deprecated)]
         let new_cookie = self
             .schema_cookie
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |x| {
@@ -3417,7 +3421,10 @@ impl Pager {
             // the OOM fault-injection sweep). Under-reporting tears only
             // leak a page: allocate_page extends the file instead, and
             // the next free_page re-links the chain — always benign.
-            self.freelist_count
+            // fetch_update under an MSRV-1.75 allow (see bump_schema_cookie).
+            #[allow(deprecated)]
+            let _ = self
+                .freelist_count
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |x| {
                     if x > 0 {
                         Some(x - 1)
@@ -3580,7 +3587,10 @@ impl Pager {
             // count decrements FIRST, so every torn exit under-reports
             // (benign page leak) instead of over-reporting (head=0 with
             // count>0 — a persistent poison).
-            self.freelist_count
+            // fetch_update under an MSRV-1.75 allow (see bump_schema_cookie).
+            #[allow(deprecated)]
+            let _ = self
+                .freelist_count
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |x| {
                     if x > 0 {
                         Some(x - 1)
