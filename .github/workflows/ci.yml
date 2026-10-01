@@ -154,10 +154,14 @@ jobs:
   test-windows:
     name: test (windows-latest, all configs)
     runs-on: windows-latest
-    # 60 min: the job measured 31 min at 3a2e63b; fsync-heavy interop
-    # suites (engine + rusqlite differential files) pay ~100ms per
-    # fsync on Windows runners — headroom for growth, still bounded.
-    timeout-minutes: 60
+    # 100 min: the job measured 31 min at 3a2e63b but the suite has
+    # roughly doubled since (session/attach/fts5/stat4/tempstore + the
+    # differential batteries), and fsync-heavy interop suites pay
+    # ~100ms per fsync on Windows runners — the 60-min bound was KILLING
+    # the job mid-matrix on deb3bb6 (two consecutive 60.3/61-min
+    # cancellations). 100 min restores headroom; if it grows past ~75 min
+    # measured, split the configs into parallel matrix jobs instead.
+    timeout-minutes: 100
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"

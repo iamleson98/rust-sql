@@ -251,6 +251,12 @@ fn main() {
     // and returns this one untouched.
     let mut persist_path: Option<String> = None;
     let mut persist_file: Option<std::fs::File> = None;
+    // Temp files pending deletion (`.once -e/-x|-w` captures: the opener
+    // keeps the file for ~10s; failed openers delete on the next pass,
+    // like sqlite3's aUnlink queue).
+    let mut unlink_queue: Vec<(std::time::Instant, String)> = Vec::new();
+    // `.once -w` prefix/suffix bookkeeping (the HTML skeleton).
+    let mut www_suffix_pending: Option<String> = None;
 
     loop {
         let main_prompt = if runner.is_remote() {
@@ -320,8 +326,32 @@ fn main() {
                 state.output_file.as_deref(),
             );
             let once_here = state.once_file.is_some();
+            let special_here = state.once_special.is_some();
             let mut persist_in_out = false;
-            if let Some(p) = state.once_file.clone() {
+            if let Some(sp) = state.once_special.as_ref() {
+                // `.once -e/-x|-w`: capture to the generated temp file.
+                let _ = out.flush();
+                out = match std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&sp.path)
+                {
+                    Ok(fh) => ShellOut::File(fh),
+                    Err(e) => {
+                        eprintln!("error: cannot open {}: {}", sp.path, e);
+                        ShellOut::stdout()
+                    }
+                };
+                if let OnceKind::Browser { plain: false } = sp.kind {
+                    // The non-plain browser capture wraps the rows in a
+                    // table skeleton (sqlite3's MODE_Www).
+                    let _ = write!(
+                        out,
+                        "</PRE>\n<TABLE border='1' cellspacing='0' cellpadding='2'>\n"
+                    );
+                    www_suffix_pending = Some("</TABLE>\n<PRE>".to_string());
+                }
+            } else if let Some(p) = state.once_file.clone() {
                 let _ = out.flush();
                 out = match std::fs::File::create(&p) {
                     Ok(fh) => ShellOut::File(fh),
@@ -340,8 +370,37 @@ fn main() {
             }
             if let Err(e) = execute_sql(&mut runner, &sql, &state, &mut out) {
                 eprintln!("error: {}", e);
+                log_shell_line(&mut state, 1, &format!("{} in \"{}\"", e, sql));
             }
-            if once_here {
+            if special_here {
+                // `.once -e|-x|-w`: finish the capture — close the temp
+                // file, hand it to the system opener, restore the shell
+                // settings (sqlite3's modePush/modePop + doXdgOpen).
+                if let Some(suffix) = www_suffix_pending.take() {
+                    let _ = write!(out, "{}", suffix);
+                    let _ = writeln!(out, "</PRE></BODY></HTML>");
+                }
+                let sp = state.once_special.take().expect("special_here");
+                let _ = out.flush();
+                out = ShellOut::stdout();
+                let ok = open_with_system_opener(&sp.path);
+                unlink_queue.push((
+                    std::time::Instant::now()
+                        + if ok {
+                            std::time::Duration::from_secs(10)
+                        } else {
+                            std::time::Duration::ZERO
+                        },
+                    sp.path.clone(),
+                ));
+                // Restore the saved shell settings.
+                let saved = sp.saved;
+                state.mode = saved.mode;
+                state.col_sep = saved.col_sep;
+                state.row_sep = saved.row_sep;
+                state.headers = saved.headers;
+                state.csv_unquoted = false;
+            } else if once_here {
                 // `.once` is consumed. A still-active `.output` resumes
                 // on the next unit — its handle was never touched, so
                 // the file keeps everything written before the interlude.
@@ -355,8 +414,28 @@ fn main() {
                 }
             }
         }
+        // Expire due temp captures (sqlite3's aUnlink processing).
+        let now = std::time::Instant::now();
+        unlink_queue.retain(|(at, path)| {
+            if now >= *at {
+                let _ = std::fs::remove_file(path);
+                false
+            } else {
+                true
+            }
+        });
     }
     println!();
+}
+
+/// Write one line to the `.log` target in sqlite3_log's format
+/// ("(code) message"). No-op when no log is open.
+fn log_shell_line(state: &mut ShellState, code: i32, msg: &str) {
+    use std::io::Write;
+    if let Some(f) = state.log_file.as_mut() {
+        let _ = writeln!(f, "({}) {}", code, msg);
+        let _ = f.flush();
+    }
 }
 
 /// Reconcile the persistent `.output` handle with the current directive:
@@ -620,7 +699,7 @@ fn normalize_url(url: &str) -> String {
 
 fn open_local(path: Option<&str>, sqlite_format: bool) -> Result<Runner, String> {
     let path = path.unwrap_or(":memory:");
-    let db = if path == ":memory:" {
+    let mut db = if path == ":memory:" {
         Database::open_in_memory()
     } else if sqlite_format {
         Database::open_sqlite_format(path)
@@ -628,6 +707,9 @@ fn open_local(path: Option<&str>, sqlite_format: bool) -> Result<Runner, String>
         Database::open(path)
     }
     .map_err(|e| format!("error opening {}: {}", path, e))?;
+    // The sqlite3 shell links its extension set (shathree) into every
+    // session: sha3()/sha3_agg() are available to all local sessions.
+    let _ = rustqlite::plugin::sha3::register(&mut db);
     Ok(Runner::Local(Box::new(db)))
 }
 
@@ -728,6 +810,44 @@ struct ShellState {
     /// `.prompt MAIN [CONT]`
     prompt_main: String,
     prompt_cont: String,
+    /// `.log FILE|on|off` — the log stream (sqlite3_log lines).
+    log_file: Option<std::fs::File>,
+    /// `.scanstats on|off|est|vm` — accepted; the engine has no
+    /// scan-status counters (same warning as a SQLite build without
+    /// SQLITE_ENABLE_STMT_SCANSTATUS).
+    scanstats: u8,
+    /// `.once -e|-x|-w` / `.excel` / `.www`: capture the next
+    /// statement to a temp file and hand it to the system opener.
+    once_special: Option<OnceSpecial>,
+    /// `.once -x` interlude flag: csv WITHOUT quoting (sqlite3's .excel
+    /// quirk — .mode csv quotes, the excel capture does not).
+    csv_unquoted: bool,
+}
+
+/// A `.once -e|-x|-w` / `.excel` / `.www` capture.
+struct OnceSpecial {
+    /// The temp file (created under $HOME like sqlite3's temp-RAND.ext).
+    path: String,
+    kind: OnceKind,
+    /// Shell settings to restore after the statement.
+    saved: ModeSnapshot,
+}
+
+enum OnceKind {
+    /// `.once -e` — temp .txt, current mode, opened with the system
+    /// opener.
+    Editor,
+    /// `.once -x` / `.excel` — temp .csv, unquoted csv with CRLF.
+    Spreadsheet,
+    /// `.once -w` / `.www` — temp .html, HTML tables (or --plain text).
+    Browser { plain: bool },
+}
+
+struct ModeSnapshot {
+    mode: OutputMode,
+    col_sep: String,
+    row_sep: String,
+    headers: bool,
 }
 
 impl Default for ShellState {
@@ -747,6 +867,10 @@ impl Default for ShellState {
             once_file: None,
             prompt_main: "rustqlite".to_string(),
             prompt_cont: "  ...".to_string(),
+            log_file: None,
+            scanstats: 0,
+            once_special: None,
+            csv_unquoted: false,
         }
     }
 }
@@ -855,10 +979,30 @@ fn handle_dot_command(
             .unwrap();
             writeln!(
                 out,
-                "  .once FILE                Redirect the NEXT statement's output."
+                "  .once ?-e|-x|-w? ?FILE?    Redirect the NEXT statement's output."
             )
             .unwrap();
-            writeln!(out, "  .mode json|table|csv|line Output mode.").unwrap();
+            writeln!(
+                out,
+                "      -e temp .txt + opener, -x (or .excel) temp CSV + spreadsheet,"
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "      -w (or .www) temp .html + browser (--plain: text page)"
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "  .excel                    Show the next query in a spreadsheet (.once -x)."
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "  .www ?--plain?            Show the next query in a browser (.once -w)."
+            )
+            .unwrap();
+            writeln!(out, "  .mode list|html|json|table|csv|line Output mode.").unwrap();
             writeln!(
                 out,
                 "  .headers on|off           Column headers in table/csv output."
@@ -893,6 +1037,23 @@ fn handle_dot_command(
             writeln!(
                 out,
                 "  .eqp on|off               EXPLAIN QUERY PLAN before each statement."
+            )
+            .unwrap();
+            writeln!(out, "  .sha3sum ?--schema? ?--sha3-224|256|384|512? ?LIKE?").unwrap();
+            writeln!(
+                out,
+                "                            SHA3 hash of the database content."
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "  .fullschema ?--indent?    Schema + sqlite_stat dumps."
+            )
+            .unwrap();
+            writeln!(out, "  .log FILE|on|off          Redirect the log stream.").unwrap();
+            writeln!(
+                out,
+                "  .scanstats on|off|est     Statement scan-status toggles."
             )
             .unwrap();
             writeln!(out, "  .print TEXT...            Print literal text.").unwrap();
@@ -1052,6 +1213,8 @@ fn handle_dot_command(
                     "table" => OutputMode::Table,
                     "csv" => OutputMode::Csv,
                     "line" => OutputMode::Line,
+                    "list" => OutputMode::List,
+                    "html" => OutputMode::Html,
                     _ => {
                         writeln!(out, "unknown mode: {}", parts[1]).unwrap();
                         return Ok(());
@@ -1121,12 +1284,6 @@ fn handle_dot_command(
                 eprintln!("output restored to stdout");
             }
         },
-        ".once" => {
-            let file = parts
-                .get(1)
-                .ok_or_else(|| "usage: .once FILE".to_string())?;
-            state.once_file = Some(file.to_string());
-        }
         ".print" => {
             let text = parts[1..].join(" ");
             writeln!(out, "{}", text).unwrap();
@@ -1154,7 +1311,8 @@ fn handle_dot_command(
             if runner.is_remote() {
                 return Err(".open is not available in remote mode".to_string());
             }
-            let db = Database::open(file).map_err(|e| e.to_string())?;
+            let mut db = Database::open(file).map_err(|e| e.to_string())?;
+            let _ = rustqlite::plugin::sha3::register(&mut db);
             *runner = Runner::Local(Box::new(db));
             writeln!(out, "opened: {}", file).unwrap();
         }
@@ -1172,8 +1330,142 @@ fn handle_dot_command(
             }
             run_shell_command(&cmd, out)?;
         }
-        ".log" | ".archive" | ".scanstats" | ".fullschema" | ".sha3sum" | ".excel" => {
-            writeln!(out, "{} is not supported in rustqlite's shell", parts[0]).unwrap();
+        ".once" => {
+            // `.once [OPTIONS] FILE` — sqlite3 3.53's option surface:
+            // -e (text editor), -x (spreadsheet), -w (browser, with
+            // --plain), -bom, or a plain FILE (options -e/-x/-w take NO
+            // file — the temp path is generated).
+            let mut file: Option<String> = None;
+            let mut kind: Option<OnceKind> = None;
+            let mut plain = false;
+            let mut bom = false;
+            let mut i = 1;
+            while i < parts.len() {
+                let arg = parts[i];
+                if arg == "-e" || arg == "--e" {
+                    kind = Some(OnceKind::Editor);
+                } else if arg == "-x" || arg == "--x" {
+                    kind = Some(OnceKind::Spreadsheet);
+                } else if arg == "-w" || arg == "--w" {
+                    kind = Some(OnceKind::Browser { plain: false });
+                } else if arg == "--plain" {
+                    plain = true;
+                    if let Some(OnceKind::Browser { .. }) = kind {
+                        kind = Some(OnceKind::Browser { plain: true });
+                    }
+                } else if arg == "-bom" || arg == "--bom" {
+                    bom = true;
+                } else if arg.starts_with('-') && arg.len() > 1 {
+                    eprintln!("line 1: {} is not a valid option", arg);
+                    return Ok(());
+                } else if file.is_none() && kind.is_none() {
+                    file = Some(arg.to_string());
+                } else {
+                    eprintln!("line 1: surplus argument");
+                    return Ok(());
+                }
+                i += 1;
+            }
+            if let Some(kind) = kind {
+                // -e/-x/-w: generated temp file under $HOME.
+                if file.is_some() {
+                    eprintln!("line 1: surplus argument");
+                    return Ok(());
+                }
+                let kind = if let OnceKind::Browser { .. } = kind {
+                    OnceKind::Browser { plain }
+                } else {
+                    kind
+                };
+                start_once_special(state, kind, bom, out)?;
+            } else if let Some(f) = file {
+                state.once_file = Some(f);
+            } else {
+                eprintln!("usage: .once ?OPTIONS? FILE");
+            }
+        }
+        ".excel" => {
+            // Shorthand for `.once -x`.
+            if parts.len() > 1 {
+                eprintln!("line 1: surplus argument");
+                return Ok(());
+            }
+            start_once_special(state, OnceKind::Spreadsheet, cfg!(windows), out)?;
+        }
+        ".www" => {
+            let plain = parts.contains(&"--plain");
+            let extra: Vec<&str> = parts[1..]
+                .iter()
+                .filter(|a| **a != "--plain")
+                .copied()
+                .collect();
+            if !extra.is_empty() {
+                eprintln!("line 1: surplus argument");
+                return Ok(());
+            }
+            start_once_special(state, OnceKind::Browser { plain }, false, out)?;
+        }
+        ".log" => {
+            if parts.len() != 2 {
+                eprintln!("Usage: .log FILENAME");
+            } else {
+                match parts[1] {
+                    "off" => state.log_file = None,
+                    "on" => {
+                        // "on" redirects to stdout.
+                        state.log_file = None; // stdout logging is the default
+                        eprintln!("log output switched to stdout");
+                    }
+                    path => {
+                        state.log_file = Some(
+                            std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(path)
+                                .map_err(|e| format!("cannot open log file {}: {}", path, e))?,
+                        );
+                    }
+                }
+            }
+        }
+        ".scanstats" => {
+            if parts.len() == 2 {
+                match parts[1] {
+                    "on" | "est" | "vm" | "off" => {
+                        state.scanstats = match parts[1] {
+                            "on" => 1,
+                            "est" => 2,
+                            "vm" => 3,
+                            _ => 0,
+                        };
+                        // Honest parity with a SQLite build without
+                        // SQLITE_ENABLE_STMT_SCANSTATUS.
+                        eprintln!("Warning: .scanstats not available in this build.");
+                    }
+                    _ => {
+                        eprintln!("Usage: .scanstats on|off|est");
+                    }
+                }
+            } else {
+                eprintln!("Usage: .scanstats on|off|est");
+            }
+        }
+        ".fullschema" => {
+            if parts.len() == 2 && parts[1] == "--indent" {
+                // Accepted (sqlite3's --indent reformats long CREATE
+                // statements; schema text is emitted as stored).
+                run_fullschema(runner, out)?;
+            } else if parts.len() == 1 {
+                run_fullschema(runner, out)?;
+            } else {
+                eprintln!("Usage: .fullschema ?--indent?");
+            }
+        }
+        ".sha3sum" => run_sha3sum(runner, &parts[1..], state, out)?,
+        ".archive" => {
+            // The archive command's full surface (zip/tar/sqlar) is the
+            // last refused dot-command — tracked in the README ledger.
+            writeln!(out, ".archive is not supported in rustqlite's shell").unwrap();
         }
         ".quit" | ".exit" => {
             let _ = out.flush();
@@ -1184,6 +1476,441 @@ fn handle_dot_command(
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// .once -e/-x/-w / .excel / .www helpers
+// ---------------------------------------------------------------------------
+
+/// Begin a `.once -e|-x|-w` capture: generate the temp path under
+/// $HOME (sqlite3's `temp-<rand>.<ext>` naming), snapshot the shell
+/// settings, and switch the next statement's output/mode.
+fn start_once_special(
+    state: &mut ShellState,
+    kind: OnceKind,
+    bom: bool,
+    out: &mut ShellOut,
+) -> Result<(), String> {
+    let suffix = match kind {
+        OnceKind::Editor => "txt",
+        OnceKind::Spreadsheet => "csv",
+        OnceKind::Browser { .. } => "html",
+    };
+    let path = new_temp_file(suffix);
+    // sqlite3 writes the UTF-8 BOM for -x on Windows (Excel needs it);
+    // an explicit -bom forces it everywhere.
+    if bom {
+        let _ = std::fs::write(&path, [0xEF, 0xBB, 0xBF]);
+    }
+    let saved = ModeSnapshot {
+        mode: state.mode,
+        col_sep: state.col_sep.clone(),
+        row_sep: state.row_sep.clone(),
+        headers: state.headers,
+    };
+    match kind {
+        OnceKind::Editor => {
+            // Text editor: mode unchanged, output to the temp .txt.
+        }
+        OnceKind::Spreadsheet => {
+            state.mode = OutputMode::Csv;
+            state.col_sep = ",".to_string();
+            state.row_sep = "\r\n".to_string();
+            state.csv_unquoted = true;
+            // sqlite3's .excel always emits the BOM on Windows.
+            if cfg!(windows) {
+                let _ = std::fs::write(&path, [0xEF, 0xBB, 0xBF]);
+            }
+        }
+        OnceKind::Browser { plain } => {
+            if plain {
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .map_err(|e| format!("cannot open {}: {}", path, e))?;
+                use std::io::Write;
+                let _ = f.write_all(b"<!DOCTYPE html>\n<BODY>\n<PLAINTEXT>\n");
+                state.mode = OutputMode::List;
+            } else {
+                state.mode = OutputMode::Html;
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .map_err(|e| format!("cannot open {}: {}", path, e))?;
+                use std::io::Write;
+                let _ = f.write_all(b"<!DOCTYPE html>\n<HTML><BODY><PRE>\n");
+            }
+        }
+    }
+    let _ = out; // status never pollutes the redirected stream
+    state.once_special = Some(OnceSpecial { path, kind, saved });
+    Ok(())
+}
+
+/// A `~/temp-<30 lowercase-alnum>.<suffix>` path, sqlite3's naming.
+fn new_temp_file(suffix: &str) -> String {
+    const ALPHA: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15)
+        ^ (std::process::id() as u64).wrapping_mul(0x2545F4914F6CDD1D);
+    let mut rand = String::with_capacity(30);
+    for _ in 0..30 {
+        // xorshift64* — cheap uniqueness is all that's needed.
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        rand.push(ALPHA[(seed.wrapping_mul(0x2545F4914F6CDD1D) % 36) as usize] as char);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    format!("{}/temp-{}.{}", home.trim_end_matches('/'), rand, suffix)
+}
+
+/// The system opener sqlite3 uses (start / open / xdg-open).
+fn open_with_system_opener(path: &str) -> bool {
+    let prog = if cfg!(windows) {
+        "start"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    match std::process::Command::new(prog)
+        .arg(path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(st) => st.success(),
+        Err(_) => {
+            eprintln!("Failed: [{} {}]", prog, path);
+            false
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SQLite's LIKE (sqlite3_strlike) for .sha3sum's table filter
+// ---------------------------------------------------------------------------
+
+/// Case-insensitive (ASCII) LIKE with `%` / `_` and an escape char
+/// (`esc == 0` disables escaping). sqlite3_strlike semantics.
+fn strlike(pattern: &str, text: &str, esc: u8) -> bool {
+    fn match_from(p: &[u8], t: &[u8], esc: u8) -> bool {
+        let (mut pi, mut ti) = (0usize, 0usize);
+        while pi < p.len() {
+            let pc = p[pi];
+            if esc != 0 && pc == esc && pi + 1 < p.len() {
+                // Escaped literal char.
+                if ti >= t.len() || !p[pi + 1].eq_ignore_ascii_case(&t[ti]) {
+                    return false;
+                }
+                pi += 2;
+                ti += 1;
+            } else if pc == b'%' {
+                // Try all splits (greedy backtracking).
+                let rest = &p[pi + 1..];
+                if rest.is_empty() {
+                    return true;
+                }
+                for k in ti..=t.len() {
+                    if match_from(rest, &t[k..], esc) {
+                        return true;
+                    }
+                }
+                return false;
+            } else if pc == b'_' {
+                if ti >= t.len() {
+                    return false;
+                }
+                pi += 1;
+                ti += 1;
+            } else {
+                if ti >= t.len() || !pc.eq_ignore_ascii_case(&t[ti]) {
+                    return false;
+                }
+                pi += 1;
+                ti += 1;
+            }
+        }
+        ti == t.len()
+    }
+    match_from(pattern.as_bytes(), text.as_bytes(), esc)
+}
+
+// ---------------------------------------------------------------------------
+// .sha3sum — sqlite3's shathree.c-backed command, byte-identical
+// ---------------------------------------------------------------------------
+
+fn run_sha3sum(
+    runner: &mut Runner,
+    args: &[&str],
+    state: &mut ShellState,
+    out: &mut ShellOut,
+) -> Result<(), String> {
+    use rustqlite::plugin::sha3::{sha3_update_stmt, sha3_update_value, Sha3};
+
+    let mut b_schema = false;
+    let mut b_separate = false;
+    let mut size: u32 = 224;
+    let mut b_debug = false;
+    let mut z_like: Option<String> = None;
+    for arg in args {
+        if let Some(stripped) = arg.strip_prefix("--").or_else(|| arg.strip_prefix('-')) {
+            match stripped {
+                "schema" => b_schema = true,
+                "sha3-224" | "sha3-256" | "sha3-384" | "sha3-512" => {
+                    size = stripped[5..].parse().unwrap_or(224);
+                }
+                "debug" => b_debug = true,
+                _ => {
+                    eprintln!("Unknown option \"{}\" on \".sha3sum\"", arg);
+                    eprintln!("Usage: .sha3sum ?OPTIONS? ?LIKE-PATTERN?");
+                    return Ok(());
+                }
+            }
+        } else if z_like.is_some() {
+            eprintln!("Usage: .sha3sum ?OPTIONS? ?LIKE-PATTERN?");
+            return Ok(());
+        } else {
+            z_like = Some((*arg).to_string());
+            b_separate = true;
+            // A pattern matching `sqlite_*` flips schema mode on.
+            if strlike("sqlite\\_%", arg, b'\\') {
+                b_schema = true;
+            }
+        }
+    }
+
+    // The table list (lowercased names, sorted — sqlite3's `ORDER BY 1
+    // COLLATE NOCASE` on already-lowercased names is a byte sort).
+    let (cols, rows) = runner
+        .query(
+            "SELECT lower(name), rootpage FROM sqlite_schema WHERE type='table' \
+             AND coalesce(rootpage,0)>1",
+        )
+        .map_err(|e| format!(".sha3sum failed: {}", e))?;
+    let _ = cols;
+    let mut tables: Vec<String> = rows
+        .iter()
+        .filter_map(|r| {
+            let name = r.first()?.as_text();
+            if !b_schema && name.starts_with("sqlite_") {
+                return None;
+            }
+            Some(name)
+        })
+        .collect();
+    if b_schema {
+        tables.push("sqlite_schema".to_string());
+    }
+    tables.sort();
+    tables.dedup();
+    // Apply the LIKE pattern (on the lowercased name).
+    if let Some(pat) = z_like.as_deref() {
+        tables.retain(|t| strlike(pat, t, 0));
+    }
+
+    // Build the per-table query strings EXACTLY as sqlite3's .sha3sum:
+    // `SELECT * FROM "<name>" NOT INDEXED;` plus the four internal-table
+    // forms (sqlite_stat4's carries a trailing newline — which in the
+    // combined hash becomes the NEXT statement's leading byte, exactly
+    // like concatenating the statements and preparing them in sequence).
+    let mut queries: Vec<(String, String)> = Vec::new(); // (query, table)
+    for t in &tables {
+        let q = match t.as_str() {
+            "sqlite_schema" => {
+                "SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY name;".to_string()
+            }
+            "sqlite_sequence" => "SELECT name,seq FROM sqlite_sequence ORDER BY name;".to_string(),
+            "sqlite_stat1" => "SELECT tbl,idx,stat FROM sqlite_stat1 ORDER BY tbl,idx;".to_string(),
+            "sqlite_stat4" => "SELECT * FROM sqlite_stat4 ORDER BY tbl, idx, rowid;\n".to_string(),
+            other if other.starts_with("sqlite_") => String::new(),
+            other => format!(
+                "SELECT * FROM \"{}\" NOT INDEXED;",
+                other.replace('"', "\"\"")
+            ),
+        };
+        queries.push((q, t.clone()));
+    }
+
+    if b_debug {
+        // The exact WITH query sqlite3 builds (for --debug parity).
+        let mut s = String::from("WITH [sha3sum$query](a,b) AS(");
+        let mut sep = "VALUES(";
+        for (q, t) in &queries {
+            s.push_str(sep);
+            s.push('\'');
+            s.push_str(&q.replace('\'', "''"));
+            s.push('\'');
+            s.push(',');
+            s.push('\'');
+            s.push_str(t);
+            s.push('\'');
+            sep = "),(";
+        }
+        s.push_str("))");
+        if b_separate {
+            s.push_str(&format!(
+                " SELECT lower(hex(sha3_query(a,{}))) AS hash, b AS label   FROM [sha3sum$query]",
+                size
+            ));
+        } else {
+            s.push_str(&format!(
+                " SELECT lower(hex(sha3_query(group_concat(a,''),{}))) AS hash   FROM [sha3sum$query]",
+                size
+            ));
+        }
+        let _ = writeln!(out, "{}", s);
+    }
+
+    // Hash. Combined mode: one context over the statement sequence
+    // (stat4's trailing '\n' prefixes the following statement's text,
+    // like sqlite3_prepare_v2 over the concatenation).
+    let hash_one = |qs: &[(String, String)]| -> Result<String, String> {
+        let mut h = Sha3::new(size).map_err(|e| e.to_string())?;
+        let mut carry = String::new();
+        for (q, _) in qs {
+            let effective = format!("{}{}", carry, q);
+            // The statement runs up to the first ';'.
+            let exec = match effective.find(';') {
+                Some(pos) => effective[..=pos].to_string(),
+                None => effective.clone(),
+            };
+            if exec.trim().is_empty() && effective.is_empty() {
+                carry = String::new();
+                continue;
+            }
+            sha3_update_stmt(&mut h, &exec);
+            let (_cols, rows) = runner.query(&exec).map_err(|e| e.to_string())?;
+            for row in &rows {
+                h.update(b"R");
+                for v in row {
+                    sha3_update_value(&mut h, v);
+                }
+            }
+            // Bytes after the final ';' carry into the next statement.
+            carry = match effective.rfind(';') {
+                Some(pos) => effective[pos + 1..].to_string(),
+                None => String::new(),
+            };
+        }
+        let digest = h.finalize();
+        Ok(digest.iter().map(|b| format!("{:02x}", b)).collect())
+    };
+
+    let out_cols: Vec<String> = if b_separate {
+        vec!["hash".to_string(), "label".to_string()]
+    } else {
+        vec!["hash".to_string()]
+    };
+    let out_rows: Vec<Vec<Value>> = if b_separate {
+        let mut acc = Vec::new();
+        for (q, t) in &queries {
+            let entry = (q.clone(), t.clone());
+            let hash = hash_one(std::slice::from_ref(&entry))?;
+            acc.push(vec![
+                Value::Text(hash.into()),
+                Value::Text(t.clone().into()),
+            ]);
+        }
+        acc
+    } else if queries.is_empty() {
+        // sqlite3's empty CTE (AS() with no VALUES rows) yields NO
+        // output — only the trailing ".sha3sum failed."
+        Vec::new()
+    } else {
+        let hash = hash_one(&queries)?;
+        vec![vec![Value::Text(hash.into())]]
+    };
+
+    if !out_rows.is_empty() {
+        print_rows(out, &out_cols, &out_rows, state);
+    }
+
+    // sqlite3's reversible-text check runs on the USER tables (always
+    // excluding sqlite_*): an empty set makes the generated check SQL
+    // invalid — the ".sha3sum failed." tail (rc=1). rustqlite's TEXT is
+    // always valid UTF-8, so the count itself is always 0; only the
+    // empty-set quirk is observable.
+    let has_user_tables = tables.iter().any(|t| !t.starts_with("sqlite_"));
+    if !has_user_tables {
+        eprintln!(".sha3sum failed.");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// .fullschema — schema + sqlite_stat dumps (sqlite3's ANALYZE sandwich)
+// ---------------------------------------------------------------------------
+
+fn run_fullschema(runner: &mut Runner, out: &mut ShellOut) -> Result<(), String> {
+    // Schema objects in rowid order, `sql;` each — internal (sqlite_*)
+    // objects are filtered out, like sqlite3's
+    // `name NOT LIKE 'sqlite__%' ESCAPE '_'`.
+    let (_, rows) = runner
+        .query(
+            "SELECT name, sql FROM sqlite_schema WHERE sql IS NOT NULL \
+             ORDER BY rowid",
+        )
+        .map_err(|e| e.to_string())?;
+    for r in &rows {
+        let name = r.first().map(|v| v.as_text()).unwrap_or_default();
+        if name.starts_with("sqlite_") {
+            continue;
+        }
+        let sql = r.get(1).map(|v| v.as_text()).unwrap_or_default();
+        let _ = writeln!(out, "{};", sql);
+    }
+
+    // Which stat tables exist?
+    let (_, srows) = runner
+        .query(
+            "SELECT name FROM sqlite_schema WHERE type='table' \
+             AND name IN ('sqlite_stat1','sqlite_stat4')",
+        )
+        .map_err(|e| e.to_string())?;
+    let names: Vec<String> = srows
+        .iter()
+        .filter_map(|r| r.first().map(|v| v.as_text()))
+        .collect();
+    if names.is_empty() {
+        let _ = writeln!(out, "/* No STAT tables available */");
+    } else {
+        let _ = writeln!(out, "ANALYZE sqlite_schema;");
+        for tbl in ["sqlite_stat1", "sqlite_stat4"] {
+            if !names.iter().any(|n| n == tbl) {
+                continue;
+            }
+            let (_, rows) = runner
+                .query(&format!("SELECT * FROM {}", tbl))
+                .map_err(|e| e.to_string())?;
+            for r in &rows {
+                let rendered: Vec<String> = r.iter().map(insert_literal).collect();
+                let _ = writeln!(out, "INSERT INTO {} VALUES({});", tbl, rendered.join(","));
+            }
+        }
+        let _ = writeln!(out, "ANALYZE sqlite_schema;");
+    }
+    Ok(())
+}
+
+/// sqlite3's `.mode insert` literal rendering.
+fn insert_literal(v: &Value) -> String {
+    match v {
+        Value::Null => "NULL".to_string(),
+        Value::Integer(i) => i.to_string(),
+        Value::Real(f) => rustqlite::types::format_real(*f),
+        Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
+        Value::Blob(b) => {
+            let hex: String = b.iter().map(|x| format!("{:02X}", x)).collect();
+            format!("X'{}'", hex)
+        }
+    }
 }
 
 /// Strip one level of matching quotes from a shell word ('...' / "...").
@@ -1906,12 +2633,16 @@ fn starts_with_keyword(text: &str, keywords: &[&str]) -> bool {
     false
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum OutputMode {
     Table,
     Json,
     Csv,
     Line,
+    /// sqlite3's default: raw values joined by `|` (no quoting).
+    List,
+    /// sqlite3's `.mode html`: <TR>/<TH>/<TD> rows (no closing tags).
+    Html,
 }
 
 fn print_rows(out: &mut impl Write, cols: &[String], rows: &[Vec<Value>], state: &ShellState) {
@@ -1924,6 +2655,8 @@ fn print_rows(out: &mut impl Write, cols: &[String], rows: &[Vec<Value>], state:
         OutputMode::Json => print_json(out, cols, rows),
         OutputMode::Csv => print_csv(out, cols, rows, state),
         OutputMode::Line => print_line(out, cols, rows, state),
+        OutputMode::List => print_list(out, cols, rows, state),
+        OutputMode::Html => print_html(out, cols, rows, state),
     }
 }
 
@@ -2003,31 +2736,23 @@ fn print_csv(out: &mut impl Write, cols: &[String], rows: &[Vec<Value>], state: 
             .iter()
             .map(|c| c.replace(state.col_sep.as_str(), " "))
             .collect();
-        let line = header.join(state.col_sep.as_str());
-        if state.row_sep == "\n" {
-            writeln!(out, "{}", line).unwrap();
-        } else {
-            write!(out, "{}{}", line, state.row_sep).unwrap();
-        }
+        write_line(out, &header.join(state.col_sep.as_str()), &state.row_sep);
     }
     for row in rows {
         let cells: Vec<String> = row
             .iter()
             .map(|v| {
                 let t = cell_text(v, state);
-                if t.contains(state.col_sep.as_str()) {
+                // `.once -x` (the excel capture) writes UNQUOTED csv —
+                // sqlite3's own quirk (.mode csv quotes, .excel does not).
+                if !state.csv_unquoted && t.contains(state.col_sep.as_str()) {
                     format!("\"{}\"", t.replace('"', "\"\""))
                 } else {
                     t
                 }
             })
             .collect();
-        let line = cells.join(state.col_sep.as_str());
-        if state.row_sep == "\n" {
-            writeln!(out, "{}", line).unwrap();
-        } else {
-            write!(out, "{}{}", line, state.row_sep).unwrap();
-        }
+        write_line(out, &cells.join(state.col_sep.as_str()), &state.row_sep);
     }
 }
 
@@ -2047,6 +2772,68 @@ fn print_line(out: &mut impl Write, cols: &[String], rows: &[Vec<Value>], state:
         }
         writeln!(out).unwrap();
     }
+}
+
+/// sqlite3's `.mode list`: raw cell text joined by `|` — NO quoting even
+/// when values contain the separator (oracle-pinned).
+fn print_list(out: &mut impl Write, cols: &[String], rows: &[Vec<Value>], state: &ShellState) {
+    let sep = "|";
+    if state.headers {
+        let line = cols.join(sep);
+        let line = if line.is_empty() { String::new() } else { line };
+        write_line(out, &line, "\n");
+    }
+    for row in rows {
+        let cells: Vec<String> = row.iter().map(|v| cell_text(v, state)).collect();
+        write_line(out, &cells.join(sep), "\n");
+    }
+}
+
+/// Emit one line with the given row separator (handles the CRLF case).
+fn write_line(out: &mut impl Write, line: &str, row_sep: &str) {
+    if row_sep == "\n" {
+        writeln!(out, "{}", line).unwrap();
+    } else {
+        write!(out, "{}{}", line, row_sep).unwrap();
+    }
+}
+
+/// sqlite3's `.mode html`: each cell on its own line inside <TR> rows;
+/// headers use <TH>, NULL renders `null` (oracle-pinned, no closing
+/// tags; `&`, `<`, `>` escaped).
+fn print_html(out: &mut impl Write, cols: &[String], rows: &[Vec<Value>], state: &ShellState) {
+    if state.headers {
+        writeln!(out, "<TR>").unwrap();
+        for c in cols {
+            writeln!(out, "<TH>{}", html_escape(c)).unwrap();
+        }
+        writeln!(out, "</TR>").unwrap();
+    }
+    for row in rows {
+        writeln!(out, "<TR>").unwrap();
+        for v in row {
+            let t = match v {
+                Value::Null => "null".to_string(),
+                other => cell_text(other, state),
+            };
+            writeln!(out, "<TD>{}", html_escape(&t)).unwrap();
+        }
+        writeln!(out, "</TR>").unwrap();
+    }
+}
+
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 fn json_value(v: &Value) -> String {

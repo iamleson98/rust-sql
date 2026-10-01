@@ -30,6 +30,7 @@ pub mod codec;
 pub mod fts5;
 pub mod geopoly;
 pub mod rtree;
+pub mod sha3;
 pub mod vtab;
 
 pub use abi::{CAggregate, CCollation, CScalar};

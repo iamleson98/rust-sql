@@ -1040,29 +1040,13 @@ impl fmt::Display for Value {
     }
 }
 
-/// Format a real number with SQLite-style rounding.
-///
-/// SQLite uses the shortest round-trippable representation: the fewest digits
-/// such that parsing the resulting string back into an f64 yields a value
-/// equal to the original. We try digits=1, 2, 3, … and return the first one
-/// that round-trips. If none do (which can happen for subnormals / NaN), we
-/// fall back to Rust's default `{}` formatter.
+/// Format a real number with SQLite's exact REAL→TEXT conversion
+/// (SQLite 3.48+ / 3.53.4: 17 significant digits with the round-trip
+/// digit-count reduction — `1e300` → `"1.0e+300"`, `49.47` →
+/// `"49.47"`, `2/3` → `"0.66666666666666663"`).
+/// See [`crate::types::fptext`] for the ported machinery.
 pub fn format_real(f: f64) -> String {
-    if f.is_nan() {
-        return "".to_string();
-    }
-    if f.is_infinite() {
-        return if f > 0.0 {
-            "Inf".to_string()
-        } else {
-            "-Inf".to_string()
-        };
-    }
-    // SQLite's REAL→TEXT is C `%!.17g`: 17 significant digits, `%g`
-    // fixed/scientific selection, always a decimal point
-    // (`1e15` → "1000000000000000.0", `1e18` → "1.0e+18",
-    // `9.223372036854776e18` → "9.2233720368547758e+18").
-    format_real_sig(f, 17)
+    crate::types::fptext::render_real_353(f)
 }
 
 /// C `"%!.Ng"` — N significant digits with SQLite's fixed/scientific

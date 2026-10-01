@@ -1,5 +1,6 @@
 //! Core types: SQL values, type affinities, rows.
 
+pub mod fptext;
 pub mod text;
 pub mod value;
 
