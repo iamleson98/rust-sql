@@ -42,6 +42,13 @@ pub struct Column {
     pub autoincrement: bool,
     pub unique: bool,
     pub collation: String,
+    /// Explicit COLLATE from the table-level PRIMARY KEY clause
+    /// (`PRIMARY KEY(..., x COLLATE NOCASE ...)`) — SQLite's PK index
+    /// uses it OVER the column's own collation. Empty = no clause
+    /// collation (inherit `collation`). Carried into the engine-internal
+    /// WITHOUT ROWID PK index and the SQLite-format writer's record
+    /// ordering.
+    pub pk_collation: String,
     /// For generated columns: the expression and whether it is STORED.
     pub generated: Option<(crate::sql::ast::Expr, bool)>,
 }
@@ -373,7 +380,13 @@ pub fn without_rowid_pk_columns(table: &Table) -> Vec<crate::sql::ast::IndexedCo
             crate::sql::ast::IndexedColumn {
                 name: c.name.clone(),
                 order: c.primary_key_order,
-                collation: if c.collation.is_empty() {
+                // Collation precedence (SQLite's PK index): the PK
+                // clause's explicit COLLATE, else the column's own.
+                // Some("...") flows through build_index_columns' explicit
+                // branch; None inherits the column's collation there.
+                collation: if !c.pk_collation.is_empty() {
+                    Some(c.pk_collation.clone())
+                } else if c.collation == "BINARY" {
                     None
                 } else {
                     Some(c.collation.clone())
@@ -1322,6 +1335,7 @@ pub fn build_table(
             autoincrement,
             unique,
             collation,
+            pk_collation: String::new(),
             generated,
         });
     }
@@ -1337,6 +1351,9 @@ pub fn build_table(
                 table_columns[idx].primary_key_order = ic.order;
                 table_columns[idx].nullable = false;
                 table_columns[idx].pk_seq = (seq + 1) as u8;
+                // The PK clause's explicit COLLATE overrides the column's
+                // own for the PK index (SQLite precedence).
+                table_columns[idx].pk_collation = ic.collation.clone().unwrap_or_default();
                 // If a single-column table-level PRIMARY KEY names a column
                 // declared exactly "INTEGER" (case-insensitive, trimmed),
                 // it is also a rowid alias — SQLite build.c
@@ -1596,6 +1613,7 @@ pub fn sqlite_master_table() -> Table {
             autoincrement: false,
             unique: false,
             collation: "BINARY".to_string(),
+            pk_collation: String::new(),
             generated: None,
         });
     }

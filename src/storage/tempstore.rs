@@ -28,9 +28,28 @@
 //! `(seq, group keys, AggState`s)` with its own codec. Chunks are
 //! append-only; each chunk is self-delimiting so any number of readers
 //! can scan them independently (one per k-way merge stream).
+//!
+//! POSITION DISCIPLINE (the Windows lesson): every read AND write in
+//! this module is POSITIONED (`read_at` / `seek_read`, `write_at` /
+//! `seek_write`) against an explicitly tracked byte cursor — nothing
+//! consults or mutates the kernel file position, and readers open
+//! their OWN handle instead of `try_clone`. Two reasons:
+//!
+//! 1. `File::try_clone` on Windows (`DuplicateHandle`) yields handles
+//!    that SHARE the kernel file-object position with the original —
+//!    any pointer-based I/O on one clone (or a `stream_position` on
+//!    the writer while a clone's cursor moved) desynchronizes the
+//!    writer's append offset and clobbers chunk bytes mid-file. On
+//!    Unix a dup'd descriptor has its OWN offset, which is why the
+//!    shared-position bug never reproduced there.
+//! 2. The first fix (cloned readers + positioned reads) still left the
+//!    WRITER on the pointer API (`stream_position` + `write_all` +
+//!    header-patch seeks) — correct on Unix, fragile by construction.
+//!    The append cursor is now a plain `u64` and every byte lands
+//!    through a positioned write.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Seek, SeekFrom, Write};
+use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -38,6 +57,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// chunk readers alive at once this bounds the read side of a merge at
 /// ~256 KiB — the write side buffers similarly inside the chunk writer.
 const READER_BUF: usize = 64 * 1024;
+
+/// Write-side buffer for one chunk (positioned flushes).
+const WRITER_BUF: usize = 64 * 1024;
 
 static FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -62,6 +84,10 @@ pub(crate) struct EphemeralFile {
     file: File,
     /// Byte offset of each frozen chunk's header, in freeze order.
     chunks: Vec<u64>,
+    /// The append cursor — the file's total length. Chunks only ever
+    /// append; the header patch writes back over its own reserved bytes.
+    /// NEVER the kernel file position (see the module docs).
+    len: u64,
 }
 
 impl EphemeralFile {
@@ -78,6 +104,7 @@ impl EphemeralFile {
             path,
             file,
             chunks: Vec::new(),
+            len: 0,
         })
     }
 
@@ -93,38 +120,32 @@ impl EphemeralFile {
         self.chunks.drain(0..n.min(self.chunks.len()));
     }
 
-    /// Begin a new chunk: returns a writer that streams records out and
-    /// seals the chunk with its record count on [`ChunkWriter::finish`].
+    /// Begin a new chunk at the tracked append cursor: reserve the
+    /// n_records header (patched on [`ChunkWriter::finish`]) and hand
+    /// back a positioned writer.
     pub(crate) fn begin_chunk(&mut self) -> io::Result<ChunkWriter<'_>> {
-        let offset = self.file.stream_position()?;
-        // Reserve the n_records header now; the writer patches it after
-        // the last record is flushed (the file stays consistent because
-        // readers are only opened after the whole group-by is built).
-        self.file.write_all(&[0u8; 4])?;
+        let offset = self.len;
+        positioned_write_all(&mut self.file, &[0u8; 4], offset)?;
+        self.len += 4;
         self.chunks.push(offset);
         Ok(ChunkWriter {
-            inner: BufWriter::with_capacity(READER_BUF, &mut self.file),
+            file: &mut self.file,
             header_pos: offset,
             n: 0,
+            buf: Vec::with_capacity(WRITER_BUF),
+            file_len: &mut self.len,
         })
     }
 
     /// Open an independent reader positioned at chunk `ci`'s header.
     ///
-    /// POSITIONED READS (pread / seek_read) with a PRIVATE cursor: a
-    /// cloned `File` (dup) SHARES the file offset with every other clone
-    /// on most platforms (POSIX dup semantics), so k-way merge streams
-    /// that interleave reads through `BufReader`s silently read each
-    /// other's positions whenever a buffer refills — the first record
-    /// boundary past a shared 64 KiB refill lands mid-record and the
-    /// stream desynchronizes (measured: a 2-chunk GROUP BY at 4389
-    /// groups/chunk emitted 2317 of 20001 groups, sorted-unequal vs
-    /// SQLite; chunks at or under one buffer never refilled, which is
-    /// exactly why the small-chunk spill tests never caught it). Each
-    /// reader now owns its cursor and serves bytes through positioned
-    /// reads, so any number of streams interleave freely.
+    /// The reader opens its OWN handle (not `try_clone`): on Windows a
+    /// duplicated handle shares the kernel file-object position with the
+    /// writer, so pointer-adjacent bookkeeping on either side can
+    /// desynchronize the other. An independent open has no shared state
+    /// at all — the k-way merge interleaves any number of them freely.
     pub(crate) fn reader(&self, ci: usize) -> io::Result<RecordReader> {
-        let f = self.file.try_clone()?;
+        let f = File::open(&self.path)?;
         let mut r = RecordReader {
             file: f,
             pos: self.chunks[ci],
@@ -152,39 +173,56 @@ impl Drop for EphemeralFile {
 
 /// Streaming writer for one chunk. Each record is length-prefixed so the
 /// reader can frame it without trusting the payload's own structure.
+/// All writes are POSITIONED against the tracked cursor; nothing touches
+/// the kernel file position.
 pub(crate) struct ChunkWriter<'a> {
-    inner: BufWriter<&'a mut File>,
+    file: &'a mut File,
     header_pos: u64,
     n: u32,
+    /// Staged record bytes (flushed at WRITER_BUF).
+    buf: Vec<u8>,
+    /// The file's append cursor (shared with the owner) — advanced by
+    /// exactly the bytes flushed.
+    file_len: &'a mut u64,
 }
 
 impl ChunkWriter<'_> {
     /// Append one record's bytes (framing added here).
     pub(crate) fn write_record(&mut self, rec: &[u8]) -> io::Result<()> {
-        self.inner.write_all(&(rec.len() as u32).to_le_bytes())?;
-        self.inner.write_all(rec)?;
+        self.buf
+            .extend_from_slice(&(rec.len() as u32).to_le_bytes());
+        self.buf.extend_from_slice(rec);
         self.n += 1;
+        if self.buf.len() >= WRITER_BUF {
+            self.flush_buf()?;
+        }
+        Ok(())
+    }
+
+    /// Push staged bytes down through one positioned write.
+    fn flush_buf(&mut self) -> io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        positioned_write_all(self.file, &self.buf, *self.file_len)?;
+        *self.file_len += self.buf.len() as u64;
+        self.buf.clear();
         Ok(())
     }
 
     /// Flush records, patch the chunk header with the final count, and
     /// push the buffered bytes down to the file.
     pub(crate) fn finish(mut self) -> io::Result<()> {
-        self.inner.flush()?;
-        let file = self.inner.get_mut();
-        let cur = file.stream_position()?;
-        file.seek(SeekFrom::Start(self.header_pos))?;
-        file.write_all(&self.n.to_le_bytes())?;
-        file.seek(SeekFrom::Start(cur))?;
-        Ok(())
+        self.flush_buf()?;
+        positioned_write_all(self.file, &self.n.to_le_bytes(), self.header_pos)
     }
 }
 
 /// Sequential record reader over one chunk — POSITIONED reads with a
-/// private cursor (see [`EphemeralFile::reader`]'s docs for why a shared
-/// fd offset is wrong here). The 64 KiB buffer keeps the syscall count
-/// at one per buffer; a record never spans a buffer seam unmanaged (the
-/// refill logic below serves both halves).
+/// private cursor (see [`EphemeralFile::reader`]'s docs). The 64 KiB
+/// buffer keeps the syscall count at one per buffer; a record never
+/// spans a buffer seam unmanaged (the refill logic below serves both
+/// halves).
 pub(crate) struct RecordReader {
     file: File,
     /// Private logical cursor (never the fd offset).
@@ -257,32 +295,179 @@ impl RecordReader {
 }
 
 /// Platform positioned read: reads at `offset` WITHOUT touching the fd's
-/// shared file offset (pread on Unix, Seek+Read fallback elsewhere; the
-/// Windows seek_read is positioned too).
-#[cfg(unix)]
+/// shared file offset (pread on Unix, seek_read on Windows), looping for
+/// exactness (a single call may return short — the WAL writer holds the
+/// same discipline).
 fn positioned_read(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    let mut done = 0usize;
+    while done < buf.len() {
+        let n = positioned_read_once(file, &mut buf[done..], offset + done as u64)?;
+        if n == 0 {
+            break; // EOF
+        }
+        done += n;
+    }
+    Ok(done)
+}
+
+#[cfg(unix)]
+fn positioned_read_once(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     use std::os::unix::fs::FileExt;
     file.read_at(buf, offset)
 }
 
 #[cfg(windows)]
-fn positioned_read(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+fn positioned_read_once(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     use std::os::windows::fs::FileExt;
     file.seek_read(buf, offset)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn positioned_read(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+fn positioned_read_once(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::io::Read;
     let mut f = file.try_clone()?;
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::Seek;
+    use std::io::SeekFrom;
     f.seek(SeekFrom::Start(offset))?;
+    f.read(buf)
+}
+
+/// Platform positioned write: writes `buf` at `offset` WITHOUT touching
+/// the fd's shared file offset (pwrite on Unix, seek_write on Windows),
+/// looping until every byte lands.
+fn positioned_write_all(file: &mut File, buf: &[u8], offset: u64) -> io::Result<()> {
     let mut done = 0usize;
     while done < buf.len() {
-        let n = f.read(&mut buf[done..])?;
+        let n = positioned_write_once(file, &buf[done..], offset + done as u64)?;
         if n == 0 {
-            break;
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "temp-store positioned write wrote nothing",
+            ));
         }
         done += n;
     }
-    Ok(done)
+    Ok(())
+}
+
+#[cfg(unix)]
+fn positioned_write_once(file: &mut File, buf: &[u8], offset: u64) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.write_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn positioned_write_once(file: &mut File, buf: &[u8], offset: u64) -> io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    file.seek_write(buf, offset)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn positioned_write_once(file: &mut File, buf: &[u8], offset: u64) -> io::Result<usize> {
+    use std::io::Seek;
+    use std::io::SeekFrom;
+    use std::io::Write;
+    let mut f = file.try_clone()?;
+    f.seek(SeekFrom::Start(offset))?;
+    f.write(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The writer/reader position discipline: interleaved readers and
+    /// an active appender never disturb each other (the Windows
+    /// shared-file-object failure class — the first reader's clone
+    /// shared the kernel position with the writer's append cursor).
+    #[test]
+    fn interleaved_reader_writer_position_discipline() {
+        let mut ef = EphemeralFile::create().unwrap();
+        // Chunk 0: three records.
+        let mut w = ef.begin_chunk().unwrap();
+        w.write_record(b"alpha").unwrap();
+        w.write_record(b"beta").unwrap();
+        w.write_record(b"gamma-delta-epsilon").unwrap();
+        w.finish().unwrap();
+        // Hold a reader open mid-chunk 0...
+        let mut r0 = ef.reader(0).unwrap();
+        let mut buf = Vec::new();
+        r0.next_record(&mut buf).unwrap();
+        assert_eq!(&buf, b"alpha");
+        // ...while more chunks append (the old bug: the writer's
+        // stream_position was polluted by the reader's cursor on
+        // Windows, clobbering chunk bytes).
+        let mut w1 = ef.begin_chunk().unwrap();
+        w1.write_record(b"zeta").unwrap();
+        w1.finish().unwrap();
+        let mut w2 = ef.begin_chunk().unwrap();
+        w2.write_record(b"eta").unwrap();
+        w2.write_record(b"theta").unwrap();
+        w2.finish().unwrap();
+        // Reader 0 continues EXACTLY where it left off.
+        r0.next_record(&mut buf).unwrap();
+        assert_eq!(&buf, b"beta");
+        r0.next_record(&mut buf).unwrap();
+        assert_eq!(&buf, b"gamma-delta-epsilon");
+        assert!(r0.next_record(&mut buf).unwrap().is_none());
+        // Fresh readers over the later chunks.
+        let mut r1 = ef.reader(1).unwrap();
+        r1.next_record(&mut buf).unwrap();
+        assert_eq!(&buf, b"zeta");
+        assert!(r1.next_record(&mut buf).unwrap().is_none());
+        let mut r2 = ef.reader(2).unwrap();
+        r2.next_record(&mut buf).unwrap();
+        assert_eq!(&buf, b"eta");
+        r2.next_record(&mut buf).unwrap();
+        assert_eq!(&buf, b"theta");
+        assert!(r2.next_record(&mut buf).unwrap().is_none());
+        // Many interleaved readers over one big chunk (buffer refills).
+        let mut wb = ef.begin_chunk().unwrap();
+        let big = vec![0xA5u8; 200_000];
+        for i in 0..64 {
+            let mut rec = format!("rec-{i:04}-").into_bytes();
+            rec.extend_from_slice(&big[..1000 + i * 512]);
+            wb.write_record(&rec).unwrap();
+        }
+        wb.finish().unwrap();
+        let ci = ef.chunk_count() - 1;
+        let mut readers: Vec<RecordReader> = (0..8).map(|_| ef.reader(ci).unwrap()).collect();
+        // Round-robin reads: every stream advances independently.
+        for round in 0..64 {
+            for r in readers.iter_mut() {
+                r.next_record(&mut buf).unwrap();
+                let expect = format!("rec-{round:04}-").into_bytes();
+                assert_eq!(&buf[..9], &expect[..], "round {round}");
+                assert_eq!(buf.len(), 9 + 1000 + round * 512);
+            }
+        }
+        for r in readers.iter_mut() {
+            assert!(r.next_record(&mut buf).unwrap().is_none());
+        }
+    }
+
+    /// Record framing across the reader-buffer seam: records larger
+    /// than one 64 KiB buffer (spanning refills) frame exactly.
+    #[test]
+    fn records_spanning_buffer_seams() {
+        let mut ef = EphemeralFile::create().unwrap();
+        let mut w = ef.begin_chunk().unwrap();
+        let seam = READER_BUF - 10; // first record ends 10 bytes shy of the seam
+        let rec0 = vec![0x11u8; seam];
+        w.write_record(&rec0).unwrap();
+        let rec1 = vec![0x22u8; 200_000]; // spans several refills
+        w.write_record(&rec1).unwrap();
+        let rec2 = vec![0x33u8; 3];
+        w.write_record(&rec2).unwrap();
+        w.finish().unwrap();
+        let mut r = ef.reader(0).unwrap();
+        let mut buf = Vec::new();
+        r.next_record(&mut buf).unwrap();
+        assert_eq!(buf, rec0);
+        r.next_record(&mut buf).unwrap();
+        assert_eq!(buf, rec1);
+        r.next_record(&mut buf).unwrap();
+        assert_eq!(buf, rec2);
+        assert!(r.next_record(&mut buf).unwrap().is_none());
+    }
 }

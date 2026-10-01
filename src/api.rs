@@ -857,7 +857,17 @@ fn without_rowid_pk_collations(
     without_rowid_record_map(table)
         .into_iter()
         .take(n_pk)
-        .map(|decl_i| collation_of(&table.columns[decl_i].collation, &table.name, registry))
+        .map(|decl_i| {
+            // PK-clause COLLATE overrides the column's own (SQLite
+            // precedence — see Column::pk_collation).
+            let col = &table.columns[decl_i];
+            let effective = if col.pk_collation.is_empty() {
+                col.collation.as_str()
+            } else {
+                col.pk_collation.as_str()
+            };
+            collation_of(effective, &table.name, registry)
+        })
         .collect()
 }
 

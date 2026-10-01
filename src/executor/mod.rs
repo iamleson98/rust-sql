@@ -4703,6 +4703,157 @@ fn collect_expr_selects<'a>(e: &'a Expr, out: &mut Vec<&'a SelectStatement>) {
 // Scan
 // ============================================================================
 
+/// Drive one table's rows in the engine's table-scan order: plain
+/// rowid tables stream the table b-tree directly; WITHOUT ROWID tables
+/// (whose native storage is an internal rowid store — INSERT order)
+/// walk the engine-internal PK index instead and fetch each row by
+/// rowid. SQLite's WITHOUT ROWID table b-tree is keyed by the PK, so
+/// un-ORDER BYed scans — and the tie order of every stable sort built
+/// above them — come out in PK order there. The `payload` borrow is
+/// valid only inside `f` (the PK-ordered variant reuses one buffer).
+/// Return `false` from `f` to stop early. A rowid that vanished between
+/// the index walk and the fetch is skipped, not fatal (the rowid store
+/// is the truth; the index is the order). `may_reenter` mirrors
+/// `scan_table_borrowed_opts` (predicates with subqueries); the
+/// PK-ordered variant copies each payload out of the page lock first,
+/// so it is re-entrancy-safe regardless.
+fn scan_table_rows<F: FnMut(i64, &[u8]) -> bool>(
+    ctx: &ExecContext<'_>,
+    table: &Table,
+    may_reenter: bool,
+    mut f: F,
+) -> Result<()> {
+    if table.without_rowid {
+        let pk = ctx
+            .catalog()
+            .indexes_on_table(&table.name)
+            .into_iter()
+            .find(|i| i.origin == crate::schema::IndexOrigin::WithoutRowidPk);
+        if let Some(pk) = pk {
+            let idx_root = ctx.index_root(&pk);
+            let table_root = ctx.table_root(table);
+            let mut rowids: Vec<i64> = Vec::new();
+            Btree::new(ctx.pager, idx_root, true).scan_index(|rowid, _key| {
+                rowids.push(rowid);
+                true
+            })?;
+            // DESC-containing PK: the internal index b-tree stores every
+            // key column ASCENDING, but SQLite's WITHOUT ROWID table
+            // b-tree applies the PK's declared per-column directions
+            // (a DESC first column sorts high-to-low). Re-order the
+            // rowids under the true PK comparator (decode each row's PK
+            // columns once; the PK is unique, so the order is total).
+            // All-ASC PKs skip this — the index walk already IS the
+            // PK order.
+            if pk
+                .columns
+                .iter()
+                .any(|c| c.order == crate::sql::ast::Order::Desc)
+            {
+                rowids = order_rowids_by_pk_desc(ctx, table, &pk, rowids)?;
+            }
+            let mut bt = Btree::new(ctx.pager, table_root, false);
+            let mut buf: Vec<u8> = Vec::new();
+            for rowid in rowids {
+                let found = bt.lookup_table_with(rowid, |payload| {
+                    // Copy out of the page lock: `f` may re-enter the
+                    // pager (correlated subqueries) or mutate (DML).
+                    buf.clear();
+                    buf.extend_from_slice(payload);
+                    Ok(())
+                })?;
+                if found.is_none() {
+                    continue; // vanished between walk and fetch: skip
+                }
+                if !f(rowid, &buf) {
+                    break;
+                }
+            }
+            return Ok(());
+        }
+        // No internal PK index (degenerate shape): fall through to the
+        // plain rowid-order walk.
+    }
+    let root = ctx.table_root(table);
+    Btree::new(ctx.pager, root, false).scan_table_borrowed_opts(f, may_reenter)
+}
+
+/// Re-order a WITHOUT ROWID table's rowids under its PK's DECLARED
+/// direction (per-column ASC/DESC with the column collations) — the
+/// engine-internal PK index stores every column ascending, so a PK
+/// with any DESC column needs the true comparator applied on top.
+fn order_rowids_by_pk_desc(
+    ctx: &ExecContext<'_>,
+    table: &Table,
+    pk: &crate::schema::Index,
+    rowids: Vec<i64>,
+) -> Result<Vec<i64>> {
+    /// (table column position, DESC?, collation) for one PK column.
+    type PkTerm = (
+        usize,
+        bool,
+        Option<std::sync::Arc<dyn crate::plugin::Collation>>,
+    );
+    // PK terms: resolved once. A PK column is always a real column of
+    // the table.
+    let terms: Vec<PkTerm> = pk
+        .columns
+        .iter()
+        .filter_map(|c| {
+            let pos = table.find_column(&c.name)?;
+            let coll = if c.collation.is_empty() {
+                None
+            } else {
+                crate::plugin::lookup_collation(&c.collation)
+            };
+            Some((pos, c.order == crate::sql::ast::Order::Desc, coll))
+        })
+        .collect();
+    let positions: Vec<usize> = terms.iter().map(|(p, _, _)| *p).collect();
+    let n_cols = table.n_columns();
+    let mut bt = Btree::new(ctx.pager, ctx.table_root(table), false);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut kbuf: Vec<Value> = Vec::new();
+    let mut keyed: Vec<(Vec<Value>, i64)> = Vec::with_capacity(rowids.len());
+    for rowid in rowids {
+        let found = bt.lookup_table_with(rowid, |payload| {
+            buf.clear();
+            buf.extend_from_slice(payload);
+            Ok(())
+        })?;
+        if found.is_none() {
+            continue;
+        }
+        kbuf.clear();
+        if crate::storage::row_codec::decode_row_selective(
+            &buf,
+            n_cols,
+            &positions,
+            rowid,
+            table.rowid_alias,
+            &mut kbuf,
+        )
+        .is_ok()
+        {
+            keyed.push((kbuf.clone(), rowid));
+        }
+    }
+    keyed.sort_unstable_by(|a, b| {
+        for (i, (_, desc, ref coll)) in terms.iter().enumerate() {
+            let ord = match coll.as_deref() {
+                Some(c) => crate::plugin::compare_collated(&a.0[i], &b.0[i], c),
+                None => value_cmp_conn(&a.0[i], &b.0[i]),
+            };
+            let ord = if *desc { ord.reverse() } else { ord };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+    Ok(keyed.into_iter().map(|(_, r)| r).collect())
+}
+
 fn exec_scan(
     ctx: &mut ExecContext<'_>,
     table: Arc<Table>,
@@ -4715,15 +4866,13 @@ fn exec_scan(
         return vtab_exec::exec_scan_vtab(ctx, &table, alias.as_ref(), None);
     }
     let mut rows = Vec::new();
-    let root = ctx.table_root(&table);
-    let mut bt = Btree::new(ctx.pager, root, false);
     let rowid_alias = table.rowid_alias;
     let n_cols = table.n_columns();
     // Hidden rowid slot (no-alias tables — see planner::HIDDEN_ROWID):
     // rows carry the trailing rowid so expression projections and
     // predicates above can reference it by name.
     let append_rowid = crate::planner::wants_rowid_slot(&table);
-    bt.scan_table_borrowed(|rowid, payload| {
+    scan_table_rows(ctx, &table, false, |rowid, payload| {
         // Fused inline serial decode — semantics identical to
         // `decode_row` (short rows pad NULL, alias column materializes
         // from the B+tree key, corrupt rows are skipped), but the tag
@@ -4913,8 +5062,6 @@ fn exec_scan_projected(
             }),
         };
     }
-    let root = ctx.table_root(&table);
-    let mut bt = Btree::new(ctx.pager, root, false);
     let n_cols = table.n_columns();
     let rowid_alias = table.rowid_alias;
     let mut rows: Vec<Row> = Vec::new();
@@ -4924,7 +5071,7 @@ fn exec_scan_projected(
             // AND duplicate projections internally (sorted walk + slot
             // permutation + duplicate-run placement) — pass the original
             // index list through unchanged.
-            bt.scan_table_borrowed(|rowid, payload| {
+            scan_table_rows(ctx, &table, false, |rowid, payload| {
                 let mut row: Vec<Value> = Vec::with_capacity(idxs.len());
                 if decode_row_selective(payload, n_cols, idxs, rowid, rowid_alias, &mut row).is_ok()
                 {
@@ -4934,7 +5081,7 @@ fn exec_scan_projected(
             })?;
         }
         None => {
-            bt.scan_table_borrowed(|rowid, payload| {
+            scan_table_rows(ctx, &table, false, |rowid, payload| {
                 if let Ok(row) = decode_row(payload, n_cols, rowid, rowid_alias) {
                     rows.push(row);
                 }
@@ -5135,8 +5282,6 @@ fn scan_filter_limit(
         None => None, // accept every row
     };
     let n_cols = table.n_columns();
-    let root = ctx.table_root(table);
-    let mut bt = Btree::new(ctx.pager, root, false);
     let rowid_alias = table.rowid_alias;
     let params: &[Value] = &ctx.params;
     // Selective decode for the predicate: decode ONLY the columns the
@@ -5172,7 +5317,7 @@ fn scan_filter_limit(
             }
             let mut sel_buf: Vec<Value> = Vec::with_capacity(wanted.len());
             let stop = stop_after;
-            bt.scan_table_borrowed(|rowid, payload| {
+            scan_table_rows(ctx, table, false, |rowid, payload| {
                 if crate::storage::row_codec::decode_row_selective(
                     payload,
                     n_cols,
@@ -5208,7 +5353,7 @@ fn scan_filter_limit(
             // Degenerate predicate (constant): full decode as before.
             let positions: Vec<usize> = (0..n_cols).collect();
             let stop = stop_after;
-            bt.scan_table_borrowed(|rowid, payload| {
+            scan_table_rows(ctx, table, false, |rowid, payload| {
                 if let Ok(mut row) = decode_row(payload, n_cols, rowid, rowid_alias) {
                     if append_rowid {
                         row.push(Value::Integer(rowid));
@@ -5228,7 +5373,7 @@ fn scan_filter_limit(
         (None, _) => {
             // No predicate: accept every row (bare Scan + LIMIT).
             let stop = stop_after;
-            bt.scan_table_borrowed(|rowid, payload| {
+            scan_table_rows(ctx, table, false, |rowid, payload| {
                 if let Ok(mut row) = decode_row(payload, n_cols, rowid, rowid_alias) {
                     if append_rowid {
                         row.push(Value::Integer(rowid));
@@ -6695,7 +6840,12 @@ fn exec_topn_scan(
     // most `keep` rows in wanted-column order. A new row replaces the
     // root only when it beats it under the total order.
     let mut sel: Vec<TopnSel> = Vec::with_capacity(keep.min(4096));
-    bt.scan_table_selective(n_cols, &wanted, rowid_alias, |rowid, row| {
+    // WITHOUT ROWID tables: walk in PK order — SQLite's tie order for
+    // ORDER BY over a WITHOUT ROWID table is the PK order (its table
+    // b-tree), which the rowid serial of the plain path would not
+    // reproduce. Plain tables keep the fused selective scan (rowid
+    // order IS the tie order there).
+    let mut offer = |rowid: i64, row: Vec<Value>| {
         let key = row[key_pos].clone();
         if sel.len() < keep {
             let idx = sel.len();
@@ -6716,8 +6866,23 @@ fn exec_topn_scan(
             };
             topn_sift_down(&mut sel, 0, desc, coll);
         }
-        true
-    })?;
+    };
+    if table.without_rowid {
+        scan_table_rows(ctx, table, false, |rowid, payload| {
+            let mut row: Vec<Value> = Vec::with_capacity(wanted.len());
+            if decode_row_selective(payload, n_cols, &wanted, rowid, rowid_alias, &mut row).is_err()
+            {
+                return true; // skip corrupt rows (selective scan's contract)
+            }
+            offer(rowid, row);
+            true
+        })?;
+    } else {
+        bt.scan_table_selective(n_cols, &wanted, rowid_alias, |rowid, row| {
+            offer(rowid, row);
+            true
+        })?;
+    }
 
     // Sort the survivors by the total order, then window [offset..keep).
     sel.sort_by(|a, b| cmp_sel(a, b, desc, coll));
@@ -6769,9 +6934,6 @@ fn exec_topn_scan_expr(
         });
     }
 
-    let root = ctx.table_root(table);
-    let mut bt = Btree::new(ctx.pager, root, false);
-
     // Bounded selection: identical max-heap discipline to the bare-column
     // streaming path, with the key EVALUATED per row (O(n) evals — the
     // materializing path also materializes keys once, so semantics and
@@ -6779,7 +6941,7 @@ fn exec_topn_scan_expr(
     // per comparison).
     let mut sel: Vec<TopnSel> = Vec::with_capacity(keep.min(4096));
     let mut wide: Vec<Value> = Vec::with_capacity(n_cols + 1);
-    bt.scan_table_borrowed(|rowid, payload| {
+    scan_table_rows(ctx, table, false, |rowid, payload| {
         if crate::storage::row_codec::decode_row_selective_wide(
             payload,
             n_cols,
@@ -8430,6 +8592,13 @@ pub(crate) struct GroupIter {
     agg_ctx: Vec<AggMergeCtx>,
     /// Record scratch for chunk reads.
     rec_buf: Vec<u8>,
+    /// A temp-store I/O or framing failure KILLS the iteration (the
+    /// caller surfaces it as a statement error). The historical policy
+    /// — an unreadable chunk or a corrupt record silently contributing
+    /// nothing — turned disk trouble into quietly WRONG ANSWERS (the
+    /// fd-exhaustion hole dropped 20k keys to 4084); no path here may
+    /// swallow a read error again.
+    io_poison: Option<crate::error::Error>,
 }
 
 enum GroupIterMode {
@@ -8507,17 +8676,28 @@ fn consolidate_spill_chunks(
         // Readers own cloned fds (no borrow of `ef`): open them all,
         // then take the mutable borrow for the writer.
         let mut streams = Vec::with_capacity(k);
+        let mut open_failed = false;
         for ci in 0..k {
-            if let Ok(r) = ef.reader(ci) {
-                streams.push(MergeStream {
+            match ef.reader(ci) {
+                Ok(r) => streams.push(MergeStream {
                     src: StreamSrc::Chunk(r),
                     head: None,
-                });
+                }),
+                Err(_) => {
+                    // Abort the pass WITHOUT retiring anything: a
+                    // partial-input merge would DESTROY the chunks whose
+                    // readers opened (their groups would exist only in
+                    // the merged output, which never gets written).
+                    open_failed = true;
+                    break;
+                }
             }
         }
-        if streams.is_empty() {
-            // Nothing readable (fd exhaustion at a bound no reachable
-            // workload should hit) — stop rather than destroy chunks.
+        if open_failed || streams.is_empty() {
+            // Nothing safely mergeable (fd exhaustion at a bound no
+            // reachable workload should hit) — stop rather than destroy
+            // chunks. The final merge below surfaces the failure through
+            // its own reader opens.
             return;
         }
         let mut iter = GroupIter {
@@ -8525,18 +8705,34 @@ fn consolidate_spill_chunks(
             n_aggs,
             agg_ctx: agg_ctx.to_vec(),
             rec_buf: Vec::with_capacity(256),
+            io_poison: None,
         };
         let write = (|| -> std::io::Result<()> {
             let mut w = ef.begin_chunk()?;
             let mut rec: Vec<u8> = Vec::with_capacity(128);
-            while let Some((keys, states)) = iter.next_group() {
-                rec.clear();
-                // seq 0: the intermediate chunk is internally key-sorted
-                // and key-deduped; the final merge's (key, seq)
-                // tie-break only arbitrates EQUAL keys across streams,
-                // which re-merge regardless of order.
-                encode_group_into_multi(&mut rec, 0, &keys, |i| &states[i], n_aggs);
-                w.write_record(&rec)?;
+            loop {
+                match iter.next_group() {
+                    Some((keys, states)) => {
+                        rec.clear();
+                        // seq 0: the intermediate chunk is internally
+                        // key-sorted and key-deduped; the final merge's
+                        // (key, seq) tie-break only arbitrates EQUAL keys
+                        // across streams, which re-merge regardless of
+                        // order.
+                        encode_group_into_multi(&mut rec, 0, &keys, |i| &states[i], n_aggs);
+                        w.write_record(&rec)?;
+                    }
+                    None => {
+                        // Poison (a read/framing failure inside the
+                        // merge) aborts the pass with NOTHING retired.
+                        if iter.take_error().is_some() {
+                            return Err(std::io::Error::other(
+                                "temp-store consolidation merge failed",
+                            ));
+                        }
+                        break;
+                    }
+                }
             }
             w.finish()
         })();
@@ -8563,18 +8759,23 @@ impl GroupIter {
                 // Spill mode: one reader per chunk + the RAM tail.
                 let n_chunks = ef.chunk_count();
                 let mut streams = Vec::with_capacity(n_chunks + 1);
+                let mut poison = None;
                 for ci in 0..n_chunks {
-                    // An unreadable chunk contributes nothing (freeze
-                    // already disarmed on write errors, so this is fd
-                    // exhaustion at read time — the RAM tail still holds
-                    // every group interned after the LAST successful
-                    // freeze, and earlier chunks are independently
-                    // readable).
-                    if let Ok(r) = ef.reader(ci) {
-                        streams.push(MergeStream {
+                    // An unreadable chunk is a hard error: silently
+                    // skipping it would return the OTHER chunks' groups
+                    // as the whole answer (the fd-exhaustion hole did
+                    // exactly that — 20k keys answered as 4084).
+                    match ef.reader(ci) {
+                        Ok(r) => streams.push(MergeStream {
                             src: StreamSrc::Chunk(r),
                             head: None,
-                        });
+                        }),
+                        Err(e) => {
+                            poison = Some(crate::error::Error::runtime(format!(
+                                "temp-store chunk read failed: {e}"
+                            )));
+                            break;
+                        }
                     }
                 }
                 // KEY-SORTED tail order (the merge is a sorted-run
@@ -8616,6 +8817,7 @@ impl GroupIter {
                     n_aggs,
                     agg_ctx,
                     rec_buf: Vec::with_capacity(256),
+                    io_poison: poison,
                 }
             }
             None => Self {
@@ -8623,8 +8825,14 @@ impl GroupIter {
                 n_aggs,
                 agg_ctx,
                 rec_buf: Vec::new(),
+                io_poison: None,
             },
         }
+    }
+
+    /// Take the fatal I/O error, if any (iteration stops at poison).
+    pub(crate) fn take_error(&mut self) -> Option<crate::error::Error> {
+        self.io_poison.take()
     }
 
     /// Next group, or `None` at exhaustion. Spill mode merges duplicate
@@ -8656,6 +8864,12 @@ impl GroupIter {
                 Some((keys, states))
             }
             GroupIterMode::Spill { streams } => {
+                // Poison kills the iteration: the caller surfaces the
+                // error (silently truncating here would return a
+                // partial answer as the whole one).
+                if self.io_poison.is_some() {
+                    return None;
+                }
                 // Fill every stream's head (disjoint field borrows: the
                 // streams live in `self.mode`, the record scratch in
                 // `self.rec_buf`).
@@ -8663,7 +8877,10 @@ impl GroupIter {
                 let n_aggs = self.n_aggs;
                 for s in streams.iter_mut() {
                     if s.head.is_none() {
-                        fill_head_into(rec_buf, s, n_aggs);
+                        if let Err(e) = fill_head_into(rec_buf, s, n_aggs) {
+                            self.io_poison = Some(e);
+                            return None;
+                        }
                     }
                 }
                 // Find the minimum (key, seq) head.
@@ -8725,11 +8942,13 @@ impl GroupIter {
 }
 
 /// Free-function form — callable while the caller holds `&mut self.mode`'s
-/// streams (disjoint-field borrow).
-fn fill_head_into(rec_buf: &mut Vec<u8>, s: &mut MergeStream, n_aggs: usize) {
+/// streams (disjoint-field borrow). Returns `Err` on a read failure or a
+/// record that does not decode (corruption — never swallowed; see
+/// `GroupIter::io_poison`).
+fn fill_head_into(rec_buf: &mut Vec<u8>, s: &mut MergeStream, n_aggs: usize) -> Result<()> {
     match &mut s.src {
-        StreamSrc::Chunk(r) => {
-            if let Ok(Some(())) = r.next_record(rec_buf) {
+        StreamSrc::Chunk(r) => match r.next_record(rec_buf) {
+            Ok(Some(())) => {
                 if let Some((seq, keys, states)) = decode_group(rec_buf, n_aggs) {
                     s.head = Some(SpilledGroup {
                         seq,
@@ -8737,9 +8956,18 @@ fn fill_head_into(rec_buf: &mut Vec<u8>, s: &mut MergeStream, n_aggs: usize) {
                         display: None,
                         states,
                     });
+                    Ok(())
+                } else {
+                    Err(crate::error::Error::runtime(
+                        "temp-store record failed to decode",
+                    ))
                 }
             }
-        }
+            Ok(None) => Ok(()), // stream exhausted
+            Err(e) => Err(crate::error::Error::runtime(format!(
+                "temp-store chunk read failed: {e}"
+            ))),
+        },
         StreamSrc::RamTail {
             keys_flat,
             keys_multi,
@@ -8750,7 +8978,7 @@ fn fill_head_into(rec_buf: &mut Vec<u8>, s: &mut MergeStream, n_aggs: usize) {
             base,
         } => {
             if *gi >= order.len() {
-                return;
+                return Ok(());
             }
             let g = order[*gi] as usize;
             // Collated GROUP BY: the merge key stays the FOLDED stored
@@ -8776,6 +9004,7 @@ fn fill_head_into(rec_buf: &mut Vec<u8>, s: &mut MergeStream, n_aggs: usize) {
                 states: st,
             });
             *gi += 1;
+            Ok(())
         }
     }
 }
@@ -9553,6 +9782,11 @@ fn finish_group_result(
             }
             out_rows.push(row);
         }
+        // A temp-store failure mid-merge is a statement error, never a
+        // partial answer.
+        if let Some(e) = iter.take_error() {
+            return Err(e);
+        }
         drop(iter);
         return Ok(ExecResult {
             columns: proj.names.clone().into(),
@@ -9571,6 +9805,9 @@ fn finish_group_result(
             row.push(finalize_agg(&states[i], &agg.func)?);
         }
         out_rows.push(row);
+    }
+    if let Some(e) = iter.take_error() {
+        return Err(e);
     }
     drop(iter);
 
@@ -10956,10 +11193,8 @@ fn exec_aggregate_no_group_by(
 
             let params = &ctx.params;
             let mut sel_buf: Vec<Value> = Vec::with_capacity(wanted.len());
-            let root = ctx.table_root(&table);
-            let mut bt = Btree::new(ctx.pager, root, false);
             let rowid_alias = table.rowid_alias;
-            bt.scan_table_borrowed(|rowid, payload| {
+            scan_table_rows(ctx, &table, false, |rowid, payload| {
                 if decode_row_selective(payload, n_cols, &wanted, rowid, rowid_alias, &mut sel_buf)
                     .is_err()
                 {
@@ -11048,160 +11283,149 @@ fn exec_aggregate_no_group_by(
         // Scratch slot for the rare non-Column arg fallback (eval_row).
         let mut scratch_arg: Vec<Value> = vec![Value::Null; aggregates.len()];
 
-        let root = ctx.table_root(&table);
-        let mut bt = Btree::new(ctx.pager, root, false);
-        // Use scan_table_borrowed — bypasses Cell::decode's per-row Vec<u8>
-        // allocation by passing &[u8] borrows directly into the page buffer.
-        // For 10k rows, this saves 10k malloc+free pairs.
+        // Use the ordered table walk — bypasses Cell::decode's per-row
+        // Vec<u8> allocation by passing &[u8] borrows directly into the
+        // page buffer. For 10k rows, this saves 10k malloc+free pairs.
         let rowid_alias = table.rowid_alias;
         let pred_may_reenter = filter_predicate.is_some_and(expr_has_subquery);
-        bt.scan_table_borrowed_opts(
-            |rowid, payload| {
-                // Decode only the wanted columns.
-                if decode_row_selective(payload, n_cols, &wanted, rowid, rowid_alias, &mut sel_buf)
-                    .is_err()
-                {
-                    return true;
+        scan_table_rows(ctx, &table, pred_may_reenter, |rowid, payload| {
+            // Decode only the wanted columns.
+            if decode_row_selective(payload, n_cols, &wanted, rowid, rowid_alias, &mut sel_buf)
+                .is_err()
+            {
+                return true;
+            }
+            // Apply the filter predicate, if any. We need a full row buffer
+            // because eval_row indexes by column position. The cheap path
+            // is to expand sel_buf back into a full row (NULLs for un-wanted
+            // columns). For aggregates only on a few cols, this is still
+            // cheaper than decode_row_into because we skip the heavy Text/Blob
+            // allocations on un-wanted cols (only Integer/Real decoded).
+            if let Some(pred) = filter_predicate {
+                let cols = wanted_names
+                    .as_ref()
+                    .expect("col_names built when filter is present");
+                // Expand into full_row_buf at the correct positions.
+                full_row_buf.clear();
+                full_row_buf.resize(n_cols, Value::Null);
+                for (i, &col_idx) in wanted.iter().enumerate() {
+                    if i < sel_buf.len() {
+                        full_row_buf[col_idx] = sel_buf[i].clone();
+                    }
                 }
-                // Apply the filter predicate, if any. We need a full row buffer
-                // because eval_row indexes by column position. The cheap path
-                // is to expand sel_buf back into a full row (NULLs for un-wanted
-                // columns). For aggregates only on a few cols, this is still
-                // cheaper than decode_row_into because we skip the heavy Text/Blob
-                // allocations on un-wanted cols (only Integer/Real decoded).
-                if let Some(pred) = filter_predicate {
+                match eval_row(pred, &full_row_buf, cols, &params, &named_params) {
+                    Ok(v) => {
+                        if !v.is_truthy() {
+                            return true;
+                        }
+                    }
+                    Err(_) => return true,
+                }
+            }
+            saw_any_row = true;
+            for i in 0..aggregates.len() {
+                // `agg_pos` / `agg_is_count_star` are precomputed ONCE above
+                // (was: a `wanted.iter().position()` linear scan per agg per
+                // row — for the 5-aggregate bench shape that was ~20 ns of
+                // pure per-row waste, and `sel_buf[pos].clone()` another
+                // Value copy per update; update_agg_state only borrows).
+                let arg_val: &Value = if agg_is_count_star[i] {
+                    &COUNT_STAR_ARG
+                } else if let Some(pos) = agg_pos[i] {
+                    &sel_buf[pos]
+                } else if let Some(arg) = &aggregates[i].arg {
                     let cols = wanted_names
                         .as_ref()
-                        .expect("col_names built when filter is present");
-                    // Expand into full_row_buf at the correct positions.
-                    full_row_buf.clear();
-                    full_row_buf.resize(n_cols, Value::Null);
-                    for (i, &col_idx) in wanted.iter().enumerate() {
-                        if i < sel_buf.len() {
-                            full_row_buf[col_idx] = sel_buf[i].clone();
+                        .expect("col_names built when not all are Column");
+                    // Fall back to eval_row for non-Column args.
+                    let mut full_row = vec![Value::Null; n_cols];
+                    for (j, &col_idx) in wanted.iter().enumerate() {
+                        if j < sel_buf.len() {
+                            full_row[col_idx] = sel_buf[j].clone();
                         }
                     }
-                    match eval_row(pred, &full_row_buf, cols, &params, &named_params) {
-                        Ok(v) => {
-                            if !v.is_truthy() {
-                                return true;
-                            }
-                        }
-                        Err(_) => return true,
+                    match eval_row(arg, &full_row, cols, &params, &named_params) {
+                        Ok(v) => scratch_arg[i] = v,
+                        Err(_) => scratch_arg[i] = Value::Null,
                     }
-                }
-                saw_any_row = true;
-                for i in 0..aggregates.len() {
-                    // `agg_pos` / `agg_is_count_star` are precomputed ONCE above
-                    // (was: a `wanted.iter().position()` linear scan per agg per
-                    // row — for the 5-aggregate bench shape that was ~20 ns of
-                    // pure per-row waste, and `sel_buf[pos].clone()` another
-                    // Value copy per update; update_agg_state only borrows).
-                    let arg_val: &Value = if agg_is_count_star[i] {
-                        &COUNT_STAR_ARG
-                    } else if let Some(pos) = agg_pos[i] {
-                        &sel_buf[pos]
-                    } else if let Some(arg) = &aggregates[i].arg {
-                        let cols = wanted_names
-                            .as_ref()
-                            .expect("col_names built when not all are Column");
-                        // Fall back to eval_row for non-Column args.
-                        let mut full_row = vec![Value::Null; n_cols];
-                        for (j, &col_idx) in wanted.iter().enumerate() {
-                            if j < sel_buf.len() {
-                                full_row[col_idx] = sel_buf[j].clone();
-                            }
-                        }
-                        match eval_row(arg, &full_row, cols, &params, &named_params) {
-                            Ok(v) => scratch_arg[i] = v,
-                            Err(_) => scratch_arg[i] = Value::Null,
-                        }
-                        &scratch_arg[i]
-                    } else {
-                        &COUNT_STAR_ARG
-                    };
-                    update_agg_state(
-                        &mut states[i],
-                        agg_funcs[i],
-                        arg_val,
-                        aggregates[i].distinct,
-                        agg_sep_at(aggregates, i),
-                    );
-                }
-                true
-            },
-            pred_may_reenter,
-        )?;
+                    &scratch_arg[i]
+                } else {
+                    &COUNT_STAR_ARG
+                };
+                update_agg_state(
+                    &mut states[i],
+                    agg_funcs[i],
+                    arg_val,
+                    aggregates[i].distinct,
+                    agg_sep_at(aggregates, i),
+                );
+            }
+            true
+        })?;
     } else {
         // Fallback: decode the entire row.
         let mut row_buf: Vec<Value> = Vec::with_capacity(n_cols);
-        let root = ctx.table_root(&table);
-        let mut bt = Btree::new(ctx.pager, root, false);
         let rowid_alias = table.rowid_alias;
         let pred_may_reenter = filter_predicate.is_some_and(expr_has_subquery);
-        bt.scan_table_borrowed_opts(
-            |rowid, payload| {
-                row_buf.clear();
-                if decode_row_into(payload, n_cols, rowid, rowid_alias, &mut row_buf).is_err() {
-                    return true; // skip corrupt rows
-                }
-                if append_rowid {
-                    row_buf.push(Value::Integer(rowid));
-                }
-                // Apply the filter predicate inline (if any).
-                if let Some(pred) = filter_predicate {
-                    let cols = columns_ref.expect("columns were built because predicate is Some");
-                    match eval_row(pred, &row_buf, cols, &params, &named_params) {
-                        Ok(v) => {
-                            if !v.is_truthy() {
-                                return true;
-                            }
-                        }
-                        Err(_) => return true,
-                    }
-                }
-                saw_any_row = true;
-                for (i, agg) in aggregates.iter().enumerate() {
-                    // Per-aggregate FILTER (WHERE ...): only rows passing
-                    // the predicate contribute to THIS aggregate (SQLite
-                    // 3.30+). Evaluated against the full decoded row.
-                    if let Some(f) = &agg.filter {
-                        let cols =
-                            columns_ref.expect("columns built when per-aggregate FILTER present");
-                        let pass = match eval_row(f, &row_buf, cols, &params, &named_params) {
-                            Ok(v) => v.is_truthy(),
-                            Err(_) => false,
-                        };
-                        if !pass {
-                            continue;
+        scan_table_rows(ctx, &table, pred_may_reenter, |rowid, payload| {
+            row_buf.clear();
+            if decode_row_into(payload, n_cols, rowid, rowid_alias, &mut row_buf).is_err() {
+                return true; // skip corrupt rows
+            }
+            if append_rowid {
+                row_buf.push(Value::Integer(rowid));
+            }
+            // Apply the filter predicate inline (if any).
+            if let Some(pred) = filter_predicate {
+                let cols = columns_ref.expect("columns were built because predicate is Some");
+                match eval_row(pred, &row_buf, cols, &params, &named_params) {
+                    Ok(v) => {
+                        if !v.is_truthy() {
+                            return true;
                         }
                     }
-                    let arg_val = if let Some(idx) = agg_col_indices[i] {
-                        // Fast path: pre-resolved column index.
-                        row_buf[idx].clone()
-                    } else if let Some(arg) = &agg.arg {
-                        // Slow path: eval_row (e.g. SUM(x + 1), AVG(x * 2)).
-                        let cols =
-                            columns_ref.expect("columns were built because not all are Column");
-                        match eval_row(arg, &row_buf, cols, &params, &named_params) {
-                            Ok(v) => v,
-                            Err(_) => Value::Null,
-                        }
-                    } else {
-                        Value::Integer(1)
+                    Err(_) => return true,
+                }
+            }
+            saw_any_row = true;
+            for (i, agg) in aggregates.iter().enumerate() {
+                // Per-aggregate FILTER (WHERE ...): only rows passing
+                // the predicate contribute to THIS aggregate (SQLite
+                // 3.30+). Evaluated against the full decoded row.
+                if let Some(f) = &agg.filter {
+                    let cols =
+                        columns_ref.expect("columns built when per-aggregate FILTER present");
+                    let pass = match eval_row(f, &row_buf, cols, &params, &named_params) {
+                        Ok(v) => v.is_truthy(),
+                        Err(_) => false,
                     };
-                    update_agg_state(
-                        &mut states[i],
-                        agg_funcs[i],
-                        &arg_val,
-                        agg.distinct,
-                        agg_sep_at(aggregates, i),
-                    );
+                    if !pass {
+                        continue;
+                    }
                 }
-                true
-            },
-            pred_may_reenter,
-        )?;
+                let arg_val = if let Some(idx) = agg_col_indices[i] {
+                    // Fast path: pre-resolved column index.
+                    row_buf[idx].clone()
+                } else if let Some(arg) = &agg.arg {
+                    // Slow path: eval_row (e.g. SUM(x + 1), AVG(x * 2)).
+                    let cols = columns_ref.expect("columns were built because not all are Column");
+                    match eval_row(arg, &row_buf, cols, &params, &named_params) {
+                        Ok(v) => v,
+                        Err(_) => Value::Null,
+                    }
+                } else {
+                    Value::Integer(1)
+                };
+                update_agg_state(
+                    &mut states[i],
+                    agg_funcs[i],
+                    &arg_val,
+                    agg.distinct,
+                    agg_sep_at(aggregates, i),
+                );
+            }
+            true
+        })?;
     }
 
     finish_no_group_by(aggregates, states, saw_any_row)
@@ -12156,6 +12380,9 @@ fn exec_aggregate(
             }
         }
         out_rows.push(row);
+    }
+    if let Some(e) = grp_iter.take_error() {
+        return Err(e);
     }
     drop(grp_iter);
 
@@ -14780,8 +15007,7 @@ fn try_fused_scan_hash_join(
         let build_side_gated = rowid_seek_join && !gated_is_probe;
         let build_side_is_alias = rowid_seek_join && gated_is_probe;
         {
-            let mut bt = Btree::new(pager, build.root, false);
-            bt.scan_table_borrowed(|rowid, payload| {
+            scan_table_rows(ctx, &build.table, false, |rowid, payload| {
                 if crate::storage::row_codec::decode_row_selective_sorted(
                     payload,
                     build.n_cols,
@@ -14967,27 +15193,33 @@ fn try_fused_scan_hash_join(
     // cost the mode exists to skip.
     if !count_only {
         {
-            let out_slots_plain: Vec<(bool, usize)> =
-                out_slots.iter().map(|s| (s.from_build, s.pos)).collect();
-            if let Some(rows) = crate::executor::parallel::try_parallel_join_probe(
-                ctx,
-                probe.root,
-                probe.n_cols,
-                &probe_wanted,
-                probe_alias,
-                &probe_key_pos,
-                &built,
-                &out_slots_plain,
-                out_combined.len(),
-                left_outer,
-                build_unmatched_tail,
-                rowid_seek_join.then_some(gated_is_probe),
-            )? {
-                let columns_out: std::sync::Arc<[String]> = out_names.into();
-                return Ok(Some(ExecResult {
-                    columns: columns_out,
-                    rows,
-                }));
+            // WITHOUT ROWID probe: the parallel probe range-splits the
+            // rowid store (INSERT order) — the serial PK-ordered walk
+            // below is the only correct order. Decline the parallel
+            // machine for those tables.
+            if !probe.table.without_rowid {
+                let out_slots_plain: Vec<(bool, usize)> =
+                    out_slots.iter().map(|s| (s.from_build, s.pos)).collect();
+                if let Some(rows) = crate::executor::parallel::try_parallel_join_probe(
+                    ctx,
+                    probe.root,
+                    probe.n_cols,
+                    &probe_wanted,
+                    probe_alias,
+                    &probe_key_pos,
+                    &built,
+                    &out_slots_plain,
+                    out_combined.len(),
+                    left_outer,
+                    build_unmatched_tail,
+                    rowid_seek_join.then_some(gated_is_probe),
+                )? {
+                    let columns_out: std::sync::Arc<[String]> = out_names.into();
+                    return Ok(Some(ExecResult {
+                        columns: columns_out,
+                        rows,
+                    }));
+                }
             }
         }
     } // !count_only
@@ -15019,8 +15251,7 @@ fn try_fused_scan_hash_join(
     };
     let serial_bitmap = build_unmatched_tail;
     {
-        let mut bt = Btree::new(pager, probe.root, false);
-        bt.scan_table_borrowed(|rowid, payload| {
+        scan_table_rows(ctx, &probe.table, false, |rowid, payload| {
             if crate::storage::row_codec::decode_row_selective_sorted(
                 payload,
                 probe.n_cols,
@@ -15106,8 +15337,7 @@ fn try_fused_scan_hash_join(
                                 // (distinct large i64s can share a double
                                 // key; the build's insert verification
                                 // splits them, this re-checks the head).
-                                let bpos =
-                                    slots[slot].head as usize * stride + built_key_slots[0];
+                                let bpos = slots[slot].head as usize * stride + built_key_slots[0];
                                 let (gated, alias) = if gated_is_probe {
                                     (&pbuf[probe_key_pos[0]], &build_vals[bpos])
                                 } else {
@@ -23666,7 +23896,9 @@ fn try_streaming_update(
             }
             Ok::<(), crate::error::Error>(())
         } else {
-            bt.scan_table_borrowed(|rowid, payload| {
+            // PK-ordered walk for WITHOUT ROWID tables (RETURNING order
+            // and trigger firing order follow the table scan order).
+            scan_table_rows(ctx, table, false, |rowid, payload| {
                 let old_owned = if needs_old_payload {
                     Some(payload.to_vec())
                 } else {
@@ -25035,38 +25267,35 @@ fn try_streaming_delete(
             })?;
         }
     } else {
-        // Full scan (optionally filtered): walk every cell.
+        // Full scan (optionally filtered): walk every cell — PK-ordered
+        // for WITHOUT ROWID tables (RETURNING order follows the scan).
         let pred_may_reenter = residual_pred.is_some_and(expr_has_subquery);
-        bt.scan_table_borrowed_opts(
-            |rowid, payload| {
-                if let Some(pred) = residual_pred {
-                    row_buf.clear();
-                    if decode_row_into(payload, n_cols, rowid, table.rowid_alias, &mut row_buf)
-                        .is_err()
-                    {
-                        return true;
-                    }
-                    match eval_row_aff(
-                        pred,
-                        &row_buf,
-                        &col_names,
-                        table.col_affinities.as_ref(),
-                        &params,
-                        &named_params,
-                    ) {
-                        Ok(v) if v.is_truthy() => {}
-                        Ok(_) => return true,
-                        Err(e) => {
-                            first_error = Some(e);
-                            return false;
-                        }
+        scan_table_rows(ctx, table, pred_may_reenter, |rowid, payload| {
+            if let Some(pred) = residual_pred {
+                row_buf.clear();
+                if decode_row_into(payload, n_cols, rowid, table.rowid_alias, &mut row_buf).is_err()
+                {
+                    return true;
+                }
+                match eval_row_aff(
+                    pred,
+                    &row_buf,
+                    &col_names,
+                    table.col_affinities.as_ref(),
+                    &params,
+                    &named_params,
+                ) {
+                    Ok(v) if v.is_truthy() => {}
+                    Ok(_) => return true,
+                    Err(e) => {
+                        first_error = Some(e);
+                        return false;
                     }
                 }
-                rowids.push(rowid);
-                true
-            },
-            pred_may_reenter,
-        )?;
+            }
+            rowids.push(rowid);
+            true
+        })?;
     }
     if let Some(e) = first_error {
         return Err(e);

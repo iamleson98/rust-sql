@@ -636,6 +636,7 @@ pub(crate) fn vtab_columns_to_schema(
             autoincrement: false,
             unique: false,
             collation: "BINARY".to_string(),
+            pk_collation: String::new(),
             generated: None,
         });
     }

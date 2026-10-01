@@ -284,6 +284,14 @@ pub(crate) fn try_parallel_fused_aggregate(
     filter_predicate: Option<&Expr>,
     aggregates: &[AggExpr],
 ) -> Result<Option<ExecResult>> {
+    // WITHOUT ROWID tables: the parallel drivers range-split the table's
+    // internal ROWID store (INSERT order); SQLite's scan order for a
+    // WITHOUT ROWID table is the PK b-tree order. The serial paths walk
+    // the engine-internal PK index instead — decline here so the two
+    // never disagree (serial = parallel output parity).
+    if table.without_rowid {
+        return Ok(None);
+    }
     let prefix = alias.unwrap_or(&table.name);
     let plan = match fused_plan_of(
         table,
@@ -421,6 +429,14 @@ pub(crate) fn try_parallel_distinct_aggregate(
     filter_predicate: Option<&Expr>,
     aggregates: &[AggExpr],
 ) -> Result<Option<ExecResult>> {
+    // WITHOUT ROWID tables: the parallel drivers range-split the table's
+    // internal ROWID store (INSERT order); SQLite's scan order for a
+    // WITHOUT ROWID table is the PK b-tree order. The serial paths walk
+    // the engine-internal PK index instead — decline here so the two
+    // never disagree (serial = parallel output parity).
+    if table.without_rowid {
+        return Ok(None);
+    }
     if !aggregates.iter().any(|a| a.distinct) {
         return Ok(None); // the fused machine owns non-DISTINCT shapes
     }
@@ -654,6 +670,14 @@ pub(crate) fn try_parallel_groupby_selective(
     n_cols: usize,
     key_collations: &[Option<String>],
 ) -> Result<Option<HashGrouper>> {
+    // WITHOUT ROWID tables: the parallel drivers range-split the table's
+    // internal ROWID store (INSERT order); SQLite's scan order for a
+    // WITHOUT ROWID table is the PK b-tree order. The serial paths walk
+    // the engine-internal PK index instead — decline here so the two
+    // never disagree (serial = parallel output parity).
+    if table.without_rowid {
+        return Ok(None);
+    }
     // Shape gates: the serial selective branch requires every key and
     // arg to be a resolved bare column (or COUNT(*) with no arg).
     if key_col_indices.iter().any(|k| k.is_none()) {
@@ -1082,6 +1106,14 @@ pub(crate) fn try_parallel_groupby_compiled(
     n_cols: usize,
     key_collations: &[Option<String>],
 ) -> Result<Option<HashGrouper>> {
+    // WITHOUT ROWID tables: the parallel drivers range-split the table's
+    // internal ROWID store (INSERT order); SQLite's scan order for a
+    // WITHOUT ROWID table is the PK b-tree order. The serial paths walk
+    // the engine-internal PK index instead — decline here so the two
+    // never disagree (serial = parallel output parity).
+    if table.without_rowid {
+        return Ok(None);
+    }
     // Aggregate-function gates (order-dependent / exotic shapes decline).
     for agg in aggregates {
         match AggFunc::from_name(&agg.func) {
@@ -1382,6 +1414,14 @@ pub(crate) fn try_parallel_topn(
     out_cols: StdArc<[String]>,
     coll: Option<StdArc<dyn crate::plugin::Collation>>,
 ) -> Result<Option<ExecResult>> {
+    // WITHOUT ROWID tables: the parallel drivers range-split the table's
+    // internal ROWID store (INSERT order); SQLite's scan order for a
+    // WITHOUT ROWID table is the PK b-tree order. The serial paths walk
+    // the engine-internal PK index instead — decline here so the two
+    // never disagree (serial = parallel output parity).
+    if table.without_rowid {
+        return Ok(None);
+    }
     if keep == 0 {
         return Ok(None); // the serial path's LIMIT-0 shortcut already answers
     }
@@ -1537,6 +1577,14 @@ pub(crate) fn try_parallel_topn_expr(
     project: Option<&[usize]>,
     out_cols: StdArc<[String]>,
 ) -> Result<Option<ExecResult>> {
+    // WITHOUT ROWID tables: the parallel drivers range-split the table's
+    // internal ROWID store (INSERT order); SQLite's scan order for a
+    // WITHOUT ROWID table is the PK b-tree order. The serial paths walk
+    // the engine-internal PK index instead — decline here so the two
+    // never disagree (serial = parallel output parity).
+    if table.without_rowid {
+        return Ok(None);
+    }
     if keep == 0 {
         return Ok(None); // the serial path's LIMIT-0 shortcut already answers
     }
@@ -1791,6 +1839,14 @@ pub(crate) fn try_parallel_sort_expr(
     append_rowid: bool,
     out_cols: StdArc<[String]>,
 ) -> Result<Option<ExecResult>> {
+    // WITHOUT ROWID tables: the parallel drivers range-split the table's
+    // internal ROWID store (INSERT order); SQLite's scan order for a
+    // WITHOUT ROWID table is the PK b-tree order. The serial paths walk
+    // the engine-internal PK index instead — decline here so the two
+    // never disagree (serial = parallel output parity).
+    if table.without_rowid {
+        return Ok(None);
+    }
     let root = ctx.table_root(table);
     let split = match plan_range_split(ctx, root)? {
         Some(s) => s,
@@ -2693,6 +2749,14 @@ pub(crate) fn try_parallel_sort(
     append_rowid: bool,
     out_cols: StdArc<[String]>,
 ) -> Result<Option<ExecResult>> {
+    // WITHOUT ROWID tables: the parallel drivers range-split the table's
+    // internal ROWID store (INSERT order); SQLite's scan order for a
+    // WITHOUT ROWID table is the PK b-tree order. The serial paths walk
+    // the engine-internal PK index instead — decline here so the two
+    // never disagree (serial = parallel output parity).
+    if table.without_rowid {
+        return Ok(None);
+    }
     let root = ctx.table_root(table);
     let split = match plan_range_split(ctx, root)? {
         Some(s) => s,
