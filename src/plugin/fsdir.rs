@@ -85,16 +85,19 @@ fn stat_row(
     level: i64,
     out: &mut Vec<FsRow>,
 ) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
     let md = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(_) => return Err(Error::corruption(format!("cannot stat file: {}", display))),
     };
     #[cfg(unix)]
-    let (mode, mtime) = (md.mode() as i64, md.mtime() as i64);
-    #[cfg(not(unix))]
+    let (mode, mtime) = {
+        use std::os::unix::fs::MetadataExt;
+        (md.mode() as i64, md.mtime() as i64)
+    };
+    #[cfg(windows)]
     let (mode, mtime) = {
         use std::os::windows::fs::MetadataExt;
+        let _ = md.file_attributes();
         let m = if md.is_dir() { 0o040000 } else { 0o100000 };
         let t = md
             .modified()
@@ -104,6 +107,15 @@ fn stat_row(
             .unwrap_or(0);
         (m, t)
     };
+    #[cfg(not(any(unix, windows)))]
+    let (mode, mtime) = (
+        if md.is_dir() { 0o040000 } else { 0o100000 },
+        md.modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+    );
     let data = if md.file_type().is_symlink() {
         let target = std::fs::read_link(path)
             .map(|p| p.to_string_lossy().into_owned())
