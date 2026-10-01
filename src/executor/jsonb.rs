@@ -25,7 +25,7 @@
 //! * [`Sp`] — the spanned decode tree: element byte offsets, used by
 //!   `json_each`/`json_tree` to reproduce SQLite's `id`/`parent` ids.
 //! * [`value_to_jb`] / [`Jb::to_value`] — SQL-value bridges using
-//!   SQLite's `%!.15g`-style REAL rendering (`1.0`, `1.0e+300`).
+//!   SQLite 3.53's 17-digit round-trip REAL rendering (`1.0`, `1.0e+300`).
 //!
 //! Reference: <https://sqlite.org/jsonb.html> (element types 0-12;
 //! sizes 12-15 in the high nibble = 1/2/4/8-byte big-endian size fields).
@@ -873,15 +873,21 @@ fn canonical_float5(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// SQL REAL rendering — SQLite's `%!.15g` with a guaranteed decimal point
+// SQL REAL rendering — SQLite 3.53's 17-digit round-trip conversion
 // ---------------------------------------------------------------------------
 
-/// Render an f64 exactly like SQLite's JSON functions do:
+/// Render an f64 exactly like SQLite 3.53's JSON functions do — the SAME
+/// FpDecode-based conversion as SQL REAL→TEXT (`types::fptext`), with a
+/// guaranteed decimal point:
 /// * 0.0 → "0.0", -0.0 → "0.0"
-/// * 15 significant digits, `%g` fixed/scientific selection
-///   (scientific when exponent < -4 or >= 15)
-/// * always a '.' in the output ("100" → "100.0", "1e+15" → "1.0e+15")
-/// * ±inf → "9.0e+999" / "-9.0e+999"
+/// * 17 significant digits, round-trip digit-count reduction
+///   (`2.0/3.0` → "0.66666666666666663", `49.47` → "49.47",
+///   `1e300` → "1.0e+300")
+/// * `%g` fixed/scientific selection at the 17-digit boundary
+///   (`1e16` → "10000000000000000.0", `1e17` → "1.0e+17")
+/// * ±inf → "9.0e+999" / "-9.0e+999" (oracle-pinned: json_array(1e999)
+///   renders "9.0e+999"); NaN never arrives as a REAL value
+///   (SQLite REAL NaN is stored as NULL)
 pub fn render_sql_f64(v: f64) -> String {
     if v.is_nan() {
         return "null".to_string();
@@ -889,7 +895,7 @@ pub fn render_sql_f64(v: f64) -> String {
     if v.is_infinite() {
         return if v > 0.0 { "9.0e+999" } else { "-9.0e+999" }.to_string();
     }
-    crate::types::format_real_sig(v, 15)
+    crate::types::format_real(v)
 }
 
 // ---------------------------------------------------------------------------
@@ -1275,7 +1281,7 @@ pub fn sp_from_bytes(b: &[u8]) -> Result<Sp, ()> {
 
 /// SQL value → element, exactly like SQLite's json functions building
 /// documents from arguments:
-/// * INTEGER → INT; REAL → FLOAT with SQLite's `%!.15g` text
+/// * INTEGER → INT; REAL → FLOAT with SQLite 3.53's 17-digit text
 /// * TEXT → TEXT (safe) / TEXTJ (escapes inserted into the payload)
 /// * BLOB → embedded element when it is valid JSON/JSONB, else null
 /// * NULL → null; NaN → null
@@ -1827,18 +1833,26 @@ mod tests {
 
     #[test]
     fn real_render_matches_sqlite() {
+        // Oracle: sqlite3 3.53.4 — SELECT json_quote(...) on every case.
         assert_eq!(render_sql_f64(1.0), "1.0");
         assert_eq!(render_sql_f64(0.0), "0.0");
         assert_eq!(render_sql_f64(-0.0), "0.0");
         assert_eq!(render_sql_f64(1.5), "1.5");
         assert_eq!(render_sql_f64(1e300), "1.0e+300");
-        assert_eq!(render_sql_f64(1e15), "1.0e+15");
+        assert_eq!(render_sql_f64(1e15), "1000000000000000.0");
+        assert_eq!(render_sql_f64(1e16), "10000000000000000.0");
         assert_eq!(render_sql_f64(1e10), "10000000000.0");
         assert_eq!(render_sql_f64(1e-5), "1.0e-05");
         assert_eq!(render_sql_f64(2e-4), "0.0002");
-        assert_eq!(render_sql_f64(123456789.12345678), "123456789.123457");
-        assert_eq!(render_sql_f64(123456789012345678.0), "1.23456789012346e+17");
+        assert_eq!(render_sql_f64(2.0 / 3.0), "0.66666666666666663");
+        assert_eq!(render_sql_f64(49.47), "49.47");
+        assert_eq!(render_sql_f64(123456789.12345678), "123456789.12345678");
+        assert_eq!(
+            render_sql_f64(123456789012345678.0),
+            "1.2345678901234568e+17"
+        );
         assert_eq!(render_sql_f64(f64::INFINITY), "9.0e+999");
+        assert_eq!(render_sql_f64(f64::NEG_INFINITY), "-9.0e+999");
         assert_eq!(render_sql_f64(0.1), "0.1");
         assert_eq!(render_sql_f64(2.5), "2.5");
     }
