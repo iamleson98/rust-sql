@@ -410,9 +410,12 @@ mod tests {
 
     #[test]
     fn realpath_shapes() {
-        // Lexical fallback (the file may not exist).
-        assert!(real_path("/x/../y").ends_with("/y"));
-        assert!(!real_path("/x/../y").contains(".."));
+        // Lexical fallback (the file may not exist); separator-agnostic
+        // so the same contract holds on windows path rendering.
+        let r = real_path("/x/../y");
+        let last = r.rsplit(['/', '\\']).next().unwrap_or("");
+        assert_eq!(last, "y", "realpath('/x/../y') = {r}");
+        assert!(!r.contains(".."));
         let here = real_path(".");
         assert!(!here.is_empty());
         assert!(std::path::Path::new(&here).is_absolute());
