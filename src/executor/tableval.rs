@@ -59,6 +59,11 @@ pub(crate) fn exec_table_function(
         "pragma_database_list" => pragma_database_list(),
         "dbstat" => dbstat(ctx, &vals)?,
         "sqlite_dbdata" => dbdata(ctx, &vals)?,
+        // The shell's file/archive TVFs (fileio.c / zipfile.c). Rows
+        // carry raw column names here — the prefix-qualified wrapping
+        // below applies uniformly.
+        "fsdir" => crate::plugin::fsdir::fsdir_rows(&vals)?,
+        "zipfile" => crate::plugin::zipfile::zipfile_read(&vals)?,
         other => {
             return Err(Error::semantic(format!(
                 "no such table-valued function: {}",

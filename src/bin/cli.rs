@@ -41,6 +41,8 @@
 //!   .quit / .exit      Exit the shell.
 
 use rustqlite::{Database, Value};
+
+mod archive;
 use std::env;
 #[cfg(feature = "auth")]
 use std::io::Read;
@@ -710,6 +712,10 @@ fn open_local(path: Option<&str>, sqlite_format: bool) -> Result<Runner, String>
     // The sqlite3 shell links its extension set (shathree) into every
     // session: sha3()/sha3_agg() are available to all local sessions.
     let _ = rustqlite::plugin::sha3::register(&mut db);
+    // The shell's file/archive function family (fileio.c): lsmode,
+    // realpath, readfile, writefile, shell_putsnl, sqlar_* — used by
+    // .archive and available to user SQL like in the sqlite3 shell.
+    let _ = rustqlite::plugin::filefns::register(&mut db);
     Ok(Runner::Local(Box::new(db)))
 }
 
@@ -902,6 +908,78 @@ impl Write for ShellOut {
     }
 }
 
+/// Every dot command the shell knows (resolution + prefix matching +
+/// the ambiguity error text).
+const DOT_COMMANDS: [&str; 41] = [
+    ".archive",
+    ".backup",
+    ".changes",
+    ".clone",
+    ".databases",
+    ".dbinfo",
+    ".dump",
+    ".echo",
+    ".eqp",
+    ".excel",
+    ".exit",
+    ".export-data",
+    ".export-schema",
+    ".fullschema",
+    ".headers",
+    ".help",
+    ".import",
+    ".indexes",
+    ".log",
+    ".mode",
+    ".nullvalue",
+    ".once",
+    ".open",
+    ".output",
+    ".print",
+    ".prompt",
+    ".quit",
+    ".read",
+    ".restore",
+    ".save",
+    ".scanstats",
+    ".schema",
+    ".separator",
+    ".sha3sum",
+    ".shell",
+    ".stats",
+    ".system",
+    ".tables",
+    ".timer",
+    ".width",
+    ".www",
+];
+
+/// Exact match, else unique prefix (sqlite3's oneline.c resolution);
+/// unknown or ambiguous names resolve to the ORIGINAL text so the
+/// dispatch's `_` arm prints the unknown-command line.
+fn resolve_command(name: &str) -> String {
+    if DOT_COMMANDS.contains(&name) {
+        return name.to_string();
+    }
+    let cands: Vec<&str> = DOT_COMMANDS
+        .iter()
+        .filter(|c| c.starts_with(name) && name.len() > 1)
+        .copied()
+        .collect();
+    match cands.len() {
+        1 => cands[0].to_string(),
+        0 => name.to_string(),
+        _ => {
+            eprintln!(
+                "ambiguous command: {} candidates are: {}",
+                name,
+                cands.join(" ")
+            );
+            name.to_string()
+        }
+    }
+}
+
 fn handle_dot_command(
     runner: &mut Runner,
     line: &str,
@@ -912,7 +990,11 @@ fn handle_dot_command(
     if parts.is_empty() {
         return Ok(());
     }
-    match parts[0] {
+    // sqlite3's dot-command resolution: the EXACT name wins; otherwise
+    // a UNIQUE prefix match (`.ar` for `.archive`, `.data` for
+    // `.databases`); an ambiguous prefix lists the candidates.
+    let resolved: String = resolve_command(parts[0]);
+    match resolved.as_str() {
         ".help" => {
             writeln!(out, "Commands:").unwrap();
             writeln!(out, "  .help                     Show this help.").unwrap();
@@ -1040,6 +1122,11 @@ fn handle_dot_command(
             )
             .unwrap();
             writeln!(out, "  .sha3sum ?--schema? ?--sha3-224|256|384|512? ?LIKE?").unwrap();
+            writeln!(
+                out,
+                "  .archive ..ar ...         Manage SQL archives (zip/sqlar)."
+            )
+            .unwrap();
             writeln!(
                 out,
                 "                            SHA3 hash of the database content."
@@ -1313,6 +1400,7 @@ fn handle_dot_command(
             }
             let mut db = Database::open(file).map_err(|e| e.to_string())?;
             let _ = rustqlite::plugin::sha3::register(&mut db);
+            let _ = rustqlite::plugin::filefns::register(&mut db);
             *runner = Runner::Local(Box::new(db));
             writeln!(out, "opened: {}", file).unwrap();
         }
@@ -1463,9 +1551,7 @@ fn handle_dot_command(
         }
         ".sha3sum" => run_sha3sum(runner, &parts[1..], state, out)?,
         ".archive" => {
-            // The archive command's full surface (zip/tar/sqlar) is the
-            // last refused dot-command — tracked in the README ledger.
-            writeln!(out, ".archive is not supported in rustqlite's shell").unwrap();
+            archive::run_archive(runner, &parts[1..], out)?;
         }
         ".quit" | ".exit" => {
             let _ = out.flush();

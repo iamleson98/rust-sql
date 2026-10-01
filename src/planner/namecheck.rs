@@ -236,6 +236,12 @@ fn tvf_columns(name: &str) -> Option<Vec<&'static str>> {
         "dbstat" => Some(crate::executor::tableval::DBSTAT_COLS.to_vec()),
         "sqlite_dbdata" => Some(crate::executor::tableval::DBDATA_COLS.to_vec()),
         "pragma_database_list" => Some(vec!["seq", "name", "file"]),
+        // The shell's file/archive TVFs (fileio.c / zipfile.c) — the
+        // same column lists the executor serves.
+        "fsdir" => Some(crate::plugin::fsdir::FSDIR_COLS.to_vec()),
+        "zipfile" => Some(vec![
+            "name", "mode", "mtime", "sz", "rawdata", "data", "method",
+        ]),
         _ => None,
     }
 }

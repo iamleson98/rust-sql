@@ -10,6 +10,11 @@ repository = "https://github.com/example/rustqlite"
 keywords = ["database", "sql", "sqlite", "embedded", "btree"]
 categories = ["database-implementations"]
 
+# src/bin/archive.rs is a MODULE of the CLI binary, not a target —
+# autobins off + the explicit [[bin]] list keep cargo from picking it
+# up as a second binary.
+autobins = false
+
 [workspace]
 members = ["compat/rustqlite-compat"]
 # `compat/libsqlite3-sys` is consumed via [patch.crates-io] from the
@@ -198,7 +203,7 @@ oom-injection = []
 # client mode in the CLI): Postgres's exact SASL mechanism. On by default;
 # `default-features = false` sheds it (the server then refuses to start
 # in auth mode with a clear message).
-auth = ["dep:sha2", "dep:rand", "dep:libc"]
+auth = ["dep:sha2", "dep:rand"]
 # Fast global allocator (see the mimalloc dependency note above).
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 extension = ["dep:libloading"]
@@ -268,7 +273,11 @@ harness = false
 # the password with echo (a warning is printed); scripting uses
 # RUSTQLITE_PASSWORD instead.
 [target.'cfg(unix)'.dependencies]
-libc = { version = "0.2", optional = true }
+# Non-optional on unix: termios for the auth prompt (the `auth`
+# feature), utimensat for writefile()'s sqlar/zip mtime restoration
+# (fileio.c parity). A thin binding over the C library std already
+# links — zero marginal native code.
+libc = "0.2"
 
 [profile.release]
 opt-level = 3

@@ -13790,6 +13790,44 @@ impl Database {
                 module,
                 args,
             } => {
+                // `CREATE VIRTUAL TABLE temp.x USING ...` — the shell's
+                // .archive machinery (ar.c's temp.zipXXX instances).
+                // Session-scoped exactly like SQLite's temp schema: the
+                // catalog carries the table (marked temp), but NO
+                // schema row is written and nothing is flushed — the
+                // instance vanishes with the connection.
+                let is_temp = name
+                    .schema
+                    .as_deref()
+                    .map(|s| s.eq_ignore_ascii_case("temp"))
+                    .unwrap_or(false);
+                if is_temp {
+                    if catalog.get_table(&name.name).is_some() {
+                        if if_not_exists {
+                            return Ok(());
+                        }
+                        return Err(Error::AlreadyExists(format!(
+                            "table {} already exists",
+                            name.name
+                        )));
+                    }
+                    let module = crate::plugin::lookup_module(&module)
+                        .ok_or_else(|| Error::semantic(format!("no such module: {}", module)))?;
+                    let instance = module.create(&name.name, &args)?;
+                    let cols = instance.columns();
+                    let mut table = crate::plugin::vtab::vtab_columns_to_schema(&name.name, &cols);
+                    table.create_sql = original_sql.to_string();
+                    let vtab = crate::plugin::vtab::VtabInstance::connected(
+                        name.name.clone(),
+                        module.clone(),
+                        args,
+                        instance,
+                    );
+                    table.vtab = Some(std::sync::Arc::new(vtab));
+                    catalog.add_table(table);
+                    catalog.mark_temp(&name.name);
+                    return Ok(());
+                }
                 if catalog.get_table(&name.name).is_some() || catalog.get_view(&name.name).is_some()
                 {
                     if if_not_exists {
@@ -13962,9 +14000,18 @@ impl Database {
                 }
                 // Capture indexes BEFORE the catalog drop removes them.
                 let indexes_on_it = catalog.indexes_on_table(&d.name);
-                let table = catalog
-                    .drop_table(&d.name)
-                    .ok_or_else(|| Error::NotFound(format!("no such table: {}", d.name)))?;
+                let table = match catalog.drop_table(&d.name) {
+                    Some(t) => t,
+                    None => {
+                        // IF EXISTS on a missing table is a silent no-op
+                        // (validate_drop already rejected the bare form
+                        // at prepare time — this arm fires for IF EXISTS).
+                        if d.if_exists {
+                            return Ok(());
+                        }
+                        return Err(Error::NotFound(format!("no such table: {}", d.name)));
+                    }
+                };
                 if let Some(vtab) = &table.vtab {
                     // Virtual table: no pages to free; run xDestroy on the
                     // module so it can drop external state. The engine's
@@ -14077,9 +14124,17 @@ impl Database {
                 Ok(())
             }
             DropKind::Index => {
-                let idx = catalog
-                    .drop_index(&d.name)
-                    .ok_or_else(|| Error::NotFound(format!("no such index: {}", d.name)))?;
+                let idx = match catalog.drop_index(&d.name) {
+                    Some(i) => i,
+                    None => {
+                        // IF EXISTS on a missing index is a silent no-op
+                        // (see the Table arm).
+                        if d.if_exists {
+                            return Ok(());
+                        }
+                        return Err(Error::NotFound(format!("no such index: {}", d.name)));
+                    }
+                };
                 // Free the whole index tree (see the DROP TABLE arm: the
                 // root-only free leaked the subtree).
                 let live_root = ctx.index_root(&idx);

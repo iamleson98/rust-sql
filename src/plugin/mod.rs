@@ -27,11 +27,14 @@ use std::sync::Arc;
 
 pub mod abi;
 pub mod codec;
+pub mod filefns;
+pub mod fsdir;
 pub mod fts5;
 pub mod geopoly;
 pub mod rtree;
 pub mod sha3;
 pub mod vtab;
+pub mod zipfile;
 
 pub use abi::{CAggregate, CCollation, CScalar};
 pub use codec::PageCodec;
@@ -319,6 +322,12 @@ impl PluginRegistry {
         r.set_module(rtree::rtree_module());
         r.set_module(rtree::rtree_i32_module());
         r.set_module(geopoly::geopoly_module());
+        // zipfile + fsdir: registered like the sqlite3 SHELL links
+        // them (shell.c's built-in extensions) — but as engine-level
+        // built-ins so the CLI's .archive machinery and user SQL share
+        // one implementation (SQLite's shell builds them into the
+        // binary; module_list reports them for every CLI session).
+        r.set_module(std::sync::Arc::new(zipfile::ZipfileModule));
         // The geopoly aggregate family is core-registered (SQLite's
         // sqlite3_geopoly_init) — available on every connection.
         r.set_aggregate(geopoly::group_bbox_function());
