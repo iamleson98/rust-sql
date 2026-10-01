@@ -930,12 +930,19 @@ fn schema_qualified_trigger_rules() {
         "semantic error: trigger tr4 cannot reference objects in database aux"
     );
 
-    // TEMP triggers may target any database (SQLite exemption). The
-    // cross-engine firing machinery is not there yet — pinned to the
-    // clear error (a documented gap, not a silent wrong-table write).
-    let err = err_of(
-        &mut db,
+    // TEMP triggers may target any database (SQLite exemption) — the
+    // cross-database firing machinery: the trigger lives in the
+    // connection's temp catalog and fires, per row, on this
+    // connection's writes to the attached table (pinned against the
+    // 3.53.4 oracle; see tests/attach_triggers.rs for the full surface).
+    db.execute(
         "CREATE TEMP TRIGGER ttr AFTER UPDATE ON aux.a BEGIN INSERT INTO audit VALUES ('temp'); END",
+        [],
+    )
+    .unwrap();
+    db.execute("UPDATE aux.a SET id = id", []).unwrap();
+    assert_eq!(
+        rows(&db, "SELECT msg FROM aux.audit WHERE msg = 'temp'"),
+        vec![vec!["temp"]]
     );
-    assert!(err.contains("cross-database triggers"), "err: {err}");
 }

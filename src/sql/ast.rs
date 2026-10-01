@@ -144,10 +144,17 @@ pub struct CreateTrigger {
     pub temp: bool,
     /// `CREATE TRIGGER IF NOT EXISTS` — silently skips a duplicate name.
     pub if_not_exists: bool,
-    /// The trigger's target table, BARE (the as-written qualifier was
-    /// validated against `schema` at parse time; the table resolves
-    /// within the trigger's database).
+    /// The trigger's target table, BARE (for non-TEMP triggers the
+    /// as-written qualifier was validated against `schema` at parse
+    /// time; the table resolves within the trigger's database).
     pub table: String,
+    /// The ON-table's as-written schema qualifier. TEMP triggers may
+    /// target a table in ANY database (SQLite): `CREATE TEMP TRIGGER
+    /// ... ON aux.t` carries `Some("aux")` here and binds the trigger
+    /// to that attached database (fired by the parent's routed-DML
+    /// driver, never by the local executor). `None` on a TEMP trigger
+    /// resolves through the connection search order at CREATE time.
+    pub table_schema: Option<String>,
     pub when: TriggerWhen,
     pub events: Vec<TriggerEvent>,
     pub for_each_row: bool,

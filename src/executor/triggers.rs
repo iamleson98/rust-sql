@@ -118,15 +118,47 @@ pub(crate) fn fire_triggers(
         // must error with SQLite's exact text before any body statement
         // runs. Validated once per Trigger registration (the Arc is
         // replaced by DDL, so the flag can never go stale).
+        //
+        // CROSS-DATABASE TEMP triggers (foreign refs in WHEN/body):
+        // validate by PLANNING every body statement — with the foreign
+        // channel armed, or on the owning attached engine — instead of
+        // against the local catalog (which cannot see aux tables). The
+        // channel is armed first (the WHEN guard may read aux too).
+        let armed_channel = if trig.has_foreign_refs {
+            crate::attach_fire::arm_foreign_channel(ctx, trig)?
+        } else {
+            false
+        };
         if !trig.validated.load(std::sync::atomic::Ordering::Acquire) {
-            validate_trigger_first_fire(ctx.catalog(), trig, table)?;
+            if trig.has_foreign_refs {
+                let check = || -> crate::error::Result<()> {
+                    for s0 in &trig.body {
+                        let mut s = s0.clone();
+                        substitute_new_old(&mut s, new_row, old_row, col_names)?;
+                        crate::attach_fire::validate_foreign_body(ctx, &s)?;
+                    }
+                    Ok(())
+                };
+                if let Err(e) = check() {
+                    if armed_channel {
+                        ctx.foreign = None;
+                    }
+                    return Err(e);
+                }
+            } else {
+                validate_trigger_first_fire(ctx.catalog(), trig, table)?;
+            }
             trig.validated
                 .store(true, std::sync::atomic::Ordering::Release);
         }
-        // WHEN guard: evaluate with NEW/OLD bound as a combined row.
+        // WHEN guard: evaluate with NEW/OLD bound as a combined row
+        // (with the channel armed — the guard may read attached tables).
         if let Some(w) = &trig.when_clause {
             let v = eval_with_new_old(w, new_row, old_row, col_names, ctx)?;
             if !v.is_truthy() {
+                if armed_channel {
+                    ctx.foreign = None;
+                }
                 continue;
             }
         }
@@ -140,6 +172,9 @@ pub(crate) fn fire_triggers(
             .any(|n| n.eq_ignore_ascii_case(&trig.name))
             && !ctx.pager.recursive_triggers_enabled()
         {
+            if armed_channel {
+                ctx.foreign = None;
+            }
             continue;
         }
         // Execute the body with NEW/OLD substituted to literals.
@@ -153,19 +188,36 @@ pub(crate) fn fire_triggers(
             for stmt in &trig.body {
                 let mut s = stmt.clone();
                 substitute_new_old(&mut s, new_row, old_row, col_names)?;
-                let plan = match &s {
-                    Statement::Insert(_) => crate::api::Database::plan_insert(ctx.catalog(), &s)?,
-                    Statement::Update(_) => crate::api::Database::plan_update(ctx.catalog(), &s)?,
-                    Statement::Delete(_) => crate::api::Database::plan_delete(ctx.catalog(), &s)?,
-                    Statement::Select(sel) => {
-                        let mut planner = crate::planner::Planner::new(ctx.catalog());
-                        planner.plan_select(sel)?
-                    }
-                    _ => {
-                        return Err(crate::error::Error::semantic(format!(
-                            "unsupported statement in trigger {} body",
-                            trig.name
-                        )));
+                if trig.has_foreign_refs && crate::attach_fire::try_foreign_body(ctx, &s)? {
+                    continue;
+                }
+                let plan = if trig.has_foreign_refs {
+                    crate::api::Database::plan_body_with_channel(
+                        ctx.catalog(),
+                        &s,
+                        ctx.foreign.clone(),
+                    )?
+                } else {
+                    match &s {
+                        Statement::Insert(_) => {
+                            crate::api::Database::plan_insert(ctx.catalog(), &s)?
+                        }
+                        Statement::Update(_) => {
+                            crate::api::Database::plan_update(ctx.catalog(), &s)?
+                        }
+                        Statement::Delete(_) => {
+                            crate::api::Database::plan_delete(ctx.catalog(), &s)?
+                        }
+                        Statement::Select(sel) => {
+                            let mut planner = crate::planner::Planner::new(ctx.catalog());
+                            planner.plan_select(sel)?
+                        }
+                        _ => {
+                            return Err(crate::error::Error::semantic(format!(
+                                "unsupported statement in trigger {} body",
+                                trig.name
+                            )));
+                        }
                     }
                 };
                 let mut plan = plan;
@@ -176,6 +228,9 @@ pub(crate) fn fire_triggers(
             }
             Ok(())
         })();
+        if armed_channel {
+            ctx.foreign = None;
+        }
         ctx.trigger_depth -= 1;
         ctx.trigger_stack.pop();
         result?;

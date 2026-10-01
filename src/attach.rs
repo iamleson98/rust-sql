@@ -507,9 +507,10 @@ fn collect_create_refs(c: &CreateStatement, out: &mut Vec<RefSite>) {
             // The ON table resolves WITHIN the trigger's database
             // (bare names scope to it: `CREATE TRIGGER aux.tr ON m`
             // looks up aux.m — SQLite). TEMP triggers may target any
-            // database (search order).
+            // database (search order for bare names, the explicit
+            // qualifier when written).
             let scope = if t.temp {
-                None
+                t.table_schema.clone()
             } else {
                 Some(t.schema.clone().unwrap_or_else(|| "main".to_string()))
             };
@@ -1092,9 +1093,13 @@ pub(crate) fn qualify_routed_error(e: Error, schema: &str) -> Error {
 /// routing:
 /// - a VIEW may not reference objects in another database (both
 ///   directions; `view v cannot reference objects in database x`);
-/// - trigger bodies may not carry schema-qualified DML targets
+/// - NON-TEMP trigger bodies may not carry schema-qualified DML targets
 ///   (`qualified table names are not allowed on INSERT, UPDATE, and
-///   DELETE statements within triggers`).
+///   DELETE statements within triggers`). TEMP triggers are the
+///   documented exception (verified against 3.53.4): a TEMP trigger on
+///   an attached table writes wherever it likes — `INSERT INTO
+///   main.log` in its body is exactly how the surface is used — and
+///   unqualified body names bind through the connection search order.
 pub(crate) fn check_stmt_rules(stmt: &Statement) -> Result<()> {
     if let Statement::Create(CreateStatement::View {
         name, select, temp, ..
@@ -1135,7 +1140,7 @@ pub(crate) fn check_stmt_rules(stmt: &Statement) -> Result<()> {
                 Statement::Delete(d) => d.schema.is_some(),
                 _ => false,
             };
-            if qualified_target {
+            if qualified_target && !t.temp {
                 return Err(Error::semantic(
                     "qualified table names are not allowed on INSERT, UPDATE, and DELETE \
                      statements within triggers",
@@ -1269,6 +1274,118 @@ fn main_resolves(db: &Database, name: &str, ctes: &[String]) -> bool {
         return true;
     }
     false
+}
+
+/// Where a TEMP trigger's ON table binds (SQLite, verified against
+/// 3.53.4): the as-written qualifier, or the connection search order
+/// (temp -> main -> attached, in ATTACH order) for bare names. A
+/// missing table is a CREATE-time error in SQLite (`no such table:
+/// nosuch` / `no such table: aux.nosuch`).
+pub(crate) enum TempTriggerTarget {
+    /// A table in THIS engine (main or temp schema).
+    Local,
+    /// A table in the attached database `schema_lc` (validated to
+    /// exist on that engine).
+    Attached(String),
+}
+
+pub(crate) fn resolve_temp_trigger_target(
+    db: &Database,
+    ct: &CreateTrigger,
+) -> Result<TempTriggerTarget> {
+    match &ct.table_schema {
+        Some(s) => {
+            let lc = s.to_ascii_lowercase();
+            if lc == "main" || lc == "temp" {
+                if db.catalog.get_table(&ct.table).is_none() {
+                    return Err(Error::NotFound(format!(
+                        "no such table: {}.{}",
+                        lc, ct.table
+                    )));
+                }
+                return Ok(TempTriggerTarget::Local);
+            }
+            let engine = db
+                .attached_engine(&lc)
+                .ok_or_else(|| Error::NotFound(format!("no such table: {}.{}", s, ct.table)))?;
+            let hit = {
+                let aux = engine.read();
+                aux.catalog.get_table(&ct.table).is_some()
+            };
+            if !hit {
+                return Err(Error::NotFound(format!(
+                    "no such table: {}.{}",
+                    s, ct.table
+                )));
+            }
+            Ok(TempTriggerTarget::Attached(lc))
+        }
+        None => {
+            // Bare name: this catalog first (temp and main share it),
+            // then the attached engines in ATTACH order.
+            if db.catalog.get_table(&ct.table).is_some() {
+                return Ok(TempTriggerTarget::Local);
+            }
+            for (name, engine) in db.attached_snapshot() {
+                let hit = {
+                    let aux = engine.read();
+                    aux.catalog.get_table(&ct.table).is_some()
+                };
+                if hit {
+                    return Ok(TempTriggerTarget::Attached(name.to_ascii_lowercase()));
+                }
+            }
+            Err(Error::NotFound(format!("no such table: {}", ct.table)))
+        }
+    }
+}
+
+/// The first ATTACHED schema referenced (explicit qualifier) by the
+/// trigger's WHEN clause or body statements — SQLite's error names one
+/// database: `trigger tr cannot reference objects in database aux`
+/// (verified against 3.53.4).
+pub(crate) fn trigger_foreign_ref_schema(db: &Database, ct: &CreateTrigger) -> Option<String> {
+    let mut sites = Vec::new();
+    for s in &ct.body {
+        collect_table_refs(s, &mut sites);
+    }
+    if let Some(w) = &ct.when_clause {
+        collect_expr_refs(w, &mut sites);
+    }
+    sites
+        .iter()
+        .filter_map(|s| s.schema.as_ref())
+        .find(|s| {
+            let lc = s.to_ascii_lowercase();
+            lc != "main" && lc != "temp" && db.attached_engine(&lc).is_some()
+        })
+        .cloned()
+}
+
+/// True when the trigger's WHEN clause or any body statement references
+/// an ATTACHED database — directly (qualified) or through an
+/// unqualified name that misses this engine's catalog (it may bind to
+/// an attached table at fire time). Conservative superset: arming the
+/// cross-database fire machinery for a trigger that turns out fully
+/// local costs nothing observable.
+pub(crate) fn trigger_has_foreign_refs(db: &Database, ct: &CreateTrigger) -> bool {
+    if trigger_foreign_ref_schema(db, ct).is_some() {
+        return true;
+    }
+    let mut sites = Vec::new();
+    for s in &ct.body {
+        collect_table_refs(s, &mut sites);
+    }
+    if let Some(w) = &ct.when_clause {
+        collect_expr_refs(w, &mut sites);
+    }
+    sites.iter().any(|s| match &s.schema {
+        None => !main_resolves(db, &s.name, &[]),
+        Some(sc) => {
+            let lc = sc.to_ascii_lowercase();
+            lc != "main" && lc != "temp" && db.attached_engine(&lc).is_some()
+        }
+    })
 }
 
 /// Collect the statement's table-reference sites with SQLite's

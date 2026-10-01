@@ -309,6 +309,10 @@ fn engine_init() {
 /// ATTACH / DETACH — real attached databases (engine federation):
 /// routing, the foreign-rows channel, cross-schema transactions.
 pub mod attach;
+/// Cross-database trigger firing — TEMP triggers that target (or
+/// reference) attached databases: the routed-DML driver and the nested
+/// foreign-body bridge (see `src/attach.rs` for the federation model).
+pub mod attach_fire;
 /// SCRAM-SHA-256 authentication (Postgres's exact SASL mechanism,
 /// RFC 7677) for `rustqlite-server`, plus the client side used by
 /// `rustqlite-cli --connect`: verifiers, the handshake state machines,

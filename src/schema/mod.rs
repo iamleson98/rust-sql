@@ -423,6 +423,26 @@ pub struct Trigger {
     pub when_clause: Option<crate::sql::ast::Expr>,
     pub body: Vec<crate::sql::ast::Statement>,
     pub create_sql: String,
+    /// TEMP triggers on ATTACHED tables (SQLite's cross-database
+    /// triggers): Some(schema_lc) when this trigger's ON table lives in
+    /// an attached database. The trigger itself is stored in THIS
+    /// engine's temp catalog (connection-scoped) and is fired by the
+    /// PARENT's routed-DML driver — never by the local executor's fire
+    /// path (`triggers_on_table` filters them out: an attached table's
+    /// name must not collide with a local table of the same name).
+    pub bound_schema: Option<String>,
+    /// Set when the bound attached database was DETACHed: SQLite's
+    /// behavior is that the temp trigger stays listed in the temp schema
+    /// but never fires again — not even if a database is re-attached
+    /// under the same name later (pinned against 3.53.4).
+    pub dormant: bool,
+    /// True when the WHEN clause or any body statement references a
+    /// FOREIGN schema (attached database). Computed at CREATE time so
+    /// the statement dispatcher can arm the foreign channel (reads) or
+    /// the nested routed-body bridge (writes) exactly when needed —
+    /// statements on tables without such triggers keep the zero-cost
+    /// local fast paths.
+    pub has_foreign_refs: bool,
     /// First-fire validation gate (SQLite validates trigger bodies
     /// lazily — at FIRE time, not CREATE time): flipped once the WHEN
     /// clause and body statements have passed prepare-time name
@@ -442,6 +462,9 @@ impl Clone for Trigger {
             when_clause: self.when_clause.clone(),
             body: self.body.clone(),
             create_sql: self.create_sql.clone(),
+            bound_schema: self.bound_schema.clone(),
+            dormant: self.dormant,
+            has_foreign_refs: self.has_foreign_refs,
             // A clone is a fresh registration: re-validate at first fire.
             validated: std::sync::atomic::AtomicBool::new(
                 self.validated.load(std::sync::atomic::Ordering::Acquire),
@@ -935,18 +958,82 @@ impl Catalog {
     }
 
     pub fn triggers_on_table(&self, table: &str) -> Vec<Arc<Trigger>> {
-        // Same borrowed-name fast path as `indexes_on_table`.
+        // Same borrowed-name fast path as `indexes_on_table`, but the
+        // result is FILTERED: TEMP triggers bound to ATTACHED tables
+        // (cross-database triggers — stored in this catalog, fired by
+        // the parent's routed-DML driver) and triggers killed by DETACH
+        // never fire on THIS engine's table of the same name.
+        let filter = |v: &Vec<Arc<Trigger>>| -> Vec<Arc<Trigger>> {
+            v.iter()
+                .filter(|t| t.bound_schema.is_none() && !t.dormant)
+                .cloned()
+                .collect()
+        };
         if let Some(v) = self.triggers_by_table.get(table) {
-            return v.clone();
+            return filter(v);
         }
         if table.bytes().any(|b| b.is_ascii_uppercase()) {
-            return self
-                .triggers_by_table
-                .get(&table.to_ascii_lowercase())
-                .cloned()
-                .unwrap_or_default();
+            if let Some(v) = self.triggers_by_table.get(&table.to_ascii_lowercase()) {
+                return filter(v);
+            }
         }
         Vec::new()
+    }
+
+    /// TEMP triggers bound to an ATTACHED table (the cross-database
+    /// trigger surface): `CREATE TEMP TRIGGER ... ON aux.t` — the
+    /// routed-DML driver looks these up before sending a statement to
+    /// the attached engine. Dormant (post-DETACH) triggers are skipped.
+    pub fn temp_triggers_bound_to(&self, schema_lc: &str, table: &str) -> Vec<Arc<Trigger>> {
+        let table_lc = table.to_ascii_lowercase();
+        self.triggers_by_table
+            .get(&table_lc)
+            .map(|v| {
+                v.iter()
+                    .filter(|t| {
+                        !t.dormant
+                            && t.bound_schema
+                                .as_deref()
+                                .map(|s| s == schema_lc)
+                                .unwrap_or(false)
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// TEMP triggers on LOCAL tables (this engine's temp/main schema)
+    /// whose WHEN/body reference attached databases — the statement
+    /// dispatcher arms the foreign channel for exactly these.
+    pub fn local_triggers_with_foreign_refs(&self, table: &str) -> Vec<Arc<Trigger>> {
+        let table_lc = table.to_ascii_lowercase();
+        self.triggers_by_table
+            .get(&table_lc)
+            .map(|v| {
+                v.iter()
+                    .filter(|t| t.bound_schema.is_none() && !t.dormant && t.has_foreign_refs)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Mark every TEMP trigger bound to `schema_lc` as dormant — the
+    /// DETACH path (SQLite: the trigger stays listed in the temp schema
+    /// but never fires again, even under a later re-ATTACH).
+    pub fn dorm_triggers_bound_to(&mut self, schema_lc: &str) {
+        for v in self.triggers_by_table.values_mut() {
+            for t in v.iter_mut() {
+                if t.bound_schema.as_deref() == Some(schema_lc) {
+                    let mut repl = (**t).clone();
+                    repl.dormant = true;
+                    let name_lc = repl.name.to_ascii_lowercase();
+                    *t = Arc::new(repl);
+                    self.triggers.insert(name_lc, t.clone());
+                }
+            }
+        }
     }
 
     pub fn add_table(&mut self, table: Table) {

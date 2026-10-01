@@ -2339,6 +2339,9 @@ fn rewrite_object_sql_column_refs(
                                 when_clause: ct.when_clause,
                                 body: ct.body,
                                 create_sql: sql.to_string(),
+                                bound_schema: None,
+                                dormant: false,
+                                has_foreign_refs: false,
                                 validated: std::sync::atomic::AtomicBool::new(false),
                             },
                         );
@@ -6916,7 +6919,27 @@ impl Database {
         let t_cache = profile::now();
         let cached = self.get_or_cache_stmt(sql)?;
         profile::span(t_cache, &profile::CACHE_NS);
-        self.execute_cached_stmt(sql, cached, params)
+        // Cross-database trigger firing on LOCAL tables: the thread-db
+        // bridge (nested routed bodies reach the parent through it) and
+        // a spanning aux savepoint when the target table carries TEMP
+        // triggers with foreign references, so aux writes from trigger
+        // bodies roll back with the statement (SQLite's multi-database
+        // statement journal semantics).
+        let _thread_db = if self.has_attached() {
+            Some(crate::plugin::abi::ThreadDbGuard::install(
+                self as *const Database as *mut Database,
+            ))
+        } else {
+            None
+        };
+        let scope = local_foreign_trigger_scope(self, &cached);
+        let r = self.execute_cached_stmt(sql, cached, params);
+        match scope {
+            Some(s) if r.is_ok() => s.finish(),
+            Some(s) => s.abort(),
+            None => {}
+        }
+        r
     }
 
     /// [`Self::execute_stmt`]'s statement machinery, starting from a
@@ -6965,7 +6988,28 @@ impl Database {
             let name = d.schema.clone();
             drop(cached);
             self.detach_database(&name)?;
+            // TEMP triggers bound to the detached database go dormant:
+            // they stay listed in the temp schema but never fire again,
+            // not even under a later re-ATTACH (SQLite 3.53.4 — pinned
+            // by tests/attach_triggers.rs).
+            self.catalog
+                .dorm_triggers_bound_to(&name.to_ascii_lowercase());
+            self.invalidate_stmt_cache();
             return Ok(());
+        }
+        // ------------------------------------------------------------------
+        // CREATE TEMP TRIGGER — intercepted BEFORE attach routing: the
+        // trigger is connection-scoped and lives in THIS engine's temp
+        // catalog even when its ON table is in an attached database
+        // (SQLite's cross-database trigger surface). Routing the CREATE
+        // to an attached engine would store it in the wrong schema.
+        // ------------------------------------------------------------------
+        if let Statement::Create(CreateStatement::Trigger(ct)) = cached.stmt.as_ref() {
+            if ct.temp {
+                let ct = ct.clone();
+                drop(cached);
+                return self.create_temp_trigger(&ct, sql);
+            }
         }
         // ------------------------------------------------------------------
         // ATTACH ROUTING (execute path). Statements that reference an
@@ -6984,6 +7028,23 @@ impl Database {
             return match crate::attach::analyze_route(self, &stmt) {
                 crate::attach::Route::Local => unreachable!("foreign stmt classified Local"),
                 crate::attach::Route::Routed { schema_lc } => {
+                    // Cross-database triggers: a DML statement targeting
+                    // an attached table with bound TEMP triggers runs
+                    // through the per-row driver (parent-side firing
+                    // around target-engine writes) instead of routing
+                    // whole.
+                    if let Some(table) = routed_dml_table(&stmt) {
+                        if crate::attach_fire::has_bound_triggers(self, &schema_lc, table) {
+                            let out = crate::attach_fire::routed_dml_with_triggers(
+                                self,
+                                &stmt,
+                                params_vec.as_slice(),
+                                &schema_lc,
+                            )?;
+                            let _ = out;
+                            return Ok(());
+                        }
+                    }
                     let engine = self
                         .attached_engine(&schema_lc)
                         .expect("validate_schemas checked");
@@ -8008,7 +8069,25 @@ impl Database {
             let _ = self.pager.flush();
         }
         let cached = self.get_or_cache_stmt(sql)?;
-        self.query_cached_stmt(sql, &cached, params)
+        // Cross-database trigger firing on LOCAL tables (query path /
+        // DML-RETURNING): the thread-db bridge + a spanning aux
+        // savepoint when the target table carries TEMP triggers with
+        // foreign references (see execute_stmt's twin).
+        let _thread_db = if self.has_attached() {
+            Some(crate::plugin::abi::ThreadDbGuard::install(
+                self as *const Database as *mut Database,
+            ))
+        } else {
+            None
+        };
+        let scope = local_foreign_trigger_scope(self, &cached);
+        let r = self.query_cached_stmt(sql, &cached, params);
+        match scope {
+            Some(s) if r.is_ok() => s.finish(),
+            Some(s) => s.abort(),
+            None => {}
+        }
+        r
     }
 
     /// [`Self::query_inner`]'s query machinery, starting from a prepared
@@ -8047,6 +8126,22 @@ impl Database {
                     unreachable!("foreign stmt classified Local")
                 }
                 crate::attach::Route::Routed { schema_lc } => {
+                    // Cross-database triggers on the query path: the
+                    // per-row driver re-enters the parent's MUTABLE
+                    // statement machinery (savepoint scope + routed
+                    // body dispatch), which `&self` cannot provide —
+                    // the documented surface for DML against a
+                    // trigger-bearing attached table is
+                    // `Database::execute` (the sqlx driver and the C
+                    // ABI's exec path both use it).
+                    if let Some(table) = routed_dml_table(&stmt) {
+                        if crate::attach_fire::has_bound_triggers(self, &schema_lc, table) {
+                            return Err(Error::Unsupported(
+                                "DML on a table with cross-database triggers must run through \
+                                 Database::execute",
+                            ));
+                        }
+                    }
                     let engine = self
                         .attached_engine(&schema_lc)
                         .expect("validate_schemas checked");
@@ -8499,6 +8594,17 @@ impl Database {
             match crate::attach::analyze_route(self, &stmt) {
                 crate::attach::Route::Local => {}
                 crate::attach::Route::Routed { schema_lc } => {
+                    // Cross-database triggers: the per-row driver needs
+                    // the parent's MUTABLE machinery — route through
+                    // Database::execute (the documented boundary).
+                    if let Some(table) = routed_dml_table(&stmt) {
+                        if crate::attach_fire::has_bound_triggers(self, &schema_lc, table) {
+                            return Err(Error::Unsupported(
+                                "DML on a table with cross-database triggers must run through \
+                                 Database::execute",
+                            ));
+                        }
+                    }
                     let engine = self
                         .attached_engine(&schema_lc)
                         .expect("validate_schemas checked");
@@ -10564,6 +10670,56 @@ impl Database {
         }
     }
 
+    /// CREATE TEMP TRIGGER — the connection-scoped trigger, including
+    /// the CROSS-DATABASE surface (SQLite, verified against 3.53.4): a
+    /// TEMP trigger may target a table in ANY database (an attached one
+    /// included) and its body may reference (read or write) any
+    /// database. Handled at the PARENT before routing: the trigger
+    /// always lives in THIS connection's temp catalog; one bound to an
+    /// attached table (or with foreign references) is fired by the
+    /// cross-database fire machinery — the routed-DML driver for
+    /// attached-table targets, the armed executor for local tables —
+    /// never by the local fast paths.
+    fn create_temp_trigger(&mut self, ct: &CreateTrigger, original_sql: &str) -> Result<()> {
+        // SQLite: a duplicate trigger name errors; IF NOT EXISTS skips.
+        if self.catalog.get_trigger(&ct.name).is_some() {
+            if ct.if_not_exists {
+                return Ok(());
+            }
+            return Err(Error::AlreadyExists(format!(
+                "trigger {} already exists",
+                ct.name
+            )));
+        }
+        // Where the ON table binds: the as-written qualifier, or the
+        // connection search order for bare names. A missing table is
+        // SQLite's CREATE-time error.
+        let bound_schema = match crate::attach::resolve_temp_trigger_target(self, ct)? {
+            crate::attach::TempTriggerTarget::Local => None,
+            crate::attach::TempTriggerTarget::Attached(schema_lc) => Some(schema_lc),
+        };
+        let trig = crate::schema::Trigger {
+            name: ct.name.clone(),
+            table: ct.table.clone(),
+            when: ct.when,
+            events: ct.events.clone(),
+            for_each_row: ct.for_each_row,
+            when_clause: ct.when_clause.clone(),
+            body: ct.body.clone(),
+            create_sql: original_sql.to_string(),
+            bound_schema,
+            dormant: false,
+            has_foreign_refs: crate::attach::trigger_has_foreign_refs(self, ct),
+            validated: std::sync::atomic::AtomicBool::new(false),
+        };
+        // Connection-scoped: temp catalog only, no schema row, nothing
+        // durable to flush.
+        self.catalog.mark_temp(&trig.name);
+        self.catalog.add_trigger(trig);
+        self.invalidate_stmt_cache();
+        Ok(())
+    }
+
     /// Execute a statement that mixes schemas on the EXECUTE path (no
     /// result rows): cross-schema INSERT (synthesized VALUES insert on
     /// the target engine), local-target DML reading attached tables (the
@@ -10577,6 +10733,23 @@ impl Database {
     ) -> Result<()> {
         let target_foreign = crate::attach::is_foreign_schema(&target_schema);
         match stmt {
+            // Cross-database triggers: mixed DML with a FOREIGN target
+            // on a trigger-bearing table runs the per-row driver
+            // (source rows materialize at the parent; each row's write
+            // + trigger firing is coordinated across engines).
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+                if target_foreign
+                    && crate::attach::is_foreign_schema(&target_schema)
+                    && target_schema.as_deref().is_some_and(|s| {
+                        let lc = s.to_ascii_lowercase();
+                        routed_dml_table(stmt)
+                            .is_some_and(|t| crate::attach_fire::has_bound_triggers(self, &lc, t))
+                    }) =>
+            {
+                let schema = target_schema.clone().expect("foreign checked");
+                crate::attach_fire::routed_dml_with_triggers(self, stmt, params, &schema)?;
+                Ok(())
+            }
             // INSERT INTO aux.x SELECT ... FROM main.t (the target may
             // also be an unqualified name that binds to aux)
             Statement::Insert(ins) if target_foreign => {
@@ -10621,16 +10794,21 @@ impl Database {
             }) if crate::attach::is_foreign_schema(&name.schema) => {
                 self.execute_cross_ctas(name, sel, sql, params)
             }
-            // A trigger whose body or target references another
-            // database (a TEMP trigger on an attached table, or a main
-            // trigger reading attached tables): the cross-engine firing
-            // machinery is not there yet — a clear message instead of
-            // the generic form error.
-            Statement::Create(crate::sql::ast::CreateStatement::Trigger(_)) => {
-                Err(Error::Unsupported(
-                    "cross-database triggers are not supported yet (create the trigger in \
-                     the same database as its table)",
-                ))
+            // A NON-TEMP trigger whose WHEN/body references another
+            // database — SQLite rejects the CREATE with its exact
+            // wording (verified against 3.53.4; TEMP triggers are the
+            // allowed form, handled at the parent before routing).
+            Statement::Create(crate::sql::ast::CreateStatement::Trigger(ct)) => {
+                let foreign = crate::attach::trigger_foreign_ref_schema(self, ct);
+                Err(match foreign {
+                    Some(schema) => Error::semantic(format!(
+                        "trigger {} cannot reference objects in database {}",
+                        ct.name, schema
+                    )),
+                    None => {
+                        Error::Unsupported("this cross-database statement form is not supported")
+                    }
+                })
             }
             _ => Err(Error::Unsupported(
                 "this cross-database statement form is not supported",
@@ -10663,6 +10841,19 @@ impl Database {
                 let target_schema = crate::attach::target_schema_of(self, stmt);
                 if crate::attach::is_foreign_schema(&target_schema) {
                     let schema = target_schema.expect("foreign checked");
+                    // Cross-database triggers: the driver needs the
+                    // parent's MUTABLE machinery — route through
+                    // Database::execute (same boundary as the query
+                    // path's Routed arm).
+                    if let Some(table) = routed_dml_table(stmt) {
+                        let lc = schema.to_ascii_lowercase();
+                        if crate::attach_fire::has_bound_triggers(self, &lc, table) {
+                            return Err(Error::Unsupported(
+                                "DML on a table with cross-database triggers must run through \
+                                 Database::execute",
+                            ));
+                        }
+                    }
                     return self.execute_cross_dml(stmt, params, &schema);
                 }
                 // LOCAL target reading attached tables.
@@ -10739,6 +10930,62 @@ impl Database {
                     .map(Some)
             }
             _ => Ok(None),
+        }
+    }
+
+    /// Plan one TEMP-trigger body statement with a PREBUILT foreign
+    /// channel (the executor's fire path — materialization happened via
+    /// the thread-db bridge before any WHEN/body evaluation). Local and
+    /// local-target-mixed bodies plan through the channel-aware planner
+    /// so `aux.t` refs resolve from the materialized rows; execution
+    /// stays IN-CONTEXT (the statement journal and root overlays of the
+    /// firing statement keep covering the body's local writes).
+    pub(crate) fn plan_body_with_channel(
+        catalog: &Catalog,
+        stmt: &Statement,
+        foreign: Option<crate::attach::ForeignTables>,
+    ) -> Result<crate::planner::plan::Plan> {
+        let mut planner = Planner::new(catalog);
+        planner.set_foreign(foreign.clone().unwrap_or_default());
+        match stmt {
+            Statement::Select(s) => planner.plan_select(s),
+            Statement::Insert(_) => {
+                // The foreign_plan_for pattern: re-plan a SELECT source
+                // with the channel; VALUES sources cannot carry table
+                // refs (their subqueries evaluate at runtime through
+                // the rewrite machinery, which sees ctx.foreign).
+                let ins = match stmt {
+                    Statement::Insert(i) => i,
+                    _ => unreachable!(),
+                };
+                match &ins.source {
+                    crate::sql::ast::InsertSource::Select(src) => {
+                        let source_plan = planner.plan_select(src)?;
+                        let table = catalog.get_table(&ins.table).ok_or_else(|| {
+                            Error::NotFound(format!("no such table: {}", ins.table))
+                        })?;
+                        let columns = Self::insert_columns(&table, ins.columns.as_ref())?;
+                        Ok(crate::planner::plan::Plan::Insert {
+                            table,
+                            source: Box::new(source_plan),
+                            columns,
+                            on_conflict: ins.or.unwrap_or(ConflictResolution::Abort),
+                            upsert: ins.upsert.clone(),
+                            returning: ins.returning.clone(),
+                        })
+                    }
+                    _ => Self::plan_insert(catalog, stmt),
+                }
+            }
+            Statement::Update(_) => {
+                Self::plan_update_channel(catalog, stmt, &HashMap::new(), foreign)
+            }
+            Statement::Delete(_) => {
+                Self::plan_delete_channel(catalog, stmt, &HashMap::new(), foreign)
+            }
+            _ => Err(Error::Unsupported(
+                "unsupported statement in a cross-database trigger body",
+            )),
         }
     }
 
@@ -10907,6 +11154,97 @@ impl Database {
             }
         }
         Ok((res.columns.to_vec(), res.rows))
+    }
+
+    /// Execute a pre-built AST statement through the full statement
+    /// machinery — the cross-database trigger fire path (a TEMP
+    /// trigger's body statements run on the PARENT, with attach
+    /// routing, so a body may read and write any database).
+    pub(crate) fn execute_ast_stmt_pub(
+        &mut self,
+        stmt: &Statement,
+        params: &[Value],
+    ) -> Result<()> {
+        // A body statement that references an attached schema takes the
+        // ROUTER, never the parent's statement cache (cache_stmt_from_ast
+        // would plan it against the parent's catalog — "no such table"
+        // for every foreign target).
+        if crate::attach::stmt_uses_attached(self, stmt) {
+            crate::attach::validate_schemas(self, stmt)?;
+            crate::attach::check_stmt_rules(stmt)?;
+            let target_schema = crate::attach::target_schema_of(self, stmt);
+            return match crate::attach::analyze_route(self, stmt) {
+                crate::attach::Route::Routed { schema_lc } => {
+                    // Cross-database triggers on the target: the driver
+                    // (a body writing another bound table fires ITS
+                    // triggers too — the recursion depth guard lives
+                    // there).
+                    if let Some(table) = routed_dml_table(stmt) {
+                        if crate::attach_fire::has_bound_triggers(self, &schema_lc, table) {
+                            crate::attach_fire::routed_dml_with_triggers(
+                                self, stmt, params, &schema_lc,
+                            )?;
+                            return Ok(());
+                        }
+                    }
+                    let engine = self.attached_engine(&schema_lc).ok_or_else(|| {
+                        Error::NotFound(format!("unknown database {}", schema_lc))
+                    })?;
+                    let stripped = crate::attach::strip_schema_refs(stmt, &schema_lc);
+                    let last_rowid = {
+                        let mut aux = engine.write();
+                        let cached_aux = aux
+                            .cache_stmt_from_ast(&stripped)
+                            .map_err(|e| crate::attach::qualify_routed_error(e, &schema_lc))?;
+                        aux.execute_cached_stmt(&ast_sql_hint(stmt), cached_aux, params.to_vec())
+                            .map_err(|e| crate::attach::qualify_routed_error(e, &schema_lc))?;
+                        aux.last_insert_rowid()
+                    };
+                    self.merge_routed_dml_counters(
+                        matches!(stmt, Statement::Insert(_)),
+                        last_rowid,
+                    );
+                    Ok(())
+                }
+                crate::attach::Route::Mixed => {
+                    self.execute_mixed(stmt, &ast_sql_hint(stmt), params, target_schema)
+                }
+                crate::attach::Route::Local => unreachable!("uses_attached classified Local"),
+            };
+        }
+        let cached = self.cache_stmt_from_ast(stmt)?;
+        let sql = ast_sql_hint(stmt);
+        self.execute_cached_stmt(&sql, cached, params)
+    }
+
+    /// Execute a stripped (localized) statement on one ATTACHED engine
+    /// — the nested foreign-body bridge for TEMP triggers on LOCAL
+    /// tables (a body statement that routes whole to one attached
+    /// database). Write-locked: body statements are DML or SELECT.
+    pub(crate) fn exec_on_engine_pub(
+        &self,
+        schema_lc: &str,
+        stripped: &Statement,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<(Vec<String>, Vec<Row>)> {
+        let engine = self
+            .attached_engine(schema_lc)
+            .ok_or_else(|| Error::NotFound(format!("unknown database {}", schema_lc)))?;
+        let last_rowid;
+        let out = {
+            let aux = engine.write();
+            let cached = aux
+                .cache_stmt_from_ast(stripped)
+                .map_err(|e| crate::attach::qualify_routed_error(e, schema_lc))?;
+            let (cols, rows) = aux
+                .query_cached_stmt_with_cols(sql, &cached, params.to_vec())
+                .map_err(|e| crate::attach::qualify_routed_error(e, schema_lc))?;
+            last_rowid = aux.last_insert_rowid();
+            (cols, rows)
+        };
+        self.merge_routed_dml_counters(matches!(stripped, Statement::Insert(_)), last_rowid);
+        Ok(out)
     }
 
     /// `exec_select_with_ctes` + the foreign channel: a mixed SELECT
@@ -13901,6 +14239,28 @@ impl Database {
                         t.name
                     )));
                 }
+                // SQLite (3.53.4): NON-TEMP trigger bodies may not carry
+                // schema-qualified DML targets — the router's
+                // check_stmt_rules covers foreign-classified statements;
+                // this is the local-create twin (a qualified MAIN/TEMP
+                // target on a local trigger). TEMP triggers are exempt
+                // (they may target any database).
+                if !t.temp {
+                    for s in &t.body {
+                        let qualified_target = match s {
+                            Statement::Insert(i) => i.schema.is_some(),
+                            Statement::Update(u) => u.schema.is_some(),
+                            Statement::Delete(d) => d.schema.is_some(),
+                            _ => false,
+                        };
+                        if qualified_target {
+                            return Err(Error::semantic(
+                                "qualified table names are not allowed on INSERT, UPDATE, and \
+                                 DELETE statements within triggers",
+                            ));
+                        }
+                    }
+                }
                 let trig = crate::schema::Trigger {
                     name: t.name.clone(),
                     table: t.table.clone(),
@@ -13910,6 +14270,13 @@ impl Database {
                     when_clause: t.when_clause,
                     body: t.body,
                     create_sql: original_sql.to_string(),
+                    // TEMP triggers on ATTACHED tables never reach this
+                    // path (intercepted before routing); a non-temp
+                    // trigger's body cannot reference attached schemas
+                    // (SQLite rejects it — the execute_mixed arm).
+                    bound_schema: None,
+                    dormant: false,
+                    has_foreign_refs: false,
                     validated: std::sync::atomic::AtomicBool::new(false),
                 };
                 // SQLite: a trigger on a TEMP table is itself temp.
@@ -17059,6 +17426,9 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
                             when_clause: t.when_clause,
                             body: t.body,
                             create_sql: sql.to_string(),
+                            bound_schema: None,
+                            dormant: false,
+                            has_foreign_refs: false,
                             validated: std::sync::atomic::AtomicBool::new(false),
                         });
                     }
@@ -17905,6 +18275,70 @@ fn parse_chain_row(sql: &str, ch: &mut InsertChain) -> ChainParse {
         }
     }
     ChainParse::Matched
+}
+
+/// The bare target-table name of a DML statement (the routed-DML
+/// driver's gate — None for anything that is not INSERT/UPDATE/DELETE).
+fn routed_dml_table(stmt: &Statement) -> Option<&str> {
+    match stmt {
+        Statement::Insert(i) => Some(&i.table),
+        Statement::Update(u) => Some(&u.table),
+        Statement::Delete(d) => Some(&d.from),
+        _ => None,
+    }
+}
+
+/// Open the cross-database statement scope for a LOCAL statement whose
+/// target table carries TEMP triggers with foreign references: a
+/// SAVEPOINT on every attached engine, finished (released) or aborted
+/// (rolled back) by the statement's outcome. Routed/mixed statements
+/// never open one (the routed-DML driver owns its own scope), and
+/// trigger-free statements keep the zero-cost fast paths.
+fn local_foreign_trigger_scope(
+    db: &Database,
+    cached: &Arc<CachedStmt>,
+) -> Option<crate::attach_fire::LocalForeignScope> {
+    if cached.has_foreign {
+        return None;
+    }
+    let table = match cached.stmt.as_ref() {
+        Statement::Insert(i) if i.schema.is_none() => &i.table,
+        Statement::Update(u) if u.schema.is_none() => &u.table,
+        Statement::Delete(d) if d.schema.is_none() => &d.from,
+        _ => return None,
+    };
+    if !db.has_attached() {
+        return None;
+    }
+    if db
+        .catalog
+        .local_triggers_with_foreign_refs(table)
+        .is_empty()
+    {
+        return None;
+    }
+    Some(crate::attach_fire::LocalForeignScope::open(db))
+}
+
+/// A synthetic SQL prefix for statements executed from a pre-built AST
+/// (the cross-database trigger fire paths): the machinery only
+/// classifies by first keyword (see `is_ddl_sql`), so the hint carries
+/// the statement kind.
+fn ast_sql_hint(stmt: &Statement) -> String {
+    let kw = match stmt {
+        Statement::Insert(_) => "INSERT",
+        Statement::Update(_) => "UPDATE",
+        Statement::Delete(_) => "DELETE",
+        Statement::Select(_) => "SELECT",
+        Statement::Create(_) => "CREATE",
+        Statement::Drop(_) => "DROP",
+        Statement::Alter(_) => "ALTER",
+        Statement::Vacuum(_) => "VACUUM",
+        Statement::Analyze { .. } | Statement::Reindex { .. } => "ANALYZE",
+        Statement::Pragma(_) => "PRAGMA",
+        _ => "SELECT",
+    };
+    format!("{} /* cross-db trigger */", kw)
 }
 
 fn is_ddl_sql(sql: &str) -> bool {

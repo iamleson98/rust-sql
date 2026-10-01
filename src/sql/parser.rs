@@ -1196,6 +1196,7 @@ impl Parser {
             temp,
             if_not_exists,
             table,
+            table_schema: if temp { table_schema } else { None },
             when,
             events,
             for_each_row,

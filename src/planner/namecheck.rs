@@ -1681,6 +1681,13 @@ fn validate_create(ctx: &Ctx<'_>, c: &CreateStatement, scope: &mut Scope) -> Res
         // create time (SQLite: "no such table: main.x") — a TABLE for
         // BEFORE/AFTER triggers, a VIEW for INSTEAD OF triggers.
         CreateStatement::Trigger(tr) => {
+            // TEMP triggers may target a table in ANY database (SQLite's
+            // cross-database trigger surface): the local catalog cannot
+            // answer — create_temp_trigger validates with SQLite's exact
+            // shapes (`no such table: aux.x` / bare `no such table: x`).
+            if tr.temp {
+                return Ok(());
+            }
             if ctx.catalog.get_table(&tr.table).is_none()
                 && ctx.catalog.get_view(&tr.table).is_none()
             {
