@@ -1599,3 +1599,19 @@ Work Log:
 
 Stage Summary:
 - The archive round rides again; ef400d3 is the run to watch.
+
+---
+Task ID: 71
+Agent: main (Super Z)
+Task: The README rewrite — concise "what this SQL does better than SQLite" + an honest current "Remaining gaps" ledger, without the per-round fix narrative (the user's explicit framing: "don't say too much for what was fixed in which day").
+
+Work Log:
+- New "What rustqlite does better than SQLite" section (after Quick start): speed (53/54 gated rows, headline multipliers), parallel execution (SQLite single-threaded by design), the concurrency architecture SQLite cannot offer (MRMW, BEGIN CONCURRENT + implicit join, true parallel writers on Arc<Database>), operational wins (byte-exact files, cold start, RSS, pure-Rust), embedding ergonomics (native sqlx driver + drop-in C ABI + SCRAM server), and the beyond-SQLite surface (pg-FTS, geospatial, DECIMAL enforcement).
+- "Remaining gaps vs SQLite" restructured: the "Closed this round" narrative and the fix-history prose are GONE; what remains is one honest current ledger in four families — Performance (measured residuals, CI-tracked), Resource, Concurrency, Feature & compatibility surface — including the new cross-database-trigger divergences (firing-order approximation, the Database::execute boundary for DML-RETURNING on bound tables, parser main./temp. normalization) and the .archive zip divergences (kept from the old ledger's CLI bullet, now compact).
+- The ATTACH feature bullet gained the cross-database trigger surface (this round's closure); the old bullet's "cross-database triggers ... clear error" boundary line is removed (closed).
+- Status line compressed to the verifiable facts (1631 default-matrix tests, per-OS limit-stress, 53/1/0 bench rows, 3.53.4 oracle) with no run-link-of-the-day.
+- Kept and restored: the full Usage section (CLI/server/library/sqlx patch lines + run-the-comparisons), the Testing methodology table (updated counts: 111 test files, 1631 tests, + the attach_triggers.rs row), License.
+- The per-commit prose block trimmed to the measured law + the honest residual; the torture paragraph trimmed to its verdicts; dot-command detail folded into the Tooling bullet.
+
+Stage Summary:
+- The README now leads with the better-than-SQLite story (evidence-linked), carries the same verifiable tables, and keeps a current, honest gap ledger with no day-by-day fix narrative.
