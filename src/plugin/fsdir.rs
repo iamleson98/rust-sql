@@ -232,8 +232,9 @@ mod tests {
             assert!(matches!(&l[3], Value::Text(_)));
             // level: root=1, children=2.
             assert_eq!(l[4], Value::Integer(2));
-            // mode: symlink bits.
-            assert_eq!(l[1], Value::Integer(0o120777));
+            // mode: the symlink TYPE bits (permissions are
+            // umask/OS-dependent — macOS runners draw 0o121165).
+            assert_eq!(l[1].as_integer() & 0o170000, 0o120000);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
