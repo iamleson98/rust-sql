@@ -1680,3 +1680,18 @@ Work Log:
 Stage Summary:
 - Landed: the S06 step path is TLS-free end to end; the SQLite-format publish path borrows instead of cloning and reuses its encode buffer; the 8-conn mixed row's real-hardware story is measured and documented. The per-commit small-file residual (~0.3-0.5x vs SQLite's ~10-20 us floor) and the 2-table PK join (1.18x) stay the honest open perf items; RSS floor stays the honest resource item with fresh numbers.
 - Next: push, track CI (the macOS-ARM torture/bench-gate draws are the verdict on the S06 fix), iterate on any red.
+
+---
+Task ID: 74-ci
+Agent: main (Super Z)
+Task: Track ddc3fed's CI run to the verdict; fold the measured results into the README.
+
+Work Log:
+- CI run 37039062756 on ddc3fed: COMPLETED / SUCCESS — 32/32 jobs green on all three OSes.
+- The board: bench_full_vs_sqlite 18 rows (mac 17W/1T, ubuntu 18W, win 18W), bench_compare 20 rows (mac 18W/2T, ubuntu 19W/1T, win 20W), criterion 8/8 everywhere, bench_sqlx_native 12/12 everywhere — ZERO LOSSES on any OS; the README's stale "54 rows" count corrected to the real 58 (the sqlx board grew to 12 rows in an earlier round).
+- The 8-conn mixed R/W 80/20 row — the historical parity guard — drew **7.32x on macOS and 8.52x on ubuntu** this fleet (SQLite paid ~690 ms of serial commit fsyncs on both; the shared engine + concurrent transactions + group commit ran 81-94 ms; the round's TLS-free decode also serves the row's 80% read mix). Documented as fsync-latency-dominated with the 13.7x quiet-box measurement and the fast-fsync parity caveat.
+- macOS-ARM torture S06 verdict on the new code: 0.91x (rq 3.7 vs sq 3.3 ms) — improved from the 0.72-0.87x class, inside the 15%+2ms gate (gate failures: 0; the whole matrix green: S07 1.35x, S12 1.27x, S16 10.10x on the same run). The ledger bullet now carries the exact number.
+- README: status line (58 rows, zero losses), the performance intro line, the concurrency table's mixed row, the ledger's S06 and mixed bullets, and the better-than section's MRMW bullet.
+
+Stage Summary:
+- The TLS-free serving round is landed and fully green; the bench board has no losses on any OS, and the former parity-guard row is a fleet-draw win. Master is at ddc3fed.

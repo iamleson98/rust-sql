@@ -2,7 +2,7 @@
 
 A from-scratch embedded SQL database engine written in pure Rust — modeled after SQLite, built to beat it.
 
-> **Status**: CI fully green on linux/windows/macos — **1631 tests** in the default matrix (lib + 111 integration suites) plus sqlx / no-default / OOM-injection / compat-ABI / limit-stress matrices and a per-OS limit-stress job at 1M-row file scale. Benchmarks vs real SQLite: **53 wins / 1 parity tie / 0 losses over 54 CI-gated rows**; byte-identical file sizes; the differential oracle is the SQLite **3.53.4** amalgamation itself. The honest ledger of what is still missing: [Remaining gaps](#remaining-gaps-vs-sqlite).
+> **Status**: CI fully green on linux/windows/macos — **1631 tests** in the default matrix (lib + 111 integration suites) plus sqlx / no-default / OOM-injection / compat-ABI / limit-stress matrices and a per-OS limit-stress job at 1M-row file scale. Benchmarks vs real SQLite: **58 CI-gated rows, zero losses on any OS** (55–58 wins per OS, the rest inside the 5% tie band; criterion 8/8 everywhere); byte-identical file sizes; the differential oracle is the SQLite **3.53.4** amalgamation itself. The honest ledger of what is still missing: [Remaining gaps](#remaining-gaps-vs-sqlite).
 
 ## Contents
 
@@ -47,7 +47,7 @@ Every claim below is a CI-gated, answer-equality-asserted measurement against bu
 
 **Concurrency SQLite architecturally cannot offer:**
 
-- True MRMW on one engine — 16-thread reads **13.9x**, 8-connection sqlx reads **10.6x**, readers never block the writer (**1.93x** at 1 writer + 7 readers). SQLite serializes readers on a connection mutex and admits exactly one writer at a time, database-wide.
+- True MRMW on one engine — 16-thread reads **13.9x**, 8-connection sqlx reads **10.6x**, readers never block the writer (**1.93x** at 1 writer + 7 readers), 8-conn mixed R/W 80/20 **7.3–13.7x**. SQLite serializes readers on a connection mutex and admits exactly one writer at a time, database-wide.
 - **`BEGIN CONCURRENT`** — optimistic multi-writer transactions (SQLite's begin-concurrent branch semantics): row-level first-committer-wins with MERGE, snapshot isolation, retriable 517s, group commit (~5x single-writer throughput at 8 connections). Plain autocommit DML implicitly joins the regime through every path — engine API, prepare/step, sqlx, and the C ABI.
 - **True parallel writers on a shared `Arc<Database>`** — N threads run N simultaneous transactions on one engine; only COMMIT takes a short critical section.
 
@@ -109,7 +109,7 @@ Every claim below is a CI-gated, answer-equality-asserted measurement against bu
 
 ## Performance vs SQLite
 
-vs rusqlite (bundled SQLite 3.5x) on identical workloads, every timing row answer-equality-asserted before timing. CI bench-gate summary: **53 wins / 1 parity tie / 0 losses over 54 rows**.
+vs rusqlite (bundled SQLite 3.5x) on identical workloads, every timing row answer-equality-asserted before timing. CI bench-gate summary: **58 rows (18 full-vs-sqlite + 20 bench_compare + 8 criterion + 12 sqlx-native), zero losses on any OS** — 55–58 wins per OS, the remainder ties.
 
 ### Serial workloads (CI, best-of, µs/ms)
 
@@ -198,7 +198,7 @@ Measured law: per-commit ≈ **~50–60 µs fixed + O(changed pages)** — indep
 | 1 writer + 7 readers (sqlx pool) | **1.93x** (CI) | lock-free committed-view memo; readers never block on the writer |
 | 8-task one-pool (sqlx) | **4.24x** (CI) | inline async execution vs worker thread + FFI |
 | 8-conn concurrent reads (sqlx) | **10.6x** (CI) | MRMW shared pages |
-| 8-conn mixed R/W 80/20 (sqlx) | 0.74x on CI runners — parity guard; **13.7x** on a quiet 6-core box | the row is fsync-latency-dominated, not engine-bound: with ~2 ms host fsyncs SQLite pays 640 serial commit fsyncs while the shared-engine side overlaps everything (reads inside stay 2.8x; CI's shared runners draw ~100–200 µs fsyncs, moving the row to parity there) |
+| 8-conn mixed R/W 80/20 (sqlx) | **7.3–8.5x** (current CI fleet) / **13.7x** (quiet 6-core box); parity draws possible on fast-fsync runners | the row is fsync-latency-dominated on SQLite's side (640 serial commit fsyncs) while the shared engine + BEGIN CONCURRENT + group commit overlap everything; reads inside stay 2.8x |
 | Intra-statement parallel aggregates (1M) | **5.8–8.8x** | worker-split + range-ordered merge — SQLite is single-threaded by design |
 | Intra-statement parallel top-N / sorts (1M) | **2.2–2.6x / 1.4x** | per-worker keep-heaps / chunk sort + k-way merge |
 | Multi-connection writers | **≥ SQLite everywhere** | plain autocommit DML **implicitly joins** the optimistic regime (no BUSY wait, conflict = retriable 517); explicit `BEGIN CONCURRENT` for multi-statement overlap |
@@ -270,8 +270,8 @@ The honest ledger — verifiable absence (`module_list` / `function_list` / `com
 
 - **SQLite-format per-commit at small file scale** (~0.3–0.5x): this round cut the fixed cost again — the changed-page diff now borrow-compares (no 4 KiB clone per touched page) and the WAL frame encode reuses one buffer (measured on a 6-core box: publish mutate 20.7 → 18.0 µs, commit 21.2 → 19.6 µs, 65 → 56 µs wall per autocommit INSERT) — but SQLite's ~10–20 µs floor keeps the small-file shape behind. Still O(changed pages), root-stable, and **9.8x faster at 265 MB** where SQLite's own commit degrades. The native container (the default; what the 54 gated rows measure) is unaffected — its per-commit path is page-granular WAL.
 - **One serial row-shape at parity**: the unfiltered 2-table PK join (1.18x warm; 1.38x at 1M-row parallel scale).
-- **8-conn mixed R/W 80/20**: parity-class on CI's shared runners — commit fsync sets the floor there (~100–200 µs draws); on a quiet 6-core box with ~2 ms fsyncs the same row is **13.7x**. The row measures host fsync latency, not engine concurrency (reads inside stay 2.8x). An explicitly-marked parity guard in CI.
-- **S06 range-scan materialization**: the step path's per-row trusted-decode thread-local round-trips are gone (the trust bit now rides the decode call — zero TLS access per row and per TEXT value; ~3 TLS closures per row previously, amplified on macOS-ARM): 1.20x on a 6-core linux draw (was 0.92x). The macOS-ARM CI draw is the standing verdict.
+- **8-conn mixed R/W 80/20**: fsync-latency-dominated on SQLite's side — **7.3–8.5x** on the current CI fleet (SQLite drew ~690 ms on both macOS and ubuntu runners: 640 serial commit fsyncs), **13.7x** on a quiet 6-core box, parity-class only when a runner's fsyncs draw fast. Reads inside stay 2.8x.
+- **S06 range-scan materialization**: the step path's per-row trusted-decode thread-local round-trips are gone (the trust bit now rides the decode call — zero TLS access per row and per TEXT value; ~3 TLS closures per row previously). Measured: 1.20x on a 6-core linux draw (was 0.92x), **0.91x on macOS-ARM** (was the 0.72–0.87x class) — inside the torture gate, still the one sub-1.0 step-path draw; the residual is per-row serve machinery, not decode.
 
 ### Resource
 
