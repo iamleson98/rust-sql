@@ -198,7 +198,7 @@ Measured law: per-commit ≈ **~50–60 µs fixed + O(changed pages)** — indep
 | 1 writer + 7 readers (sqlx pool) | **1.93x** (CI) | lock-free committed-view memo; readers never block on the writer |
 | 8-task one-pool (sqlx) | **4.24x** (CI) | inline async execution vs worker thread + FFI |
 | 8-conn concurrent reads (sqlx) | **10.6x** (CI) | MRMW shared pages |
-| 8-conn mixed R/W 80/20 (sqlx) | 0.74x — parity guard | commit fsync sets the floor (host-dominated; reads inside stay 2.8x) |
+| 8-conn mixed R/W 80/20 (sqlx) | 0.74x on CI runners — parity guard; **13.7x** on a quiet 6-core box | the row is fsync-latency-dominated, not engine-bound: with ~2 ms host fsyncs SQLite pays 640 serial commit fsyncs while the shared-engine side overlaps everything (reads inside stay 2.8x; CI's shared runners draw ~100–200 µs fsyncs, moving the row to parity there) |
 | Intra-statement parallel aggregates (1M) | **5.8–8.8x** | worker-split + range-ordered merge — SQLite is single-threaded by design |
 | Intra-statement parallel top-N / sorts (1M) | **2.2–2.6x / 1.4x** | per-worker keep-heaps / chunk sort + k-way merge |
 | Multi-connection writers | **≥ SQLite everywhere** | plain autocommit DML **implicitly joins** the optimistic regime (no BUSY wait, conflict = retriable 517); explicit `BEGIN CONCURRENT` for multi-statement overlap |
@@ -268,15 +268,15 @@ The honest ledger — verifiable absence (`module_list` / `function_list` / `com
 
 ### Performance (measured residuals, CI-tracked)
 
-- **SQLite-format per-commit at small file scale** (~0.11–0.32x): the publish machinery's ~50–60 µs fixed cost vs SQLite's ~10 µs — but O(changed pages), root-stable, and **9.8x faster at 265 MB** where SQLite's own commit degrades. The native container (the default; what the 54 gated rows measure) is unaffected — its per-commit path is page-granular WAL.
+- **SQLite-format per-commit at small file scale** (~0.3–0.5x): this round cut the fixed cost again — the changed-page diff now borrow-compares (no 4 KiB clone per touched page) and the WAL frame encode reuses one buffer (measured on a 6-core box: publish mutate 20.7 → 18.0 µs, commit 21.2 → 19.6 µs, 65 → 56 µs wall per autocommit INSERT) — but SQLite's ~10–20 µs floor keeps the small-file shape behind. Still O(changed pages), root-stable, and **9.8x faster at 265 MB** where SQLite's own commit degrades. The native container (the default; what the 54 gated rows measure) is unaffected — its per-commit path is page-granular WAL.
 - **One serial row-shape at parity**: the unfiltered 2-table PK join (1.18x warm; 1.38x at 1M-row parallel scale).
-- **8-conn mixed R/W 80/20**: parity-class by construction — commit fsync sets the floor (host-dominated); reads inside stay 2.8x. An explicitly-marked parity guard in CI.
-- **S06 range-scan materialization** (~0.92x linux / 0.72–0.87x macOS-ARM draws): the fused drivers serve raw record bytes per step.
+- **8-conn mixed R/W 80/20**: parity-class on CI's shared runners — commit fsync sets the floor there (~100–200 µs draws); on a quiet 6-core box with ~2 ms fsyncs the same row is **13.7x**. The row measures host fsync latency, not engine concurrency (reads inside stay 2.8x). An explicitly-marked parity guard in CI.
+- **S06 range-scan materialization**: the step path's per-row trusted-decode thread-local round-trips are gone (the trust bit now rides the decode call — zero TLS access per row and per TEXT value; ~3 TLS closures per row previously, amplified on macOS-ARM): 1.20x on a 6-core linux draw (was 0.92x). The macOS-ARM CI draw is the standing verdict.
 
 ### Resource
 
 - **Binary size +1.0 MB (1.5x)**: mimalloc + the feature surface; `default-features = false` recovers the glibc baseline. The only deliberate resource regression.
-- **mimalloc's RSS floor** at small scale (0.5–0.9x): ~1 MB open-time baseline + WAL bookkeeping; time columns on the same sections are 2.1–8x wins; torture memory columns run 1–6 MB above SQLite — reported, not gated.
+- **mimalloc's RSS floor** at small scale: ~4–5 MB above SQLite on a 1M-row file open (11.6 vs 7.25 MB hwm, 6-core box; the lean arena-reserve/THP env moves it ~0.2 MB and buys a 28% faster cold open) — mimalloc's per-size-class page commits, not engine live-set bloat. Time columns on the same torture sections are 1.03–8.75x wins; the memory columns run 1–6 MB above SQLite — reported, not gated.
 - **SQLite-format mode loads the whole image into RAM** (~6x file size) — unusable at GB scale; see [cold start](#cold-start-on-large-files). (The native container is the scale path; `VACUUM INTO` converts.)
 
 ### Concurrency

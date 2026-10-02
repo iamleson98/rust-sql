@@ -308,6 +308,46 @@ pub fn decode_row_selective(
     alias: Option<usize>,
     out: &mut Vec<Value>,
 ) -> Result<()> {
+    decode_row_selective_opt(buf, n_cols_total, col_indices, rowid, alias, out, None)
+}
+
+/// [`decode_row_selective`] for the hot serving paths: the TEXT-trust
+/// decision arrives as a plain bool (per-batch state — e.g. the step
+/// path's `CellPlan::mem_pager`), so the per-row decode never touches
+/// thread-local storage. `trusted` only skips the redundant UTF-8
+/// validation of payloads this process encoded itself; `false` behaves
+/// exactly like the TLS-unarmed `decode_row_selective`.
+pub fn decode_row_selective_trusted(
+    buf: &[u8],
+    n_cols_total: usize,
+    col_indices: &[usize],
+    rowid: i64,
+    alias: Option<usize>,
+    out: &mut Vec<Value>,
+    trusted: bool,
+) -> Result<()> {
+    decode_row_selective_opt(
+        buf,
+        n_cols_total,
+        col_indices,
+        rowid,
+        alias,
+        out,
+        Some(trusted),
+    )
+}
+
+/// The shared body of [`decode_row_selective`] (TLS trust) and
+/// [`decode_row_selective_trusted`] (explicit trust).
+fn decode_row_selective_opt(
+    buf: &[u8],
+    n_cols_total: usize,
+    col_indices: &[usize],
+    rowid: i64,
+    alias: Option<usize>,
+    out: &mut Vec<Value>,
+    trusted: Option<bool>,
+) -> Result<()> {
     let n = col_indices.len();
     if n == 0 {
         out.clear();
@@ -351,7 +391,16 @@ pub fn decode_row_selective(
     }
 
     if ascending {
-        return decode_selective_walk(buf, n_cols_total, col_indices, rowid, alias, out, None);
+        return decode_selective_walk(
+            buf,
+            n_cols_total,
+            col_indices,
+            rowid,
+            alias,
+            out,
+            None,
+            trusted,
+        );
     }
     if col_indices.len() <= SMALL {
         let n = col_indices.len();
@@ -382,13 +431,23 @@ pub fn decode_row_selective(
             alias,
             out,
             Some(&order_stack[..n]),
+            trusted,
         );
     }
     // > 16 projected columns: the rare wide-schema case; heap perm.
     let mut order: Vec<usize> = (0..col_indices.len()).collect();
     order.sort_unstable_by_key(|&slot| col_indices[slot]);
     let sorted: Vec<usize> = order.iter().map(|&slot| col_indices[slot]).collect();
-    decode_selective_walk(buf, n_cols_total, &sorted, rowid, alias, out, Some(&order))
+    decode_selective_walk(
+        buf,
+        n_cols_total,
+        &sorted,
+        rowid,
+        alias,
+        out,
+        Some(&order),
+        trusted,
+    )
 }
 
 /// The shared single-cursor walk behind [`decode_row_selective`]:
@@ -402,6 +461,7 @@ fn decode_selective_walk(
     alias: Option<usize>,
     out: &mut [Value],
     slots: Option<&[usize]>,
+    trusted: Option<bool>,
 ) -> Result<()> {
     // Output slot for sorted position `k` (identity when ascending).
     #[inline]
@@ -458,7 +518,7 @@ fn decode_selective_walk(
                 }
                 pos += 1;
             } else {
-                let (v, n) = Value::decode(&buf[pos..])
+                let (v, n) = Value::decode_with_trust(&buf[pos..], trusted)
                     .map_err(|e| crate::error::Error::corruption(format!("row decode: {}", e)))?;
                 if run_end - wanted_idx == 1 {
                     // Common case: one slot — move the value, no clone.

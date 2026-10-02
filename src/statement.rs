@@ -1509,8 +1509,10 @@ struct CellPlan {
     /// (`SELECT id FROM t WHERE id BETWEEN …`, the OLTP point/range
     /// drains).
     all_rowid: bool,
-    /// In-memory pager: TEXT decode arms the trusted mode around each
-    /// row (mirrors the pooled scan family's save/restore).
+    /// In-memory pager: payloads are this process's own encoder output,
+    /// so TEXT decode skips the redundant UTF-8 validation. Carried as
+    /// the plain trust bit for [`decode_row_selective_trusted`] — no
+    /// thread-local access on the per-row serve path.
     mem_pager: bool,
 }
 
@@ -1556,32 +1558,23 @@ fn serve_cell_row(
         let start = entry.off as usize;
         let end = start + entry.len as usize;
         let record = arena.get(start..end).unwrap_or(&[]);
-        let decoded = if plan.mem_pager {
-            // In-memory payloads are this process's own encoder output:
-            // arm trusted TEXT decode around this row (save/restore —
-            // the same discipline the pooled scans use per walk).
-            let saved = crate::types::value::text_decode_trusted();
-            crate::types::value::set_text_decode_trusted(true);
-            let r = crate::storage::row_codec::decode_row_selective(
-                record,
-                plan.n_cols,
-                &plan.project,
-                entry.rowid,
-                plan.rowid_alias,
-                serve_row,
-            );
-            crate::types::value::set_text_decode_trusted(saved);
-            r
-        } else {
-            crate::storage::row_codec::decode_row_selective(
-                record,
-                plan.n_cols,
-                &plan.project,
-                entry.rowid,
-                plan.rowid_alias,
-                serve_row,
-            )
-        };
+        // Trust as a plain bool, once per row, from the per-BATCH plan
+        // state: in-memory payloads are this process's own encoder
+        // output, so TEXT decode skips the redundant UTF-8 validation.
+        // (The old form armed/restore the thread-local around EVERY row
+        // — 3 TLS closures per row, the S06 step-path residual that
+        // macOS-ARM amplified to a 0.72x loss. Semantics identical:
+        // file-backed records decode with `trusted=false`, exactly the
+        // unarmed flag's behavior.)
+        let decoded = crate::storage::row_codec::decode_row_selective_trusted(
+            record,
+            plan.n_cols,
+            &plan.project,
+            entry.rowid,
+            plan.rowid_alias,
+            serve_row,
+            plan.mem_pager,
+        );
         if decoded.is_ok() {
             return true;
         }

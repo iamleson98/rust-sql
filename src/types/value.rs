@@ -615,6 +615,24 @@ impl Value {
     /// consumed). The rowid marker 0x09 decodes as NULL at this level — the
     /// row-level decoder (`decode_row*`) substitutes the B+tree cell key.
     pub fn decode(buf: &[u8]) -> Result<(Value, usize), &'static str> {
+        Self::decode_with_trust(buf, None)
+    }
+
+    /// [`Self::decode`] with the TEXT-trust decision carried as a plain
+    /// parameter instead of thread-local state:
+    /// - `None` — the TLS flag is read LAZILY, exactly when a TEXT value
+    ///   is actually decoded (byte-identical to the historical `decode`).
+    /// - `Some(t)` — the caller already knows the answer (per-batch pager
+    ///   state, an armed trusted scope); the hot scan/serve paths pass it
+    ///   so per-row and per-TEXT-value decoding NEVER touches TLS. The
+    ///   old per-row save/arm/restore (3 thread-local closures per row in
+    ///   `serve_cell_row`) was the S06 step-path residual — ~10% of the
+    ///   per-row budget on x86-64, amplified ~3x on macOS-ARM's slower
+    ///   TLS access.
+    pub fn decode_with_trust(
+        buf: &[u8],
+        trusted: Option<bool>,
+    ) -> Result<(Value, usize), &'static str> {
         if buf.is_empty() {
             return Err("empty buffer");
         }
@@ -675,7 +693,7 @@ impl Value {
                 // pagers arm the trusted mode (payloads are this process's
                 // own encoder output), skipping the redundant pass.
                 let body = &rest[n..n + len];
-                if text_decode_trusted() {
+                if trusted.unwrap_or_else(text_decode_trusted) {
                     // SAFETY: in-memory payloads were written by `encode`
                     // from `String` values — valid UTF-8 by construction.
                     let t = unsafe { Text::from_utf8_unchecked(body) };

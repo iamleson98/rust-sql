@@ -157,8 +157,24 @@ impl WalWriter {
     /// the commit marker. `changed` must be non-empty (callers skip
     /// no-op commits). Returns the bytes to append to the sidecar.
     pub fn encode_commit(&mut self, changed: &[(u32, Vec<u8>)], db_size: u32) -> Vec<u8> {
-        assert!(!changed.is_empty(), "a WAL commit needs at least one frame");
         let mut out = Vec::with_capacity(changed.len() * (24 + self.page_size as usize));
+        self.encode_commit_into(&mut out, changed, db_size);
+        out
+    }
+
+    /// [`Self::encode_commit`] into a caller-owned buffer — the per-
+    /// commit publish path reuses one scratch Vec across commits
+    /// (capacity retained in the container coordinator) instead of
+    /// allocating ~12 KiB per autocommit.
+    pub fn encode_commit_into(
+        &mut self,
+        out: &mut Vec<u8>,
+        changed: &[(u32, Vec<u8>)],
+        db_size: u32,
+    ) {
+        assert!(!changed.is_empty(), "a WAL commit needs at least one frame");
+        out.clear();
+        out.reserve(changed.len() * (24 + self.page_size as usize));
         if self.wal_len == 32 && self.n_frames == 0 {
             // First commit under fresh salts: the header leads.
             out.extend_from_slice(&self.header());
@@ -181,7 +197,6 @@ impl WalWriter {
             self.n_frames += 1;
             self.wal_len += 24 + self.page_size;
         }
-        out
     }
 
     /// Checkpoint pressure: SQLite's default autocheckpoint fires at

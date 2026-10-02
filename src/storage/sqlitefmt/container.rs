@@ -223,6 +223,12 @@ pub struct ContainerState {
     /// (head, count) of the cached freelist structure — the header's
     /// fields come from here.
     free_cache_head: (u32, u32),
+    /// Reused WAL frame-encoding buffer (one Vec's capacity for the
+    /// coordinator's life instead of a ~12 KiB alloc+free per
+    /// autocommit). `encode_commit_into` fills it; the publish path
+    /// takes it and hands it back after the sidecar append. Capacity
+    /// retention is best-effort — error paths may drop it.
+    commit_scratch: Vec<u8>,
 }
 
 /// An open file handle plus the identity (length, and on unix the
@@ -370,17 +376,10 @@ impl<'a> PageReader<'a> {
             READER_CACHE_HITS.fetch_add(1, Relaxed);
             return Some(p.clone());
         }
-        use std::io::{Read, Seek};
-        if self.file.is_none() {
-            READER_FILE_OPENS.fetch_add(1, Relaxed);
-            self.file = Some(std::fs::File::open(self.path).ok()?);
-        }
-        READER_FILE_READS.fetch_add(1, Relaxed);
-        let file = self.file.as_mut()?;
-        let off = (pgno as u64 - 1) * page_size as u64;
-        file.seek(std::io::SeekFrom::Start(off)).ok()?;
         let mut buf = vec![0u8; page_size as usize];
-        file.read_exact(&mut buf).ok()?;
+        if !self.fill_from_file(pgno, page_size, &mut buf) {
+            return None;
+        }
         // A main-file page enters the committed-view cache: the next
         // descent over this page is a RAM hit (the cache is the
         // coordinator's, and commits are serialized through its mutex).
@@ -389,6 +388,71 @@ impl<'a> PageReader<'a> {
         }
         cache.insert(pgno, buf.clone());
         Some(buf)
+    }
+
+    /// The borrow-returning twin of [`Self::read`]: same lookup order
+    /// (overlay → cache → file), but a hit is handed back as a REFERENCE
+    /// — the compare-then-maybe-insert publish sites used to clone a
+    /// 4 KiB page (heap alloc + memcpy) on every hit just to byte-
+    /// compare it and drop it. A file miss reads the page, admits it
+    /// into the committed-view cache ONCE, and returns a reference into
+    /// the cache (the old path made a second copy to return).
+    ///
+    /// The returned reference is tied ONLY to `overlay` and `cache`
+    /// (not `self`): callers must drop it before mutating either map,
+    /// but the reader itself is free as soon as the call returns.
+    fn read_ref<'o>(
+        &mut self,
+        pgno: u32,
+        page_size: u32,
+        overlay: &'o HashMap<u32, Vec<u8>>,
+        cache: &'o mut HashMap<u32, Vec<u8>>,
+    ) -> Option<&'o Vec<u8>> {
+        if let Some(p) = overlay.get(&pgno) {
+            READER_OVERLAY_HITS.fetch_add(1, Relaxed);
+            return Some(p);
+        }
+        if cache.contains_key(&pgno) {
+            READER_CACHE_HITS.fetch_add(1, Relaxed);
+            return cache.get(&pgno);
+        }
+        let mut buf = vec![0u8; page_size as usize];
+        if !self.fill_from_file(pgno, page_size, &mut buf) {
+            return None;
+        }
+        // A main-file page enters the committed-view cache (see
+        // [`Self::read`]); the reference handed back points into it.
+        if cache.len() >= PAGE_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(pgno, buf);
+        cache.get(&pgno)
+    }
+
+    /// The file-read tail shared by [`Self::read`] and [`Self::read_ref`]:
+    /// lazily open the main file, seek to the page, read it into `buf`.
+    /// False = the read failed (the page is not part of the committed
+    /// view, or an I/O error struck).
+    fn fill_from_file(&mut self, pgno: u32, page_size: u32, buf: &mut Vec<u8>) -> bool {
+        use std::io::{Read, Seek};
+        if self.file.is_none() {
+            READER_FILE_OPENS.fetch_add(1, Relaxed);
+            match std::fs::File::open(self.path) {
+                Ok(f) => self.file = Some(f),
+                Err(_) => return false,
+            }
+        }
+        READER_FILE_READS.fetch_add(1, Relaxed);
+        let Some(file) = self.file.as_mut() else {
+            return false;
+        };
+        let off = (pgno as u64 - 1) * page_size as u64;
+        if file.seek(std::io::SeekFrom::Start(off)).is_err() {
+            return false;
+        }
+        buf.clear();
+        buf.resize(page_size as usize, 0);
+        file.read_exact(buf).is_ok()
     }
 }
 
@@ -1024,8 +1088,10 @@ impl Container {
             } = out;
             // Only pages whose bytes actually differ enter the commit set.
             for (pgno, bytes) in out_pages {
-                match reader.read(pgno, ps, &st.overlay, &mut cache) {
-                    Some(old) if old == bytes => {}
+                // Borrow-compare: a hit is never cloned (the old path
+                // copied 4 KiB per touched page just to compare it).
+                match reader.read_ref(pgno, ps, &st.overlay, &mut cache) {
+                    Some(old) if old.as_slice() == bytes.as_slice() => {}
                     _ => {
                         changed.insert(pgno, bytes);
                     }
@@ -1100,8 +1166,8 @@ impl Container {
             // set (identical rebuilds — a failed-but-restored statement
             // bumped the epoch — cost nothing).
             for (pgno, bytes) in &build.pages {
-                match reader.read(*pgno, ps, &st.overlay, &mut cache) {
-                    Some(old) if &old == bytes => {}
+                match reader.read_ref(*pgno, ps, &st.overlay, &mut cache) {
+                    Some(old) if old == bytes => {}
                     _ => {
                         changed.insert(*pgno, bytes.clone());
                     }
@@ -1180,8 +1246,8 @@ impl Container {
             let build = splice_schema_tree(ps, reuse, st.n_pages + 1, &cells, st.text_enc)
                 .map_err(SpliceError::Other)?;
             for (pgno, bytes) in &build.pages {
-                match reader.read(*pgno, ps, &st.overlay, &mut cache) {
-                    Some(old) if &old == bytes => {}
+                match reader.read_ref(*pgno, ps, &st.overlay, &mut cache) {
+                    Some(old) if old == bytes => {}
                     _ => {
                         changed.insert(*pgno, bytes.clone());
                     }
@@ -1237,8 +1303,8 @@ impl Container {
             let free_vec: Vec<u32> = st.free.iter().copied().collect();
             let fl = build_freelist(&free_vec, ps);
             for (pgno, bytes) in &fl.pages {
-                match reader.read(*pgno, ps, &st.overlay, &mut cache) {
-                    Some(old) if &old == bytes => {}
+                match reader.read_ref(*pgno, ps, &st.overlay, &mut cache) {
+                    Some(old) if old == bytes => {}
                     _ => {
                         changed.insert(*pgno, bytes.clone());
                     }
@@ -1345,12 +1411,17 @@ impl Container {
             let db_size = st.n_pages;
             let mut writer = st.wal.take().unwrap_or_else(|| WalWriter::new(ps, 0));
             let pre_len = writer.wal_len();
-            let bytes = writer.encode_commit(&frames, db_size);
+            let mut scratch = std::mem::take(&mut st.commit_scratch);
+            writer.encode_commit_into(&mut scratch, &frames, db_size);
             let wal_path = wal_path_of(&self.path);
             // The append fsyncs only under synchronous=FULL/EXTRA.
             let sync = params.synchronous >= 2;
-            append_wal_cached(&mut st, &wal_path, &writer, pre_len, &bytes, sync)
-                .map_err(SpliceError::Other)?;
+            let append_r = append_wal_cached(&mut st, &wal_path, &writer, pre_len, &scratch, sync);
+            // Hand the buffer back even on error: the capacity is the
+            // point (one Vec for the coordinator's life), the bytes are
+            // already consumed by the append attempt.
+            st.commit_scratch = scratch;
+            append_r.map_err(SpliceError::Other)?;
             for (pgno, page) in &frames {
                 st.overlay.insert(*pgno, page.clone());
                 // Page ownership moves to the overlay (the sidecar is
