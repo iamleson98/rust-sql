@@ -1651,3 +1651,14 @@ Work Log:
 Stage Summary:
 - The per-commit fixed cost round is complete and CORRECT: raw leaf patch/split paths (no cell-model decode/encode, no per-cell allocs), the O(1) freelist cache on no-move commits, run-coalesced checkpoint pwrite — with the two WIP corruption bugs root-caused and fixed (both pinned by existing suites).
 - The macOS bench row's loss profile (per-commit overhead) is directly targeted: autocommit insert cost halved locally; CI's macOS bench-gate is the verdict.
+
+---
+Task ID: 73-ci
+Agent: main (Super Z)
+Task: Track c840d9d's CI run to the verdict.
+
+Work Log:
+- CI run 36998996963 on c840d9d: COMPLETED / SUCCESS — 32/32 jobs green on all three OSes, including the round's target: bench-gate (macos-latest) GREEN (the INSERT multi-VALUES 100/batch row that drew 0.57x on d76bbb9), bench-gate (ubuntu/windows), every test matrix (default/sqlx/no-default x3 OSes), limit-stress on all three OSes, torture, million-record compare, sqlite file interop, oom-injection, and the compat-ABI job.
+
+Stage Summary:
+- The per-commit fixed-cost round is landed and fully green; the bench board on this run had no losses. Master is at c840d9d.
