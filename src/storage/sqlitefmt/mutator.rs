@@ -128,6 +128,27 @@ impl From<&str> for MutateFallback {
 type MResult<T> = Result<T, MutateFallback>;
 
 // ---------------------------------------------------------------------------
+// Mutator instrumentation (per-commit cost anatomy): counters at the
+// fast-path decision points, the src reads and the model fallbacks.
+// Read by the per-commit probes; always-on (one atomic add each).
+// ---------------------------------------------------------------------------
+pub static MUT_SRC_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MUT_SRC_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MUT_RAW_TABLE_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MUT_RAW_TABLE_FALLBACK: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static MUT_RAW_INDEX_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MUT_RAW_INDEX_FALLBACK: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static MUT_MODEL_LEAF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MUT_SPLITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MUT_TABLE_OP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MUT_TABLE_LEAF_RAW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MUT_TABLE_LEAF_MODEL_MAP: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static MUT_DESC_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// ---------------------------------------------------------------------------
 // The session
 // ---------------------------------------------------------------------------
 
@@ -459,6 +480,242 @@ fn fits(ptype: u8, cells: &[MutCell], usable: usize) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// RAW LEAF FAST PATHS
+//
+// The common autocommit commit touches ONE leaf of each tree with a
+// cell that fits — but the cell-model path pays decode_page +
+// encode_page, ONE ALLOCATION PER CELL, on that leaf (an index leaf
+// packs ~300 entries at 4 KiB). These paths patch the leaf's RAW
+// bytes instead: an insert grows the content area down (one small
+// memmove for the pointer array + the new cell's bytes — SQLite's own
+// insertCell discipline), a delete/replace compacts the surviving
+// cells in one pass (one page-sized allocation, no per-cell allocs).
+// Anything structurally richer — a split needed, an overflow chain on
+// the NEW cell, a verify that needs chain assembly — returns None and
+// the caller takes the cell-model path unchanged.
+//
+// A full leaf plus one new cell (the canonical first-touch shape after
+// a dense build) takes the RAW 2-WAY SPLIT below before falling back:
+// the same arithmetic `plan_leaf_runs` runs, over extents instead of
+// decoded cells.
+// ---------------------------------------------------------------------------
+
+/// A/B kill switch: `RSQL_NO_RAW_FAST=1` disables the raw-leaf fast
+/// paths (every op takes the cell-model path) for benchmarking.
+fn raw_fast_disabled() -> bool {
+    static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *D.get_or_init(|| std::env::var_os("RSQL_NO_RAW_FAST").is_some())
+}
+
+/// A/B kill switch for the RAW 2-way leaf SPLIT alone (the other raw
+/// fast paths stay on): `RSQL_NO_RAW_SPLIT=1`.
+fn raw_split_disabled() -> bool {
+    static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *D.get_or_init(|| std::env::var_os("RSQL_NO_RAW_SPLIT").is_some())
+}
+
+/// A leaf page's raw geometry (parsed once; validated).
+struct RawLeaf {
+    /// Cell count (header bytes 3..5).
+    n: usize,
+    /// Cell content start (bytes 5..7; 0 means 65536).
+    content: usize,
+    /// The cell-pointer array's first byte (8 for both leaf kinds).
+    array: usize,
+}
+
+/// Parse a leaf's geometry; `None` on anything malformed.
+fn raw_leaf(raw: &[u8]) -> Option<RawLeaf> {
+    if raw.len() < 8 {
+        return None;
+    }
+    let ptype = raw[0];
+    if ptype != 0x0d && ptype != 0x0a {
+        return None;
+    }
+    let n = u16::from_be_bytes([raw[3], raw[4]]) as usize;
+    let mut content = u16::from_be_bytes([raw[5], raw[6]]) as usize;
+    if content == 0 {
+        content = 65536;
+    }
+    let array = 8usize;
+    if array + n * 2 > content || content > raw.len() {
+        return None;
+    }
+    Some(RawLeaf { n, content, array })
+}
+
+/// Insert `cell` at pointer position `pos` on a CLEAN leaf (no
+/// freeblocks, no fragments): existing cells never move — the content
+/// area grows down by the cell's length. `None` when the leaf is
+/// dirty (freeblock list present — the space math would be wrong) or
+/// the cell does not fit (the caller takes the split path).
+fn raw_leaf_grow_insert(raw: &[u8], leaf: &RawLeaf, pos: usize, cell: &[u8]) -> Option<Vec<u8>> {
+    if u16::from_be_bytes([raw[1], raw[2]]) != 0 || raw[7] != 0 {
+        return None; // freeblocks/fragments: not a clean leaf
+    }
+    let l = cell.len();
+    let new_content = leaf.content.checked_sub(l)?;
+    if new_content < leaf.array + (leaf.n + 1) * 2 {
+        return None; // does not fit — split
+    }
+    let mut page = raw.to_vec();
+    // Pointer array: shift [pos, n) up one slot, install the new entry.
+    let (dst, src) = (leaf.array + (pos + 1) * 2, leaf.array + pos * 2);
+    page.copy_within(src..src + (leaf.n - pos) * 2, dst);
+    page[leaf.array + pos * 2..leaf.array + pos * 2 + 2]
+        .copy_from_slice(&(new_content as u16).to_be_bytes());
+    // Header: count +1, content start moved down.
+    page[3..5].copy_from_slice(&((leaf.n + 1) as u16).to_be_bytes());
+    let cs = if new_content >= 65536 {
+        0u16
+    } else {
+        new_content as u16
+    };
+    page[5..7].copy_from_slice(&cs.to_be_bytes());
+    page[new_content..new_content + l].copy_from_slice(cell);
+    Some(page)
+}
+
+/// Compact rebuild of a leaf: `skip` one pointer position, insert
+/// `cell` at `ins`, or both (a replace). Surviving cells are copied
+/// in one pass into a fresh dense page — bottom-up packing (cell 0 at
+/// the lowest content offset; a valid layout to every SQLite reader),
+/// freeblocks and fragments dropped — with no per-cell allocation.
+/// `None` when the result would not fit a page.
+fn raw_leaf_rebuild(
+    raw: &[u8],
+    leaf: &RawLeaf,
+    skip: Option<usize>,
+    ins: Option<(usize, &[u8])>,
+    usable: usize,
+) -> Option<Vec<u8>> {
+    if raw.len() < usable {
+        return None;
+    }
+    let new_n = leaf.n + ins.is_some() as usize - skip.is_some() as usize;
+    // Extent of every surviving cell (one varint parse each; no alloc).
+    let extent_of = |i: usize| -> Option<usize> {
+        let cp =
+            u16::from_be_bytes([raw[leaf.array + i * 2], raw[leaf.array + i * 2 + 1]]) as usize;
+        cell_extent(raw, cp, usable).ok()
+    };
+    let mut total = 0usize;
+    for i in 0..leaf.n {
+        if Some(i) == skip {
+            continue;
+        }
+        total += extent_of(i)?;
+    }
+    let ins_len = ins.as_ref().map(|(_, c)| c.len()).unwrap_or(0);
+    if leaf.array + new_n * 2 + total + ins_len > usable {
+        return None; // does not fit — split
+    }
+    let mut page = vec![0u8; usable];
+    page[0] = raw[0];
+    page[3..5].copy_from_slice(&(new_n as u16).to_be_bytes());
+    let content = usable - total - ins_len;
+    let cs = if content >= 65536 {
+        0u16
+    } else {
+        content as u16
+    };
+    page[5..7].copy_from_slice(&cs.to_be_bytes());
+    // Pointer slots + content offsets in one ascending walk. The
+    // insert fires when the walk REACHES its slot — checked BEFORE the
+    // cell copy (an insert at slot 0, or at the slot a same-position
+    // skip vacated, must land before the first copied cell; a
+    // check-after-copy could never fire for slot 0 and would silently
+    // drop the cell, leaving the top pointer zeroed).
+    let ins_at = ins.map(|(at, _)| at);
+    let mut off = content;
+    let mut slot = 0usize;
+    for i in 0..leaf.n {
+        if Some(i) == skip {
+            continue;
+        }
+        if Some(slot) == ins_at {
+            let (_, cell) = ins.expect("ins_at implies ins");
+            page[leaf.array + slot * 2..leaf.array + slot * 2 + 2]
+                .copy_from_slice(&(off as u16).to_be_bytes());
+            page[off..off + cell.len()].copy_from_slice(cell);
+            off += cell.len();
+            slot += 1;
+        }
+        let cp =
+            u16::from_be_bytes([raw[leaf.array + i * 2], raw[leaf.array + i * 2 + 1]]) as usize;
+        let extent = extent_of(i)?;
+        page[leaf.array + slot * 2..leaf.array + slot * 2 + 2]
+            .copy_from_slice(&(off as u16).to_be_bytes());
+        page[off..off + extent].copy_from_slice(&raw[cp..cp + extent]);
+        off += extent;
+        slot += 1;
+    }
+    // Insert at the END (a trailing insert or a replace-at-tail).
+    if Some(slot) == ins_at {
+        let (_, cell) = ins.expect("ins_at implies ins");
+        page[leaf.array + slot * 2..leaf.array + slot * 2 + 2]
+            .copy_from_slice(&(off as u16).to_be_bytes());
+        page[off..off + cell.len()].copy_from_slice(cell);
+        off += cell.len();
+        slot += 1;
+    }
+    debug_assert_eq!(slot, new_n, "rebuild slot accounting");
+    debug_assert_eq!(off, usable, "rebuild content accounting");
+    Some(page)
+}
+
+/// Build a dense page of the given type from `cells` (the same
+/// bottom-up packing discipline as `raw_leaf_rebuild`; valid to every
+/// SQLite reader). `right_most` lands in bytes 8..12 for interior
+/// types. `None` when the cells do not fit.
+fn dense_page(ptype: u8, cells: &[&[u8]], usable: usize, right_most: u32) -> Option<Vec<u8>> {
+    let hdr: usize = if matches!(ptype, 0x05 | 0x02) { 12 } else { 8 };
+    let total: usize = cells.iter().map(|c| c.len()).sum();
+    if hdr + 2 * cells.len() + total > usable {
+        return None;
+    }
+    let mut page = vec![0u8; usable];
+    page[0] = ptype;
+    page[3..5].copy_from_slice(&(cells.len() as u16).to_be_bytes());
+    let content = usable - total;
+    let cs = if content >= 65536 {
+        0u16
+    } else {
+        content as u16
+    };
+    page[5..7].copy_from_slice(&cs.to_be_bytes());
+    if hdr == 12 {
+        page[8..12].copy_from_slice(&right_most.to_be_bytes());
+    }
+    let mut off = content;
+    for (i, c) in cells.iter().enumerate() {
+        page[hdr + i * 2..hdr + i * 2 + 2].copy_from_slice(&(off as u16).to_be_bytes());
+        page[off..off + c.len()].copy_from_slice(c);
+        off += c.len();
+    }
+    Some(page)
+}
+
+/// The payload slice of an IN-PAGE table-leaf cell at pointer
+/// position `pos` (`None` when the cell overflows — chain assembly
+/// is the model path's job).
+fn inpage_table_payload<'r>(
+    raw: &'r [u8],
+    leaf: &RawLeaf,
+    pos: usize,
+    usable: usize,
+) -> Option<&'r [u8]> {
+    let cp =
+        u16::from_be_bytes([raw[leaf.array + pos * 2], raw[leaf.array + pos * 2 + 1]]) as usize;
+    let (total, l1) = read_varint(raw, cp)?;
+    let (_, l2) = read_varint(raw, cp + l1)?;
+    let at = cp + l1 + l2;
+    let total = total as usize;
+    (total <= table_x(usable)).then(|| &raw[at..at + total])
+}
+
+// ---------------------------------------------------------------------------
 // Mutator core
 // ---------------------------------------------------------------------------
 
@@ -506,13 +763,18 @@ impl<'a> Mutator<'a> {
     /// the session, and re-cloning them per op is the mutator's single
     /// biggest fixed cost.
     fn raw(&mut self, pgno: u32) -> MResult<Vec<u8>> {
+        use std::sync::atomic::Ordering::Relaxed;
         if let Some(bytes) = self.raw_pages.get(&pgno) {
+            MUT_DESC_READS.fetch_add(1, Relaxed);
             return Ok(bytes.clone());
         }
         if let Some(bytes) = self.desc_raw.get(&pgno) {
+            MUT_DESC_READS.fetch_add(1, Relaxed);
             return Ok(bytes.clone());
         }
         if let Some(bytes) = (self.src)(pgno) {
+            MUT_SRC_CALLS.fetch_add(1, Relaxed);
+            MUT_SRC_BYTES.fetch_add(bytes.len() as u64, Relaxed);
             self.desc_raw.insert(pgno, bytes.clone());
             return Ok(bytes);
         }
@@ -791,6 +1053,7 @@ impl<'a> Mutator<'a> {
         if op.expect.is_none() && op.set.is_none() {
             return Ok(());
         }
+        MUT_TABLE_OP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // ---- Descent ----
         // Interior pages take the RAW binary-search path (no cell-model
         // decode — one allocation per cell is a cost a descent never
@@ -803,7 +1066,10 @@ impl<'a> Mutator<'a> {
             if let Some(pc) = self.pages.get(&pgno) {
                 let ptype = pc.ptype;
                 match ptype {
-                    0x0d => break (self.pages.remove(&pgno).expect("just checked"), 0x0du8),
+                    0x0d => {
+                        MUT_TABLE_LEAF_MODEL_MAP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        break (self.pages.remove(&pgno).expect("just checked"), 0x0du8);
+                    }
                     0x05 => {
                         let mut child = pc.right_most;
                         for c in &pc.cells {
@@ -826,6 +1092,20 @@ impl<'a> Mutator<'a> {
             let raw = self.raw(pgno)?;
             match raw[0] {
                 0x0d => {
+                    // RAW fast path first: the common one-cell patch
+                    // never enters the cell model. `None` = structurally
+                    // richer — the model path below handles it unchanged.
+                    MUT_TABLE_LEAF_RAW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if !raw_fast_disabled() {
+                        if let Some(r) =
+                            self.try_raw_table_leaf(pgno, &raw, &op, path.last().copied())
+                        {
+                            MUT_RAW_TABLE_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return r;
+                        }
+                        MUT_RAW_TABLE_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    MUT_MODEL_LEAF.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let pc = decode_page(pgno, &raw, self.usable).map_err(MutateFallback)?;
                     break (pc, 0x0du8);
                 }
@@ -1222,6 +1502,7 @@ impl<'a> Mutator<'a> {
         node: PageCells,
         ptype: u8,
     ) -> MResult<()> {
+        MUT_SPLITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let index_tree = matches!(ptype, 0x0a | 0x02);
         let is_root = path.is_empty();
 
@@ -1463,6 +1744,519 @@ impl<'a> Mutator<'a> {
         Ok((lo, exact, child))
     }
 
+    /// Binary-search a raw table leaf for `rowid`: the first pointer
+    /// position whose rowid >= it (probes parse only the two leading
+    /// varints). `Err` propagates a malformed cell; overflow cells are
+    /// fine (the rowid precedes the payload).
+    fn raw_table_leaf_pos(raw: &[u8], leaf: &RawLeaf, rowid: i64) -> MResult<usize> {
+        let cell_rowid = |i: usize| -> MResult<i64> {
+            let cp =
+                u16::from_be_bytes([raw[leaf.array + i * 2], raw[leaf.array + i * 2 + 1]]) as usize;
+            let (_, l1) =
+                read_varint(raw, cp).ok_or_else(|| MutateFallback("bad cell varint".into()))?;
+            let (rid, _) = read_varint(raw, cp + l1)
+                .ok_or_else(|| MutateFallback("bad rowid varint".into()))?;
+            Ok(rid)
+        };
+        let (mut lo, mut hi) = (0usize, leaf.n);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if rowid <= cell_rowid(mid)? {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        Ok(lo)
+    }
+
+    /// The raw table-leaf op fast path (see the section comment).
+    /// `None` = structurally inapplicable (fall back to the cell
+    /// model); `Some(Err)` = a JOURNAL verify failure (stale journal —
+    /// propagate, never fall back); `Some(Ok)` = the leaf is patched
+    /// into `raw_pages`.
+    fn try_raw_table_leaf(
+        &mut self,
+        pgno: u32,
+        raw: &[u8],
+        op: &TableRowOp,
+        parent: Option<u32>,
+    ) -> Option<MResult<()>> {
+        let leaf = raw_leaf(raw)?;
+        let pos = match Self::raw_table_leaf_pos(raw, &leaf, op.rowid) {
+            Ok(p) => p,
+            Err(e) => return Some(Err(e)),
+        };
+        let present = pos < leaf.n && {
+            let cp = u16::from_be_bytes([raw[leaf.array + pos * 2], raw[leaf.array + pos * 2 + 1]])
+                as usize;
+            read_varint(raw, cp).and_then(|(_, l1)| read_varint(raw, cp + l1).map(|(r, _)| r))
+                == Some(op.rowid)
+        };
+        match (&op.expect, &op.set) {
+            (None, None) => Some(Ok(())),
+            (None, Some(rec)) => {
+                if present {
+                    return Some(Err(format!(
+                        "insert: rowid {} already present (stale journal?)",
+                        op.rowid
+                    )
+                    .into()));
+                }
+                // New cells needing an overflow chain take the model
+                // path (chain pages must be allocated).
+                let c = make_table_leaf_cell(self.usable, op.rowid, rec);
+                if c.ptr_pos.is_some() {
+                    return None;
+                }
+                let patched = match raw_leaf_grow_insert(raw, &leaf, pos, &c.head) {
+                    Some(p) => p,
+                    // Full leaf: the RAW 2-way split (the canonical
+                    // first-touch shape after a dense build) before the
+                    // model fallback.
+                    None => {
+                        if !raw_split_disabled() {
+                            return self.try_raw_leaf_split(
+                                pgno, raw, &leaf, pos, &c.head, false, parent, op.rowid,
+                            );
+                        }
+                        return None;
+                    }
+                };
+                self.raw_pages.insert(pgno, patched);
+                self.touched.insert(pgno);
+                self.max_page = self.max_page.max(pgno);
+                Some(Ok(()))
+            }
+            (Some(old), new) => {
+                if !present {
+                    return Some(Err(format!(
+                        "update/delete: rowid {} absent (stale journal?)",
+                        op.rowid
+                    )
+                    .into()));
+                }
+                let found = inpage_table_payload(raw, &leaf, pos, self.usable)?;
+                if found != old.as_slice() {
+                    return Some(Err(format!(
+                        "update/delete: rowid {} record mismatch (stale journal?)",
+                        op.rowid
+                    )
+                    .into()));
+                }
+                // A delete that would EMPTY the leaf takes the model
+                // path: the model prunes empty table leaves (releasing
+                // the page + patching the parent) — an un-pruned empty
+                // leaf left mid-tree violates the discipline later ops
+                // and the whole-object rebuilds rely on.
+                if new.is_none() && leaf.n == 1 {
+                    return None;
+                }
+                let old_extent = {
+                    let cp = u16::from_be_bytes([
+                        raw[leaf.array + pos * 2],
+                        raw[leaf.array + pos * 2 + 1],
+                    ]) as usize;
+                    match cell_extent(raw, cp, self.usable) {
+                        Ok(e) => e,
+                        Err(e) => return Some(Err(e.into())),
+                    }
+                };
+                match new {
+                    None => {
+                        // In-page verify means no chain to free.
+                        let patched = raw_leaf_rebuild(raw, &leaf, Some(pos), None, self.usable)?;
+                        self.raw_pages.insert(pgno, patched);
+                        self.touched.insert(pgno);
+                        self.max_page = self.max_page.max(pgno);
+                        Some(Ok(()))
+                    }
+                    Some(rec) => {
+                        let c = make_table_leaf_cell(self.usable, op.rowid, rec);
+                        if c.ptr_pos.is_some() {
+                            return None;
+                        }
+                        if c.head.len() == old_extent {
+                            // Same-extent replace: patch the cell's
+                            // bytes in place; nothing moves.
+                            let cp = u16::from_be_bytes([
+                                raw[leaf.array + pos * 2],
+                                raw[leaf.array + pos * 2 + 1],
+                            ]) as usize;
+                            let mut page = raw.to_vec();
+                            page[cp..cp + c.head.len()].copy_from_slice(&c.head);
+                            self.raw_pages.insert(pgno, page);
+                            self.touched.insert(pgno);
+                            self.max_page = self.max_page.max(pgno);
+                            Some(Ok(()))
+                        } else {
+                            let patched = raw_leaf_rebuild(
+                                raw,
+                                &leaf,
+                                Some(pos),
+                                Some((pos, &c.head)),
+                                self.usable,
+                            )?;
+                            self.raw_pages.insert(pgno, patched);
+                            self.touched.insert(pgno);
+                            self.max_page = self.max_page.max(pgno);
+                            Some(Ok(()))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Binary-search a raw index leaf for `key`: the first pointer
+    /// position whose entry >= it (each probe decodes one record;
+    /// overflow entries assemble through `raw`, exactly like
+    /// `raw_index_probe`). Returns `(pos, exact)`.
+    fn raw_entry_leaf_pos(
+        &mut self,
+        raw: &[u8],
+        leaf: &RawLeaf,
+        order: &EntryOrder,
+        key: &[Value],
+    ) -> MResult<(usize, bool)> {
+        let mut lo = 0usize;
+        let mut hi = leaf.n;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let cp = u16::from_be_bytes([raw[leaf.array + mid * 2], raw[leaf.array + mid * 2 + 1]])
+                as usize;
+            let cell = &raw[cp..];
+            let payload = self.index_payload(cell, false)?;
+            let mv = decode_record_all_enc(&payload, self.enc).map_err(MutateFallback)?;
+            match self.cmp_entries(order, &mv, key) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Equal => return Ok((mid, true)),
+                std::cmp::Ordering::Greater => hi = mid,
+            }
+        }
+        Ok((lo, false))
+    }
+
+    /// The raw index-leaf insert fast path (see the section comment).
+    fn try_raw_entry_leaf_insert(
+        &mut self,
+        pgno: u32,
+        raw: &[u8],
+        order: &EntryOrder,
+        key: &[Value],
+        parent: Option<u32>,
+    ) -> Option<MResult<()>> {
+        let leaf = raw_leaf(raw)?;
+        let (pos, exact) = match self.raw_entry_leaf_pos(raw, &leaf, order, key) {
+            Ok(p) => p,
+            Err(e) => return Some(Err(e)),
+        };
+        if exact {
+            return Some(Err(
+                "index insert: key already present (leaf, stale journal?)".into(),
+            ));
+        }
+        // Chain-bearing new entries take the model path.
+        let c = make_index_cell(self.usable, key, self.enc);
+        if c.ptr_pos.is_some() {
+            return None;
+        }
+        let patched = match raw_leaf_grow_insert(raw, &leaf, pos, &c.head) {
+            Some(p) => p,
+            // Full leaf: the RAW 2-way split before the model fallback
+            // (same rationale as the table path).
+            None => {
+                if !raw_split_disabled() {
+                    return self
+                        .try_raw_leaf_split(pgno, raw, &leaf, pos, &c.head, true, parent, 0);
+                }
+                return None;
+            }
+        };
+        self.raw_pages.insert(pgno, patched);
+        self.touched.insert(pgno);
+        self.max_page = self.max_page.max(pgno);
+        Some(Ok(()))
+    }
+
+    /// The raw index-leaf delete fast path (see the section comment).
+    /// Index trees NEVER prune empty leaves (the model's own
+    /// discipline — the parent's separator must survive), so an
+    /// emptying delete stays on the raw path.
+    fn try_raw_entry_leaf_delete(
+        &mut self,
+        pgno: u32,
+        raw: &[u8],
+        order: &EntryOrder,
+        key: &[Value],
+        expect_enc: &[u8],
+    ) -> Option<MResult<()>> {
+        let leaf = raw_leaf(raw)?;
+        let (pos, exact) = match self.raw_entry_leaf_pos(raw, &leaf, order, key) {
+            Ok(p) => p,
+            Err(e) => return Some(Err(e)),
+        };
+        if !exact {
+            return Some(Err("index delete: key absent (stale journal?)".into()));
+        }
+        // In-page verify only: an overflowing found entry needs chain
+        // assembly AND chain freeing — the model path's job.
+        let cp =
+            u16::from_be_bytes([raw[leaf.array + pos * 2], raw[leaf.array + pos * 2 + 1]]) as usize;
+        let (total, l1) = match read_varint(raw, cp) {
+            Some((t, l)) => (t as usize, l),
+            None => return Some(Err(MutateFallback("bad cell varint".into()))),
+        };
+        if total > index_x(self.usable) {
+            return None; // overflow entry — model path
+        }
+        if &raw[cp + l1..cp + l1 + total] != expect_enc {
+            return Some(Err(
+                "index delete: entry bytes mismatch (stale journal?)".into()
+            ));
+        }
+        let patched = raw_leaf_rebuild(raw, &leaf, Some(pos), None, self.usable)?;
+        self.raw_pages.insert(pgno, patched);
+        self.touched.insert(pgno);
+        self.max_page = self.max_page.max(pgno);
+        Some(Ok(()))
+    }
+
+    /// The RAW 2-way leaf split (see the section comment). A full leaf
+    /// plus one new in-page cell is the canonical first-touch shape
+    /// after a dense build; the model path pays decode_page (one
+    /// allocation per cell — a leaf packs hundreds) to run the very
+    /// same arithmetic this path runs over extents. The plan replicates
+    /// `plan_leaf_runs`' 2-way discipline EXACTLY (first strictly
+    /// minimal imbalance wins; both sides must fit; index trees push
+    /// the boundary cell up, table trees copy the left side's max
+    /// rowid), and the parent patch replicates `split_node`'s
+    /// propagation for the 2-run case: the old pair is replaced by
+    /// [left pair, right pair] (the last run re-pairs with the old
+    /// separator), or — when the split page is the parent's right-most
+    /// — the left pair appends and the right page becomes right-most.
+    /// `None` = anything richer (root split, no 2-way point, parent
+    /// full, session-decoded parent, overflow on the new cell): the
+    /// model path handles it unchanged.
+    #[allow(clippy::too_many_arguments)]
+    fn try_raw_leaf_split(
+        &mut self,
+        pgno: u32,
+        raw: &[u8],
+        leaf: &RawLeaf,
+        pos: usize,
+        cell: &[u8],
+        index_tree: bool,
+        parent_pgno: Option<u32>,
+        new_rowid: i64,
+    ) -> Option<MResult<()>> {
+        // ---- Parent preconditions (checked before anything allocates) ----
+        let parent = parent_pgno?;
+        if self.pages.contains_key(&parent) {
+            return None; // session-decoded parent: the model map is authoritative
+        }
+        let praw = match self.raw(parent) {
+            Ok(p) => p,
+            Err(e) => return Some(Err(e)),
+        };
+        let want: u8 = if index_tree { 0x02 } else { 0x05 };
+        if praw.first() != Some(&want) || praw.len() < 12 {
+            return None;
+        }
+        let pn = u16::from_be_bytes([praw[3], praw[4]]) as usize;
+        let mut pcontent = u16::from_be_bytes([praw[5], praw[6]]) as usize;
+        if pcontent == 0 {
+            pcontent = 65536;
+        }
+        if 12 + pn * 2 > pcontent || pcontent > praw.len() {
+            return None;
+        }
+        let p_right_most = u32::from_be_bytes([praw[8], praw[9], praw[10], praw[11]]);
+        // The parent cell referencing pgno (interior cells open with
+        // the left-child page number).
+        let ptr = |i: usize| -> usize {
+            u16::from_be_bytes([praw[12 + i * 2], praw[13 + i * 2]]) as usize
+        };
+        let usable = self.usable;
+        let pext = |i: usize| -> Option<usize> { cell_extent(&praw, ptr(i), usable).ok() };
+        let mut idx = None;
+        for i in 0..pn {
+            let cp = ptr(i);
+            if praw.get(cp..cp + 4) == Some(&pgno.to_be_bytes()[..]) {
+                idx = Some(i);
+                break;
+            }
+        }
+        let idx = idx?;
+        let rightmost_case = p_right_most == pgno;
+        if !rightmost_case && idx + 1 == pn {
+            return None; // the pair past the last cell: inconsistent
+        }
+
+        // ---- Combined cell list (old cells + the new one at `pos`) ----
+        let n = leaf.n;
+        let big = n + 1;
+        let cp_of = |i: usize| -> usize {
+            u16::from_be_bytes([raw[leaf.array + i * 2], raw[leaf.array + i * 2 + 1]]) as usize
+        };
+        // Per-position extent; `pos` is the new cell.
+        let mut ext: Vec<usize> = Vec::with_capacity(big);
+        for p in 0..big {
+            if p == pos {
+                ext.push(cell.len());
+            } else {
+                let oi = if p < pos { p } else { p - 1 };
+                ext.push(cell_extent(raw, cp_of(oi), usable).ok()?);
+            }
+        }
+        let mut prefix: Vec<usize> = Vec::with_capacity(big + 1);
+        prefix.push(0);
+        for p in 0..big {
+            prefix.push(prefix[p] + ext[p]);
+        }
+        let total = prefix[big];
+        // The combined cell at position `p` (borrowed from `raw` or the
+        // new cell) and its rowid.
+        let cell_bytes = |p: usize| -> Option<&[u8]> {
+            if p == pos {
+                return Some(cell);
+            }
+            let oi = if p < pos { p } else { p - 1 };
+            let cp = cp_of(oi);
+            Some(&raw[cp..cp + ext[p]])
+        };
+        let cell_rowid = |p: usize| -> Option<i64> {
+            if p == pos {
+                return Some(new_rowid);
+            }
+            let oi = if p < pos { p } else { p - 1 };
+            let cp = cp_of(oi);
+            let (_, l1) = read_varint(raw, cp)?;
+            let (rid, _) = read_varint(raw, cp + l1)?;
+            Some(rid)
+        };
+
+        // ---- The 2-way plan (plan_leaf_runs' exact discipline) ----
+        let fits = |bytes: usize, count: usize| bytes + 8 + 2 * count <= usable;
+        let (cut, table_sep, index_boundary) = if index_tree {
+            // Balanced 2-way with the boundary cell pushed up: left
+            // keeps [0..b), right [b+1..big); both non-empty.
+            let mut best: Option<(usize, usize)> = None; // (b, imbalance)
+            for b in 1..big.saturating_sub(1) {
+                let left = prefix[b];
+                let right = total - prefix[b + 1];
+                if !fits(left, b) || !fits(right, big - b - 1) {
+                    continue;
+                }
+                let imb = (left as i64 - right as i64).unsigned_abs() as usize;
+                if !best.is_some_and(|(_, cur)| imb >= cur) {
+                    best = Some((b, imb));
+                }
+            }
+            let (b, _) = best?;
+            (b, 0i64, Some(cell_bytes(b)?.to_vec()))
+        } else {
+            let mut best: Option<(usize, usize)> = None; // (k, imbalance)
+            for (k, &left) in prefix.iter().enumerate().take(big).skip(1) {
+                let right = total - left;
+                if !fits(left, k) || !fits(right, big - k) {
+                    continue;
+                }
+                let imb = (left as i64 - right as i64).unsigned_abs() as usize;
+                if !best.is_some_and(|(_, cur)| imb >= cur) {
+                    best = Some((k, imb));
+                }
+            }
+            let (k, _) = best?;
+            (k, cell_rowid(k - 1)?, None)
+        };
+
+        // ---- Parent byte math (still before any allocation) ----
+        let old_cp = ptr(idx);
+        let old_extent = pext(idx)?;
+        if old_extent < 4 || old_cp + old_extent > praw.len() {
+            return None;
+        }
+        let old_bytes = &praw[old_cp..old_cp + old_extent];
+        // Table pairs: [u32 child][varint rowid]. Index pairs:
+        // [u32 child][entry bytes].
+        let mut pair_left: Vec<u8> = Vec::with_capacity(4 + 16);
+        pair_left.extend_from_slice(&pgno.to_be_bytes());
+        if index_tree {
+            pair_left.extend_from_slice(index_boundary.as_ref().expect("planned above"));
+        } else {
+            write_varint(&mut pair_left, table_sep);
+        }
+        // The patch: non-right-most replaces one pair with two (the
+        // right pair re-uses the old bytes with the child re-pointed —
+        // same extent); right-most appends the left pair. Either way
+        // the parent grows by pair_left and one cell pointer.
+        let mut ptotal = 0usize;
+        for i in 0..pn {
+            ptotal += pext(i)?;
+        }
+        if ptotal + pair_left.len() + 12 + 2 * (pn + 1) > usable {
+            return None; // the parent would overflow — the model path splits it upward
+        }
+
+        // ---- Materialize ----
+        let right = self.alloc();
+        let leaf_type: u8 = if index_tree { 0x0a } else { 0x0d };
+        // Left page: combined [0..cut) — for index trees the boundary
+        // cell at `cut` is pushed up, not kept.
+        let mut lrefs: Vec<&[u8]> = Vec::with_capacity(cut);
+        for p in 0..cut {
+            lrefs.push(cell_bytes(p)?);
+        }
+        // Right page: table [cut..big), index [cut+1..big).
+        let rstart = if index_tree { cut + 1 } else { cut };
+        let mut rrefs: Vec<&[u8]> = Vec::with_capacity(big - rstart);
+        for p in rstart..big {
+            rrefs.push(cell_bytes(p)?);
+        }
+        if lrefs.is_empty() || rrefs.is_empty() {
+            return None; // both sides must be non-empty (mirrors the model)
+        }
+        let left_page = dense_page(leaf_type, &lrefs, usable, 0)?;
+        let right_page = dense_page(leaf_type, &rrefs, usable, 0)?;
+        // The patched parent.
+        let mut prefs: Vec<&[u8]> = Vec::with_capacity(pn + 1);
+        let mut pair_right: Vec<u8> = Vec::with_capacity(old_extent);
+        let new_right_most = if rightmost_case {
+            for i in 0..pn {
+                let cp = ptr(i);
+                prefs.push(&praw[cp..cp + pext(i)?]);
+            }
+            prefs.push(&pair_left);
+            right
+        } else {
+            pair_right.extend_from_slice(&right.to_be_bytes());
+            pair_right.extend_from_slice(&old_bytes[4..]);
+            for i in 0..pn {
+                if i == idx {
+                    prefs.push(&pair_left);
+                    prefs.push(&pair_right);
+                } else {
+                    let cp = ptr(i);
+                    prefs.push(&praw[cp..cp + pext(i)?]);
+                }
+            }
+            p_right_most
+        };
+        let parent_page = dense_page(want, &prefs, usable, new_right_most)?;
+
+        // ---- Install ----
+        MUT_SPLITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.raw_pages.insert(pgno, left_page);
+        self.raw_pages.insert(right, right_page);
+        self.raw_pages.insert(parent, parent_page);
+        self.touched.insert(pgno);
+        self.touched.insert(right);
+        self.touched.insert(parent);
+        self.max_page = self.max_page.max(pgno).max(right).max(parent);
+        Some(Ok(()))
+    }
+
     /// Insert one entry (assumed absent — verified during descent).
     fn entry_insert(&mut self, root: u32, order: &EntryOrder, key: &[Value]) -> MResult<()> {
         let mut path: Vec<u32> = Vec::new();
@@ -1476,6 +2270,23 @@ impl<'a> Mutator<'a> {
                 let raw = self.raw(pgno)?;
                 match raw[0] {
                     0x0a => {
+                        // RAW fast path first: the common one-entry patch
+                        // never enters the cell model.
+                        if !raw_fast_disabled() {
+                            if let Some(r) = self.try_raw_entry_leaf_insert(
+                                pgno,
+                                &raw,
+                                order,
+                                key,
+                                path.last().copied(),
+                            ) {
+                                MUT_RAW_INDEX_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                return r;
+                            }
+                            MUT_RAW_INDEX_FALLBACK
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        MUT_MODEL_LEAF.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let pc = decode_page(pgno, &raw, self.usable).map_err(MutateFallback)?;
                         break (pc, 0x0au8);
                     }
@@ -1591,6 +2402,18 @@ impl<'a> Mutator<'a> {
                     // Exact: fall through to the model path below
                     // (take_page decodes, the model search re-finds the
                     // pair, the successor replacement runs).
+                } else if raw[0] == 0x0a {
+                    // RAW fast path first: the common one-entry delete
+                    // never enters the cell model.
+                    if !raw_fast_disabled() {
+                        if let Some(r) =
+                            self.try_raw_entry_leaf_delete(pgno, &raw, order, key, &expect_enc)
+                        {
+                            MUT_RAW_INDEX_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return r;
+                        }
+                        MUT_RAW_INDEX_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 } else if raw[0] != 0x0a {
                     return Err(
                         format!("index descent: page {pgno} has type 0x{:02x}", raw[0]).into(),
@@ -1756,6 +2579,19 @@ impl<'a> Mutator<'a> {
     /// `root`, then produce the outcome (touched pages + exact span /
     /// freelist accounting).
     pub fn run(mut self, root: u32, ops: MutateOps) -> MResult<MutateOutcome> {
+        // DEBUG (bug hunt): `RSQL_FORCE_DECLINE=ix` declines every
+        // index-shaped session — reproduces mixed mutate+splice commits
+        // with the raw paths disabled.
+        if let Some(list) = std::env::var_os("RSQL_FORCE_DECLINE") {
+            let list = list.to_string_lossy().to_string();
+            let hit = match &ops {
+                MutateOps::Table(_) => list.contains("tbl"),
+                MutateOps::Entries(_, _) => list.contains("ix"),
+            };
+            if hit {
+                return Err("forced decline (debug)".into());
+            }
+        }
         match ops {
             MutateOps::Table(ops) => {
                 for op in ops {

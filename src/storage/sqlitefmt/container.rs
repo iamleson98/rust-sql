@@ -206,6 +206,23 @@ pub struct ContainerState {
     /// journal-mode switches — everything that rewrites or retires the
     /// sidecar.
     wal_io: Option<FileIo>,
+    /// Freelist-skip bookkeeping: the free-set generation the cached
+    /// freelist structure (`free_cache.head`, `free_cache.count`,
+    /// `free_cache.pages`) was built from. A commit whose mutations
+    /// never moved a page in or out of `free` (the overwhelmingly
+    /// common data-only shape) reuses the cached structure instead of
+    /// rebuilding every freelist trunk page and byte-comparing it
+    /// against the committed view — O(1) instead of O(freelist
+    /// pages) on the per-commit path.
+    free_version: u64,
+    /// The free-set generation as of the LAST freelist build.
+    free_built_version: u64,
+    /// The last built freelist structure (page bytes + head/count for
+    /// the header), valid while `free_built_version == free_version`.
+    free_cache: BTreeMap<u32, Vec<u8>>,
+    /// (head, count) of the cached freelist structure — the header's
+    /// fields come from here.
+    free_cache_head: (u32, u32),
 }
 
 /// An open file handle plus the identity (length, and on unix the
@@ -705,6 +722,15 @@ impl Container {
             .collect();
         st.next_ver = next;
         st.free = free;
+        // The adopted file's freelist STRUCTURE was written by whoever
+        // last committed (possibly real SQLite — a different trunk
+        // selection than ours); only the free SET walked above is
+        // truth. Reset the freelist cache so the first splice builds
+        // and byte-verifies our structure against the file.
+        st.free_version = 0;
+        st.free_built_version = u64::MAX;
+        st.free_cache.clear();
+        st.free_cache_head = (0, 0);
         st.overlay.clear();
         st.page_cache.clear();
         st.wal = if st.journal_wal {
@@ -801,6 +827,12 @@ impl Container {
             .collect();
         st.next_ver = next;
         st.free.clear();
+        // A full publish rewrote the file wholesale: the freelist
+        // cache describes a previous page space. Reset it.
+        st.free_version = 0;
+        st.free_built_version = u64::MAX;
+        st.free_cache.clear();
+        st.free_cache_head = (0, 0);
         st.overlay.clear();
         st.page_cache.clear();
         st.force_full = false;
@@ -826,6 +858,12 @@ impl Container {
         st.force_full = true;
         st.spans.clear();
         st.free.clear();
+        // The page space is gone — so is the freelist cache's
+        // meaning. Reset it.
+        st.free_version = 0;
+        st.free_built_version = u64::MAX;
+        st.free_cache.clear();
+        st.free_cache_head = (0, 0);
         st.overlay.clear();
         st.page_cache.clear();
         st.wal = None;
@@ -881,12 +919,14 @@ impl Container {
         }
         let n_old = st.n_pages;
         // SQLite's WAL frame discipline (measured against the real
-        // engine): a WAL commit NEVER bumps the change counter, and
-        // page 1 rides a commit only when its content changed beyond
-        // the counter/size fields or the file GREW (the in-header
-        // database size is refreshed on growth — everything else
-        // defers to the checkpoint). Rollback commits keep the classic
-        // whole-counter rewrite.
+        // engine — probe_sqlite_wal_shape): a WAL commit NEVER bumps
+        // the change counter, and page 1 rides a commit when its
+        // content changed beyond the counter/size fields OR the file
+        // GREW (real SQLite's bulk-growth txn opens with a page-1
+        // frame — the in-header size must move with the file; the
+        // non-growing data-only commits are the ones that skip page 1
+        // entirely). Rollback commits keep the classic whole-counter
+        // rewrite.
         let wal_mode = st.journal_wal;
         let committed_pages = n_old;
         let counter_eff = if wal_mode {
@@ -905,6 +945,9 @@ impl Container {
         let mut cache = std::mem::take(&mut st.page_cache);
 
         // ---- 1a. Dropped objects: their pages join the freelist ----
+        if !dropped.is_empty() {
+            st.free_version += 1;
+        }
         for key in dropped {
             if let Some(s) = st.spans.remove(key) {
                 for p in s.pages {
@@ -925,8 +968,14 @@ impl Container {
         // NEXT session runs — two same-commit objects that both split
         // (a table and its index) must never be handed the same page,
         // and a page one session pruned may be reused by the next.
+        // The free-set clone is paid only when a mutation actually
+        // runs (the empty-mutates commit skips the O(freelist) copy).
         let mut mutate_outcomes: Vec<(&MutateItem, MutateOutcome)> = Vec::new();
-        let mut mut_free: BTreeSet<u32> = st.free.clone();
+        let mut mut_free: BTreeSet<u32> = if mutates.is_empty() {
+            BTreeSet::new()
+        } else {
+            st.free.clone()
+        };
         let mut mut_tail = st.n_pages + 1;
         let mut mut_pending: HashMap<u32, Vec<u8>> = HashMap::new();
         let phase_t0 = std::time::Instant::now();
@@ -962,22 +1011,36 @@ impl Container {
             }
             let old_root = st.spans.get(&item.key).map(|s| s.root);
             roots_moved |= old_root != Some(out.root);
+            // Destructure once: the touched pages MOVE into the commit
+            // set (no per-page clone — the outcome is consumed here).
+            let MutateOutcome {
+                root: out_root,
+                pages: out_pages,
+                added: out_added,
+                removed: out_removed,
+                max_page: out_max_page,
+                took_from_free: out_took,
+                freed: out_freed,
+            } = out;
             // Only pages whose bytes actually differ enter the commit set.
-            for (pgno, bytes) in &out.pages {
-                match reader.read(*pgno, ps, &st.overlay, &mut cache) {
-                    Some(old) if &old == bytes => {}
+            for (pgno, bytes) in out_pages {
+                match reader.read(pgno, ps, &st.overlay, &mut cache) {
+                    Some(old) if old == bytes => {}
                     _ => {
-                        changed.insert(*pgno, bytes.clone());
+                        changed.insert(pgno, bytes);
                     }
                 }
             }
-            for p in &out.took_from_free {
+            if !out_took.is_empty() || !out_freed.is_empty() {
+                st.free_version += 1;
+            }
+            for p in &out_took {
                 st.free.remove(p);
             }
-            for p in &out.freed {
+            for p in &out_freed {
                 st.free.insert(*p);
             }
-            st.n_pages = st.n_pages.max(out.max_page);
+            st.n_pages = st.n_pages.max(out_max_page);
             st.next_ver += 1;
             let ver = st.next_ver;
             st.span_versions.insert(item.key.clone(), ver);
@@ -987,13 +1050,13 @@ impl Container {
             // splice of a leaf cell moves no page identities).
             match st.spans.get_mut(&item.key) {
                 Some(rec) => {
-                    rec.root = out.root;
-                    for p in &out.removed {
+                    rec.root = out_root;
+                    for p in &out_removed {
                         if let Ok(i) = rec.pages.binary_search(p) {
                             rec.pages.remove(i);
                         }
                     }
-                    for p in &out.added {
+                    for p in &out_added {
                         match rec.pages.binary_search(p) {
                             Ok(_) => {}
                             Err(i) => rec.pages.insert(i, *p),
@@ -1047,15 +1110,20 @@ impl Container {
             // Span bookkeeping: consumed free pages leave the freelist;
             // old pages the rebuild no longer needs enter it.
             let new_set: BTreeSet<u32> = build.used.iter().copied().collect();
+            let mut free_moved = !new_set.is_empty();
             for p in &new_set {
-                st.free.remove(p);
+                free_moved |= st.free.remove(p);
             }
             if let Some(s) = &old_span {
                 for p in &s.pages {
                     if !new_set.contains(p) {
                         st.free.insert(*p);
+                        free_moved = true;
                     }
                 }
+            }
+            if free_moved {
+                st.free_version += 1;
             }
             st.n_pages = st.n_pages.max(build.max_page);
             st.next_ver += 1;
@@ -1120,15 +1188,20 @@ impl Container {
                 }
             }
             let new_set: BTreeSet<u32> = build.used.iter().copied().collect();
+            let mut free_moved = !new_set.is_empty();
             for p in &new_set {
-                st.free.remove(p);
+                free_moved |= st.free.remove(p);
             }
             if let Some(s) = &old_span {
                 for p in &s.pages {
                     if *p != 1 && !new_set.contains(p) {
                         st.free.insert(*p);
+                        free_moved = true;
                     }
                 }
+            }
+            if free_moved {
+                st.free_version += 1;
             }
             st.n_pages = st.n_pages.max(build.max_page);
             st.next_ver += 1;
@@ -1144,24 +1217,46 @@ impl Container {
         // ---- 2. Freelist structure ----
         PHASE_SPLICE_NS.fetch_add(phase_t0.elapsed().as_nanos() as u64, Relaxed);
         let phase_t0 = std::time::Instant::now();
-        let free_vec: Vec<u32> = st.free.iter().copied().collect();
-        let fl = build_freelist(&free_vec, ps);
-        for (pgno, bytes) in &fl.pages {
-            match reader.read(*pgno, ps, &st.overlay, &mut cache) {
-                Some(old) if &old == bytes => {}
-                _ => {
-                    changed.insert(*pgno, bytes.clone());
+        // The freelist-cache read side. Every `st.free` mutation this
+        // commit happened above (each bumps `free_version`); nothing
+        // below mutates it. When the generation is unchanged the
+        // committed view already holds this exact structure (the
+        // commit that installed the cache either wrote those pages or
+        // byte-verified them identical), so the O(freelist pages)
+        // rebuild + read + compare collapses to two u32 reads. The
+        // fresh build is stashed and installed ONLY at successful
+        // exits — a failed commit must never leave the cache marked
+        // valid for pages that never landed.
+        type FreshFreelist = ((u32, u32), Vec<(u32, Vec<u8>)>);
+        let mut fl_fresh: Option<FreshFreelist> = None;
+        let cache_ok = st.free_built_version == st.free_version
+            && std::env::var_os("RSQL_NO_FREECACHE").is_none();
+        let (fl_head, fl_count) = if cache_ok {
+            st.free_cache_head
+        } else {
+            let free_vec: Vec<u32> = st.free.iter().copied().collect();
+            let fl = build_freelist(&free_vec, ps);
+            for (pgno, bytes) in &fl.pages {
+                match reader.read(*pgno, ps, &st.overlay, &mut cache) {
+                    Some(old) if &old == bytes => {}
+                    _ => {
+                        changed.insert(*pgno, bytes.clone());
+                    }
                 }
             }
-        }
+            let head_count = (fl.head, fl.count);
+            fl_fresh = Some((head_count, fl.pages));
+            head_count
+        };
 
         // ---- 3. Header (page 1) — SQLite's WAL frame discipline ----
         // In WAL mode page 1 rides a commit ONLY when its content
-        // changed beyond the counter/size fields, or the file grew
-        // (the size-field refresh; measured against real SQLite — its
-        // data-only WAL commits carry no page-1 frame at all, and the
-        // change counter never moves). Rollback commits keep the
-        // classic counter-rewrite shape.
+        // changed beyond the counter/size fields (measured against real
+        // SQLite: its data-only WAL commits — growth included — carry
+        // NO page-1 frame at all; the commit frame's db-size field is
+        // the size truth until the checkpoint folds it, and the change
+        // counter never moves). Rollback commits keep the classic
+        // counter-rewrite shape.
         let header = build_header_enc(
             st.journal_wal,
             ps,
@@ -1173,8 +1268,8 @@ impl Container {
             st.text_enc.as_u32(),
             0, // largest root: auto-vacuum files never splice
             0,
-            fl.head,
-            fl.count,
+            fl_head,
+            fl_count,
         );
         let page1_needed = if !wal_mode {
             true
@@ -1198,6 +1293,14 @@ impl Container {
                     items.len(),
                     roots_moved
                 );
+            }
+            // A successful exit: install the freshly built freelist
+            // cache (its pages all matched — the committed view holds
+            // them; nothing to write).
+            if let Some(((head, count), pages)) = fl_fresh {
+                st.free_cache_head = (head, count);
+                st.free_cache = pages.into_iter().collect();
+                st.free_built_version = st.free_version;
             }
             st.page_cache = cache;
             return Ok(false);
@@ -1311,6 +1414,14 @@ impl Container {
         }
         st.epoch += 1;
         st.page_cache = cache;
+        // The commit landed: the committed view now holds every
+        // freelist page of the fresh build (written this commit, or
+        // byte-verified identical above). Install the cache.
+        if let Some(((head, count), pages)) = fl_fresh {
+            st.free_cache_head = (head, count);
+            st.free_cache = pages.into_iter().collect();
+            st.free_built_version = st.free_version;
+        }
         PHASE_COMMIT_NS.fetch_add(phase_t0.elapsed().as_nanos() as u64, Relaxed);
         Ok(true)
     }

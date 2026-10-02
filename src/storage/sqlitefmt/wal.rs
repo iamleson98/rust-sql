@@ -227,6 +227,22 @@ impl WalWriter {
     }
 }
 
+/// Write one contiguous run of pages in a single positioned write
+/// (the checkpoint's run-coalescing — see the caller).
+fn flush_run(f: &mut std::fs::File, run: &[(u32, &[u8])], ps: usize) -> Result<usize, String> {
+    if run.is_empty() {
+        return Ok(0);
+    }
+    let first = run[0].0;
+    let off = (first as u64 - 1) * ps as u64;
+    let mut buf = Vec::with_capacity(run.len() * ps);
+    for (_, page) in run.iter() {
+        buf.extend_from_slice(page);
+    }
+    pwrite_page(f, &buf, off).map_err(|e| format!("write run at page {first}: {e}"))?;
+    Ok(run.len())
+}
+
 /// Incremental checkpoint (wal.html §4.3): copy every COMMITTED frame's
 /// page back into the main database file, extend/truncate the main file
 /// to the last commit frame's database size, fsync (per `sync` —
@@ -319,9 +335,19 @@ pub fn checkpoint(path: &Path, page_size: u32, sync: bool) -> Result<(usize, u32
     // writing page-order would also be correct, but the deterministic
     // order keeps differential tests stable.
     writes.sort_by_key(|(i, _, _)| *i);
-    // Copy the committed pages back into the main file. Positioned
-    // writes (pwrite / seek_write): one syscall per page, no shared
-    // cursor to move.
+    // Copy the committed pages back into the main file. RUN-COALESCED
+    // positioned writes: contiguous pages (an autocommit run of
+    // leaf+split+page-1 frames lands on neighboring pages) merge into
+    // ONE pwrite per run — a 1000-frame checkpoint issues hundreds of
+    // syscalls instead of one thousand, the dominant per-commit
+    // amortized cost of the WAL regime at small scale. The byte
+    // result is identical to per-page writes: the write set is a
+    // DEDUP'D map (one entry per page — the LAST frame of each page
+    // wins), so page order is safe, and every run starts at its own
+    // first page's offset. The run is CLEARED after each flush — a
+    // page after a gap must start a NEW run, never ride the previous
+    // one (riding it would write the whole accumulation contiguously
+    // from the old first page's offset, clobbering unrelated pages).
     let t0 = std::time::Instant::now();
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -329,11 +355,20 @@ pub fn checkpoint(path: &Path, page_size: u32, sync: bool) -> Result<(usize, u32
         .map_err(|e| format!("open {}: {e}", path.display()))?;
     let ps = page_size as usize;
     let mut written = 0usize;
+    // Page order (the write set is a dedup'd map — the copy result is
+    // order-independent, and page order is what makes runs adjacent).
+    writes.sort_by_key(|(_, pgno, _)| *pgno);
+    let mut run: Vec<(u32, &[u8])> = Vec::new();
     for (_, pgno, page) in &writes {
-        let off = (*pgno as u64 - 1) * ps as u64;
-        pwrite_page(&mut f, page, off).map_err(|e| format!("write page {pgno}: {e}"))?;
-        written += 1;
+        if let Some(last) = run.last() {
+            if last.0 + 1 != *pgno {
+                written += flush_run(&mut f, &run, ps)?;
+                run.clear();
+            }
+        }
+        run.push((*pgno, page));
     }
+    written += flush_run(&mut f, &run, ps)?;
     if commit_db_size > 0 {
         let want = commit_db_size as u64 * ps as u64;
         let cur = f.metadata().map(|m| m.len()).unwrap_or(0);

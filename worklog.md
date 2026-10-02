@@ -1631,3 +1631,23 @@ Work Log:
 
 Stage Summary:
 - Toolchain drift absorbed with the MSRV-compatible form; 42d1026 is the run to watch.
+
+---
+Task ID: 73
+Agent: main (Super Z)
+Task: Finish the interrupted per-commit cost round (the macOS bench-gate loss on INSERT multi-VALUES) — the raw leaf fast paths, the freelist cache, the run-coalesced checkpoint — including the two corruption bugs the WIP shipped with; then push for CI.
+
+Work Log:
+- CI state at round start: d76bbb9 red on ONE row — bench-gate (macos-latest), bench_full_vs_sqlite INSERT (multi-VALUES 100/batch): 1.68M vs SQLite 2.94M ops/s (0.57x, 42.5% slower); 17 wins / 1 loss of 18. Every other job green.
+- Found the interrupted WIP in the tree: mutator raw leaf fast paths (+848 lines), container freelist cache, WAL run-coalesced checkpoint + a page-1 discipline rewrite; one syntax-corrupted line (dense_page's pointer-array write) and two type errors. Fixed those; the lib compiled.
+- The WIP's bug hunt was MID-STREAM: tests/foreign_incremental red on 3 tests (mass_delete / untouched_table_pages / ddl_commits) with double-ownership signatures. Reproduced via a VACUUM+25-inserts repro (integrity bad, 25 rows lost).
+- Bug 1 (container.rs): the WIP had removed the `grew` condition from page1_needed ("data-only WAL commits — growth included — carry no page-1 frame"). WRONG for growth: probe_sqlite_wal_shape (extended to dump the full page-1 frame map) shows real SQLite's bulk-growth txn OPENS with a page-1 frame (frames [0,2,4] of 67 — frame 4 is the growth txn's first frame); only non-growing data-only commits skip page 1. Without it, the in-header db size goes stale the moment the file grows past it — every reader (ours and SQLite's) then treats the new pages as out-of-range (the observed "invalid page number 50" / "never used" / data loss). Restored `beyond || grew` with the probe's measurement documented at the site.
+- Bug 2 (wal.rs): the run-coalesced checkpoint never cleared the run between flushes — after flushing a contiguous run at a gap, later pages were APPENDED to the same run, and the final flush wrote the whole accumulation contiguously from the FIRST run's page offset (ix1's pages [26,27,28] written at pages [5,6,7]'s offsets — the frankenstein double-ownership the forensic walker showed). Fixed with run.clear() after each flush + the invariant documented at the loop.
+- Also removed the WIP's checkpoint-side page-1 size patch (dead code with the discipline restored; it also diverged from SQLite's at-rest shape).
+- A/B verified the surviving perf work: probe_commit_scale scenario A (single-row autocommit INSERT into a large table) 63.0 -> 29.4 us/commit at 100k rows (2.1x), 35.5 -> 25.5 at 500k, 37.2 -> 27.6 at 2M; UPDATE 95.7 -> 73.5. probe_phase_breakdown: 295/300 raw-ok table ops, 0 model-leaf decodes on the INSERT round, 111 raw splits; per-commit INSERT 26.5 us (mutate 11.6 / commit 7.9).
+- Bench (local, linux): 18/18 rows WIN including INSERT multi-VALUES 100/batch 2.68M vs 2.25M (1.19x) — the row macOS lost. Full local gates: default matrix 112 suites green, sqlx green, no-default 73 suites green (parallel_join's SIGKILL-at-exit reproduced on unmodified HEAD — sandbox cgroup artifact, all 17 of its tests pass), doc tests 5/5, fmt clean, clippy -D warnings clean in all four configs (default/no-default/sqlx/workspace).
+- Examples: kept forensic_walk (tree+freelist ownership walker), probe_phase_breakdown (the per-commit counter anatomy), probe_sqlite_wal_shape (the oracle pin for the page-1 discipline); dropped the one-shot repro scratch.
+
+Stage Summary:
+- The per-commit fixed cost round is complete and CORRECT: raw leaf patch/split paths (no cell-model decode/encode, no per-cell allocs), the O(1) freelist cache on no-move commits, run-coalesced checkpoint pwrite — with the two WIP corruption bugs root-caused and fixed (both pinned by existing suites).
+- The macOS bench row's loss profile (per-commit overhead) is directly targeted: autocommit insert cost halved locally; CI's macOS bench-gate is the verdict.
