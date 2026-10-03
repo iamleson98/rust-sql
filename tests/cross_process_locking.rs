@@ -327,6 +327,16 @@ fn killed_writer_releases_locks_and_state_is_consistent() {
 /// count is a snapshot of committed state at each statement (>= every
 /// count it observed before, and the final count matches after the
 /// writer drains).
+///
+/// The growth floor keys on the writer's OWN `p1-count-25` marker, not
+/// a wall-clock: on a loaded shared runner (the oom-injection config
+/// runs the whole suite on the System allocator, and this binary runs
+/// up to ~20 processes — a parent and hammering helper per test — on
+/// 2 cores) the writer's commit pace collapses to single digits per
+/// second; a fixed "25 rows in 3 seconds" threshold is a runner-load
+/// lottery, not a correctness claim. The marker wait keeps the REAL
+/// assertions — monotonicity on every statement, freshness under
+/// hammering, final-state agreement — load-independent.
 #[test]
 fn concurrent_reader_never_sees_torn_or_lost_state() {
     let dir = tempdir("hammer");
@@ -336,8 +346,11 @@ fn concurrent_reader_never_sees_torn_or_lost_state() {
 
     let mut db2 = open_wal(&db_path);
     let mut last = 0i64;
+    // Phase 1 — read continuously until the writer's 25-row marker lands
+    // (up to 60s on a starved runner): every statement's count must be >=
+    // the previous one (the torn/lost-state contract).
     let t0 = Instant::now();
-    while t0.elapsed() < Duration::from_secs(3) {
+    while t0.elapsed() < Duration::from_secs(60) {
         if std::env::var("RSQL_SLOW_READER").is_ok() {
             std::thread::sleep(Duration::from_millis(30));
         }
@@ -347,9 +360,22 @@ fn concurrent_reader_never_sees_torn_or_lost_state() {
             .as_integer();
         assert!(n >= last, "reader count went backwards: {n} < {last}");
         last = n;
+        if last >= 25 && marker(&dir, "p1-count-25").exists() {
+            break;
+        }
     }
-    // The reader observed foreign commits streaming in.
     assert!(last >= 25, "reader should have observed growth, saw {last}");
+    // Phase 2 — one more second of overlap reading (monotonicity under
+    // continued hammering), then drain.
+    let t1 = Instant::now();
+    while t1.elapsed() < Duration::from_secs(1) {
+        let n: i64 = db2.query("SELECT COUNT(*) FROM t", []).unwrap()[0]
+            .first()
+            .unwrap()
+            .as_integer();
+        assert!(n >= last, "reader count went backwards: {n} < {last}");
+        last = n;
+    }
 
     write_marker(&dir, "stop");
     assert!(wait_marker(&dir, "p1-done", Duration::from_secs(60)));
