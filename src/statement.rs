@@ -552,9 +552,13 @@ impl<'a> Statement<'a> {
             self.enc_guard = Some(crate::executor::ConnEncGuard::install(
                 self.db.conn_text_enc(),
             ));
-            let gate = pull_gate_for(self.db, stmt_is_dml);
+            // NOTE: this statement's start-section pull gate lives INSIDE
+            // `start()` now, taken AFTER the cross-process read scope —
+            // the freshness resync inside `xread_scope` takes the install
+            // gate's WRITE side, and this thread's own READ guard held
+            // across it self-deadlocks (parking_lot read→write on one
+            // thread waits for itself — the backup_wal_mode_source hang).
             let started = self.start();
-            drop(gate);
             started?;
         }
         // Serve one buffered row. The PREVIOUS current_row's consumer
@@ -741,6 +745,21 @@ impl<'a> Statement<'a> {
         // statement (the Database-level entries take the same scope for
         // their one-shot paths).
         self.xread_scope = self.db.xread_scope()?;
+        // CONCURRENT-REGIME READER GATE for this statement's pager-
+        // walking sections — taken HERE, AFTER the xread scope above:
+        // the freshness resync may take the install gate's WRITE side
+        // (a foreign reset/reopen swaps committed state exactly like a
+        // concurrent install), and a read guard held across that call
+        // on the SAME thread would wait for itself forever. (Moved
+        // from step_inner, which held it around the whole of start();
+        // every early return below drops it with the function.)
+        let _pull_gate = {
+            let stmt_is_dml = matches!(
+                self.stmt.as_ref(),
+                AstStatement::Insert(_) | AstStatement::Update(_) | AstStatement::Delete(_)
+            );
+            pull_gate_for(self.db, stmt_is_dml)
+        };
 
         // Committed-view arming (SELECT statements only): while a
         // foreign write transaction is open on this database, the pager
