@@ -81,6 +81,46 @@ pub(crate) const READ_BYTE: u64 = 2;
 
 const RANGE_LEN: u64 = 1;
 
+/// The fd-level mode of one lock byte, as this handle last established
+/// it (userspace mirror of the kernel state — see [`XLock::state`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[repr(u8)]
+enum Mode {
+    #[default]
+    None = 0,
+    Shared = 1,
+    Exclusive = 2,
+}
+
+/// Userspace mirror of the kernel lock state for THIS handle's bytes.
+/// Two platform gaps force the bookkeeping:
+///
+/// * **Windows re-locks**: `LockFileEx` on a byte-range THE SAME HANDLE
+///   already locks exclusively fails with `ERROR_LOCK_VIOLATION` — it
+///   has no Linux-OFD "a same-fd request replaces the fd's own lock"
+///   semantics. The concurrent regime re-takes the WRITE byte through
+///   the same handle on every writer identity's flush (one engine, one
+///   pager, one lock file descriptor); on Windows that second take saw
+///   its OWN lock as a foreign conflict and the whole
+///   `concurrent_edge_interleavings` suite failed with a bogus
+///   "held by a connection in ANOTHER process" BUSY. A same-mode
+///   re-request is satisfied from the mirror — zero syscalls, and the
+///   same idempotency Linux OFD gives natively.
+/// * **Windows upgrades**: shared→exclusive on the same handle must be
+///   a manual unlock→try→restore dance (Linux OFD replaces atomically).
+///
+/// The mirror is guarded by one non-blocking-syscall mutex; every
+/// `ofd` call checks and updates it under that lock, so it can never
+/// disagree with the kernel about what THIS fd holds. READ (byte 2) is
+/// additionally reference-counted: fd-level locks have no counts, so
+/// overlapping per-statement guards on one pager would otherwise drop
+/// the byte at the FIRST guard's drop, not the last statement's end.
+#[derive(Default)]
+struct LockState {
+    modes: [Mode; 3],
+    read_holds: u32,
+}
+
 /// The lock file path for a database: `<db>-rsqllock`.
 pub fn xlock_path_for<P: AsRef<Path>>(db_path: P) -> PathBuf {
     let p = db_path.as_ref();
@@ -96,6 +136,7 @@ pub struct XLock {
     file: File,
     #[allow(dead_code)]
     path: PathBuf,
+    state: parking_lot::Mutex<LockState>,
 }
 
 impl XLock {
@@ -111,7 +152,11 @@ impl XLock {
             .create(true)
             .truncate(false)
             .open(&path)?;
-        Ok(Self { file, path })
+        Ok(Self {
+            file,
+            path,
+            state: parking_lot::Mutex::new(LockState::default()),
+        })
     }
 
     /// Take a shared lock on `byte` (blocking is not used anywhere in the
@@ -160,9 +205,146 @@ impl XLock {
         self.lock_shared(LIVE_BYTE)
     }
 
+    // ----------------------------------------------------------------- core
+    /// Tracker-fronted lock operation (see [`LockState`] for why the
+    /// userspace mirror exists). `Ok(true)` = the requested state now
+    /// holds on this fd; `Ok(false)` = a foreign holder blocks an
+    /// exclusive request (busy); `Err` = a real syscall failure.
+    fn ofd(&self, byte: u64, shared: bool, unlock: bool) -> io::Result<bool> {
+        let mut st = self.state.lock();
+        let idx = byte as usize;
+        if idx >= 3 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "xlock protocol uses exactly three bytes",
+            ));
+        }
+
+        // READ (byte 2) is the per-statement shared byte: refcounted so
+        // overlapping statement guards keep the fd-level lock until the
+        // LAST one drops (fd-level locks carry no counts of their own).
+        if byte == READ_BYTE {
+            if unlock {
+                st.read_holds = st.read_holds.saturating_sub(1);
+                if st.read_holds == 0 && st.modes[idx] != Mode::None {
+                    let r = self.raw_ofd(byte, false, true).map(|_| ());
+                    if r.is_ok() {
+                        st.modes[idx] = Mode::None;
+                    }
+                    return r.map(|_| true);
+                }
+                return Ok(true);
+            }
+            if st.modes[idx] == Mode::Shared {
+                // Held (possibly by an overlapping statement guard) — a
+                // shared take never conflicts with it.
+                st.read_holds += 1;
+                return Ok(true);
+            }
+            let r = self.raw_ofd(byte, true, false);
+            if matches!(r, Ok(true)) {
+                st.modes[idx] = Mode::Shared;
+                st.read_holds = 1;
+            }
+            return r;
+        }
+
+        let want = if unlock {
+            Mode::None
+        } else if shared {
+            Mode::Shared
+        } else {
+            Mode::Exclusive
+        };
+        let cur = st.modes[idx];
+
+        if unlock {
+            if cur == Mode::None {
+                // Idempotent release of a byte this fd does not hold
+                // (fd semantics: unlocking an unlocked range is a no-op).
+                return Ok(true);
+            }
+            let r = self.raw_ofd(byte, false, true).map(|_| ());
+            if r.is_ok() {
+                st.modes[idx] = Mode::None;
+            }
+            return r.map(|_| true);
+        }
+
+        if cur == want {
+            // SAME-MODE re-request: satisfied from the mirror. Linux
+            // OFD would replace the fd's own lock (a kernel round-trip
+            // for a no-op); Windows would FAIL it as a self-conflict
+            // (ERROR_LOCK_VIOLATION) — the concurrent regime's repeated
+            // WRITE-byte takes through one handle depend on this arm.
+            return Ok(true);
+        }
+
+        if cur != Mode::None && want == Mode::Exclusive {
+            // UPGRADE (shared → exclusive) on a byte this fd holds.
+            // Unix: a same-fd OFD request replaces atomically — direct.
+            // Windows: no in-place upgrade — unlock, try, restore the
+            // shared lock when the exclusive draw fails (the POSIX
+            // failed-request-leaves-locks-untouched contract, emulated).
+            #[cfg(windows)]
+            {
+                let unlocked = self.raw_ofd(byte, false, true).map(|_| ());
+                if let Err(e) = unlocked {
+                    return Err(e);
+                }
+                st.modes[idx] = Mode::None;
+                match self.raw_ofd(byte, false, false) {
+                    Ok(true) => {
+                        st.modes[idx] = Mode::Exclusive;
+                        return Ok(true);
+                    }
+                    Ok(false) => {
+                        // Restore the shared lock we dropped for the
+                        // attempt. A failure here is a lock-file I/O
+                        // error on a byte we DO want back — surface it.
+                        let restored = self.raw_ofd(byte, true, false).map(|_| ());
+                        if restored.is_ok() {
+                            st.modes[idx] = Mode::Shared;
+                            return Ok(false);
+                        }
+                        return restored.map(|_| false);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            #[cfg(unix)]
+            {
+                let r = self.raw_ofd(byte, false, false);
+                if matches!(r, Ok(true)) {
+                    st.modes[idx] = Mode::Exclusive;
+                }
+                return r;
+            }
+        }
+
+        // Plain take (cur == None) or downgrade (exclusive → shared).
+        // A downgrade via the same-fd replace is atomic on Unix; on
+        // Windows LockFileEx on a range the handle holds exclusively
+        // also draws ERROR_LOCK_VIOLATION, so the dance applies there
+        // too — unlock first, then take the requested mode.
+        #[cfg(windows)]
+        if cur != Mode::None {
+            let unlocked = self.raw_ofd(byte, false, true).map(|_| ());
+            if let Err(e) = unlocked {
+                return Err(e);
+            }
+            st.modes[idx] = Mode::None;
+        }
+        let r = self.raw_ofd(byte, shared, false);
+        if matches!(r, Ok(true)) {
+            st.modes[idx] = want;
+        }
+        r
+    }
+
     // ---------------------------------------------------------------- unix
     #[cfg(unix)]
-    fn ofd(&self, byte: u64, shared: bool, unlock: bool) -> io::Result<bool> {
+    fn raw_ofd(&self, byte: u64, shared: bool, unlock: bool) -> io::Result<bool> {
         use std::os::raw::c_int;
         use std::os::unix::io::AsRawFd;
         let mut fl: libc::flock = unsafe { std::mem::zeroed() };
@@ -198,7 +380,7 @@ impl XLock {
 
     // ------------------------------------------------------------- windows
     #[cfg(windows)]
-    fn ofd(&self, byte: u64, shared: bool, unlock: bool) -> io::Result<bool> {
+    fn raw_ofd(&self, byte: u64, shared: bool, unlock: bool) -> io::Result<bool> {
         // Raw kernel32 FFI (the wal.rs `file_identity` pattern — the
         // crate deliberately has no windows-sys/winapi dependency).
         use std::os::raw::c_void;
