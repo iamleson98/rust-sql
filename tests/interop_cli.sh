@@ -76,8 +76,16 @@ EOF
 printf "SELECT name FROM t WHERE id = 2;\n.quit\n" | "$CLI" "$DB_A" | grep -q "bob" \
     || fail "engine could not read sqlite3-created data"
 
+# The engine's writes ADOPT the path into the native container; the
+# interchange export puts the committed state back into real SQLite
+# bytes so sqlite3 can verify it.
 printf "INSERT INTO t VALUES (4, 'dave', 4.5);\nDELETE FROM t WHERE id = 1;\n.quit\n" | "$CLI" "$DB_A" >/dev/null \
     || fail "engine write to sqlite3-created file failed"
+# Two steps (Windows cannot rename over a file a live session holds):
+# export to a sibling, then move it over the original.
+"$CLI" --export-sqlite "$DB_A.export" "$DB_A" >/dev/null \
+    || fail "engine sqlite-format export failed"
+mv "$DB_A.export" "$DB_A"
 
 "$SQLITE3" "$DB_A" "SELECT count(*) FROM t;" | grep -q 3 \
     || fail "sqlite3 cannot see the engine's writes"
