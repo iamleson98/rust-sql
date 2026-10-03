@@ -1766,7 +1766,24 @@ impl Pager {
             f.write_all(&image)?;
             f.sync_all()?;
         }
-        std::fs::rename(&tmp, path)?;
+        // Atomic rename; the Windows-pinned edge (another process holds
+        // the path open with no share-delete — a live sqlite3 reader, an
+        // editor, AV) falls back to remove+rename, then to an IN-PLACE
+        // overwrite: atomicity traded for correctness in exactly this
+        // single-writer edge, the same ladder the interchange writer
+        // (`sqlitefmt::writer::write_image_atomic`) uses.
+        if std::fs::rename(&tmp, path).is_err() {
+            let _ = std::fs::remove_file(path);
+            if std::fs::rename(&tmp, path).is_err() {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(path)?;
+                f.write_all(&image)?;
+                f.sync_all()?;
+            }
+        }
         #[cfg(unix)]
         {
             if let Ok(dir) = std::fs::File::open(parent) {
