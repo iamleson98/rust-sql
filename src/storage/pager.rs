@@ -116,7 +116,7 @@ impl Pager {
     /// pagers only). Called from the PRAGMA setters so every write path
     /// — SQL pragmas, the Rust API, future call sites — is covered.
     fn persist_file_setting(&self, f: impl FnOnce(&mut PersistedFileSettings)) {
-        if self.store.is_memory() {
+        if self.store.read().is_memory() {
             return;
         }
         let mut map = file_settings().lock().unwrap_or_else(|e| e.into_inner());
@@ -135,7 +135,7 @@ impl Pager {
     /// previous generation had absorbed PRAGMAs comes up configured,
     /// not reset to the built-in defaults.
     fn apply_persisted_file_settings(&self) {
-        if self.store.is_memory() {
+        if self.store.read().is_memory() {
             return;
         }
         let key = settings_key(&self.path);
