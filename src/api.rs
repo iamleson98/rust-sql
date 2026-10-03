@@ -14366,6 +14366,16 @@ impl Database {
         //   legacy_alter_table, recursive_triggers, defer_foreign_keys —
         //   parsed and accepted, semantics unchanged.
         let name = p.name.to_ascii_lowercase();
+        // BARE `PRAGMA wal_checkpoint` — SQLite's canonical spelling is
+        // the PASSIVE checkpoint: best-effort, folds when this handle is
+        // (or becomes) sole, silently defers while another connection
+        // holds the file. The query/step path additionally returns the
+        // (busy, log, checkpointed) row (see `read_pragma`); the
+        // value/call forms run the urgent blocking variant below.
+        if name == "wal_checkpoint" && p.value.is_none() {
+            ctx.pager.checkpoint_wal()?;
+            return Ok(());
+        }
         if let Some(value) = &p.value {
             // Evaluate the value expression with no row context.
             let empty_row: Vec<Value> = Vec::new();
@@ -15172,6 +15182,78 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
             ));
         }
         return None;
+    }
+    // `PRAGMA wal_checkpoint[(PASSIVE|FULL|RESTART|TRUNCATE)]` — the
+    // action pragma (SQLite: the bare form is PASSIVE). Returns the
+    // (busy, log, checkpointed) row SQLite does: busy = 1 when the
+    // checkpoint could not complete (another connection holds the file
+    // — the PASSIVE report-instead-of-error contract), log = frames in
+    // the log before the checkpoint, checkpointed = frames folded.
+    // Non-WAL databases report (0, -1, -1) — pinned against bundled
+    // 3.53.4 (examples/probe_sqlite_ckpt.rs).
+    if name == "wal_checkpoint" {
+        // Mode: bare = PASSIVE; the call/assign form carries the word.
+        let mode = p
+            .value
+            .as_ref()
+            .and_then(|v| match value_as_expr(v) {
+                crate::sql::ast::Expr::Column { name, .. } => Some(name.to_ascii_lowercase()),
+                crate::sql::ast::Expr::Literal(Value::Text(t)) => Some(t.to_ascii_lowercase()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "passive".to_string());
+        let log: i64 = {
+            let g = db.pager.wal.read();
+            match g.as_ref() {
+                Some(state) => state.wal.n_frames() as i64,
+                // No WAL state: a DELETE-mode file or a memory store —
+                // SQLite's non-WAL shape.
+                None => -1,
+            }
+        };
+        let row = if log < 0 {
+            (0i64, -1i64, -1i64)
+        } else {
+            // PASSIVE: best-effort — fold when this handle is (or
+            // becomes) sole, defer silently otherwise. FULL / RESTART /
+            // TRUNCATE: the urgent variant (bounded wait for
+            // sole-ness, SQLITE_BUSY error when it expires — the
+            // blocking class SQLite gives explicit requests).
+            let res = if mode == "full" || mode == "restart" || mode == "truncate" {
+                db.pager.checkpoint_wal_now().map(|_| ())
+            } else {
+                db.pager.checkpoint_wal().map(|_| ())
+            };
+            let after: i64 = {
+                let g = db.pager.wal.read();
+                g.as_ref().map(|s| s.wal.n_frames() as i64).unwrap_or(0)
+            };
+            match (res.is_ok(), after) {
+                // Folded: the whole pre-checkpoint log moved into the
+                // main file and the log reset.
+                (true, 0) => (0, log, log),
+                // PASSIVE deferred (a live reader holds the fold off):
+                // completed nothing — busy, per SQLite's PASSIVE
+                // report-instead-of-error contract.
+                (true, _) => (1, log, 0),
+                // FULL/RESTART/TRUNCATE blocked: SQLITE_BUSY already
+                // surfaced through execute(); the row still reports
+                // busy=1 for the query/step path.
+                (false, _) => (1, log, 0),
+            }
+        };
+        return Some(PragmaRows {
+            columns: vec![
+                "busy".to_string(),
+                "log".to_string(),
+                "checkpointed".to_string(),
+            ],
+            rows: vec![vec![
+                Value::Integer(row.0),
+                Value::Integer(row.1),
+                Value::Integer(row.2),
+            ]],
+        });
     }
     // Table-valued introspection pragmas: the argument arrives as the
     // call form (`PRAGMA table_info(t)`) or a string literal.

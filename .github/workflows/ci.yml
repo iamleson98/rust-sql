@@ -638,6 +638,15 @@ jobs:
       # package root, so a relative path would resolve against
       # compat/libsqlite3-sys/ and miss the engine artifact.
       RUSTQLITE_LIB_DIR: ${{ github.workspace }}/target/debug
+      # Dylib-mode resolution for BOTH the proc-macro host (rustc
+      # dlopens sqlx-macros, which links libsqlite3-sys -> our engine
+      # .so) and the final binaries: without these the loader silently
+      # falls back to the SYSTEM libsqlite3 and the job validates the
+      # wrong engine. The bins' linkage canary (SELECT
+      # sqlite_source_id() contains 'rustqlite') makes any residual
+      # fallback a loud failure, not a silent green.
+      LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
+      DYLD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

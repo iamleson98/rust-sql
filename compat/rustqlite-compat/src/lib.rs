@@ -1011,12 +1011,47 @@ fn set_conn_err(conn: &Conn, e: &rustqlite::Error) -> c_int {
 
 /// Would executing this AST mutate the database? (Read-only connection
 /// enforcement — see `Conn::readonly`.)
+/// True for write-form PRAGMAs that only configure the CONNECTION (or
+/// the engine's per-connection view of it) and never write the database
+/// file — SQLite's own read-only connections accept these (sqlx's
+/// connect-time `PRAGMA foreign_keys = ON` depends on it).
+fn stmt_is_connection_state_pragma(stmt: &rustqlite::sql::ast::Statement) -> bool {
+    match stmt {
+        rustqlite::sql::ast::Statement::Pragma(p) => {
+            let name = p.name.to_ascii_lowercase();
+            matches!(
+                name.as_str(),
+                "foreign_keys"
+                    | "synchronous"
+                    | "busy_timeout"
+                    | "cache_size"
+                    | "temp_store"
+                    | "locking_mode"
+                    | "case_sensitive_like"
+                    | "recursive_triggers"
+                    | "defer_foreign_keys"
+                    | "ignore_check_constraints"
+                    | "automatic_index"
+                    | "trusted_schema"
+            )
+        }
+        _ => false,
+    }
+}
+
 fn ast_mutates_database(stmt: &rustqlite::sql::ast::Statement) -> bool {
     use rustqlite::sql::ast::Statement as S;
     match stmt {
         S::Select(_) | S::Explain { .. } => false,
         S::Begin(_) | S::Commit | S::Rollback(_) | S::Savepoint(_) | S::Release(_) => false,
-        S::Pragma(p) => p.value.is_some() && !is_table_valued_read_pragma(&p.name),
+        // The bare `PRAGMA wal_checkpoint` is an ACTION pragma (a fold
+        // of WAL pages into the main file) even though it carries no
+        // value — SQLite rejects it on read-only connections with
+        // SQLITE_READONLY like every other database-mutating statement.
+        S::Pragma(p) => {
+            (p.value.is_some() && !is_table_valued_read_pragma(&p.name))
+                || p.name.eq_ignore_ascii_case("wal_checkpoint")
+        }
         // INSERT / UPDATE / DELETE / CREATE / DROP / ALTER / ATTACH /
         // DETACH / VACUUM all mutate.
         _ => true,
@@ -2206,7 +2241,14 @@ unsafe fn prepare_impl(
     // Read-only connections reject database-mutating statements at
     // PREPARE (SQLite's SQLITE_READONLY for a readonly connection —
     // transaction control and SELECTs are unaffected).
-    if conn.readonly && ast_mutates_database(&ast) {
+    // Connection-STATE pragmas are exempt: they configure THIS
+    // connection (query-planner / enforcement flags) and never touch the
+    // database file — SQLite itself accepts them on read-only
+    // connections, and sqlx sends `PRAGMA foreign_keys = ON` at EVERY
+    // connect (including read-only ones — sqlx-sqlite 0.9's default
+    // pragma set). Without the exemption every sqlx read-only pool fails
+    // to connect.
+    if conn.readonly && ast_mutates_database(&ast) && !stmt_is_connection_state_pragma(&ast) {
         return conn.set_err(SQLITE_READONLY, "attempt to write a readonly database");
     }
     let kind = classify(&ast);

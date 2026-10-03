@@ -56,8 +56,27 @@ fn wait_gone(dir: &Path, name: &str, timeout: Duration) -> bool {
 }
 
 /// Spawn this test binary in helper mode running ONLY the dispatcher.
+/// Under `RSQL_XPROC_TRACE=1` the helpers INHERIT stderr instead of
+/// null-ing it, so a failing run's captured output tells BOTH sides'
+/// story (the reader's probe decisions in-process, the writer's
+/// checkpoint deferrals from the child) — see `xlock_trace!` in
+/// storage/pager.rs.
 fn spawn_helper(dir: &Path, role: &str) -> Child {
     let exe = std::env::current_exe().unwrap();
+    let trace = std::env::var("RSQL_XPROC_TRACE").is_ok();
+    if trace {
+        eprintln!(
+            "[harness pid{}] spawning helper {role} (stdio inherited)",
+            std::process::id()
+        );
+    }
+    let stdio = || {
+        if trace {
+            std::process::Stdio::inherit()
+        } else {
+            std::process::Stdio::null()
+        }
+    };
     Command::new(exe)
         .env(HELPER_VAR, role)
         .env(DIR_VAR, dir)
@@ -65,8 +84,8 @@ fn spawn_helper(dir: &Path, role: &str) -> Child {
         .arg("xproc_helper_dispatch")
         .arg("--exact")
         .arg("--test-threads=1")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(stdio())
+        .stderr(stdio())
         .spawn()
         .expect("spawn helper")
 }
@@ -319,6 +338,9 @@ fn concurrent_reader_never_sees_torn_or_lost_state() {
     let mut last = 0i64;
     let t0 = Instant::now();
     while t0.elapsed() < Duration::from_secs(3) {
+        if std::env::var("RSQL_SLOW_READER").is_ok() {
+            std::thread::sleep(Duration::from_millis(30));
+        }
         let n: i64 = db2.query("SELECT COUNT(*) FROM t", []).unwrap()[0]
             .first()
             .unwrap()
@@ -467,5 +489,131 @@ fn sole_checkpoint_succeeds() {
         .as_integer();
     assert_eq!(n, 200);
     db.execute("PRAGMA integrity_check", []).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A sidecar that RESET (shrank below the reader's horizon) under a live
+/// reader must never freeze that reader at its stale horizon — the
+/// length-only freshness probe read the post-reset, still-regrowing log
+/// as "no growth" forever (the macOS concurrent_reader freeze: reader
+/// stuck at 88 rows while a fresh open saw 5473).
+///
+/// The reset is produced the LEGITIMATE way — folded main file + fresh
+/// 32-byte header — by a sole checkpoint on a COPY of the database, then
+/// transplanted over the live reader's files (exactly the state a foreign
+/// checkpoint leaves behind when the sole gate cannot block it). The
+/// regrowth after the transplant is deliberately SMALLER than the
+/// pre-reset log so the post-reset file length stays below the reader's
+/// stale expected length — the exact freeze shape: the old probe's
+/// `len <= expected` returned "no growth" on every statement for the
+/// rest of the handle's life.
+#[test]
+fn reader_survives_foreign_sidecar_reset_with_smaller_regrowth() {
+    let dir = tempdir("resetfreeze");
+    let db_path = dir.join(DB_NAME);
+    let sidecar = {
+        let mut p = db_path.as_os_str().to_os_string();
+        p.push("-wal");
+        PathBuf::from(p)
+    };
+
+    // Writer fills the log (150 autocommit INSERTs -> ~300 frames), and
+    // the reader absorbs a first view: horizon == the full log.
+    let mut h1 = open_wal(&db_path);
+    h1.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
+    for i in 0..150 {
+        h1.execute(
+            "INSERT INTO t (v) VALUES (?)",
+            [Value::Text(format!("v{i}").into())],
+        )
+        .unwrap();
+    }
+    let mut h2 = open_wal(&db_path);
+    let n: i64 = h2.query("SELECT COUNT(*) FROM t", []).unwrap()[0]
+        .first()
+        .unwrap()
+        .as_integer();
+    assert_eq!(n, 150);
+    drop(h1); // close-time fold DEFERS (h2 live): the log keeps ~300 frames.
+
+    // The foreign checkpoint, run the only legitimate way: on a COPY
+    // with no other handles. The copy's fold lands in ITS main file and
+    // its sidecar resets to a fresh 32-byte header (new salt).
+    let copy_dir = dir.join("copy");
+    std::fs::create_dir_all(&copy_dir).unwrap();
+    let copy_db = copy_dir.join(DB_NAME);
+    let copy_sidecar = {
+        let mut p = copy_db.as_os_str().to_os_string();
+        p.push("-wal");
+        PathBuf::from(p)
+    };
+    std::fs::copy(&db_path, &copy_db).unwrap();
+    std::fs::copy(&sidecar, &copy_sidecar).unwrap();
+    {
+        let mut hc = open_wal(&copy_db);
+        hc.execute("PRAGMA wal_checkpoint", []).unwrap();
+        let n: i64 = hc.query("SELECT COUNT(*) FROM t", []).unwrap()[0]
+            .first()
+            .unwrap()
+            .as_integer();
+        assert_eq!(n, 150, "the copy must fold to the full state");
+        // The transplant happens while hc still holds the copy open: a
+        // sole handle's close-time teardown REMOVES its (already reset)
+        // sidecar, and the transplant needs those fresh-header bytes.
+        std::fs::copy(&copy_db, &db_path).unwrap();
+        std::fs::copy(&copy_sidecar, &sidecar).unwrap();
+        drop(hc);
+    }
+    assert!(
+        std::fs::metadata(&sidecar).unwrap().len() <= 4096,
+        "post-reset sidecar must be the fresh-header shape, not the old log"
+    );
+
+    // Regrowth SMALLER than the pre-reset log: the post-reset file stays
+    // below the reader's stale expected length — the freeze shape.
+    {
+        let mut h3 = open_wal(&db_path);
+        for i in 0..30 {
+            h3.execute(
+                "INSERT INTO t (v) VALUES (?)",
+                [Value::Text(format!("w{i}").into())],
+            )
+            .unwrap();
+        }
+        let n: i64 = h3.query("SELECT COUNT(*) FROM t", []).unwrap()[0]
+            .first()
+            .unwrap()
+            .as_integer();
+        assert_eq!(n, 180);
+        drop(h3);
+    }
+
+    // THE CONTRACT: the live reader sees the post-reset truth. The old
+    // probe served the stale memoized 150 here (its expected length was
+    // the pre-reset log's, the regrown file never passed it, and no
+    // reopen ever happened).
+    let n2: i64 = h2.query("SELECT COUNT(*) FROM t", []).unwrap()[0]
+        .first()
+        .unwrap()
+        .as_integer();
+    assert_eq!(n2, 180, "a reset sidecar must not freeze a live reader");
+    // And stays consistent on the next statement.
+    let n2b: i64 = h2.query("SELECT COUNT(*) FROM t", []).unwrap()[0]
+        .first()
+        .unwrap()
+        .as_integer();
+    assert_eq!(n2b, 180);
+    h2.execute("PRAGMA integrity_check", []).unwrap();
+
+    // A fresh open agrees.
+    let h4 = open_wal(&db_path);
+    let n4: i64 = h4.query("SELECT COUNT(*) FROM t", []).unwrap()[0]
+        .first()
+        .unwrap()
+        .as_integer();
+    assert_eq!(n4, 180);
+    drop(h4);
+    drop(h2);
     let _ = std::fs::remove_dir_all(&dir);
 }

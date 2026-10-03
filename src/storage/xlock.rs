@@ -69,7 +69,6 @@
 
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -165,6 +164,7 @@ impl XLock {
     #[cfg(unix)]
     fn ofd(&self, byte: u64, shared: bool, unlock: bool) -> io::Result<bool> {
         use std::os::raw::c_int;
+        use std::os::unix::io::AsRawFd;
         let mut fl: libc::flock = unsafe { std::mem::zeroed() };
         fl.l_type = if unlock {
             libc::F_UNLCK as std::os::raw::c_short

@@ -21,6 +21,14 @@ sea-orm = { version = "2.0", features = ["sqlx-sqlite", "runtime-tokio"] }
 [patch.crates-io]
 libsqlite3-sys = { path = "../compat/libsqlite3-sys" }
 
+# Run (absolute paths!): cd sqlx-interop && RUSTQLITE_LIB_DIR=$PWD/../target/release \
+#   LD_LIBRARY_PATH=$PWD/../target/release cargo run --release
+# A RELATIVE RUSTQLITE_LIB_DIR resolves against compat/libsqlite3-sys/
+# (build scripts run with CWD = package root), the engine .so goes
+# missing, and the loader silently falls back to the SYSTEM libsqlite3 -
+# the bins' linkage canary (sqlite_source_id contains 'rustqlite') turns
+# any residual fallback into a loud failure.
+
 [workspace]
 
 [profile.release]

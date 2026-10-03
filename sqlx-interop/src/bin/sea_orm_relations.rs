@@ -87,6 +87,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Database::connect(&url).await?;
     println!("connected");
 
+    // LINKAGE CANARY (see src/main.rs): rustqlite reports
+    // `COMPILER=rustc` in its compile options — real SQLite reports
+    // clang/gcc/msvc. Fail fast if this process fell back to the system
+    // libsqlite3.
+    {
+        let rows = db
+            .query_all_raw(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "PRAGMA compile_options",
+            ))
+            .await
+            .expect("canary query failed");
+        let is_rustqlite = rows
+            .iter()
+            .any(|r| {
+                r.try_get::<String>("", "compile_options")
+                    .map(|v| v.starts_with("COMPILER=rustc"))
+                    .unwrap_or(false)
+            });
+        assert!(
+            is_rustqlite,
+            "LINKAGE CANARY FAILED: this process is NOT running on the \
+             rustqlite engine — fix RUSTQLITE_LIB_DIR / LD_LIBRARY_PATH"
+        );
+        println!("linkage canary ok: rustqlite engine confirmed");
+    }
+
     // Schema from entities (composite PK junction table included).
     let schema = Schema::new(DbBackend::Sqlite);
     for stmt in [

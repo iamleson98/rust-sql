@@ -30,6 +30,27 @@
 //! inserting/evicting pages at a time) but reads can proceed concurrently
 //! because they take only a read lock on the cache.
 
+/// Cross-process protocol tracing (storage::xlock + the freshness probe):
+/// enabled by `RSQL_XPROC_TRACE=1`, off (and compiled to almost nothing)
+/// otherwise. Every trace site is on a path that is already rare —
+/// statement boundaries on non-writer WAL handles, checkpoint deferrals,
+/// reset recoveries — so the formatting closure only runs when the env
+/// var is set. Output goes to stderr: the cross-process test harness
+/// inherits helper stderr under the same variable, so one cargo test
+/// run collects BOTH sides' story on failure.
+macro_rules! xlock_trace {
+    ($msg:expr) => {{
+        #[inline]
+        fn traced() -> bool {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| std::env::var("RSQL_XPROC_TRACE").is_ok())
+        }
+        if traced() {
+            eprintln!("[xlock pid{}] {}", std::process::id(), ($msg)());
+        }
+    }};
+}
+
 use crate::error::{Error, Result};
 use crate::storage::page::{FileHeader, Page, PageId, DB_HEADER_SIZE, DEFAULT_PAGE_SIZE};
 use parking_lot::{Mutex, RwLock};
@@ -1400,7 +1421,15 @@ impl Pager {
         self.schema_cookie
             .store(base.schema_cookie, Ordering::Release);
         let target_size = base.n_pages as u64 * self.page_size() as u64;
-        if let Ok(len) = self.store.read().len() {
+        // The length read must NOT hold the store's read lock across the
+        // `set_len` write below: an `if let` scrutinee's temporaries live
+        // to the END of the block, so the inline form kept the read
+        // guard alive while `store.write()` waited for it to drain — a
+        // SELF-DEADLOCK on every savepoint rollback that truncates a
+        // grown file (found by the sqlx interop: a failing migration's
+        // atomic rollback hung the whole pool forever).
+        let current_len = self.store.read().len();
+        if let Ok(len) = current_len {
             if len > target_size {
                 self.store.write().set_len(target_size)?;
             }
@@ -4536,6 +4565,62 @@ impl Pager {
             Ok(m) => m,
             Err(_) => return Ok(false),
         };
+        // CONTENT-AWARE probe — length alone cannot distinguish "nobody
+        // appended" from "the log was RESET under us". Two reset shapes
+        // must be caught here, before the growth comparison, or a reader
+        // can freeze on a stale horizon FOREVER:
+        //
+        // * IN-PLACE TRUNCATE RESET (a foreign fold + `reset_synced`:
+        // set_len(0) + a fresh-salt header on the SAME inode). The file
+        // shrinks below this reader's horizon; if the foreign writer's
+        // next cycles never regrow the file past the STALE expected
+        // length (an auto-checkpointing hammer resets every
+        // WAL_AUTOCHECKPOINT_FRAMES frames, so the size OSCILLATES), the
+        // old `len <= expected` probe read "no growth" on every
+        // statement for the rest of the handle's life — a cross-process
+        // reader permanently stuck at a long-gone snapshot
+        // (`concurrent_reader_never_sees_torn_or_lost_state`, first seen
+        // on the macOS runners).
+        // * DELETE + RECREATE RESET (a foreign generation swapping the
+        // file): the path stat tracks the NEW inode while this handle's
+        // Wal still reads the OLD one — same freeze, plus reads from a
+        // dead inode.
+        //
+        // Identity is (dev, ino) where available; `None` (platform
+        // without identity) simply skips that half — the shrink check
+        // still catches the truncate shape.
+        let mine = {
+            let g = self.wal.read();
+            g.as_ref().and_then(|s| s.wal.identity())
+        };
+        let now = crate::storage::wal::path_identity(&sidecar);
+        let replaced = mine.is_some() && now.is_some() && mine != now;
+        let shrunk = meta.len() < expected;
+        if replaced || shrunk {
+            xlock_trace!(|| {
+                format!(
+                    "resync: sidecar {} under horizon expected={} len={} \
+                     mine={mine:?} now={now:?} -> full reopen",
+                    if replaced { "REPLACED" } else { "SHRUNK" },
+                    expected,
+                    meta.len()
+                )
+            });
+            let _gate = self.install_gate_write();
+            let mut fresh = crate::storage::wal::Wal::open_shared(&self.path, self.page_size())?;
+            let map = fresh.committed_page_map()?.into_iter().collect();
+            {
+                let mut g = self.wal.write();
+                if let Some(state) = g.as_mut() {
+                    state.wal = fresh;
+                    state.map = map;
+                }
+            }
+            self.cache.write().clear();
+            self.lru.lock().clear();
+            self.reload_header_from_committed()?;
+            return Ok(true);
+        }
         if meta.len() <= expected {
             // Fresh (or a torn tail a foreign writer is appending right
             // now — uncommitted, invisible; the next growth re-probes).
@@ -4557,6 +4642,9 @@ impl Pager {
         let visible = match absorbed {
             Some(v) => v,
             None => {
+                xlock_trace!(
+                    || "resync: absorb hit a SALT MISMATCH (reset log) -> full reopen".to_string()
+                );
                 let mut fresh =
                     crate::storage::wal::Wal::open_shared(&self.path, self.page_size())?;
                 let map = fresh.committed_page_map()?.into_iter().collect();
@@ -4577,6 +4665,17 @@ impl Pager {
             // Growth was an uncommitted in-flight tail only.
             return Ok(false);
         }
+        xlock_trace!(|| {
+            format!(
+                "resync: absorbed {} new visible frames, {} distinct pages",
+                visible.len(),
+                visible
+                    .iter()
+                    .map(|&(id, _)| id)
+                    .collect::<std::collections::HashSet<PageId>>()
+                    .len()
+            )
+        });
         {
             let mut g = self.wal.write();
             if let Some(state) = g.as_mut() {
@@ -4873,8 +4972,22 @@ impl Pager {
             // them — the close-time teardown or an explicit
             // `checkpoint_wal_now` from a sole moment).
             let r = match self.xlock_sole_gate()? {
-                Some(_sole) => self.checkpoint_wal_locked(),
-                None => Ok(()),
+                Some(_sole) => {
+                    xlock_trace!(|| "checkpoint: sole gate OPEN — folding + resetting".to_string());
+                    self.checkpoint_wal_locked()
+                }
+                None => {
+                    xlock_trace!(|| {
+                        let frames = self
+                            .wal
+                            .read()
+                            .as_ref()
+                            .map(|s| s.wal.n_frames())
+                            .unwrap_or(0);
+                        format!("checkpoint: sole gate BLOCKED (live foreign handle) — fold DEFERRED, {frames} frames stay durable in the sidecar")
+                    });
+                    Ok(())
+                }
             };
             if acquired {
                 crate::storage::wal::release_wal_lease(&sidecar, self.instance_id);

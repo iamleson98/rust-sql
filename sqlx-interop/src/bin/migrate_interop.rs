@@ -22,6 +22,27 @@ async fn main() {
         .await
         .expect("connect");
 
+    // LINKAGE CANARY: this workspace exists to prove UNMODIFIED sqlx and
+    // sea-orm run on the rustqlite engine. A misconfigured link line
+    // (missing rpath / LD_LIBRARY_PATH) silently falls back to the SYSTEM
+    // libsqlite3 — every assertion below would then be validating system
+    // SQLite, not this engine. The marker: rustqlite's compile options
+    // report `COMPILER=rustc` (real SQLite reports clang/gcc/msvc).
+    {
+        let opts: Vec<String> = sqlx::query_scalar("PRAGMA compile_options")
+            .fetch_all(&pool)
+            .await
+            .expect("canary query failed");
+        assert!(
+            opts.iter().any(|o| o.starts_with("COMPILER=rustc")),
+            "LINKAGE CANARY FAILED: this process is NOT running on the \
+             rustqlite engine (compile_options: {opts:?}) — fix \
+             RUSTQLITE_LIB_DIR / LD_LIBRARY_PATH before trusting anything \
+             this workspace reports"
+        );
+        println!("linkage canary ok: rustqlite engine confirmed");
+    }
+
     // 1. Fresh apply.
     sqlx::migrate!("./migrations")
         .run(&pool)
