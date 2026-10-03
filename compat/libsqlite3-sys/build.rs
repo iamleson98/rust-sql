@@ -157,8 +157,28 @@ fn main() {
         canonical.display()
     );
 
-    println!("cargo:rustc-link-lib=dylib={}", link_name);
-    println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    if is_windows && target_env == "msvc" && link_name == "sqlite3" {
+        // MSVC's link.exe resolves `dylib=sqlite3` to the literal
+        // `sqlite3.lib` — which on the engine side is cargo's STATICLIB
+        // artifact for the compat crate (crate-type = ["cdylib",
+        // "staticlib", "rlib"]): a FULL archive of the engine whose
+        // members (the #[global_allocator] shims among them) collide
+        // with the linking crate's own std — LNK2005 duplicate
+        // __rust_alloc on the very first proc-macro host link
+        // (sqlx_macros.dll pulls libsqlite3-sys through sqlx-macros).
+        // Link the cdylib's IMPORT LIBRARY by its exact artifact name
+        // instead: `dylib=sqlite3.dll` makes link.exe look for
+        // `sqlite3.dll.lib` (the stubs cargo leaves in <profile>/deps/),
+        // whose import table still references sqlite3.dll — exactly
+        // what the runtime loader must find (the DLL itself is copied
+        // next to the exes and the proc-macro cdylibs below).
+        println!("cargo:rustc-link-search=native={}", lib_dir.display());
+        println!("cargo:rustc-link-search=native={}", lib_dir.join("deps").display());
+        println!("cargo:rustc-link-lib=dylib=sqlite3.dll");
+    } else {
+        println!("cargo:rustc-link-lib=dylib={}", link_name);
+        println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    }
     if is_windows {
         // No rpath on Windows: make the engine DLL loadable by the
         // artifacts this build produces instead (exe dir + deps dir).

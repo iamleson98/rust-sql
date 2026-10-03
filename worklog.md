@@ -1795,3 +1795,17 @@ Work Log:
 
 Stage Summary:
 - The xlock round is hardened end to end: windows compiles, the macOS reader-freeze class is closed by the content-aware probe with a discriminating regression test on all 3 OSes, the interop job validates the RIGHT engine on every OS, and `PRAGMA wal_checkpoint` matches SQLite's shapes. Pushing for the 3-OS CI verdict.
+
+---
+Task ID: 78
+Agent: main (Super Z)
+Task: The windows lock-semantics fix — run 37129028152's last failing front (all seven windows jobs, one root cause in the xlock re-lock path).
+
+Work Log:
+- Run 37129028152 (c6f6309) verdict: macOS fully green — the content-aware freshness probe closed the concurrent_reader freeze, and the interop linkage fixes (DYLD_LIBRARY_PATH + canaries + the readonly connection-state pragma exemption) held — linux fully green. The only failures were the seven windows jobs, every one the same root cause exposed by the xlock compile fix finally letting windows run the suite:
+- concurrent_edge_interleavings 7/7 FAILED with "the WAL writer lease ... is held by a connection in ANOTHER process" — from xlock_take_writer_role's try_lock_exclusive seeing a conflict where only ONE process exists. Root cause: Windows LockFileEx on a byte-range the SAME HANDLE already locks exclusively fails with ERROR_LOCK_VIOLATION — no Linux-OFD same-fd-replace semantics. The concurrent regime re-takes the WRITE byte through the same handle (one engine, one pager, one lock-file descriptor) on every writer identity's flush; on windows the second take saw its OWN lock as foreign.
+- Fix: XLock keeps a userspace mirror of what THIS fd holds (parking_lot-guarded [Mode; 3] + a read-hold count), updated only from post-syscall truth: a same-mode re-request is satisfied from the mirror (the windows fix AND a syscall saved per concurrent-regime flush on unix); windows upgrades (the sole gate's shared->exclusive) become the manual unlock->try->restore dance; windows downgrades unlock first; READ (byte 2) is reference-counted so overlapping per-statement guards keep the fd lock until the LAST statement ends (fd-level locks carry no counts — the first guard's drop used to release the byte early); unlock of a not-held byte is an idempotent no-op. Cross-fd/cross-process conflicts are unchanged (the mirror only fast-paths states the same fd established).
+- Local gates: concurrent_edge_interleavings 7/7, cross_process_locking 9/9, check clean; the full matrix re-run rode along (full_matrix2.log); committed 26b1eee and pushed for the three-OS verdict (run 37130151733).
+
+Stage Summary:
+- The xlock protocol now behaves identically through Linux OFD and Windows LockFileEx semantics via the userspace held-mode mirror; the READ byte gained proper per-statement counting. Awaiting the 26b1eee CI verdict — every prior front is already green.
