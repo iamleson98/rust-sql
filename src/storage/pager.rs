@@ -4595,7 +4595,17 @@ impl Pager {
         };
         let now = crate::storage::wal::path_identity(&sidecar);
         let replaced = mine.is_some() && now.is_some() && mine != now;
-        let shrunk = meta.len() < expected;
+        // A REAL horizon only exists once this handle has absorbed at
+        // least one frame (expected > the header). With 0 frames the
+        // expected length is just the never-yet-written header — a 0-
+        // or 32-byte sidecar is the FRESH-START state, not a reset,
+        // and flagging it re-opened on EVERY probe (a full cache clear
+        // + a Wal::open_shared + a committed-map rebuild per
+        // statement, forever) was a reopen storm on fresh databases
+        // (run 37142144108: 209 spurious `SHRUNK expected=32 len=0`
+        // reopens from one helper).
+        let shrunk =
+            expected > crate::storage::wal::WAL_HEADER_SIZE as u64 && meta.len() < expected;
         if replaced || shrunk {
             xlock_trace!(|| {
                 format!(

@@ -124,7 +124,8 @@ fn hammer_state(dir: &Path, writer: &mut std::process::Child) -> String {
             let name = name.to_string_lossy();
             if let Some(n) = name
                 .strip_prefix("p1-count-")
-                .and_then(|s| s.parse::<i64>().ok())
+                // marker() appends ".marker" to every name.
+                .and_then(|s| s.trim_end_matches(".marker").parse::<i64>().ok())
             {
                 max_marker = max_marker.max(n);
             }
