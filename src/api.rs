@@ -594,154 +594,81 @@ pub struct Database {
     /// for read-heavy workloads) the break costs ONE relaxed atomic load
     /// instead of a mutex round-trip (~10 ns) on every query.
     insert_chain_hot: AtomicBool,
-    /// SQLite-format (fileformat2) bridge state. `Some` when this
-    /// database's persistent file is a REAL SQLite `.db`: the operating
-    /// state lives in the in-memory pager (native engine speed) and the
-    /// file is rewritten in SQLite's exact disk format at every commit
-    /// boundary (see `dump_foreign`).
-    foreign: Option<ForeignSqlite>,
+    /// SQLite-format (fileformat2) interop state. `Some` when this
+    /// database was loaded FROM a real SQLite `.db`: the operating
+    /// state lives in the in-memory pager (native engine speed) until
+    /// the first write commit ADOPTS the path into the native
+    /// container (see `PendingAdopt`).
+    pending: Option<PendingAdopt>,
 }
 
-/// Persistence state for a SQLite-format (fileformat2) database file.
+/// A SQLite-format file loaded for interop, pending adoption.
 ///
-/// The engine's native `RSQLDB04` container stays the default for
-/// files it creates; when `Database::open` sniffs SQLite's magic, the
-/// whole image is decoded into the engine and this struct owns the
-/// round-trip bookkeeping: emit order of `sqlite_schema` rows (original
-/// creation order first, engine-created objects appended), the
-/// `sqlite_sequence` map, and the header counters that must advance
-/// monotonically across dumps.
-pub(crate) struct ForeignSqlite {
-    dirty: AtomicBool,
-    /// Text encoding of the interop file (header field 56: 1/2/3).
+/// The live in-place container machinery this struct used to carry
+/// (the shared page space, the page mutator, the WAL sidecar, the
+/// row-delta journal) is gone, deliberately: opening a SQLite-format
+/// file loads it into the engine's in-memory pager (full SQL surface,
+/// native speed), and the FIRST WRITE COMMIT adopts the path into the
+/// native container (one atomic whole-image publish; see
+/// [`Database::from_sqlite_file`] and `Pager::adopt_file_backing`).
+/// Until then the session is read-only WITH RESPECT TO THE FILE — the
+/// original bytes are never touched.
+///
+/// What remains is (a) the adoption state machine and (b) the
+/// round-trip fidelity fields the one-shot EXPORT writer consumes
+/// ([`Database::export_sqlite_format`], `VACUUM INTO` on a pending
+/// session): the schema emit order, the `sqlite_sequence` snapshot,
+/// and the header shape of the source.
+pub(crate) struct PendingAdopt {
+    /// Set once the path has been adopted into the native container:
+    /// the session is then a plain native session and every check
+    /// short-circuits on this flag.
+    adopted: std::sync::atomic::AtomicBool,
+    /// A write has been committed in-memory since the load — the
+    /// signal that the next commit boundary adopts the path.
+    wrote: std::sync::atomic::AtomicBool,
+    /// True while `load_foreign_image` replays the source file — its
+    /// own BEGIN..COMMIT boundary must not read as a user write (a
+    /// read-only open never adopts).
+    loading: std::sync::atomic::AtomicBool,
+    /// Text encoding of the source file (header field 56: 1/2/3).
     /// Interior-mutable so `PRAGMA encoding` can set it from the
-    /// read-only pragma path. Every dump writes records, index keys and
-    /// sqlite_schema text in this encoding.
+    /// read-only pragma path while the schema is empty. Every export
+    /// writes records, index keys and sqlite_schema text in this
+    /// encoding.
     text_enc: AtomicU32,
-    /// Emit order for sqlite_schema rows: original rows in creation
-    /// order, then objects first seen at a later dump.
+    /// Emit order for sqlite_schema rows: source rows in creation
+    /// order, then objects first seen at a later export.
     order: Mutex<Vec<SchemaOrderKey>>,
     next_rowid: Mutex<i64>,
-    /// `sqlite_sequence` contents: table name (lowercased) -> high-water mark.
+    /// `sqlite_sequence` contents: table name (lowercased) -> high-water
+    /// mark (the load-time snapshot; the live catalog table is the
+    /// high-water store — this is the export writer's fallback).
     sequences: Mutex<HashMap<String, i64>>,
-    /// Preserve the source's page size across rewrites (0 = default 4096).
+    /// Preserve the source's page size across exports (0 = default 4096).
     page_size: u32,
+    /// Header counters an export advances monotonically.
     change_counter: AtomicU32,
     schema_cookie: AtomicU32,
-    had_wal: AtomicBool,
-    /// The file's journal mode (header 18/19 == 2, a live source
-    /// sidecar, or an established engine WAL session). Read by
-    /// `PRAGMA journal_mode`; the writer emits 18/19 accordingly.
-    journal_wal: AtomicBool,
-    /// Auto-vacuum mode written into every dump (0 = none, 1 = FULL,
-    /// 2 = INCREMENTAL). Captured from the source file's header (52/64)
-    /// at open; `PRAGMA auto_vacuum` can still change it while the
-    /// schema is empty (SQLite's rule — silently ignored afterwards).
+    /// Auto-vacuum mode of the source (0 = none, 1 = FULL, 2 =
+    /// INCREMENTAL), re-emitted on export (pointer-map geometry).
     auto_vacuum: AtomicU8,
-    /// The file's SHARED page-space coordinator: object spans, the
-    /// container freelist, the WAL sidecar session and the overlay of
-    /// pages newer than the main file — one per path, process-wide,
-    /// serialized under its own mutex. Every session (Database) on the
-    /// file splices its own changed objects into THIS page space; see
-    /// `storage::sqlitefmt::container` for the architecture.
-    coord: std::sync::Arc<crate::storage::sqlitefmt::container::Container>,
-    /// This session's last-publish snapshot: the engine-root change
-    /// epochs, the schema-tree change epoch and the per-object span
-    /// versions as of its last successful commit. The next commit
-    /// diffs against this to decide which objects to splice or
-    /// page-mutate (O(#objects) detection, O(changed pages) work).
-    snap: Mutex<ForeignSnap>,
-    /// The row-delta journal — page-level splicing's capture side (see
-    /// `storage::sqlitefmt::delta`). Advisory by construction: any
-    /// exactness doubt poisons it and the commit falls back to the
-    /// whole-object splice.
-    journal: std::sync::Arc<Mutex<crate::storage::sqlitefmt::delta::DeltaJournal>>,
-    /// True when this session's commits may still live only in the WAL
-    /// sidecar (splice publishes under WAL mode; cleared by full
-    /// publishes). The close-time contract: the LAST session folds the
-    /// sidecar — but when it has VANISHED (another session's full
-    /// publish retired it) while this session had frames pending, the
-    /// session re-publishes its committed state from memory (the old
-    /// `last_image` fallback's semantics — the writer's knowledge is
-    /// authoritative for what it committed).
-    wal_pending: AtomicBool,
 }
 
-/// One object's cached change-epoch handle — the CREATE-time root's
-/// `Arc<AtomicU64>` (stable for the object's lifetime; root splits
-/// alias onto it), plus the epoch this session's last successful
-/// publish recorded. The per-commit dirty walk is then one LOCK-FREE
-/// atomic load per object; the pager's shard mutex is taken only when
-/// the slot set is (re)built — on DDL, where the catalog itself
-/// changed. `MAX` is the new-object baseline: the next walk marks it
-/// dirty unconditionally (a fresh session's first publish splices
-/// everything, the byte-compare decides what moves).
-struct ObjectEpochSlot {
-    slot: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    last: u64,
-}
-
-/// One session's last-publish snapshot (see `ForeignSqlite::snap`).
-#[derive(Default)]
-struct ForeignSnap {
-    /// Object key (lowercased schema name) → its change-epoch slot +
-    /// last-published epoch — the diff base for the next commit's
-    /// dirty-object set. Rebuilt alongside the cached snapshot (only
-    /// when the schema epoch moves — every catalog write bumps it).
-    slots: HashMap<String, ObjectEpochSlot>,
-    /// Objects that left the catalog at the last slot REBUILD (DROP /
-    /// rename), stashed for the next commit's publish to free — the
-    /// rebuild itself destroys the old slot set, so the diff is taken
-    /// there. Empty on the steady-state path (no DDL → no drops).
-    pending_dropped: Vec<String>,
-    /// The schema TREE's change epoch (`Pager::root_epoch(0)`) at the
-    /// last publish — any DDL or rootpage schema-row rewrite bumps it,
-    /// so this single u64 replaces the per-object signature build
-    /// (string clones + sort, O(total schema text) per commit).
-    schema_epoch: u64,
-    /// Object key → the coordinator span version this session's last
-    /// publish recorded. Page-level mutations are offered only on a
-    /// match (another session's publish in between → whole-splice).
-    versions: HashMap<String, u64>,
-    /// Set once the session's first publish (full) has happened.
-    published: bool,
-    /// Set when the snapshot was seeded from a CLEAN LOAD (the
-    /// in-memory state is exactly the file's committed state) — the
-    /// first commit boundary then needs no publish at all, matching
-    /// the byte-stable idle-reopen contract.
-    loaded_clean: bool,
-    /// The loaded file's header values (user_version / application_id
-    /// / journal mode), compared at the skip decision — any drift is a
-    /// header-visible change that must publish.
-    loaded_uv: u32,
-    loaded_app: u32,
-    loaded_journal_wal: bool,
-    /// Cached catalog snapshot + the schema epoch it was captured at.
-    /// A stable epoch means no catalog write happened since the
-    /// capture (every DDL and every rootpage schema-row rewrite bumps
-    /// root 0), so the descriptor set — the O(#objects) capture walk
-    /// with its name-keyed map builds — is reusable verbatim. The
-    /// Arc's internal `Arc<Table>` handles are the catalog's own, so
-    /// descriptor-level changes always arrive through a DDL (epoch
-    /// bump) and never mutate behind the cache.
-    cached_snapshot: Option<std::sync::Arc<SqliteCatalogSnapshot>>,
-    cached_epoch: u64,
-}
-
-impl ForeignSqlite {
-    /// The file's text encoding.
+impl PendingAdopt {
+    /// The source file's text encoding.
     fn text_enc(&self) -> crate::storage::sqlitefmt::record::TextEnc {
         crate::storage::sqlitefmt::record::TextEnc::from_u32(self.text_enc.load(Ordering::Acquire))
             .unwrap_or(crate::storage::sqlitefmt::record::TextEnc::Utf8)
     }
 
-    /// Set the file's text encoding (see `apply_encoding`: only while
-    /// the database holds no schema content).
+    /// Set the export encoding (see `apply_encoding`: only while the
+    /// database holds no schema content).
     fn set_text_enc(&self, enc: crate::storage::sqlitefmt::record::TextEnc) {
         self.text_enc.store(enc.as_u32(), Ordering::Release);
     }
 
-    /// The file's auto-vacuum mode (see `apply_auto_vacuum`).
+    /// The source file's auto-vacuum mode (see `apply_auto_vacuum`).
     fn auto_vacuum(&self) -> u8 {
         self.auto_vacuum.load(Ordering::Acquire)
     }
@@ -766,12 +693,6 @@ struct SqliteCatalogSnapshot {
     indexes: HashMap<String, std::sync::Arc<Index>>,
     views: HashMap<String, std::sync::Arc<crate::schema::View>>,
     triggers: HashMap<String, std::sync::Arc<crate::schema::Trigger>>,
-    /// True when any persistent table carries an AUTOINCREMENT column
-    /// — the cheap gate for the synthesized-sqlite_sequence check
-    /// (the descriptor walk it guards is O(#objects); without this
-    /// flag every commit on an autoincrement-free schema would pay
-    /// it).
-    has_autoincrement: bool,
     /// The resolved sqlite_schema emit order (source rows in creation
     /// order, engine-created objects appended per kind).
     order: Vec<SchemaOrderKey>,
@@ -795,14 +716,6 @@ enum SchemaRowSource {
 /// of truth shared by the full collector and the splice path's
 /// schema-tree rebuild.
 struct SchemaRowDesc {
-    kind: &'static str,
-    /// Display-case name as stored in sqlite_schema.
-    name: String,
-    tbl_name: String,
-    sql: Option<String>,
-    /// Lowercased schema name — the coordinator span key for rooted
-    /// rows (tables and indexes).
-    key: String,
     source: SchemaRowSource,
 }
 
@@ -941,42 +854,17 @@ fn collation_of(
     }
 }
 
-/// Dump the SQLite-format file on drop when writes are pending (the
+/// Adopt the SQLite-format file on drop when writes are pending (the
 /// in-memory state is the only durable copy at that point).
 impl Drop for Database {
     fn drop(&mut self) {
-        if let Some(f) = &self.foreign {
-            if f.dirty.load(Ordering::Acquire) || f.had_wal.load(Ordering::Acquire) {
-                let _ = self.dump_foreign();
-            }
-            // SQLite's clean-close semantics: the LAST connection
-            // checkpoints the WAL and removes the sidecar, leaving a
-            // self-contained .db (plain file copies stay valid). The
-            // coordinator folds the live sidecar into the main file
-            // INCREMENTALLY (page copies, wal.html §4.3) — and when the
-            // sidecar vanished while THIS session still had committed
-            // frames pending in it, the session re-publishes its
-            // committed state from memory (the writer's knowledge is
-            // authoritative for what it committed).
-            use crate::storage::sqlitefmt::container::DetachOutcome;
-            if f.coord
-                .session_detach(f.wal_pending.load(Ordering::Acquire))
-                == DetachOutcome::Republish
-            {
-                // Force past dump_foreign's clean fast-path AND past
-                // the splice path (nothing is epoch-dirty — the
-                // session's last publish already recorded these
-                // objects): the whole committed state must be
-                // re-published wholesale, over whatever layout the
-                // sidecar's loss left in the file.
-                f.coord.invalidate();
-                f.dirty.store(true, Ordering::Release);
-                let _ = self.dump_foreign();
+        if let Some(p) = &self.pending {
+            if p.wrote.load(Ordering::Acquire) && !p.adopted.load(Ordering::Acquire) {
+                let _ = self.maybe_adopt();
             }
         }
     }
 }
-
 /// Generic FxHash-style string hasher for statement-cache keys.
 ///
 /// The statement cache is consulted on EVERY query/execute: hashing the
@@ -2457,17 +2345,6 @@ impl Drop for ReadBurstDrain<'_> {
     }
 }
 
-/// When page-level mutation beats the whole-object splice: any delta
-/// set up to the fixed cut always (the journal is already captured; the
-/// mutator touches only the changed pages), and beyond it whenever the
-/// object is big enough that re-collecting every row would cost more
-/// than descending per delta (a leaf packs ~30-100 cells — 64 is the
-/// conservative multiplier). Bulk loads into small objects stay on the
-/// dense fresh-build splice path.
-fn mutate_beats_splice(deltas: usize, span_pages: usize) -> bool {
-    deltas <= 4096 || (span_pages > 0 && deltas < span_pages.saturating_mul(64))
-}
-
 impl Database {
     /// Open or create a database at the given path.
     ///
@@ -2640,7 +2517,7 @@ impl Database {
             // plugin scope must install on every statement.
             has_plugins: std::sync::atomic::AtomicBool::new(true),
             attached: parking_lot::Mutex::new(Vec::new()),
-            foreign: None,
+            pending: None,
         })
     }
 
@@ -2679,6 +2556,22 @@ impl Database {
         let mut db = Self::open_memory_inner()?;
         db.path = path;
         Ok(db)
+    }
+
+    /// `open_memory_inner` bound to a REAL path: the SQLite-format
+    /// interop session's pre-adoption pager (memory store, the file's
+    /// path — see `Pager::open_memory_at`).
+    fn open_memory_inner_at(path: &Path) -> Result<Self> {
+        crate::engine_init();
+        let pager: Arc<Pager> = Arc::new(Pager::open_memory_at(path, DEFAULT_CACHE_PAGES)?);
+        let mut catalog = Catalog::new();
+        catalog.schema_cookie = pager.schema_cookie();
+        load_schema(&pager, &mut catalog)?;
+        Ok(Self::from_pager_and_catalog(
+            pager,
+            catalog,
+            path.to_path_buf(),
+        ))
     }
 
     /// Constructor for `open_in_memory` that skips the path bookkeeping
@@ -3021,7 +2914,7 @@ impl Database {
             // plugin scope must install on every statement.
             has_plugins: std::sync::atomic::AtomicBool::new(true),
             attached: parking_lot::Mutex::new(Vec::new()),
-            foreign: None,
+            pending: None,
         }
     }
 
@@ -3038,14 +2931,14 @@ impl Database {
     ///
     /// `Database::open` sniffs the magic and routes here automatically;
     /// this constructor is the explicit form (handy for `CREATE` intent,
-    /// which is `Database::open_sqlite_format`).
+    /// (the magic sniff; there is no explicit form — the first
+    /// write adopts the path into the native container).
     fn from_sqlite_file(path: &Path) -> Result<Self> {
-        // Orphaned atomic-write staging files (`{stem}.rsqltmp{pid}`
-        // from a previous process that died between staging and
-        // rename — the "random temp file" dev checkouts used to
-        // accumulate) are swept here, at the single choke point every
-        // SQLite-format open flows through (Database::open sniffing +
-        // open_sqlite_format).
+        // Orphaned staging files from a previous process that died
+        // between the temp write and the rename: adoption temps here
+        // (the export writer sweeps its own), at the single choke point
+        // every SQLite-format open flows through.
+        crate::storage::pager::Pager::sweep_adopt_temps(path);
         crate::storage::sqlitefmt::writer::sweep_stale_tmps(path);
         // Hot rollback journal (fileformat2.html §1.1): a crashed engine
         // commit — or a crashed REAL SQLite writer on this same file —
@@ -3059,11 +2952,11 @@ impl Database {
             .map_err(|e| Error::Io(std::io::Error::other(e)))?;
         let image = crate::storage::sqlitefmt::read_sqlite_file(path)
             .map_err(|e| Error::Io(std::io::Error::other(e)))?;
-        let mut db = Self::open_memory_inner()?;
-        db.pager.enable_epoch_tracking();
-        db.path = path.to_path_buf();
-        let foreign = ForeignSqlite {
-            dirty: AtomicBool::new(false),
+        let mut db = Self::open_memory_inner_at(path)?;
+        let pending = PendingAdopt {
+            adopted: AtomicBool::new(false),
+            wrote: AtomicBool::new(false),
+            loading: AtomicBool::new(false),
             text_enc: AtomicU32::new(image.text_enc.as_u32()),
             order: Mutex::new(Vec::new()),
             next_rowid: Mutex::new(0),
@@ -3071,90 +2964,49 @@ impl Database {
             page_size: image.page_size,
             change_counter: AtomicU32::new(0),
             schema_cookie: AtomicU32::new(0),
-            had_wal: AtomicBool::new(image.had_wal),
-            journal_wal: AtomicBool::new(image.journal_wal),
             auto_vacuum: AtomicU8::new(image.auto_vacuum),
-            coord: {
-                let c = crate::storage::sqlitefmt::container::attach(path);
-                c.session_attach();
-                c
-            },
-            snap: Mutex::new(ForeignSnap::default()),
-            journal: std::sync::Arc::new(Mutex::new(Default::default())),
-            wal_pending: AtomicBool::new(false),
         };
-        db.foreign = Some(foreign);
+        db.pending = Some(pending);
         db.load_foreign_image(image)?;
         Ok(db)
     }
 
-    /// Create (or open) a database whose file is written in SQLite's
-    /// own disk format — so the `sqlite3` CLI and every SQLite driver
-    /// can open what this engine writes. This is the explicit form of
-    /// the format choice; opening an existing SQLite file auto-detects.
-    ///
-    /// A fresh file is written immediately (a valid empty database); a
-    /// file with SQLite magic is opened through the interop path.
-    pub fn open_sqlite_format<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let path = path.as_ref();
-        // Fresh-create path: the main file may not exist yet, but a
-        // crashed earlier attempt can still have left its staging file
-        // behind — sweep those too (from_sqlite_file sweeps again for
-        // existing files; both are idempotent best-effort).
-        crate::storage::sqlitefmt::writer::sweep_stale_tmps(path);
-        if path.exists() && crate::storage::sqlitefmt::is_sqlite_file(path) {
-            return Self::from_sqlite_file(path);
-        }
-        if path.exists() {
-            // A non-empty non-SQLite file: refuse rather than clobber.
-            if std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(true) {
-                return Err(Error::semantic(format!(
-                    "open_sqlite_format: {} exists and is not a SQLite-format file",
-                    path.display()
-                )));
-            }
-        }
-        let mut db = Self::open_memory_inner()?;
-        db.pager.enable_epoch_tracking();
-        db.path = path.to_path_buf();
-        db.foreign = Some(ForeignSqlite {
-            dirty: AtomicBool::new(true),
-            text_enc: AtomicU32::new(1),
-            order: Mutex::new(Vec::new()),
-            next_rowid: Mutex::new(0),
-            sequences: Mutex::new(HashMap::new()),
-            page_size: 0, // default 4096 on first write
-            change_counter: AtomicU32::new(1),
-            schema_cookie: AtomicU32::new(1),
-            had_wal: AtomicBool::new(false),
-            // Engine-created interop files are WAL-managed by design:
-            // the sidecar is the commit mechanism (header 18/19 = 2/2,
-            // `PRAGMA journal_mode` reports wal, incremental commits
-            // from the first dump — pinned by the WAL suites).
-            journal_wal: AtomicBool::new(true),
-            auto_vacuum: AtomicU8::new(0),
-            coord: {
-                let c = crate::storage::sqlitefmt::container::attach(path);
-                c.session_attach();
-                c
-            },
-            snap: Mutex::new(ForeignSnap::default()),
-            journal: std::sync::Arc::new(Mutex::new(Default::default())),
-            wal_pending: AtomicBool::new(false),
-        });
-        db.dump_foreign()?;
-        Ok(db)
+    /// Export the database to `path` as a REAL SQLite-format file (the
+    /// one-shot interchange writer — a dense bottom-up rebuild in
+    /// SQLite's exact disk format, committed atomically via
+    /// temp+fsync+rename). Works on every session shape: a
+    /// pending-adopt session round-trips the source's fidelity fields
+    /// (schema emit order, `sqlite_sequence`, text encoding,
+    /// auto-vacuum mode, page size); native and in-memory sessions
+    /// export their committed state in catalog order, UTF-8, delete
+    /// journal mode. The output opens in the `sqlite3` CLI, passes
+    /// `PRAGMA integrity_check` there, and loads back through
+    /// [`Database::open`]. The session itself is untouched.
+    pub fn export_sqlite_format<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        let out = self.collect_sqlite_export()?;
+        crate::storage::sqlitefmt::write_sqlite_file(path.as_ref(), &out)
+            .map_err(|e| Error::Io(std::io::Error::other(e)))
     }
 
-    /// The persistent disk format of this database: `"sqlite"` when the
-    /// file is a real SQLite database (interop mode), `"native"` for the
-    /// engine's own `RSQLDB04` container.
+    /// The persistent disk format of this database: `"sqlite"` while a
+    /// loaded SQLite-format file is still pending adoption (its bytes
+    /// are still SQLite's), `"native"` for everything else — the
+    /// engine's own container, including a session whose path was just
+    /// adopted into it.
     pub fn disk_format(&self) -> &'static str {
-        if self.foreign.is_some() {
+        if self.pending_active() {
             "sqlite"
         } else {
             "native"
         }
+    }
+
+    /// True while a loaded SQLite-format file is still pending
+    /// adoption (read-only with respect to the file's bytes).
+    pub(crate) fn pending_active(&self) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|p| !p.adopted.load(Ordering::Acquire))
     }
 
     /// The connection's SQLite-format text encoding (UTF-8 for native
@@ -3163,9 +3015,14 @@ impl Database {
     /// min / max / CAST follow the file's BINARY-collation byte order
     /// (see executor::conn_enc).
     pub(crate) fn conn_text_enc(&self) -> crate::storage::sqlitefmt::record::TextEnc {
-        self.foreign
+        // The SOURCE's encoding rides the session for its LIFETIME —
+        // including after adoption: SQLite guarantees a connection's
+        // collation never changes mid-connection, and the loaded values'
+        // BINARY order must stay the source's raw-encoding-byte order
+        // (new sessions on the adopted native file order UTF-8).
+        self.pending
             .as_ref()
-            .map(|f| f.text_enc())
+            .map(|p| p.text_enc())
             .unwrap_or(crate::storage::sqlitefmt::record::TextEnc::Utf8)
     }
 
@@ -3176,9 +3033,14 @@ impl Database {
         &mut self,
         image: crate::storage::sqlitefmt::SqliteDbImage,
     ) -> Result<()> {
+        // The load is not a user write: its own BEGIN..COMMIT boundary
+        // must never read as one (a read-only open never adopts).
+        if let Some(p) = self.pending.as_ref() {
+            p.loading.store(true, Ordering::Release);
+        }
         // Order bookkeeping from the source schema.
         {
-            let foreign = self.foreign.as_ref().unwrap();
+            let foreign = self.pending.as_ref().unwrap();
             let mut order = foreign.order.lock();
             let mut next_rowid = foreign.next_rowid.lock();
             for row in &image.schema {
@@ -3194,80 +3056,30 @@ impl Database {
             }
         }
         // ONE explicit transaction around the whole load: without it,
-        // every 256-row insert chunk commits through `dump_foreign`'s
-        // O(db) image rebuild — opening a 300k-row file paid ~1170 full
-        // rebuilds (75 s, where SQLite's own integrity check of the same
-        // file runs in 0.44 s). SQLite's bulk-load advice (batch work in
-        // BEGIN..COMMIT) applied to our own load path. A load failure
-        // rolls back and the failed `from_sqlite_file` open is dropped.
+        // every 256-row insert chunk pays a commit boundary (and, with
+        // writes marked, an adoption attempt) — one transaction batches
+        // the whole replay. A load failure rolls back and the failed
+        // `from_sqlite_file` open is dropped.
         self.execute("BEGIN", ())?;
-        // The image's header values, captured before the move below.
-        let loaded_uv = image.user_version;
-        let loaded_app = image.application_id;
         let load = self.load_foreign_image_inner(image);
-        // Seed the session's publish snapshot from the loaded state —
-        // BEFORE the load transaction's COMMIT fires its commit
-        // boundary: the in-memory state IS the file's committed state,
-        // so the boundary needs no publish at all (the byte-stable
-        // idle-reopen contract; without this, every open would re-encode
-        // and rewrite the whole database).
-        if load.is_ok() {
-            self.seed_foreign_snap_from_load(loaded_uv, loaded_app);
-        }
         match load {
             Ok(()) => self.execute("COMMIT", ())?,
             Err(e) => {
                 let _ = self.execute("ROLLBACK", ());
+                if let Some(p) = self.pending.as_ref() {
+                    p.loading.store(false, Ordering::Release);
+                }
                 return Err(e);
             }
         }
-        // A loaded WAL sidecar is now folded into the in-memory state;
-        // the next dump removes the stale sidecars.
+        // A loaded WAL sidecar is folded into the in-memory state; the
+        // adoption (or an export) removes the stale sidecars. The load
+        // is over: user writes from here on are real writes.
+        if let Some(p) = self.pending.as_ref() {
+            p.loading.store(false, Ordering::Release);
+            p.wrote.store(false, Ordering::Release);
+        }
         Ok(())
-    }
-
-    /// Seed the session's publish snapshot from a completed clean load
-    /// (see `load_foreign_image`): every object's current epoch, the
-    /// loaded schema signature, and the file's header values — so the
-    /// load transaction's COMMIT boundary recognizes that the in-memory
-    /// state already IS the file's committed state and publishes
-    /// nothing.
-    fn seed_foreign_snap_from_load(&self, loaded_uv: u32, loaded_app: u32) {
-        let Some(foreign) = self.foreign.as_ref() else {
-            return;
-        };
-        let snapshot = self.sqlite_catalog_snapshot(foreign.order.lock().clone());
-        // The load's post-state: every slot records its CURRENT epoch
-        // (the in-memory state IS the file's committed state — the
-        // byte-stable idle-reopen contract: no write since the load,
-        // no dirty object, no publish).
-        let mut slots: HashMap<String, ObjectEpochSlot> =
-            HashMap::with_capacity(snapshot.tables.len() + snapshot.indexes.len());
-        for (name, t) in &snapshot.tables {
-            let slot = self.pager.root_epoch_slot(t.root_page);
-            let last = slot.load(Ordering::Acquire);
-            slots.insert(name.clone(), ObjectEpochSlot { slot, last });
-        }
-        for (name, i) in &snapshot.indexes {
-            let slot = self.pager.root_epoch_slot(i.root_page);
-            let last = slot.load(Ordering::Acquire);
-            slots.insert(name.clone(), ObjectEpochSlot { slot, last });
-        }
-        let schema_epoch = self.pager.root_epoch(0);
-        let journal_wal = foreign.journal_wal.load(Ordering::Acquire);
-        let mut snap = foreign.snap.lock();
-        snap.slots = slots;
-        snap.pending_dropped.clear();
-        snap.schema_epoch = schema_epoch;
-        snap.published = true;
-        snap.loaded_clean = true;
-        snap.loaded_uv = loaded_uv;
-        snap.loaded_app = loaded_app;
-        snap.loaded_journal_wal = journal_wal;
-        // The load just replaced the catalog: the snapshot cache (keyed
-        // on the PRE-load schema epoch) is stale by construction.
-        snap.cached_snapshot = None;
-        snap.cached_epoch = 0;
     }
 
     fn load_foreign_image_inner(
@@ -3493,914 +3305,119 @@ impl Database {
         flush(self, &mut out, count_in_chunk)
     }
 
-    /// Mark the SQLite-format file dirty after a successful write, and
-    /// dump immediately when this is an autocommit boundary (no explicit
-    /// transaction open). Used by the fast-insert paths, which return
-    /// early from `execute`.
-    fn note_foreign_write(&mut self) -> Result<()> {
-        if let Some(f) = &self.foreign {
-            f.dirty.store(true, Ordering::Release);
-            if !self.in_transaction.load(Ordering::Acquire) {
-                self.dump_foreign()?;
+    /// Mark the pending SQLite-format file written after a successful
+    /// write, and adopt immediately when this is an autocommit boundary
+    /// (no explicit transaction open). Used by the fast-insert paths,
+    /// which return early from `execute`.
+    fn note_pending_write(&mut self) -> Result<()> {
+        if let Some(p) = &self.pending {
+            if !p.adopted.load(Ordering::Acquire) {
+                p.wrote.store(true, Ordering::Release);
+                if !self.in_transaction.load(Ordering::Acquire) {
+                    self.maybe_adopt()?;
+                }
             }
         }
         Ok(())
     }
 
-    /// Arm the SQLite-format delta journal for ONE statement (see
-    /// `storage::sqlitefmt::delta` — page-level splicing's capture
-    /// side). Foreign-backed databases only: one atomic load when the
-    /// database is native / in-memory. The concurrent regime's write
-    /// paths (page shadows, MERGE replay) do not flow through the
-    /// journal — capture suspends (poison) while it is open. A nested
-    /// `execute` (the sink already armed) also poisons: statement
-    /// boundaries cannot be tracked across re-entrancy.
-    pub(crate) fn delta_stmt_scope(&self) -> Option<crate::preupdate::DeltaGuard> {
-        let foreign = self.foreign.as_ref()?;
-        if self.concurrent_active.load(Ordering::Acquire) {
-            foreign.journal.lock().poison();
-            return None;
-        }
-        if !foreign.journal.lock().active() {
-            return None;
-        }
-        let target = foreign.journal.clone();
-        if crate::preupdate::arm_delta_sink(target) {
-            Some(crate::preupdate::delta_guard())
-        } else {
-            foreign.journal.lock().poison();
-            None
-        }
-    }
-
-    /// Drop the delta journal (a statement failed — the engine undid
-    /// its rows, and the journal's per-statement watermarks cannot see
-    /// re-entrant or partially-unwound shapes from here; conservative
-    /// clear, the next publish rebuilds whole-object).
-    pub(crate) fn poison_delta_journal(&self) {
-        if let Some(foreign) = self.foreign.as_ref() {
-            foreign.journal.lock().poison();
-        }
-    }
-
-    /// [`note_foreign_write`] for the streaming-statement (prepare/step)
+    /// [`note_pending_write`] for the streaming-statement (prepare/step)
     /// path: DML executed through `Statement` bypasses
-    /// `Database::execute` entirely, so the statement epilogue calls this
-    /// to keep the SQLite-format file durable — mark dirty, and when the
-    /// statement ran in autocommit mode, append the commit's frames to
-    /// the WAL sidecar (or full-write on the first commit) exactly like
-    /// the execute paths do. Without it, prepared DML commits live only
-    /// in memory and the Drop checkpoint publishes a stale image.
-    pub fn note_foreign_stmt_commit(&self) {
-        if let Some(f) = &self.foreign {
-            f.dirty.store(true, Ordering::Release);
-            if !self.in_transaction.load(Ordering::Acquire) {
-                let _ = self.dump_foreign();
+    /// `Database::execute` entirely, so the statement epilogue calls
+    /// this to keep the pending file's adoption honest — mark written,
+    /// and when the statement ran in autocommit mode, adopt the path
+    /// into the native container exactly like the execute paths do.
+    pub fn note_pending_stmt_commit(&self) {
+        if let Some(p) = &self.pending {
+            if !p.adopted.load(Ordering::Acquire) {
+                p.wrote.store(true, Ordering::Release);
+                if !self.in_transaction.load(Ordering::Acquire) {
+                    let _ = self.maybe_adopt();
+                }
             }
         }
     }
 
-    /// Publish the persistent file in SQLite's disk format when the
-    /// in-memory state has committed writes. No-op when clean.
+    /// Adopt-on-write: at a write-commit boundary of a session loaded
+    /// from a SQLite-format file, atomically convert the PATH into the
+    /// native container (one whole-image publish) and rebind this
+    /// session's pager onto it — see `Pager::adopt_file_backing`. From
+    /// here on the session is a plain native session: page-granular
+    /// WAL commits, multi-session MRMW on the file, checkpoints.
     ///
-    /// THE INCREMENTAL PAGE-DIFF ARCHITECTURE (see
-    /// `storage::sqlitefmt::container`): after this session's first
-    /// FULL publish establishes the file's shared page space, every
-    /// later commit
-    ///   1. diffs the engine's per-root change epochs against this
-    ///      session's last-publish snapshot — O(#objects), never
-    ///      O(database),
-    ///   2. re-collects and re-encodes ONLY the objects whose trees
-    ///      were written, splicing each b-tree onto its own previous
-    ///      pages, then the container freelist, then fresh tail pages
-    ///      (page identities stay stable; shrinkage routes into a real
-    ///      SQLite freelist),
-    ///   3. commits the KNOWN changed-page set through the journal-mode
-    ///      protocol — WAL frames in wal mode, a rollback journal
-    ///      (pre-images, in-place writes, journal deletion) in delete
-    ///      mode — never an image-wide diff.
-    ///
-    /// Per-commit CPU and memory scale with the CHANGED object, not
-    /// the database; multiple sessions on one file share the page
-    /// space (per-object last-writer merge under the coordinator's
-    /// lock).
-    ///
-    /// The FULL atomic write (temp + fsync + rename) remains for: the
-    /// session's first commit (which also folds whatever sidecar the
-    /// source left behind — `had_wal`), DDL (schema rows move),
-    /// `PRAGMA journal_mode` switches, auto-vacuum containers
-    /// (pointer-map geometry is a full-build concern), a detected
-    /// external rewrite of the main file, and any incremental failure —
-    /// always a correct state, just the slow path.
-    pub fn dump_foreign(&self) -> Result<()> {
-        use crate::storage::sqlitefmt::container::PublishParams;
-
-        let Some(foreign) = self.foreign.as_ref() else {
+    /// No-op for native/in-memory sessions, for a clean load (a
+    /// read-only open NEVER touches the file's bytes), while the load
+    /// itself replays, and after the first adoption.
+    fn maybe_adopt(&self) -> Result<()> {
+        let Some(p) = self.pending.as_ref() else {
             return Ok(());
         };
-        if !foreign.dirty.load(Ordering::Acquire) && !foreign.had_wal.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let coord = foreign.coord.clone();
-
-        // ---- Change detection (metadata only, O(#objects)) ----
-        // Epochs are read BEFORE any rows are collected: a mutation
-        // racing the collection then leaves the recorded epoch BEHIND
-        // the live data, so the next commit re-splices the object
-        // (conservative, correct); the reverse — recording an epoch
-        // AHEAD of the collected data — is impossible because every
-        // mutation path bumps its root on exit, after the pages are
-        // live.
-        //
-        // The catalog snapshot is CACHED across commits (a stable
-        // schema epoch means the catalog did not change — every DDL
-        // and every rootpage schema-row rewrite bumps root 0), so the
-        // per-commit metadata work is one epoch read per object and
-        // one hash lookup per object — no per-object capture walk, no
-        // name-keyed map rebuilds, no String clones for clean objects.
-        let schema_epoch_now = self.pager.root_epoch(0);
-        let snapshot: std::sync::Arc<SqliteCatalogSnapshot> = {
-            let snap = foreign.snap.lock();
-            match &snap.cached_snapshot {
-                Some(s) if snap.published && snap.cached_epoch == schema_epoch_now => s.clone(),
-                _ => {
-                    drop(snap);
-                    if std::env::var_os("RSQL_SPLICE_TRACE").is_some() {
-                        eprintln!("[splice] snapshot cache MISS (capture + slot rebuild)");
-                    }
-                    let s = std::sync::Arc::new(
-                        self.sqlite_catalog_snapshot(foreign.order.lock().clone()),
-                    );
-                    let mut snap = foreign.snap.lock();
-                    // A racing thread may have stored a fresher capture
-                    // (captured at a LATER epoch); never regress it.
-                    if snap.cached_epoch <= schema_epoch_now {
-                        // Rebuild the epoch-slot set from the new
-                        // snapshot: existing names keep their recorded
-                        // last-published epoch, new names take the MAX
-                        // baseline (dirty on the next walk), and names
-                        // that left the catalog are stashed as this
-                        // session's pending drops (the rebuild destroys
-                        // the old set — the diff is taken here).
-                        let mut slots = HashMap::with_capacity(s.tables.len() + s.indexes.len());
-                        let mut dropped_here: Vec<String> = Vec::new();
-                        for (name, t) in &s.tables {
-                            let last = snap.slots.get(name).map(|os| os.last).unwrap_or(u64::MAX);
-                            slots.insert(
-                                name.clone(),
-                                ObjectEpochSlot {
-                                    slot: self.pager.root_epoch_slot(t.root_page),
-                                    last,
-                                },
-                            );
-                        }
-                        for (name, i) in &s.indexes {
-                            let last = snap.slots.get(name).map(|os| os.last).unwrap_or(u64::MAX);
-                            slots.insert(
-                                name.clone(),
-                                ObjectEpochSlot {
-                                    slot: self.pager.root_epoch_slot(i.root_page),
-                                    last,
-                                },
-                            );
-                        }
-                        for name in snap.slots.keys() {
-                            if !s.tables.contains_key(name) && !s.indexes.contains_key(name) {
-                                dropped_here.push(name.clone());
-                            }
-                        }
-                        if !dropped_here.is_empty() {
-                            let pending = std::mem::take(&mut snap.pending_dropped);
-                            let mut merged = dropped_here;
-                            merged.extend(pending);
-                            snap.pending_dropped = merged;
-                        }
-                        snap.slots = slots;
-                        snap.cached_snapshot = Some(s.clone());
-                        snap.cached_epoch = schema_epoch_now;
-                    }
-                    s
-                }
-            }
-        };
-        // The per-object dirty walk: one LOCK-FREE atomic load per
-        // object (the slots were resolved at the last catalog change),
-        // a String clone only for the actually-dirty names.
-        let (
-            published,
-            prev_schema_epoch,
-            loaded_clean,
-            loaded_uv,
-            loaded_app,
-            loaded_jw,
-            dirty_keys,
-            dropped_keys,
-            epoch_updates,
-        ) = {
-            let mut snap = foreign.snap.lock();
-            let published = snap.published;
-            let mut dirty: Vec<String> = Vec::new();
-            let mut updates: Vec<(String, u64)> = Vec::new();
-            for (name, os) in &snap.slots {
-                let e = os.slot.load(std::sync::atomic::Ordering::Acquire);
-                if e != os.last {
-                    updates.push((name.clone(), e));
-                    dirty.push(name.clone());
-                }
-            }
-            // Object-set changes ride the schema epoch: every CREATE /
-            // DROP / ALTER writes through the schema tree, so a stable
-            // epoch means the set is IDENTICAL since the last publish
-            // and the (rebuilt-and-stashed) drops list is the only
-            // other source.
-            let dropped: Vec<String> = std::mem::take(&mut snap.pending_dropped);
-            (
-                published,
-                snap.schema_epoch,
-                snap.loaded_clean,
-                snap.loaded_uv,
-                snap.loaded_app,
-                snap.loaded_journal_wal,
-                dirty,
-                dropped,
-                updates,
-            )
-        };
-        let schema_changed = published && schema_epoch_now != prev_schema_epoch;
-
-        let (counter, cookie) = coord.next_counters(schema_changed);
-        let params = PublishParams {
-            page_size: if foreign.page_size == 0 {
-                4096
-            } else {
-                foreign.page_size
-            },
-            journal_wal: foreign.journal_wal.load(Ordering::Acquire),
-            text_enc: foreign.text_enc(),
-            auto_vacuum: foreign.auto_vacuum(),
-            user_version: self.pager.user_version(),
-            application_id: self.pager.application_id(),
-            change_counter: counter,
-            schema_cookie: cookie,
-            // SQLite's own discipline: WAL commits fsync only under
-            // FULL/EXTRA — OFF/NORMAL defer to the checkpoint.
-            synchronous: self.pager.synchronous(),
-        };
-
-        // ---- The clean-load skip ----
-        // A session seeded from a clean load whose state never diverged
-        // (no dirty objects, no drops, no DDL, header values unchanged)
-        // already matches the file byte-for-byte — publishing would
-        // rewrite the whole database for nothing (and break the
-        // byte-stable idle-reopen contract).
-        if loaded_clean
-            && !foreign.had_wal.load(Ordering::Acquire)
-            && dirty_keys.is_empty()
-            && dropped_keys.is_empty()
-            && !schema_changed
-            && params.user_version == loaded_uv
-            && params.application_id == loaded_app
-            && params.journal_wal == loaded_jw
+        if p.adopted.load(Ordering::Acquire)
+            || p.loading.load(Ordering::Acquire)
+            || !p.wrote.load(Ordering::Acquire)
         {
-            self.finish_foreign_publish(
-                foreign,
-                &params,
-                &epoch_updates,
-                &dropped_keys,
-                schema_epoch_now,
-            );
             return Ok(());
         }
-
-        // ---- Incremental splice (the common path) ----
-        // A fresh coordinator (process restart / last session closed)
-        // ADOPTS the file's layout first — the file IS the page space.
-        if !foreign.had_wal.load(Ordering::Acquire) && !coord.established() {
-            coord.try_adopt(&params);
-        }
-        if !foreign.had_wal.load(Ordering::Acquire) && coord.can_splice(&params) {
-            let spliced = self.splice_foreign_commit(
-                &snapshot,
-                &dirty_keys,
-                &dropped_keys,
-                schema_changed,
-                &coord,
-                &params,
-            );
-            match spliced {
-                Ok(true) => {
-                    foreign
-                        .wal_pending
-                        .store(coord.wal_has_frames(), Ordering::Release);
-                    self.finish_foreign_publish(
-                        foreign,
-                        &params,
-                        &epoch_updates,
-                        &dropped_keys,
-                        schema_epoch_now,
-                    );
-                    return Ok(());
-                }
-                Ok(false) => {
-                    // Nothing actually changed (byte-identical rebuilds):
-                    // no write, no counter advance — but the session's
-                    // snapshot still refreshes so these objects are not
-                    // re-collected next commit.
-                    self.finish_foreign_publish(
-                        foreign,
-                        &params,
-                        &epoch_updates,
-                        &dropped_keys,
-                        schema_epoch_now,
-                    );
-                    return Ok(());
-                }
-                Err(_) => {
-                    // Any splice failure (I/O error, replaced sidecar,
-                    // unreadable base page) falls through to the full
-                    // publish below: the main file still holds the last
-                    // committed state and the full write republishes it.
-                }
-            }
-        }
-
-        // ---- Full publish (the slow path) ----
-        let out =
-            self.collect_foreign_dump_counters(params.change_counter, params.schema_cookie)?;
-        let built = crate::storage::sqlitefmt::writer::build_bytes_spanned(&out)
-            .map_err(|e| Error::Io(std::io::Error::other(e)))?;
-        coord
-            .publish_full(&built, &params)
-            .map_err(|e| Error::Io(std::io::Error::other(e)))?;
-        foreign.wal_pending.store(false, Ordering::Release);
-        self.finish_foreign_publish(
-            foreign,
-            &params,
-            &epoch_updates,
-            &dropped_keys,
-            schema_epoch_now,
-        );
+        // Single-writer rule: the pre-adoption session is the file's
+        // only writer (the container's multi-session page-space
+        // coordination was dropped WITH the container — a second
+        // session's adoption races this rename and the loser's open
+        // re-checks the magic, now native).
+        self.pager.adopt_file_backing(&self.path)?;
+        p.adopted.store(true, Ordering::Release);
+        p.wrote.store(false, Ordering::Release);
         Ok(())
     }
 
-    /// Collect and splice the DIRTY objects of one incremental commit
-    /// (see `dump_foreign`). `Ok(false)` = nothing changed.
-    #[allow(clippy::too_many_arguments)]
-    fn splice_foreign_commit(
-        &self,
-        snapshot: &SqliteCatalogSnapshot,
-        dirty_keys: &[String],
-        dropped_keys: &[String],
-        schema_changed: bool,
-        coord: &std::sync::Arc<crate::storage::sqlitefmt::container::Container>,
-        params: &crate::storage::sqlitefmt::container::PublishParams,
-    ) -> Result<bool> {
-        use crate::storage::sqlitefmt::container::{
-            MutateItem, SpliceError, SpliceItem, SpliceSchemaRow,
-        };
-        use crate::storage::sqlitefmt::writer::SpanKey;
-        use crate::storage::sqlitefmt::OutObject;
-
-        // Only the objects whose trees were written get re-collected —
-        // and of those, the ones with an EXACT row-delta journal and a
-        // matching span version go through PAGE-LEVEL MUTATION instead
-        // (O(changed pages) — see `storage::sqlitefmt::mutator`).
-        let registry = self.plugins.read().clone();
-        let foreign = self.foreign.as_ref().unwrap();
-        let enc = foreign.text_enc();
-        // The journal is usable only when no DDL touched the interval
-        // (DDL re-keys objects; the mutate path would verify-fail and
-        // fall back anyway, but skipping it up front is cheaper).
-        let journal_usable = !schema_changed && foreign.journal.lock().active();
-        if std::env::var_os("RSQL_SPLICE_TRACE").is_some() {
-            let j = foreign.journal.lock();
-            eprintln!(
-                "[splice] decision: journal_usable={journal_usable} schema_changed={schema_changed} active={} deltas={:?}",
-                j.active(),
-                j.deltas.keys().collect::<Vec<_>>(),
-            );
-        }
-        // The dirty keys' recorded span versions — O(dirty), never a
-        // clone of the whole per-object map (the many-tables case
-        // would pay an O(#objects) String-clone walk per commit).
-        let snap_versions: HashMap<String, u64> = {
-            let snap = foreign.snap.lock();
-            dirty_keys
-                .iter()
-                .filter_map(|k| snap.versions.get(k).map(|v| (k.clone(), *v)))
-                .collect()
-        };
-        let version_ok = |key: &str| -> bool {
-            let v = snap_versions.get(key).copied().unwrap_or(0);
-            v != 0 && v == coord.span_version(&SpanKey::Object(key.to_string()))
-        };
-        let mut items: Vec<SpliceItem> = Vec::with_capacity(dirty_keys.len());
-        let mut mutates: Vec<MutateItem> = Vec::new();
-        for key in dirty_keys {
-            if let Some(table) = snapshot.tables.get(key) {
-                if table.vtab.is_some() {
-                    // Virtual tables have no b-tree (rootpage 0); their
-                    // schema rows are DDL-stable.
-                    continue;
-                }
-                if journal_usable {
-                    // Page-level mutation beats the whole-object splice
-                    // for any delta set up to the fixed cut, and beyond
-                    // it whenever the object is big enough that
-                    // re-collecting every row would cost more than
-                    // descending per delta (a leaf packs ~30-100 cells;
-                    // 64 is the conservative multiplier).
-                    let span_pages = coord.span_page_count(&SpanKey::Object(key.clone()));
-                    let deltas = foreign
-                        .journal
-                        .lock()
-                        .deltas
-                        .get(key)
-                        .filter(|d| !d.is_empty() && mutate_beats_splice(d.len(), span_pages))
-                        .cloned();
-                    if let Some(deltas) = deltas {
-                        let ops = if table.without_rowid {
-                            self.without_rowid_mutate_ops(table, &deltas, &registry)
-                        } else {
-                            self.table_mutate_ops(table, &deltas, enc)
-                        };
-                        if let Some(ops) = ops.filter(|_| version_ok(key)) {
-                            mutates.push(MutateItem {
-                                key: SpanKey::Object(key.clone()),
-                                ops,
-                            });
-                            continue;
-                        }
-                    }
-                }
-                let obj = if table.without_rowid {
-                    OutObject::WithoutRowid {
-                        name: table.name.clone(),
-                        sql: table.create_sql.clone(),
-                        pk_collations: without_rowid_pk_collations(table, &registry),
-                        rows: self.dump_without_rowid_rows(table)?,
-                    }
-                } else {
-                    OutObject::Table {
-                        name: table.name.clone(),
-                        sql: table.create_sql.clone(),
-                        alias: table.rowid_alias,
-                        rows: self.dump_table_rows(table)?,
-                    }
-                };
-                items.push(SpliceItem {
-                    key: SpanKey::Object(key.clone()),
-                    object: obj,
-                });
-            } else if let Some(idx) = snapshot.indexes.get(key) {
-                // Index deltas are DERIVED from the owning table's row
-                // journal at publish time (the same composition the
-                // whole-object dump uses, so both paths write
-                // byte-identical entries).
-                if journal_usable
-                    && matches!(idx.kind, crate::schema::IndexKind::Btree)
-                    && idx.columns.iter().all(|c| c.expr.is_none())
-                    && idx.partial_expr.is_none()
-                {
-                    let table_lc = idx.table.to_ascii_lowercase();
-                    let eligible_table = snapshot
-                        .tables
-                        .get(&table_lc)
-                        .is_some_and(|t| !t.without_rowid && t.vtab.is_none());
-                    if eligible_table {
-                        let span_pages = coord.span_page_count(&SpanKey::Object(key.clone()));
-                        let deltas = foreign
-                            .journal
-                            .lock()
-                            .deltas
-                            .get(&table_lc)
-                            .filter(|d| !d.is_empty() && mutate_beats_splice(d.len(), span_pages))
-                            .cloned();
-                        if let Some(deltas) = deltas {
-                            let table = &snapshot.tables[&table_lc];
-                            let ops = self.index_mutate_ops(idx, table, &deltas, &registry);
-                            if let Some(ops) = ops.filter(|_| version_ok(key)) {
-                                mutates.push(MutateItem {
-                                    key: SpanKey::Object(key.clone()),
-                                    ops,
-                                });
-                                continue;
-                            }
-                        }
-                    }
-                }
-                let obj = self.dump_index_object(idx.as_ref(), &snapshot.tables, &registry)?;
-                items.push(SpliceItem {
-                    key: SpanKey::Object(key.clone()),
-                    object: obj,
-                });
-            }
-        }
-
-        // The schema rows (emit order, the shared descriptor walk) for
-        // the schema-tree rebuild on DDL / root moves — LAZY: the
-        // descriptor walk is O(#objects) with several String clones per
-        // object, and a data-only commit on a stable layout (the
-        // mutate path — roots never move) never needs it.
-        let schema_rows_of = || {
-            let descs = self.sqlite_schema_row_descs(snapshot);
-            descs
-                .iter()
-                .map(|d| SpliceSchemaRow {
-                    kind: d.kind.to_string(),
-                    name: d.name.clone(),
-                    tbl_name: d.tbl_name.clone(),
-                    sql: d.sql.clone(),
-                    key: match &d.source {
-                        SchemaRowSource::Table(_) | SchemaRowSource::Index(_) => {
-                            Some(d.key.clone())
-                        }
-                        _ => None,
-                    },
-                })
-                .collect::<Vec<SpliceSchemaRow>>()
-        };
-
-        // The synthesized sqlite_sequence appearing for the first time
-        // (a legacy image whose catalog never carried the table gains
-        // an AUTOINCREMENT table): it needs real content and a span —
-        // build it exactly like the full collector does. Once the span
-        // exists, later commits treat it as a schema row only (its
-        // content is static until the real catalog table materializes,
-        // which is DDL and re-keys the same span). The descriptor walk
-        // runs only while the span does not exist yet.
-        let seq_key = SpanKey::Object("sqlite_sequence".into());
-        if snapshot.has_autoincrement && !coord.has_span(&seq_key) {
-            let descs = self.sqlite_schema_row_descs(snapshot);
-            if descs
-                .iter()
-                .any(|d| matches!(d.source, SchemaRowSource::SynthSequence))
-            {
-                let foreign = self.foreign.as_ref().unwrap();
-                let sequences = foreign.sequences.lock();
-                let mut seq_rows: Vec<(i64, Vec<Value>)> = Vec::new();
-                for (name, t) in &snapshot.tables {
-                    if !t.columns.iter().any(|c| c.autoincrement) {
-                        continue;
-                    }
-                    let max_rowid = self.table_max_rowid(t).unwrap_or(0);
-                    let seq = sequences.get(name).copied().unwrap_or(0).max(max_rowid);
-                    seq_rows.push((
-                        seq_rows.len() as i64 + 1,
-                        vec![
-                            Value::Text(crate::types::text::Text::from(t.name.as_str())),
-                            Value::Integer(seq),
-                        ],
-                    ));
-                }
-                if !seq_rows.is_empty() {
-                    items.push(SpliceItem {
-                        key: seq_key,
-                        object: OutObject::Table {
-                            name: "sqlite_sequence".into(),
-                            sql: "CREATE TABLE sqlite_sequence(name,seq)".into(),
-                            alias: None,
-                            rows: seq_rows,
-                        },
-                    });
-                }
-            }
-        }
-
-        let dropped: Vec<SpanKey> = dropped_keys
-            .iter()
-            .map(|k| SpanKey::Object(k.clone()))
-            .collect();
-        // The mutate/retry loop: a page-level mutation that declines
-        // (stale journal, verification mismatch) returns BEFORE
-        // anything commits; the failed objects are re-collected as
-        // whole-tree splices and the publish retried. Each round moves
-        // at least one key to the rebuild side, so it terminates.
-        loop {
-            match coord.publish_splice(
-                &items,
-                &mutates,
-                &dropped,
-                schema_changed,
-                &schema_rows_of,
-                params,
-            ) {
-                Ok(done) => return Ok(done),
-                Err(SpliceError::MutateFallback(failed)) => {
-                    let mut moved = false;
-                    for key in &failed {
-                        let SpanKey::Object(name) = key else {
-                            continue;
-                        };
-                        let Some(pos) = mutates.iter().position(|m| &m.key == key) else {
-                            continue;
-                        };
-                        let item = mutates.remove(pos);
-                        moved = true;
-                        if let Some(table) = snapshot.tables.get(name) {
-                            let obj = if table.without_rowid {
-                                OutObject::WithoutRowid {
-                                    name: table.name.clone(),
-                                    sql: table.create_sql.clone(),
-                                    pk_collations: without_rowid_pk_collations(table, &registry),
-                                    rows: self.dump_without_rowid_rows(table)?,
-                                }
-                            } else {
-                                OutObject::Table {
-                                    name: table.name.clone(),
-                                    sql: table.create_sql.clone(),
-                                    alias: table.rowid_alias,
-                                    rows: self.dump_table_rows(table)?,
-                                }
-                            };
-                            items.push(SpliceItem {
-                                key: item.key,
-                                object: obj,
-                            });
-                        } else if let Some(idx) = snapshot.indexes.get(name) {
-                            let obj =
-                                self.dump_index_object(idx.as_ref(), &snapshot.tables, &registry)?;
-                            items.push(SpliceItem {
-                                key: item.key,
-                                object: obj,
-                            });
-                        }
-                    }
-                    if !moved {
-                        return Err(Error::Io(std::io::Error::other(
-                            "splice mutation fallback made no progress",
-                        )));
-                    }
-                }
-                Err(SpliceError::Other(e)) => {
-                    return Err(Error::Io(std::io::Error::other(e)));
-                }
-            }
-        }
-    }
-
-    /// Rowid-table mutation ops from the delta journal — the record
-    /// encoding mirrors `dump_table_rows` exactly (alias elision, the
-    /// file's text encoding) so mutated and rebuilt files agree
-    /// byte-for-byte on every record.
-    fn table_mutate_ops(
-        &self,
-        table: &Table,
-        deltas: &[crate::storage::sqlitefmt::delta::RowDelta],
-        enc: crate::storage::sqlitefmt::record::TextEnc,
-    ) -> Option<crate::storage::sqlitefmt::mutator::MutateOps> {
-        use crate::storage::sqlitefmt::mutator::{MutateOps, TableRowOp};
-        use crate::storage::sqlitefmt::record::encode_record_aliased_enc;
-        let ops = deltas
-            .iter()
-            .map(|d| TableRowOp {
-                rowid: d.rowid,
-                expect: d
-                    .old
-                    .as_ref()
-                    .map(|v| encode_record_aliased_enc(v, table.rowid_alias, enc)),
-                set: d
-                    .new
-                    .as_ref()
-                    .map(|v| encode_record_aliased_enc(v, table.rowid_alias, enc)),
-            })
-            .collect();
-        Some(MutateOps::Table(ops))
-    }
-
-    /// WITHOUT ROWID mutation ops: full PK-first records (the same
-    /// reorder `dump_without_rowid_rows` performs), ordered by the PK
-    /// collations.
-    fn without_rowid_mutate_ops(
-        &self,
-        table: &Table,
-        deltas: &[crate::storage::sqlitefmt::delta::RowDelta],
-        registry: &crate::plugin::PluginRegistry,
-    ) -> Option<crate::storage::sqlitefmt::mutator::MutateOps> {
-        // The record encoding happens inside the mutator (Entries carry
-        // VALUES; the comparator needs collation semantics, not bytes).
-        use crate::storage::sqlitefmt::mutator::{EntryOp, EntryOrder, MutateOps};
-        let map = without_rowid_record_map(table);
-        let n = table.n_columns();
-        let compose = |vals: &[Value]| -> Vec<Value> {
-            let mut record: Vec<Value> = vec![Value::Null; n];
-            for (decl_i, val) in vals.iter().enumerate() {
-                if decl_i < n {
-                    record[decl_i] = val.clone();
-                }
-            }
-            let mut sorted: Vec<Option<Value>> = vec![None; n];
-            let mut used = vec![false; n];
-            for (rec_i, decl_i) in map.iter().enumerate() {
-                if *decl_i < n {
-                    sorted[rec_i] = Some(record[*decl_i].clone());
-                    used[*decl_i] = true;
-                }
-            }
-            let mut next = 0usize;
-            for decl_i in 0..n {
-                if !used[decl_i] {
-                    while next < n && sorted[next].is_some() {
-                        next += 1;
-                    }
-                    if next < n {
-                        sorted[next] = Some(record[decl_i].clone());
-                    }
-                }
-            }
-            sorted
-                .into_iter()
-                .map(|v| v.unwrap_or(Value::Null))
-                .collect()
-        };
-        let ops = deltas
-            .iter()
-            .map(|d| EntryOp {
-                expect: d.old.as_ref().map(|v| compose(v)),
-                set: d.new.as_ref().map(|v| compose(v)),
-            })
-            .collect();
-        Some(MutateOps::Entries(
-            EntryOrder {
-                desc: Vec::new(),
-                collations: without_rowid_pk_collations(table, registry),
-            },
-            ops,
-        ))
-    }
-
-    /// Index mutation ops derived from the owning table's row deltas —
-    /// `[key columns..., rowid]` per entry, exactly the whole-object
-    /// dump's composition. The caller pre-checked eligibility (plain
-    /// Btree index, no expressions, no partial predicate).
-    fn index_mutate_ops(
-        &self,
-        idx: &crate::schema::Index,
-        table: &Table,
-        deltas: &[crate::storage::sqlitefmt::delta::RowDelta],
-        registry: &crate::plugin::PluginRegistry,
-    ) -> Option<crate::storage::sqlitefmt::mutator::MutateOps> {
-        use crate::storage::sqlitefmt::mutator::{EntryOp, EntryOrder, MutateOps};
-        let key_pos: Vec<usize> = idx
-            .columns
-            .iter()
-            .map(|c| table.find_column(&c.name))
-            .collect::<Option<Vec<_>>>()?;
-        let compose = |vals: &[Value], rowid: i64| -> Vec<Value> {
-            let mut entry: Vec<Value> = key_pos.iter().map(|&p| vals[p].clone()).collect();
-            entry.push(Value::Integer(rowid));
-            entry
-        };
-        let ops = deltas
-            .iter()
-            .map(|d| {
-                // NOTE: the entry's rowid suffix is the delta's rowid —
-                // exact for inserts, deletes and rowid-preserving
-                // updates. A rowid-CHANGING update composes a stale old
-                // entry, the mutation's expect-verify fails, and the
-                // object falls back to the whole-object splice (correct,
-                // just un-accelerated).
-                EntryOp {
-                    expect: d.old.as_ref().map(|v| compose(v, d.rowid)),
-                    set: d.new.as_ref().map(|v| compose(v, d.rowid)),
-                }
-            })
-            .collect();
-        let desc: Vec<bool> = idx
-            .columns
-            .iter()
-            .map(|c| c.order == crate::sql::ast::Order::Desc)
-            .collect();
-        let collations: Vec<crate::storage::sqlitefmt::Collation> = idx
-            .columns
-            .iter()
-            .map(|c| collation_of(&c.collation, &idx.name, registry))
-            .collect();
-        Some(MutateOps::Entries(EntryOrder { desc, collations }, ops))
-    }
-
-    /// Post-publish bookkeeping shared by both paths: the session's
-    /// snapshot (epochs + schema signature) advances to the values read
-    /// BEFORE collection, the coordinator's counters become the values
-    /// this connection reports, and the dirty/had_wal flags clear.
-    fn finish_foreign_publish(
-        &self,
-        foreign: &ForeignSqlite,
-        params: &crate::storage::sqlitefmt::container::PublishParams,
-        epoch_updates: &[(String, u64)],
-        dropped: &[String],
-        schema_epoch: u64,
-    ) {
-        {
-            let mut snap = foreign.snap.lock();
-            // Epoch bookkeeping is DELTA-based: advance the objects the
-            // walk marked (a session's opening walk carries every
-            // object, so the session's first publish still seeds every
-            // slot) and drop the gone. Clean objects keep their
-            // recorded epochs untouched.
-            for (k, e) in epoch_updates {
-                if let Some(os) = snap.slots.get_mut(k) {
-                    os.last = *e;
-                }
-            }
-            for k in dropped {
-                snap.slots.remove(k);
-                snap.versions.remove(k);
-            }
-            snap.schema_epoch = schema_epoch;
-            snap.published = true;
-            snap.loaded_clean = false;
-            // Per-object span versions: only the objects this publish
-            // touched (the same delta set) can have moved.
-            let names: Vec<String> = epoch_updates.iter().map(|(k, _)| k.clone()).collect();
-            let versions = foreign.coord.span_versions_of(&names);
-            for (k, v) in versions {
-                snap.versions.insert(k, v);
-            }
-        }
-        // The publish consumed (or rebuilt past) the delta journal.
-        foreign.journal.lock().reset_after_publish();
-        foreign
-            .change_counter
-            .store(params.change_counter, Ordering::Release);
-        foreign
-            .schema_cookie
-            .store(params.schema_cookie, Ordering::Release);
-        foreign.dirty.store(false, Ordering::Release);
-        foreign.had_wal.store(false, Ordering::Release);
-    }
-
-    /// Collect the complete committed state as a SQLite-format build.
-    fn collect_foreign_dump(&self) -> Result<crate::storage::sqlitefmt::OutDb> {
-        let foreign = self.foreign.as_ref().unwrap();
-        self.collect_foreign_dump_counters(
-            foreign.change_counter.load(Ordering::Acquire).max(1),
-            foreign.schema_cookie.load(Ordering::Acquire).max(1),
-        )
-    }
-
-    /// [`collect_foreign_dump`] with explicit header counters (the
-    /// coordinator-issued values on the incremental-commit paths).
-    fn collect_foreign_dump_counters(
-        &self,
-        change_counter: u32,
-        schema_cookie: u32,
-    ) -> Result<crate::storage::sqlitefmt::OutDb> {
-        let foreign = self.foreign.as_ref().unwrap();
-        let objects =
-            self.collect_sqlite_objects(foreign.order.lock().clone(), &foreign.sequences.lock())?;
+    /// Collect the complete committed state as a SQLite-format build —
+    /// the one-shot EXPORT collector ([`Self::export_sqlite_format`],
+    /// `VACUUM INTO` on a pending session, the `.archive` CLI). A
+    /// pending session round-trips its fidelity fields (schema emit
+    /// order, `sqlite_sequence`, text encoding, auto-vacuum mode, page
+    /// size); every other session exports in catalog order, UTF-8,
+    /// delete journal mode (SQLite's own `VACUUM INTO` shape).
+    fn collect_sqlite_export(&self) -> Result<crate::storage::sqlitefmt::OutDb> {
+        // Fidelity fields survive ADOPTION by design: an adopted
+        // session still exports the source's shape (SQLite's own
+        // `VACUUM INTO` of a UTF-16 database writes UTF-16).
+        let (order, sequences, page_size, change_counter, schema_cookie, text_enc, auto_vacuum) =
+            match self.pending.as_ref() {
+                Some(p) => (
+                    p.order.lock().clone(),
+                    p.sequences.lock().clone(),
+                    p.page_size,
+                    p.change_counter.load(Ordering::Acquire).max(1),
+                    p.schema_cookie.load(Ordering::Acquire).max(1),
+                    p.text_enc(),
+                    p.auto_vacuum(),
+                ),
+                _ => (
+                    Vec::new(),
+                    HashMap::new(),
+                    0,
+                    1,
+                    1,
+                    crate::storage::sqlitefmt::record::TextEnc::Utf8,
+                    0,
+                ),
+            };
+        let objects = self.collect_sqlite_objects(order, &sequences)?;
         Ok(crate::storage::sqlitefmt::OutDb {
-            page_size: foreign.page_size,
+            objects,
+            page_size,
             user_version: self.pager.user_version(),
             application_id: self.pager.application_id(),
             change_counter,
             schema_cookie,
-            text_enc: foreign.text_enc(),
-            auto_vacuum: foreign.auto_vacuum(),
-            journal_wal: foreign.journal_wal.load(Ordering::Acquire),
-            objects,
-        })
-    }
-
-    /// The engine's native `RSQLDB04` container as a real SQLite-format
-    /// build — the native→SQLite export path behind `VACUUM INTO 'file'`
-    /// on a native-format database.
-    ///
-    /// Header shape matches real SQLite's own `VACUUM INTO` output
-    /// (probed against bundled SQLite,
-    /// `examples/probe_vacuum_into_shape.rs`): the source's page size, a
-    /// rollback-journal marker (header 18/19 = 1/1 — SQLite writes that
-    /// even when the source is in WAL mode), a fresh change counter of
-    /// 1, UTF-8 text. The native container is always dense, so no
-    /// auto-vacuum pointer map. The output is a standalone file with no
-    /// sidecar — openable by the `sqlite3` CLI, VS Code SQLite
-    /// extensions and every SQLite tool.
-    fn collect_native_sqlite_export(&self) -> Result<crate::storage::sqlitefmt::OutDb> {
-        // Empty initial order: every object is engine-created, so the
-        // walk appends them in stable alphabetical order per kind.
-        let objects = self.collect_sqlite_objects(Vec::new(), &HashMap::new())?;
-        Ok(crate::storage::sqlitefmt::OutDb {
-            page_size: self.pager.page_size(),
-            user_version: self.pager.user_version(),
-            application_id: self.pager.application_id(),
-            change_counter: 1,
-            schema_cookie: self.pager.schema_cookie().max(1),
-            text_enc: crate::storage::sqlitefmt::record::TextEnc::Utf8,
-            auto_vacuum: 0,
+            text_enc,
+            auto_vacuum,
+            // Exports are one-shot images: a delete-journal-mode file
+            // that opens clean everywhere (SQLite's own VACUUM INTO
+            // writes 1/1 here too).
             journal_wal: false,
-            objects,
         })
     }
 
-    /// The shared sqlite_schema object walk for every SQLite-format dump
-    /// (foreign rewrites and native exports): tables — each followed by
-    /// its `sqlite_autoindex_*` rows — then standalone indexes, views
-    /// and triggers, in the given emit order (entries whose catalog
-    /// object is gone are skipped silently). `sequences` backs the
-    /// `sqlite_sequence` synthesis fallback for catalogs that do not
-    /// carry the table as a real rowid table (the native engine always
-    /// does once AUTOINCREMENT is used — its live rows are emitted by
-    /// the normal table path).
     fn collect_sqlite_objects(
         &self,
         order: Vec<SchemaOrderKey>,
@@ -4547,9 +3564,6 @@ impl Database {
         append_new_objects(&triggers, SchemaOrderKey::Trigger, &known, &mut order);
 
         SqliteCatalogSnapshot {
-            has_autoincrement: tables
-                .values()
-                .any(|t| t.columns.iter().any(|c| c.autoincrement)),
             tables,
             indexes,
             views,
@@ -4577,11 +3591,6 @@ impl Database {
                         continue;
                     };
                     descs.push(SchemaRowDesc {
-                        kind: "table",
-                        name: table.name.clone(),
-                        tbl_name: table.name.clone(),
-                        sql: Some(table.create_sql.clone()),
-                        key: name.clone(),
                         source: SchemaRowSource::Table(table.clone()),
                     });
                     // The engine's catalog carries the autoindexes it
@@ -4591,11 +3600,6 @@ impl Database {
                     for (idx_name, idx) in sorted_indexes_on(&snapshot.indexes, name) {
                         if idx_name.starts_with("sqlite_autoindex_") {
                             descs.push(SchemaRowDesc {
-                                kind: "index",
-                                name: idx.name.clone(),
-                                tbl_name: idx.table.clone(),
-                                sql: None, // SQLite stores NULL for autoindexes
-                                key: idx_name.to_ascii_lowercase(),
                                 source: SchemaRowSource::Index(idx.clone()),
                             });
                             emitted_autoindexes.insert(idx_name);
@@ -4615,11 +3619,6 @@ impl Database {
                         continue;
                     };
                     descs.push(SchemaRowDesc {
-                        kind: "index",
-                        name: idx.name.clone(),
-                        tbl_name: idx.table.clone(),
-                        sql: Some(idx.create_sql.clone()),
-                        key: name.clone(),
                         source: SchemaRowSource::Index(idx.clone()),
                     });
                 }
@@ -4628,11 +3627,6 @@ impl Database {
                         continue;
                     };
                     descs.push(SchemaRowDesc {
-                        kind: "view",
-                        name: v.name.clone(),
-                        tbl_name: v.name.clone(),
-                        sql: Some(v.create_sql.clone()),
-                        key: name.clone(),
                         source: SchemaRowSource::View(v.clone()),
                     });
                 }
@@ -4641,11 +3635,6 @@ impl Database {
                         continue;
                     };
                     descs.push(SchemaRowDesc {
-                        kind: "trigger",
-                        name: t.name.clone(),
-                        tbl_name: t.table.clone(),
-                        sql: Some(t.create_sql.clone()),
-                        key: name.clone(),
                         source: SchemaRowSource::Trigger(t.clone()),
                     });
                 }
@@ -4668,11 +3657,6 @@ impl Database {
         }
         if any_autoinc && !snapshot.tables.contains_key("sqlite_sequence") {
             descs.push(SchemaRowDesc {
-                kind: "table",
-                name: "sqlite_sequence".into(),
-                tbl_name: "sqlite_sequence".into(),
-                sql: Some("CREATE TABLE sqlite_sequence(name,seq)".into()),
-                key: "sqlite_sequence".into(),
                 source: SchemaRowSource::SynthSequence,
             });
         }
@@ -4907,10 +3891,13 @@ impl Database {
     /// then re-seeds a `:memory:` database from the image bytes, or
     /// rewrites the file and reopens it.
     fn execute_vacuum(&mut self, v: &VacuumStatement) -> Result<()> {
-        // SQLite-format databases: the dump IS the compaction (dense
-        // rebuild, no freelist, no fragmentation) — every write already
-        // produces SQLite's own VACUUM-shaped file.
-        if self.foreign.is_some() {
+        // A pending SQLite-format load: VACUUM INTO exports a REAL
+        // SQLite-format file of the committed state (the interchange
+        // writer — the one place the engine still writes SQLite bytes);
+        // plain VACUUM adopts the path into the native container FIRST
+        // (the rewrite SQLite's VACUUM performs) and then falls through
+        // to the native compaction below.
+        if self.pending_active() {
             if let Some(into) = &v.into {
                 let p = std::path::Path::new(into);
                 if p.exists() {
@@ -4918,21 +3905,15 @@ impl Database {
                         "cannot VACUUM INTO existing file: {into}"
                     )));
                 }
-                let out = self.collect_foreign_dump()?;
+                let out = self.collect_sqlite_export()?;
                 crate::storage::sqlitefmt::write_sqlite_file(p, &out)
                     .map_err(|e| Error::Io(std::io::Error::other(e)))?;
                 return Ok(());
             }
-            let foreign = self.foreign.as_ref();
-            if let Some(foreign) = foreign {
-                // VACUUM rebuilds the page layout wholesale: the next
-                // publish takes the full-write path (every page differs
-                // anyway) — drop the page space and re-publish.
-                foreign.coord.invalidate();
-                foreign.dirty.store(true, Ordering::Release);
+            if let Some(p) = self.pending.as_ref() {
+                p.wrote.store(true, Ordering::Release);
             }
-            self.dump_foreign()?;
-            return Ok(());
+            self.maybe_adopt()?;
         }
         if let Some(schema) = &v.schema {
             if !schema.eq_ignore_ascii_case("main") {
@@ -5007,7 +3988,7 @@ impl Database {
                     "cannot VACUUM INTO existing file: {into}"
                 )));
             }
-            let out = self.collect_native_sqlite_export()?;
+            let out = self.collect_sqlite_export()?;
             crate::storage::sqlitefmt::write_sqlite_file(p, &out).map_err(|e| {
                 Error::Io(std::io::Error::other(format!("vacuum into {into}: {e}")))
             })?;
@@ -6764,14 +5745,7 @@ impl Database {
     /// mutations go through interior mutability so the body could in principle
     /// be `&self`. We keep `&mut self` for API clarity (writers serialize).
     pub fn execute<P: Params>(&mut self, sql: &str, params: P) -> Result<()> {
-        let r = self.execute_stmt(sql, params);
-        if r.is_err() {
-            // A failed statement's rows were undone by the engine's
-            // statement-atomicity restore; the delta journal cannot
-            // assume anything about what survived — drop it.
-            self.poison_delta_journal();
-        }
-        r
+        self.execute_stmt(sql, params)
     }
 
     /// [`Self::execute`]'s body (the wrapper handles delta-journal
@@ -6822,9 +5796,6 @@ impl Database {
         // (script split, hook re-entry) and restores the previous sink on
         // exit, including on unwind.
         let _preupdate_guard = self.preupdate_scope();
-        // Delta-journal scope (page-level splicing capture): armed for
-        // the statement's duration on foreign-backed databases.
-        let _delta_guard = self.delta_stmt_scope();
         // Session-extension capture scope: the current connection's
         // sessions ride the preupdate TLS sink for the statement.
         let _session_guard = self.session_stmt_scope();
@@ -6895,7 +5866,7 @@ impl Database {
                         self.recover_failed_autocommit_fastpath(dirty_at_start);
                     }
                     if chained? {
-                        self.note_foreign_write()?;
+                        self.note_pending_write()?;
                         return Ok(());
                     }
                     if let Some(fi) = try_fast_insert_parse(sql) {
@@ -6904,7 +5875,7 @@ impl Database {
                             self.recover_failed_autocommit_fastpath(dirty_at_start);
                         }
                         if fast? {
-                            self.note_foreign_write()?;
+                            self.note_pending_write()?;
                             return Ok(());
                         }
                     }
@@ -7069,8 +6040,9 @@ impl Database {
                 }
             };
         }
-        // `PRAGMA encoding = X` (write form): needs &self — ForeignSqlite
-        // owns the encoding and the executor context cannot reach it.
+        // `PRAGMA encoding = X` (write form): needs &self — the pending
+        // state owns the export encoding and the executor context
+        // cannot reach it.
         // The read/query paths handle it in `read_pragma`; this is the
         // execute path. Result: empty (SQLite's write form returns no
         // rows). Positional `?` values resolve against the bound params.
@@ -7082,7 +6054,7 @@ impl Database {
                 return Ok(());
             }
             // `PRAGMA auto_vacuum = X` (write form): same routing as
-            // encoding — ForeignSqlite owns the mode; empty result.
+            // encoding — the pending state owns the mode; empty result.
             if p.value.is_some() && p.name.eq_ignore_ascii_case("auto_vacuum") {
                 let mode = auto_vacuum_value(p, params.as_slice());
                 drop(cached);
@@ -7196,12 +6168,12 @@ impl Database {
                 if ctx.roots_changed {
                     self.sync_schema_roots_inner()?;
                 }
-                if let Some(foreign) = self.foreign.as_ref() {
-                    foreign
-                        .dirty
-                        .store(true, std::sync::atomic::Ordering::Release);
-                    if !self.in_transaction.load(Ordering::Acquire) {
-                        self.dump_foreign()?;
+                if let Some(p) = self.pending.as_ref() {
+                    if !p.adopted.load(Ordering::Acquire) {
+                        p.wrote.store(true, Ordering::Release);
+                        if !self.in_transaction.load(Ordering::Acquire) {
+                            self.maybe_adopt()?;
+                        }
                     }
                 }
                 self.maybe_drain_after_burst();
@@ -7522,7 +6494,7 @@ impl Database {
             // own sqlite_stat1/4 DDL through this same path, so those two
             // names pass when replaying a foreign schema; the engine's
             // ANALYZE never comes through here (internal call).
-            if self.foreign.is_none() {
+            if !self.pending_active() {
                 if let Statement::Create(CreateStatement::Table { name, .. }) = stmt_ref {
                     if name.name.to_ascii_lowercase().starts_with("sqlite_") {
                         return Err(Error::constraint(format!(
@@ -7540,7 +6512,6 @@ impl Database {
                     sql,
                     matches!(stmt_ref, Statement::Create(CreateStatement::Index { .. })),
                 ),
-                self.foreign.as_ref(),
             )
         };
         profile::span(t_exec, &profile::EXEC_NS);
@@ -7691,6 +6662,12 @@ impl Database {
             self.refresh_maps_flag();
         }
         if result.is_ok() && ctx.rolled_back {
+            // The transaction's writes are undone — nothing is left to
+            // adopt, and a read-only-open SQLite-format file must stay
+            // untouched at close.
+            if let Some(p) = &self.pending {
+                p.wrote.store(false, Ordering::Release);
+            }
             // ROLLBACK restored the file/pager to its BEGIN state (the
             // `__begin__` savepoint's undo log, or the snapshot fallback).
             // The maps must return to their BEGIN-time values — the live
@@ -7892,16 +6869,21 @@ impl Database {
         // root sync, and cache invalidation — so the dump reads fully
         // settled state.
         if result.is_ok() && !ctx.rolled_back {
-            if let Some(foreign) = self.foreign.as_ref() {
-                let wrote = ctx.changes > 0
-                    || is_ddl
-                    || matches!(stmt_ref, Statement::Commit)
-                    || matches!(stmt_ref, Statement::Pragma(p) if p.value.is_some());
-                if wrote {
-                    let in_txn = self.in_transaction.load(Ordering::Acquire);
-                    foreign.dirty.store(true, Ordering::Release);
-                    if !in_txn {
-                        self.dump_foreign()?;
+            if let Some(p) = self.pending.as_ref() {
+                if !p.adopted.load(Ordering::Acquire) {
+                    // A deferred commit (BEGIN; INSERT; COMMIT) is caught
+                    // by the stored flag; a bare COMMIT of a read-only
+                    // transaction must NOT adopt (the file's bytes were
+                    // never a user's write target).
+                    let wrote = p.wrote.load(Ordering::Acquire)
+                        || ctx.changes > 0
+                        || is_ddl
+                        || matches!(stmt_ref, Statement::Pragma(q) if q.value.is_some());
+                    if wrote {
+                        p.wrote.store(true, Ordering::Release);
+                        if !self.in_transaction.load(Ordering::Acquire) {
+                            self.maybe_adopt()?;
+                        }
                     }
                 }
             }
@@ -8035,11 +7017,7 @@ impl Database {
     /// `root_overrides` and `max_rowids` are snapshot-cloned (read lock) for
     /// the duration of the query — a SELECT never writes them back.
     pub fn query<P: Params>(&self, sql: &str, params: P) -> Result<Vec<Row>> {
-        let r = self.query_inner(sql, params);
-        if r.is_err() {
-            self.poison_delta_journal();
-        }
-        r
+        self.query_inner(sql, params)
     }
 
     /// [`Self::query`]'s body (the wrapper handles delta-journal
@@ -8250,14 +7228,6 @@ impl Database {
                 Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
             ) {
             self.preupdate_scope()
-        } else {
-            None
-        };
-        let _delta_guard = if matches!(
-            cached.stmt.as_ref(),
-            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
-        ) {
-            self.delta_stmt_scope()
         } else {
             None
         };
@@ -8680,14 +7650,6 @@ impl Database {
         } else {
             None
         };
-        let _delta_guard = if matches!(
-            cached.stmt.as_ref(),
-            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
-        ) {
-            self.delta_stmt_scope()
-        } else {
-            None
-        };
         if let Statement::Explain { inner, analyze } = cached.stmt.as_ref() {
             if *analyze {
                 return self.explain_analyze_select(inner, params_vec.as_slice());
@@ -8894,15 +7856,13 @@ impl Database {
             // Lazy write-back mode: the cache IS the store — snapshot the
             // merged cache+store state (a flush would be a no-op).
             self.pager.memory_image_current()
-        } else if self.foreign.is_some() {
-            // SQLite-format file: SQLite's serialize contract is "the
-            // image reflects the CURRENT committed state". The main file
-            // can legitimately sit BEHIND a live WAL sidecar (mid-load
-            // incremental commits, WAL-appended transactions) — a plain
-            // read-back would serialize stale bytes. Checkpoint first:
-            // fold pending state into the main file (full atomic write,
-            // sidecar removed, session reset), then read it back.
-            self.checkpoint_foreign_image()?;
+        } else if self.pending_active() {
+            // A pending-adopt session's FILE BYTES are the last
+            // committed state by construction (writes adopt atomically
+            // at their commit boundary, so a still-pending session has
+            // no un-adopted committed writes; the load's replay never
+            // marks one). serialize returns the source's SQLite bytes —
+            // byte-stable on an untouched open.
             std::fs::read(&self.path).map_err(Error::from)
         } else if self.pager.wal_enabled() {
             // NATIVE WAL mode has the same committed-state-lives-in-the-
@@ -8922,60 +7882,6 @@ impl Database {
             let _ = self.pager.flush();
             std::fs::read(&self.path).map_err(Error::from)
         }
-    }
-
-    /// Foreign-file checkpoint for [`Self::image`]: fold the current
-    /// committed state into the main file atomically and retire any WAL
-    /// sidecar (the same clean-close semantics `Drop` applies). No write
-    /// when the main file is already current (clean AND sidecar-less) —
-    /// `image()` on an untouched database must be byte-stable.
-    fn checkpoint_foreign_image(&self) -> Result<()> {
-        use crate::storage::sqlitefmt::container::PublishParams;
-        let Some(foreign) = self.foreign.as_ref() else {
-            return Ok(());
-        };
-        let dirty = foreign.dirty.load(Ordering::Acquire);
-        let had_wal = foreign.had_wal.load(Ordering::Acquire);
-        let live_frames = foreign
-            .coord
-            .state
-            .lock()
-            .wal
-            .as_ref()
-            .is_some_and(|w| w.has_frames());
-        if !dirty && !had_wal && !live_frames {
-            return Ok(());
-        }
-        // A full publish through the coordinator: the main file becomes
-        // the current committed state (sidecars retired) and the page
-        // space stays valid for later splices. Counters pass through
-        // unchanged — serialize is not a transaction.
-        let params = PublishParams {
-            page_size: if foreign.page_size == 0 {
-                4096
-            } else {
-                foreign.page_size
-            },
-            journal_wal: foreign.journal_wal.load(Ordering::Acquire),
-            text_enc: foreign.text_enc(),
-            auto_vacuum: foreign.auto_vacuum(),
-            user_version: self.pager.user_version(),
-            application_id: self.pager.application_id(),
-            change_counter: foreign.change_counter.load(Ordering::Acquire).max(1),
-            schema_cookie: foreign.schema_cookie.load(Ordering::Acquire).max(1),
-            synchronous: self.pager.synchronous(),
-        };
-        let out =
-            self.collect_foreign_dump_counters(params.change_counter, params.schema_cookie)?;
-        let built = crate::storage::sqlitefmt::writer::build_bytes_spanned(&out)
-            .map_err(|e| Error::Io(std::io::Error::other(e)))?;
-        foreign
-            .coord
-            .publish_full(&built, &params)
-            .map_err(|e| Error::Io(std::io::Error::other(e)))?;
-        foreign.dirty.store(false, Ordering::Release);
-        foreign.had_wal.store(false, Ordering::Release);
-        Ok(())
     }
 
     /// Get a reference to the catalog (for debugging/testing).
@@ -9941,7 +8847,7 @@ impl Database {
     /// a foreign (SQLite-format) container's mode switch routes through
     /// its own machinery and stays gated.
     fn journal_mode_pragma_is_noop(&self, p: &PragmaStatement) -> bool {
-        if self.foreign.is_some() || !p.name.eq_ignore_ascii_case("journal_mode") {
+        if !p.name.eq_ignore_ascii_case("journal_mode") {
             return false;
         }
         let Some(value) = &p.value else {
@@ -10019,10 +8925,6 @@ impl Database {
     /// ROLLBACK TO SAVEPOINT <name> — restore pager + bookkeeping maps to
     /// the savepoint; the transaction stays open.
     fn exec_rollback_to_savepoint(&mut self, name: &str) -> Result<()> {
-        // Partial transaction undo: the delta journal cannot track
-        // which of its rows survived the savepoint's rollback — drop
-        // it (the next publish rebuilds whole-object).
-        self.poison_delta_journal();
         // Savepoint ops can pop the __begin__ undo level (see
         // exec_savepoint): committed-view reconstruction is off until the
         // transaction ends.
@@ -10525,12 +9427,12 @@ impl Database {
         if ctx.roots_changed {
             self.sync_schema_roots_inner()?;
         }
-        if let Some(foreign) = self.foreign.as_ref() {
-            foreign
-                .dirty
-                .store(true, std::sync::atomic::Ordering::Release);
-            if !self.in_transaction.load(Ordering::Acquire) {
-                self.dump_foreign()?;
+        if let Some(p) = self.pending.as_ref() {
+            if !p.adopted.load(Ordering::Acquire) {
+                p.wrote.store(true, Ordering::Release);
+                if !self.in_transaction.load(Ordering::Acquire) {
+                    self.maybe_adopt()?;
+                }
             }
         }
         self.maybe_drain_after_burst();
@@ -12899,14 +11801,14 @@ impl Database {
         if catalog.get_table("sqlite_stat1").is_none() {
             const STAT1_DDL: &str = "CREATE TABLE sqlite_stat1(tbl,idx,stat)";
             let ddl = parse(STAT1_DDL)?;
-            Self::execute_statement_static(&ddl, ctx, catalog, STAT1_DDL, None)?;
+            Self::execute_statement_static(&ddl, ctx, catalog, STAT1_DDL)?;
         }
         // SQLite's exact stat4 schema (no declared types; the stored
         // DDL text matches byte-for-byte, so CREATE only when absent).
         if catalog.get_table("sqlite_stat4").is_none() {
             const STAT4_DDL: &str = "CREATE TABLE sqlite_stat4(tbl,idx,neq,nlt,ndlt,sample)";
             let ddl4 = parse(STAT4_DDL)?;
-            Self::execute_statement_static(&ddl4, ctx, catalog, STAT4_DDL, None)?;
+            Self::execute_statement_static(&ddl4, ctx, catalog, STAT4_DDL)?;
         }
         // Clear this run's rows (a targeted ANALYZE keeps other tables'
         // rows — SQLite only replaces the analyzed tables' entries).
@@ -12924,7 +11826,7 @@ impl Database {
             None => "DELETE FROM sqlite_stat1".to_string(),
         };
         let del = parse(&clear_sql)?;
-        Self::execute_statement_static(&del, ctx, catalog, &clear_sql, None)?;
+        Self::execute_statement_static(&del, ctx, catalog, &clear_sql)?;
         let clear4_sql = match &target {
             Some(t) => {
                 let owner = catalog
@@ -12939,7 +11841,7 @@ impl Database {
             None => "DELETE FROM sqlite_stat4".to_string(),
         };
         let del4 = parse(&clear4_sql)?;
-        Self::execute_statement_static(&del4, ctx, catalog, &clear4_sql, None)?;
+        Self::execute_statement_static(&del4, ctx, catalog, &clear4_sql)?;
 
         // Collect: row count per table (memoized cell-count walk) +
         // distinct-prefix counts per index (GROUP BY counting through the
@@ -13068,7 +11970,7 @@ impl Database {
         }
         for sql in &insert_sqls {
             let stmt = parse(sql)?;
-            Self::execute_statement_static(&stmt, ctx, catalog, sql, None)?;
+            Self::execute_statement_static(&stmt, ctx, catalog, sql)?;
         }
         // Keep other tables' in-memory rows on a targeted run.
         if target.is_some() {
@@ -13254,7 +12156,6 @@ impl Database {
         ctx: &mut ExecContext,
         catalog: &mut Catalog,
         original_sql: &str,
-        foreign: Option<&ForeignSqlite>,
     ) -> Result<()> {
         match stmt {
             Statement::Create(c) => {
@@ -13302,9 +12203,6 @@ impl Database {
                 ctx.in_transaction = true;
                 ctx.pager.note_tx_begun();
                 ctx.txn_snapshot = Some(ctx.pager.snapshot());
-                if let Some(f) = foreign {
-                    f.journal.lock().begin_txn();
-                }
                 Ok(())
             }
             Statement::Commit => {
@@ -13313,9 +12211,6 @@ impl Database {
                 ctx.pager.clear_savepoints();
                 ctx.pager.flush()?;
                 ctx.pager.note_tx_committed();
-                if let Some(f) = foreign {
-                    f.journal.lock().commit_txn();
-                }
                 Ok(())
             }
             Statement::Rollback(_) => {
@@ -13357,12 +12252,9 @@ impl Database {
                 ctx.max_rowids.clear();
                 ctx.rolled_back = true;
                 ctx.pager.note_tx_rolled_back();
-                if let Some(f) = foreign {
-                    f.journal.lock().rollback_txn();
-                }
                 Ok(())
             }
-            Statement::Pragma(p) => Self::execute_pragma(p.clone(), ctx, foreign),
+            Statement::Pragma(p) => Self::execute_pragma(p.clone(), ctx),
             Statement::Alter(a) => Self::execute_alter(a.clone(), ctx, catalog),
             Statement::Analyze { target, .. } => {
                 Self::execute_analyze(target.clone(), ctx, catalog)
@@ -15245,11 +14137,7 @@ impl Database {
         }
     }
 
-    fn execute_pragma(
-        p: PragmaStatement,
-        ctx: &mut ExecContext,
-        foreign: Option<&ForeignSqlite>,
-    ) -> Result<()> {
+    fn execute_pragma(p: PragmaStatement, ctx: &mut ExecContext) -> Result<()> {
         // Honored pragmas:
         //   foreign_keys = 0/1/on/off   — toggle FK enforcement (SQLite
         //                                 default: off)
@@ -15367,15 +14255,12 @@ impl Database {
                         _ => String::new(),
                     };
                     match mode.as_str() {
-                        // A foreign SQLite-format file's mode is the
-                        // FILE's (header 18/19 + sidecar session) —
-                        // apply_journal_mode owns that switch; the
-                        // native pager is irrelevant there.
-                        "wal" | "delete" | "truncate" | "persist" | "memory" | "off"
-                            if foreign.is_some() =>
-                        {
-                            let _ = apply_journal_mode_foreign(foreign, &mode);
-                        }
+                        // A pending-adopt session is memory-backed: the
+                        // native pager's mode switch is the whole story
+                        // (logical WAL on the memory store pre-adoption;
+                        // the file's own mode materializes at adoption —
+                        // adopted files come up delete-mode like every
+                        // fresh native file).
                         "wal" => ctx.pager.enable_wal()?,
                         "delete" | "truncate" | "persist" | "memory" | "off" => {
                             ctx.pager.disable_wal()?;
@@ -15433,18 +14318,11 @@ impl Database {
                     ctx.pager.set_locking_mode_exclusive(mode == "exclusive");
                 }
                 "wal_checkpoint" => {
-                    // A SQLite-format file checkpoints through its
-                    // coordinator (fold the sidecar into the main file,
-                    // retire it) — the native pager is irrelevant there.
-                    if let Some(foreign) = foreign {
-                        let sync = ctx.pager.synchronous() != 0;
-                        foreign
-                            .coord
-                            .checkpoint_now(sync)
-                            .map_err(|e| Error::Io(std::io::Error::other(e)))?;
-                    } else {
-                        ctx.pager.checkpoint_wal()?;
-                    }
+                    // The native pager owns checkpointing in every shape
+                    // now (a pending-adopt session is memory-backed: a
+                    // no-op there; post-adoption it is the file's own
+                    // WAL).
+                    ctx.pager.checkpoint_wal()?;
                 }
                 "cache_size" => {
                     // SQLite semantics: positive N = N pages, negative N =
@@ -16033,18 +14911,15 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
             // databases are always "memory" (SQLite: WAL/DELETE writes
             // on `:memory:` return "memory" — the only modes it
             // supports are memory and off).
-            let ret = if db.foreign.is_none() && db.pager.is_memory() {
+            let ret = if db.pager.is_memory() {
+                // Memory-backed stores (including a pending-adopt
+                // session — its data lives in memory until the first
+                // write adopts the path) report "memory".
                 "memory".to_string()
+            } else if db.pager.wal_enabled() {
+                "wal".to_string()
             } else {
-                let wal = match &db.foreign {
-                    Some(f) => f.journal_wal.load(Ordering::Acquire),
-                    None => db.pager.wal_enabled(),
-                };
-                if wal {
-                    "wal".to_string()
-                } else {
-                    "delete".to_string()
-                }
+                "delete".to_string()
             };
             return Some(PragmaRows::single("journal_mode", Value::Text(ret.into())));
         }
@@ -16345,23 +15220,8 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
         "parallel_scan" => Value::Integer(pager.parallel_scan_min_rows()),
         "temp_store" => Value::Integer(pager.temp_store()),
         "page_size" => Value::Integer(pager.page_size() as i64),
-        "page_count" => {
-            // Foreign SQLite-format files report the CONTAINER's page
-            // space (the coordinator's live count, WAL frames included)
-            // — the in-memory pager's page ids are the engine's own.
-            match &db.foreign {
-                Some(f) => Value::Integer(f.coord.state.lock().n_pages as i64),
-                None => Value::Integer(pager.n_pages() as i64),
-            }
-        }
-        "freelist_count" => {
-            // The container's real freelist (pages freed by shrunk or
-            // dropped objects, reusable by later splices).
-            match &db.foreign {
-                Some(f) => Value::Integer(f.coord.state.lock().free.len() as i64),
-                None => Value::Integer(pager.freelist_count() as i64),
-            }
-        }
+        "page_count" => Value::Integer(pager.n_pages() as i64),
+        "freelist_count" => Value::Integer(pager.freelist_count() as i64),
         // The SETTING as given (SQLite reports the raw value: negative
         // = KiB, positive = pages; fresh default -2000), not the
         // derived page capacity.
@@ -16376,25 +15236,15 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
             // behavior.
             Value::Integer(pager.data_version_base())
         }
-        "schema_version" => match &db.foreign {
-            // The FILE's schema cookie (coordinator-owned, monotonic
-            // across sessions since the incremental architecture).
-            Some(f) => Value::Integer(f.schema_cookie.load(Ordering::Acquire) as i64),
-            None => Value::Integer(pager.schema_cookie() as i64),
-        },
+        "schema_version" => Value::Integer(pager.schema_cookie() as i64),
         "journal_mode" => {
-            // Foreign SQLite-format files carry their own mode: the
-            // persistent header marker (18/19 = 2/2) or a live sidecar
-            // session — the native pager's mode is irrelevant there.
-            // In-memory databases are "memory" (SQLite's journal_mode
-            // for `:memory:` files).
-            let wal = match &db.foreign {
-                Some(f) => f.journal_wal.load(Ordering::Acquire),
-                None => pager.wal_enabled(),
-            };
-            let mode = if db.foreign.is_none() && pager.is_memory() {
+            // In-memory stores (including a pending-adopt session — its
+            // data lives in memory until the first write adopts the
+            // path) report "memory", SQLite's journal_mode for
+            // `:memory:` databases.
+            let mode = if pager.is_memory() {
                 "memory"
-            } else if wal {
+            } else if pager.wal_enabled() {
                 "wal"
             } else {
                 "delete"
@@ -16417,15 +15267,21 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
         "user_version" => Value::Integer(pager.user_version() as i64),
         "application_id" => Value::Integer(pager.application_id() as i64),
         "auto_vacuum" => Value::Integer(
-            db.foreign
+            // The INTERCHANGE shape (what an export writes) — unlike
+            // `encoding`, this reports the source's mode even after
+            // adoption: the field survives for exports by design.
+            db.pending
                 .as_ref()
-                .map(|f| f.auto_vacuum() as i64)
+                .map(|p| p.auto_vacuum() as i64)
                 .unwrap_or(0),
         ),
         "encoding" => Value::Text(
-            db.foreign
+            // The INTERCHANGE encoding (what an export writes; SQLite's
+            // own "the header was materialized" rule: fixed once content
+            // exists). Survives adoption like every fidelity field.
+            db.pending
                 .as_ref()
-                .map(|f| f.text_enc().pragma_name())
+                .map(|p| p.text_enc().pragma_name())
                 .unwrap_or("UTF-8")
                 .into(),
         ),
@@ -16456,59 +15312,10 @@ fn pragma_value_text(p: &PragmaStatement, params: Option<&[Value]>) -> Option<St
     }
 }
 
-/// Apply a `PRAGMA journal_mode = X` mode switch from the read/query path
-/// (the pager methods take `&self` — interior mutability).
-/// The foreign-file half of [`apply_journal_mode`] (the execute-pragma
-/// path holds only the ForeignSqlite state, not the Database).
-fn apply_journal_mode_foreign(f: Option<&ForeignSqlite>, mode: &str) -> Result<()> {
-    if let Some(f) = f {
-        apply_foreign_journal_mode(f, mode);
-    }
-    Ok(())
-}
-
-/// Foreign journal-mode switch, mirroring SQLite's persistent FILE
-/// conversion semantics: `wal` converts the file (header 18/19 = 2/2 in
-/// the MAIN file — a 1/1 main file ignores the sidecar on every
-/// real-SQLite open, so the marker may never ride a WAL frame); the
-/// rollback family converts back (checkpoint + 1/1 header). Both
-/// directions drop any live session: the next dump re-publishes the
-/// file wholesale under the new mode, then re-establishes incremental
-/// commits (WAL frames / rollback-journal pages). One full write per
-/// mode switch, never per commit.
-fn apply_foreign_journal_mode(f: &ForeignSqlite, mode: &str) {
-    // A live session's sidecar is superseded by the next full write
-    // (write_image_atomic clears sidecars).
-    let downgrade = matches!(mode, "delete" | "truncate" | "persist" | "memory" | "off");
-    if downgrade && f.journal_wal.swap(false, Ordering::AcqRel) {
-        f.coord.invalidate();
-        f.dirty.store(true, Ordering::Release);
-    } else if mode == "wal" {
-        let was = f.journal_wal.swap(true, Ordering::AcqRel);
-        if !was {
-            // First switch to WAL: the conversion must reach the MAIN
-            // file's header now, not a sidecar frame. Drop the live
-            // page space so the next dump (the pragma itself
-            // triggers one) rewrites the file with 18/19 = 2/2 and
-            // establishes the WAL session.
-            f.coord.invalidate();
-            f.dirty.store(true, Ordering::Release);
-        }
-    }
-}
-
 fn apply_journal_mode(db: &Database, mode: &str) -> Result<()> {
-    // Foreign SQLite-format files: the mode is the FILE's (header
-    // 18/19 + the sidecar session), not the native pager's. `wal`
-    // arms the sidecar commit path (or keeps it); the rollback family
-    // drops any live session — the next commit is a full atomic write
-    // with a 1/1 header, exactly SQLite's WAL -> delete checkpoint +
-    // downgrade (minus the "no other connections" rule: this engine
-    // is single-writer by construction).
-    if let Some(f) = &db.foreign {
-        apply_foreign_journal_mode(f, mode);
-        return Ok(());
-    }
+    // A pending-adopt session is memory-backed: the native pager's
+    // mode switch is the whole story (the logical WAL flag; the
+    // adopted file comes up in its own mode like every native file).
     match mode {
         "wal" => db.pager.enable_wal(),
         "delete" | "truncate" | "persist" | "memory" | "off" => db.pager.disable_wal(),
@@ -16527,28 +15334,28 @@ fn apply_journal_mode(db: &Database, mode: &str) -> Result<()> {
 /// real SQLite's integrity_check validates entry by entry. Native-format
 /// databases have no pointer-map concept (always dense): no-op.
 fn apply_auto_vacuum(db: &Database, mode: u8) -> Result<()> {
-    if let Some(f) = &db.foreign {
-        if !foreign_schema_materialized(db) {
-            f.auto_vacuum.store(mode, Ordering::Release);
-            // The next dump (next statement or explicit flush) rewrites
-            // the file — including pointer-map pages and header 52/64.
-            f.dirty.store(true, Ordering::Release);
+    // A pending session records the mode for its EXPORTS (the export
+    // writer emits pointer-map geometry and header 52/64); the native
+    // container has no auto-vacuum — the assignment is a no-op there.
+    if let Some(p) = db.pending.as_ref() {
+        if !p.adopted.load(Ordering::Acquire) && !pending_schema_materialized(db) {
+            p.auto_vacuum.store(mode, Ordering::Release);
         }
         // Materialized schema: silently ignored (SQLite behavior).
     }
     Ok(())
 }
 
-/// True once the SQLite-format header has materialized: any schema
-/// object exists, in the SOURCE's row order (`foreign.order`, populated
-/// at open — entries persist through drops, matching SQLite's "the
-/// header was written, the mode is fixed") or in the live catalog
-/// (engine-created objects on a fresh file, which never passed through
-/// a load). Until then, format-affecting pragmas (encoding,
-/// auto_vacuum) may still reshape the file.
-fn foreign_schema_materialized(db: &Database) -> bool {
-    if let Some(f) = &db.foreign {
-        if !f.order.lock().is_empty() {
+/// True once the source SQLite-format header has materialized: any
+/// schema object exists, in the SOURCE's row order (`pending.order`,
+/// populated at open — entries persist through drops, matching
+/// SQLite's "the header was written, the mode is fixed") or in the
+/// live catalog (engine-created objects on a fresh file, which never
+/// passed through a load). Until then, format-affecting pragmas
+/// (encoding, auto_vacuum) may still reshape the file.
+fn pending_schema_materialized(db: &Database) -> bool {
+    if let Some(p) = db.pending.as_ref() {
+        if !p.order.lock().is_empty() {
             return true;
         }
     }
@@ -16635,19 +15442,15 @@ fn apply_encoding(db: &Database, value: &str) -> Result<()> {
         // `PRAGMA encoding='CP1252'` returns Ok and changes nothing).
         _ => return Ok(()),
     };
-    if let Some(f) = &db.foreign {
+    if let Some(p) = db.pending.as_ref() {
         // Same materialized-schema gate as auto_vacuum: the source's row
         // order OR any live catalog object fixes the header's shape.
-        if !foreign_schema_materialized(db) {
-            f.set_text_enc(requested);
-            // The next dump (next statement, drop, or explicit flush)
-            // rewrites the file — including header field 56.
-            f.dirty.store(true, Ordering::Release);
+        if !p.adopted.load(Ordering::Acquire) && !pending_schema_materialized(db) {
+            p.set_text_enc(requested);
         }
-        // Materialized schema: silently ignored (SQLite behavior).
+        // Materialized schema (or an adopted session): silently ignored
+        // (SQLite behavior; native files are UTF-8 only).
     }
-    // Native-format databases: UTF-8 is the container's only encoding;
-    // the assignment is a no-op either way.
     Ok(())
 }
 
@@ -19750,7 +18553,7 @@ fn delete_stat_rows(
             val.replace('\'', "''")
         );
         if let Ok(stmt) = crate::sql::parse(&sql) {
-            let _ = Database::execute_statement_static(&stmt, ctx, catalog, &sql, None);
+            let _ = Database::execute_statement_static(&stmt, ctx, catalog, &sql);
         }
     }
     // The in-memory map follows the same cleanup.

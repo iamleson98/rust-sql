@@ -113,8 +113,13 @@ fn update_changes_counter_all_paths() {
 #[test]
 fn sqlite_format_stmt_path_durable() {
     let path = temp_path("stmt_dura");
+    // A REAL SQLite-format source file (the interchange writer).
     {
-        let mut db = Database::open_sqlite_format(&path).unwrap();
+        let fx = Database::open_in_memory().unwrap();
+        fx.export_sqlite_format(&path).unwrap();
+    }
+    {
+        let mut db = Database::open(&path).unwrap();
         assert_eq!(db.disk_format(), "sqlite");
         // DDL through execute (the compat layer's Once path)…
         db.execute(
@@ -139,10 +144,11 @@ fn sqlite_format_stmt_path_durable() {
         step_all(&mut db, "DELETE FROM t WHERE id = ?", &[Value::Integer(3)]);
     } // Drop here — the pre-fix Drop checkpoint wrote a stale image.
 
-    // Engine reopen: rows survive.
+    // Engine reopen: rows survive — the path was ADOPTED into the
+    // native container at the first prepared-statement commit.
     {
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.disk_format(), "sqlite");
+        assert_eq!(db.disk_format(), "native");
         let rows = db.query("SELECT id, v FROM t ORDER BY id", []).unwrap();
         assert_eq!(
             rows,
@@ -154,9 +160,13 @@ fn sqlite_format_stmt_path_durable() {
         );
     }
 
-    // Real SQLite verifies the file the engine wrote.
+    // Real SQLite verifies the engine's written state (through the
+    // interchange export — the adopted path itself is native now).
     {
-        let con = rusqlite::Connection::open(&path).unwrap();
+        let vdb = Database::open(&path).unwrap();
+        let out = temp_path("stmt_dura_export");
+        vdb.export_sqlite_format(&out).unwrap();
+        let con = rusqlite::Connection::open(&out).unwrap();
         let ok: String = con
             .query_row("PRAGMA integrity_check", [], |r| r.get(0))
             .unwrap();
@@ -180,7 +190,11 @@ fn sqlite_format_stmt_path_durable() {
 fn sqlite_format_stmt_path_tx_commit_durable() {
     let path = temp_path("stmt_tx");
     {
-        let mut db = Database::open_sqlite_format(&path).unwrap();
+        let fx = Database::open_in_memory().unwrap();
+        fx.export_sqlite_format(&path).unwrap();
+    }
+    {
+        let mut db = Database::open(&path).unwrap();
         db.execute(
             "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT NOT NULL)",
             [],

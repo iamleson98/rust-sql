@@ -1,36 +1,34 @@
-//! SQLite on-disk format (fileformat2) interoperability.
+//! SQLite on-disk format (fileformat2) — the INTERCHANGE surface.
 //!
-//! rustqlite's native `RSQLDB04` container is byte-incompatible with
-//! SQLite (little-endian freelist, custom record codec, 0-based pages).
-//! This module gives the engine a SECOND, complete file-format stack so
-//! real SQLite `.db` files can be opened, queried, written, and handed
-//! back — with the result passing `PRAGMA integrity_check` in SQLite
-//! itself:
+//! rustqlite's storage is the native `RSQLDB0x` container; SQLite's own
+//! file format is an interchange format this module reads and writes
+//! ONE-SHOT (there is deliberately no live in-place SQLite-format
+//! container — opening a SQLite-format file loads it for interop, and
+//! the first write commit ADOPTS the path into the native container;
+//! see `Database::from_sqlite_file` / `Pager::adopt_file_backing`):
 //!
 //! * **reader** — parses the 100-byte header, applies committed WAL
 //!   frames, walks table b-trees (rowid + WITHOUT ROWID) with exact
 //!   overflow-chain reassembly, and decodes SQLite records (serial
-//!   types) into engine `Value`s.
+//!   types) into engine `Value`s. Used by `Database::open` (magic
+//!   sniff) for every SQLite-created file.
 //! * **writer** — bulk-builds dense b-trees bottom-up with SQLite's
 //!   separator invariants, overflow formulas and cell layouts, then
-//!   commits atomically (temp + fsync + rename).
+//!   commits atomically (temp + fsync + rename). Powers
+//!   `Database::export_sqlite_format`, `VACUUM INTO` and the
+//!   `.archive` CLI's file format.
+//! * **rj** — hot ROLLBACK-journal replay at open: a crashed REAL
+//!   SQLite writer on this file left pre-images that restore the
+//!   pre-transaction state (SQLite's own open-time `pager_playback`).
 //!
-//! The integration lives in `api.rs`: `Database::open` sniffs the magic
-//! and transparently loads SQLite files into the engine (in-memory
-//! operating state, dump-on-commit persistence), so every SQL feature
-//! above the storage layer — planner, executor, parallel scans, C ABI,
-//! sqlx driver — works unchanged on SQLite-created files, and files the
-//! engine writes open in the `sqlite3` CLI.
+//! Keeping reader/writer one-shot is the point: whole-image costs are
+//! paid once at a boundary (open / export), never per commit.
 
-pub mod container;
-pub mod delta;
 pub mod header;
-pub mod mutator;
 pub mod reader;
 pub mod record;
 pub mod rj;
 pub mod varint;
-pub mod wal;
 pub mod writer;
 
 pub use reader::{read_sqlite_file, RawRow, SchemaRow, SqliteDbImage};

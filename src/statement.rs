@@ -474,11 +474,7 @@ impl<'a> Statement<'a> {
 
     /// Produce the next row. Returns [`StepResult::Row`] while rows remain.
     pub fn step(&mut self) -> Result<StepResult> {
-        let r = self.step_inner();
-        if r.is_err() {
-            self.db.poison_delta_journal();
-        }
-        r
+        self.step_inner()
     }
 
     /// [`Self::step`]'s body (the wrapper handles delta-journal
@@ -999,7 +995,7 @@ impl<'a> Statement<'a> {
                 }
                 // Foreign (SQLite-format) durability: `Database::execute`
                 // dumps at every autocommit boundary
-                // (`note_foreign_write`); the streaming-statement path —
+                // (`note_pending_write`); the streaming-statement path —
                 // which is what the C ABI compat layer drives for every
                 // prepared DML — must do the same, or committed rows live
                 // only in memory: the Drop checkpoint would then write the
@@ -1008,7 +1004,7 @@ impl<'a> Statement<'a> {
                 // since the last Once/DDL/COMMIT statement. A WAL frame
                 // append per autocommit DML is exactly what SQLite itself
                 // does in this mode.
-                self.db.note_foreign_stmt_commit();
+                self.db.note_pending_stmt_commit();
             } else if self.deltas.max_rowids_changed && !self.db.pager.committed_reads_armed() {
                 // Committed-view reads never merge (see query()).
                 self.merge_max_rowids();
@@ -1087,11 +1083,6 @@ impl<'a> Statement<'a> {
         // the closure's duration. No-op when none is registered or when
         // an outer scope on this thread already covers this Database.
         let _preupdate_guard = db.preupdate_scope();
-        // Delta-journal scope (page-level splicing capture — see
-        // `storage::sqlitefmt::delta`): the stepped-statement surface
-        // journals too, so prepared DML through the C ABI / sqlx
-        // accelerates exactly like `Database::execute` DML.
-        let _delta_guard = db.delta_stmt_scope();
         // Session-extension capture scope (the current connection's
         // sessions) — the stepped-statement surface records too.
         let _session_guard = db.session_stmt_scope();

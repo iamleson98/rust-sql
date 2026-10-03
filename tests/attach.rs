@@ -530,11 +530,12 @@ fn attach_real_files_both_formats() {
         );
     }
 
-    // Create a REAL SQLite-format file via the interop bridge, attach it.
+    // Create a REAL SQLite-format file via the interchange writer, attach it.
     {
-        let mut s = Database::open_sqlite_format(&sqlite_file).unwrap();
+        let mut s = Database::open_in_memory().unwrap();
         s.execute("CREATE TABLE u(b TEXT)", []).unwrap();
         s.execute("INSERT INTO u VALUES ('sq')", []).unwrap();
+        s.export_sqlite_format(&sqlite_file).unwrap();
     }
     let mut db2 = mem();
     db2.execute(

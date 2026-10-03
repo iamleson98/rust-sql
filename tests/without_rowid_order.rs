@@ -106,13 +106,16 @@ fn worow_scan_order_all_drivers() {
     assert_eq!(texts(&db.query("SELECT a FROM t", []).unwrap(), 0), expect);
     drop(db);
 
-    // SQLite-format container written by the ENGINE (rows insert in
-    // arbitrary order): the scan must still read PK order.
-    let mut sdb = Database::open_sqlite_format(dir.join("sfmt.db")).unwrap();
+    // SQLite-format round trip (rows insert in arbitrary order): the
+    // engine exports real SQLite bytes, reloads them through the
+    // interop reader, and the scan must still read PK order.
+    let mut sdb = Database::open_in_memory().unwrap();
     mk(
         &mut sdb,
         "CREATE TABLE t(a TEXT PRIMARY KEY, b INT) WITHOUT ROWID",
     );
+    sdb.export_sqlite_format(dir.join("sfmt.db")).unwrap();
+    let sdb = Database::open(dir.join("sfmt.db")).unwrap();
     assert_eq!(texts(&sdb.query("SELECT a FROM t", []).unwrap(), 0), expect);
 }
 

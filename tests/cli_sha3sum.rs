@@ -260,10 +260,7 @@ fn fullschema_analyze_sandwich() {
                  INSERT INTO t VALUES (1,'x'),(2,'y');\n\
                  CREATE INDEX ia ON t(b);\n\
                  ANALYZE;\n";
-    let (out, _err) = run_cli(
-        &[db.to_str().unwrap(), "--sqlite-format"],
-        &format!("{}\n.quit\n", setup),
-    );
+    let (out, _err) = run_cli(&[db.to_str().unwrap()], &format!("{}\n.quit\n", setup));
     assert!(out.contains("OK"), "setup failed: {out}");
     let (out, _err) = run_cli(&[db.to_str().unwrap()], ".fullschema\n.quit\n");
     let body: Vec<&str> = out

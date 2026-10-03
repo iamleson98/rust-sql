@@ -3,7 +3,7 @@
 #
 # Uses the REAL sqlite3 CLI (not rusqlite) in both directions:
 #   1. sqlite3 creates a database -> rustqlite-cli reads AND writes it.
-#   2. rustqlite-cli --sqlite-format creates a database -> sqlite3 reads it.
+#   2. rustqlite-cli creates a database -> --export-sqlite -> sqlite3 reads it.
 #   3. A second rustqlite-cli session re-reads what it wrote.
 #
 # Requires: sqlite3 on PATH, a built rustqlite-cli binary.
@@ -61,6 +61,7 @@ command -v "$SQLITE3" >/dev/null 2>&1 || fail "sqlite3 CLI not found on PATH"
 
 DB_A="$WORK/sqlite_created.db"
 DB_B="$WORK/engine_created.db"
+DB_B_EXPORT="$WORK/engine_created.sqlite"
 
 echo "== 1. sqlite3 creates, rustqlite reads+writes =="
 "$SQLITE3" "$DB_A" <<'EOF'
@@ -83,23 +84,25 @@ printf "INSERT INTO t VALUES (4, 'dave', 4.5);\nDELETE FROM t WHERE id = 1;\n.qu
 IC_A="$("$SQLITE3" "$DB_A" "PRAGMA integrity_check;")"
 [ "$IC_A" = "ok" ] || fail "integrity_check after engine writes: $IC_A"
 
-echo "== 2. rustqlite --sqlite-format creates, sqlite3 reads =="
-rm -f "$DB_B"
-printf "CREATE TABLE u(a INTEGER PRIMARY KEY, b TEXT UNIQUE, c BLOB);\nBEGIN;\nINSERT INTO u VALUES (1, 'x', x'0102');\nINSERT INTO u VALUES (2, 'y', NULL);\nCOMMIT;\n.quit\n" | "$CLI" --sqlite-format "$DB_B" >/dev/null \
-    || fail "engine sqlite-format session failed"
-[ -s "$DB_B" ] || fail "engine did not write the sqlite-format file"
+echo "== 2. rustqlite creates, sqlite3 reads the export =="
+rm -f "$DB_B" "$DB_B_EXPORT"
+printf "CREATE TABLE u(a INTEGER PRIMARY KEY, b TEXT UNIQUE, c BLOB);\nBEGIN;\nINSERT INTO u VALUES (1, 'x', x'0102');\nINSERT INTO u VALUES (2, 'y', NULL);\nCOMMIT;\n.quit\n" | "$CLI" "$DB_B" >/dev/null \
+    || fail "engine session failed"
+"$CLI" --export-sqlite "$DB_B_EXPORT" "$DB_B" >/dev/null \
+    || fail "engine sqlite-format export failed"
+[ -s "$DB_B_EXPORT" ] || fail "engine did not write the sqlite-format export"
 
-"$SQLITE3" "$DB_B" "SELECT a, b FROM u ORDER BY a;" | tr '\n' ' ' | grep -q "1|x 2|y" \
+"$SQLITE3" "$DB_B_EXPORT" "SELECT a, b FROM u ORDER BY a;" | tr '\n' ' ' | grep -q "1|x 2|y" \
     || fail "sqlite3 cannot read engine-created file"
-IC_B="$("$SQLITE3" "$DB_B" "PRAGMA integrity_check;")"
+IC_B="$("$SQLITE3" "$DB_B_EXPORT" "PRAGMA integrity_check;")"
 [ "$IC_B" = "ok" ] || fail "integrity_check on engine-created file: $IC_B"
 # UNIQUE constraint still enforced by SQLite itself on the engine's file.
-if "$SQLITE3" "$DB_B" "INSERT INTO u(b) VALUES ('x');" 2>/dev/null; then
+if "$SQLITE3" "$DB_B_EXPORT" "INSERT INTO u(b) VALUES ('x');" 2>/dev/null; then
     fail "UNIQUE constraint lost in the engine's file"
 fi
 
 echo "== 3. engine re-reads its own file =="
 printf "SELECT count(*) FROM u;\n.quit\n" | "$CLI" "$DB_B" | grep -q 2 \
-    || fail "engine cannot reopen its own sqlite-format file"
+    || fail "engine cannot reopen its own file"
 
 echo "PASS: CLI-level SQLite interop verified in both directions."

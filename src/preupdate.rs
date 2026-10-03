@@ -29,7 +29,6 @@
 use crate::schema::Table;
 use crate::types::Value;
 use std::cell::{Cell, RefCell};
-use std::sync::Arc;
 
 /// Which change is about to happen to the row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,16 +97,6 @@ thread_local! {
     static DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
-/// The SQLite-format delta journal sink — the page-level splicing
-/// capture path (see `storage::sqlitefmt::delta`). Armed per statement
-/// by the engine on foreign-backed databases only; one TLS load when
-/// unset (native and in-memory databases never arm it).
-type DeltaTarget = Arc<parking_lot::Mutex<crate::storage::sqlitefmt::delta::DeltaJournal>>;
-thread_local! {
-    static DELTA: RefCell<Option<DeltaTarget>> = const { RefCell::new(None) };
-    static DELTA_ARMED: Cell<bool> = const { Cell::new(false) };
-}
-
 /// The session-capture sink: the sessions registered for the CURRENT
 /// connection identity, armed per statement (engine `Database::execute`
 /// / the streaming paths; the C-ABI layer rides the same list through
@@ -117,46 +106,6 @@ pub type SessionTarget =
 thread_local! {
     static SESSIONS: RefCell<Option<SessionTarget>> = const { RefCell::new(None) };
     static SESSIONS_ARMED: Cell<bool> = const { Cell::new(false) };
-}
-
-/// Install the delta journal target for one statement. Fails (returns
-/// false, arming nothing) when a target is already armed — a nested
-/// `execute` — which the caller treats as a poison (the journal cannot
-/// track statement boundaries across re-entrancy).
-pub(crate) fn arm_delta_sink(target: DeltaTarget) -> bool {
-    DELTA.with(|d| {
-        if d.borrow().is_some() {
-            return false;
-        }
-        *d.borrow_mut() = Some(target);
-        true
-    })
-}
-
-/// The delta sink's unwind-safe guard.
-pub struct DeltaGuard {
-    armed: bool,
-}
-
-impl DeltaGuard {
-    pub fn disarm(mut self) {
-        DELTA.with(|d| {
-            *d.borrow_mut() = None;
-        });
-        DELTA_ARMED.with(|a| a.set(false));
-        self.armed = false;
-    }
-}
-
-impl Drop for DeltaGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            DELTA.with(|d| {
-                *d.borrow_mut() = None;
-            });
-            DELTA_ARMED.with(|a| a.set(false));
-        }
-    }
 }
 
 /// The session sink's unwind-safe guard (pops / restores on drop).
@@ -190,18 +139,6 @@ fn sessions_armed() -> bool {
 #[inline]
 pub fn session_sink_armed() -> bool {
     sessions_armed()
-}
-
-/// Wrap an armed sink into its guard (called only after a successful
-/// `arm_delta_sink`).
-pub(crate) fn delta_guard() -> DeltaGuard {
-    DELTA_ARMED.with(|a| a.set(true));
-    DeltaGuard { armed: true }
-}
-
-#[inline]
-fn delta_armed() -> bool {
-    DELTA_ARMED.with(|a| a.get())
 }
 
 /// True when the active borrowed sink points at the given hook slot —
@@ -274,24 +211,6 @@ pub(crate) fn fire(
     old: Option<&[Value]>,
     new: Option<&[Value]>,
 ) {
-    // The SQLite-format delta journal (page-level splicing capture):
-    // same events, values in declared order — no user hook required.
-    // Checked BEFORE the hook gate: foreign-backed databases arm the
-    // journal on every DML statement whether or not a preupdate hook
-    // is registered (the hook-less case is the common one).
-    if delta_armed() {
-        DELTA.with(|d| {
-            if let Some(target) = d.borrow().as_ref() {
-                let mut j = target.lock();
-                j.record(
-                    &table.name,
-                    if table.without_rowid { 0 } else { rowid },
-                    old.map(|v| v.to_vec()),
-                    new.map(|v| v.to_vec()),
-                );
-            }
-        });
-    }
     if sessions_armed() {
         let depth = DEPTH.with(|d| d.get());
         SESSIONS.with(|s| {
@@ -345,9 +264,9 @@ pub(crate) fn fire(
 /// decodes the old values first (cold path — runs only when a hook is
 /// installed).
 pub(crate) fn fire_delete_payload(table: &Table, rowid: i64, payload: &[u8]) {
-    // The delta journal and the session sinks need the decoded old row
+    // The session sinks need the decoded old row
     // too (capture) — decode when ANY consumer is listening.
-    if !hook_installed() && !delta_armed() && !sessions_armed() {
+    if !hook_installed() && !sessions_armed() {
         return;
     }
     if let Ok(old_row) =
@@ -365,11 +284,11 @@ pub fn enabled() -> bool {
 }
 
 /// True when ANY preupdate consumer is listening — a registered user
-/// hook OR the SQLite-format delta journal's armed sink. The executor's
+/// hook OR an armed session sink. The executor's
 /// fused/bulk drivers and old-value fetch gates ask THIS (not
 /// [`enabled`]): the journal needs the same per-row old/new values the
 /// hook does, and it arms without installing a hook.
 #[inline]
 pub(crate) fn events_needed() -> bool {
-    hook_installed() || delta_armed() || sessions_armed()
+    hook_installed() || sessions_armed()
 }

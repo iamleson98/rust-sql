@@ -67,6 +67,9 @@ fn sqlite_created_file_reads_and_writes_back() {
         db.execute("DELETE FROM t WHERE id = 2", ()).unwrap();
         let count = rows_of(&db, "SELECT count(*) FROM t");
         assert_eq!(count[0][0], Value::Integer(3));
+        // The writes adopted the path; the export puts the committed
+        // state back into real SQLite bytes.
+        db.export_sqlite_format(&path).unwrap();
     }
 
     // SQLite verifies.
@@ -130,6 +133,9 @@ fn sqlite_file_indexes_autoincrement_sequences_roundtrip() {
         // user_version is live in-session.
         let uv = rows_of(&db, "PRAGMA user_version");
         assert_eq!(uv[0][0], Value::Integer(77));
+        // The writes adopted the path; the export puts the committed
+        // state back into real SQLite bytes.
+        db.export_sqlite_format(&path).unwrap();
     }
     {
         let con = rusqlite::Connection::open(&path).unwrap();
@@ -233,6 +239,9 @@ fn sqlite_file_overflow_and_large_trees() {
             (),
         )
         .unwrap();
+        // The writes adopted the path; the export puts the committed
+        // state back into real SQLite bytes.
+        db.export_sqlite_format(&path).unwrap();
     }
     {
         let con = rusqlite::Connection::open(&path).unwrap();
@@ -281,6 +290,9 @@ fn sqlite_file_explicit_transaction_roundtrip() {
         db.execute("ROLLBACK", ()).unwrap();
         let n = rows_of(&db, "SELECT count(*) FROM t");
         assert_eq!(n[0][0], Value::Integer(3));
+        // The writes adopted the path; the export puts the committed
+        // state back into real SQLite bytes.
+        db.export_sqlite_format(&path).unwrap();
     }
     {
         let con = rusqlite::Connection::open(&path).unwrap();
@@ -322,6 +334,9 @@ fn sqlite_file_views_triggers_without_rowid() {
         let logs = rows_of(&db, "SELECT msg FROM log");
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0][0], Value::Text("ins:d".into()));
+        // The writes adopted the path; the export puts the committed
+        // state back into real SQLite bytes.
+        db.export_sqlite_format(&path).unwrap();
     }
     {
         let con = rusqlite::Connection::open(&path).unwrap();
@@ -353,8 +368,7 @@ fn sqlite_file_views_triggers_without_rowid() {
 fn engine_created_sqlite_file_verified_by_sqlite() {
     let path = temp_path("b_create");
     {
-        let mut db = Database::open_sqlite_format(&path).unwrap();
-        assert_eq!(db.disk_format(), "sqlite");
+        let mut db = Database::open_in_memory().unwrap();
         db.execute(
             "CREATE TABLE users(id INTEGER PRIMARY KEY, email TEXT UNIQUE, score REAL)",
             (),
@@ -377,6 +391,7 @@ fn engine_created_sqlite_file_verified_by_sqlite() {
         )
         .unwrap();
         db.execute("PRAGMA user_version = 5", ()).unwrap();
+        db.export_sqlite_format(&path).unwrap();
     }
     {
         let con = rusqlite::Connection::open(&path).unwrap();
@@ -429,7 +444,7 @@ fn engine_created_sqlite_file_verified_by_sqlite() {
 fn engine_large_tree_overflow_verified() {
     let path = temp_path("b_large");
     {
-        let mut db = Database::open_sqlite_format(&path).unwrap();
+        let mut db = Database::open_in_memory().unwrap();
         db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, b BLOB)", ())
             .unwrap();
         db.execute("BEGIN", ()).unwrap();
@@ -451,6 +466,7 @@ fn engine_large_tree_overflow_verified() {
         }
         db.execute("COMMIT", ()).unwrap();
         db.execute("CREATE INDEX idx_v ON t(v)", ()).unwrap();
+        db.export_sqlite_format(&path).unwrap();
     }
     {
         let con = rusqlite::Connection::open(&path).unwrap();
@@ -473,13 +489,16 @@ fn engine_large_tree_overflow_verified() {
             .unwrap();
         assert_eq!(blob_len, 450);
     }
-    // Truncate hard: delete 90% then verify file shrinks logically.
+    // Truncate hard: delete 90% (the write adopts the path), then
+    // verify the committed state through the interchange export.
+    let shrunk = temp_path("b_large_shrunk");
     {
         let mut db = Database::open(&path).unwrap();
         db.execute("DELETE FROM t WHERE id % 10 != 0", ()).unwrap();
+        db.export_sqlite_format(&shrunk).unwrap();
     }
     {
-        let con = rusqlite::Connection::open(&path).unwrap();
+        let con = rusqlite::Connection::open(&shrunk).unwrap();
         assert_eq!(integrity_check(&con), "ok");
         let n: i64 = con
             .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
@@ -492,7 +511,7 @@ fn engine_large_tree_overflow_verified() {
 fn negative_numbers_and_edge_values() {
     let path = temp_path("b_edge");
     {
-        let mut db = Database::open_sqlite_format(&path).unwrap();
+        let mut db = Database::open_in_memory().unwrap();
         db.execute(
             "CREATE TABLE e(a INTEGER PRIMARY KEY, i INT, r REAL, t TEXT, b BLOB)",
             (),
@@ -534,6 +553,9 @@ fn negative_numbers_and_edge_values() {
                 .unwrap();
         }
         db.execute("COMMIT", ()).unwrap();
+        // The writes adopted the path; the export puts the committed
+        // state back into real SQLite bytes.
+        db.export_sqlite_format(&path).unwrap();
     }
     {
         let con = rusqlite::Connection::open(&path).unwrap();
@@ -571,7 +593,7 @@ fn negative_numbers_and_edge_values() {
 fn dump_on_drop_and_multi_table_consistency() {
     let path = temp_path("b_drop");
     {
-        let mut db = Database::open_sqlite_format(&path).unwrap();
+        let mut db = Database::open_in_memory().unwrap();
         db.execute("CREATE TABLE a(x INTEGER PRIMARY KEY)", ())
             .unwrap();
         db.execute("CREATE TABLE b(y)", ()).unwrap();
@@ -581,7 +603,8 @@ fn dump_on_drop_and_multi_table_consistency() {
                 .unwrap();
         }
         db.execute("INSERT INTO b VALUES ('bval')", ()).unwrap();
-        // No explicit dump: Drop must persist everything.
+        // The interchange writer materializes everything.
+        db.export_sqlite_format(&path).unwrap();
     }
     {
         let con = rusqlite::Connection::open(&path).unwrap();
@@ -645,6 +668,10 @@ fn sqlite_wal_mode_file_reads() {
         let mut db = db;
         db.execute("INSERT INTO w VALUES (4, 'four')", ()).unwrap();
         drop(writer);
+        // The write adopted the path (folding the writer's WAL frames);
+        // the export puts the committed state back into real SQLite
+        // bytes for the verification below.
+        db.export_sqlite_format(&path).unwrap();
     }
     {
         let con = rusqlite::Connection::open(&path).unwrap();
@@ -779,6 +806,9 @@ fn autovacuum_full_roundtrip() {
         db.execute("INSERT INTO wr VALUES ('d', 4)", ()).unwrap();
         db.execute("UPDATE ovr SET wide = 'y' WHERE id = 1", ())
             .unwrap();
+        // The writes adopted the path; the export puts the committed
+        // state back into real SQLite bytes.
+        db.export_sqlite_format(&path).unwrap();
     }
     verify_av_file(&path, 1, big_sum, 10);
     let _ = std::fs::remove_file(&path);
@@ -794,6 +824,9 @@ fn autovacuum_incremental_roundtrip() {
         assert_eq!(av[0][0], Value::Integer(2), "INCREMENTAL reports mode 2");
         db.execute("INSERT INTO big(id, pad) VALUES (200000, 'q')", ())
             .unwrap();
+        // The write adopted the path; the export puts the committed
+        // state back into real SQLite bytes (mode + ptrmap intact).
+        db.export_sqlite_format(&path).unwrap();
     }
     // Header 64 (incremental flag) must be set: mode 2 round-trips.
     let data = std::fs::read(&path).unwrap();
@@ -808,8 +841,12 @@ fn autovacuum_incremental_roundtrip() {
 #[test]
 fn autovacuum_pragma_roundtrip_on_empty_engine_file() {
     let path = temp_path("av_empty");
+    Database::open_in_memory()
+        .unwrap()
+        .export_sqlite_format(&path)
+        .unwrap();
     {
-        let mut db = Database::open_sqlite_format(&path).unwrap();
+        let mut db = Database::open(&path).unwrap();
         // Fresh file: default none.
         assert_eq!(rows_of(&db, "PRAGMA auto_vacuum")[0][0], Value::Integer(0));
         // Write form (bare keyword and integer) on the EMPTY schema.
@@ -829,6 +866,9 @@ fn autovacuum_pragma_roundtrip_on_empty_engine_file() {
         // Once content exists, the assignment is silently ignored.
         db.execute("PRAGMA auto_vacuum = NONE", ()).unwrap();
         assert_eq!(rows_of(&db, "PRAGMA auto_vacuum")[0][0], Value::Integer(1));
+        // Materialize the interchange file (the write above adopted the
+        // path; the source's auto-vacuum shape survives for exports).
+        db.export_sqlite_format(&path).unwrap();
     }
     {
         let con = rusqlite::Connection::open(&path).unwrap();
@@ -857,6 +897,7 @@ fn non_autovacuum_rewrite_stays_dense() {
     {
         let mut db = Database::open(&path).unwrap();
         db.execute("INSERT INTO t VALUES (4)", ()).unwrap();
+        db.export_sqlite_format(&path).unwrap();
     }
     let data = std::fs::read(&path).unwrap();
     let be32 = |o: usize| u32::from_be_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
@@ -876,14 +917,18 @@ fn autovacuum_ptrmap_entry_geometry() {
     // pointer-map page; its first entry (page 3, the first object root)
     // is type 1 with parent 0.
     let path = temp_path("av_geom");
+    Database::open_in_memory()
+        .unwrap()
+        .export_sqlite_format(&path)
+        .unwrap();
     {
-        let mut db = Database::open_sqlite_format(&path).unwrap();
+        let mut db = Database::open(&path).unwrap();
         db.execute("PRAGMA auto_vacuum = FULL", ()).unwrap();
         db.execute("CREATE TABLE t(a)", ()).unwrap();
         db.execute("INSERT INTO t VALUES (1)", ()).unwrap();
-        // Later commits append WAL frames; VACUUM forces the full
-        // materialization (page map + header) into the main file.
-        db.execute("VACUUM", ()).unwrap();
+        // The interchange export materializes the pointer map + header
+        // (the write above adopted the path; the shape survives).
+        db.export_sqlite_format(&path).unwrap();
     }
     let data = std::fs::read(&path).unwrap();
     assert_eq!(data.len() % 4096, 0);
@@ -897,277 +942,6 @@ fn autovacuum_ptrmap_entry_geometry() {
     }
     let _ = std::fs::remove_file(&path);
 }
-
-// ---------------------------------------------------------------------------
-// REAL WAL sidecar writes: after the first full write of a session,
-// later commits append checksum-chained frames to <db>-wal. Real SQLite
-// recovers and sees the committed state; the engine's own reader folds
-// the same frames; torn tails stop at the last commit boundary.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn engine_wal_sidecar_sqlite_reads_incremental_commits() {
-    let path = temp_path("wal_writer");
-    let wal = rustqlite::storage::sqlitefmt::reader::wal_path_of(&path);
-    // Keep the engine ALIVE so the sidecar is the live commit log: a
-    // CONCURRENT SQLite reader must recover it.
-    let mut db = Database::open_sqlite_format(&path).unwrap();
-    db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", ())
-        .unwrap();
-    // First dump after the initial empty full write: a WAL commit.
-    let w1 = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
-    assert!(w1 > 32, "CREATE TABLE commit must be WAL frames (got {w1})");
-    for base in (0..25).step_by(5) {
-        // Multi-row statements: five WAL commits (five fsyncs), not 25.
-        let values: Vec<String> = (1..=5)
-            .map(|k| {
-                let i = base + k;
-                format!("({i}, 'v{i}')")
-            })
-            .collect();
-        db.execute(&format!("INSERT INTO t VALUES {}", values.join(",")), ())
-            .unwrap();
-    }
-    let w2 = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
-    assert!(w2 > w1, "inserts append frames incrementally");
-    // The main file must NOT have been rewritten (still the initial
-    // full write): its size is unchanged while the sidecar grew.
-    let main = std::fs::metadata(&path).unwrap().len();
-    assert!(
-        main > 0 && main <= 4096 * 2,
-        "main file stays small: {main}"
-    );
-    let n: i64 = db.query("SELECT count(*) FROM t", ()).unwrap()[0][0].as_integer();
-    assert_eq!(n, 25);
-    // CONCURRENT real SQLite: recovers the engine's WAL frames.
-    {
-        let con = rusqlite::Connection::open(&path).unwrap();
-        assert_eq!(integrity_check(&con), "ok");
-        let n: i64 = con
-            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(n, 25, "SQLite must recover the engine's WAL frames");
-        let v: String = con
-            .query_row("SELECT v FROM t WHERE id = 25", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(v, "v25");
-    }
-    // Clean close (SQLite semantics): checkpoint + sidecar removal,
-    // leaving a self-contained main file.
-    drop(db);
-    assert!(
-        !wal.exists(),
-        "clean close must fold and remove the sidecar"
-    );
-    {
-        let con = rusqlite::Connection::open(&path).unwrap();
-        assert_eq!(integrity_check(&con), "ok");
-        let n: i64 = con
-            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(n, 25, "post-checkpoint main file holds everything");
-    }
-    let _ = std::fs::remove_file(&path);
-}
-
-#[test]
-fn engine_wal_growth_beyond_main_file() {
-    // A WAL commit that GROWS the database past the main file's length:
-    // new pages live only in the sidecar; both SQLite and the engine's
-    // reader must extend their page view from the commit frame's
-    // db-size field.
-    let path = temp_path("wal_growth");
-    let wal = rustqlite::storage::sqlitefmt::reader::wal_path_of(&path);
-    let mut db = Database::open_sqlite_format(&path).unwrap();
-    db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, pad TEXT)", ())
-        .unwrap();
-    let main0 = std::fs::metadata(&path).unwrap().len();
-    // ~300-byte pads, 300 rows in 3 multi-row commits: ~100 changed
-    // pages per commit stays well under the 1000-frame autocheckpoint
-    // threshold, so the growth lives ONLY in the sidecar and the main
-    // file is genuinely untouched (and only 3 fsyncs on slow runners).
-    for base in (0..300).step_by(100) {
-        let values: Vec<String> = (0..100)
-            .map(|k| {
-                let i = base + k;
-                format!("({}, 'pad-{i:04}-{}')", i + 1, "x".repeat(280))
-            })
-            .collect();
-        db.execute(
-            &format!("INSERT INTO t(id, pad) VALUES {}", values.join(",")),
-            (),
-        )
-        .unwrap();
-    }
-    let n: i64 = db.query("SELECT count(*) FROM t", ()).unwrap()[0][0].as_integer();
-    assert_eq!(n, 300);
-    // WAL exists and the main file was NOT rewritten.
-    assert!(std::fs::metadata(&wal)
-        .map(|m| m.len() > 32)
-        .unwrap_or(false));
-    assert_eq!(
-        std::fs::metadata(&path).unwrap().len(),
-        main0,
-        "main untouched"
-    );
-    // Concurrent SQLite sees the grown pages through the sidecar.
-    {
-        let con = rusqlite::Connection::open(&path).unwrap();
-        assert_eq!(integrity_check(&con), "ok");
-        let n: i64 = con
-            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(n, 300, "grown pages visible through the sidecar");
-        let pad: String = con
-            .query_row("SELECT pad FROM t WHERE id = 300", [], |r| r.get(0))
-            .unwrap();
-        assert!(!pad.is_empty());
-    }
-    // The engine's own reader folds the same frames (a SECOND engine
-    // connection while the writer is alive).
-    {
-        let db2 = Database::open(&path).unwrap();
-        let n: i64 = db2.query("SELECT count(*) FROM t", ()).unwrap()[0][0].as_integer();
-        assert_eq!(n, 300, "engine's own reader folds grown WAL pages");
-    }
-    // Clean close: the main file grows to hold everything.
-    drop(db);
-    let main1 = std::fs::metadata(&path).unwrap().len();
-    assert!(main1 > main0, "checkpoint materializes the growth");
-    {
-        let con = rusqlite::Connection::open(&path).unwrap();
-        let n: i64 = con
-            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(n, 300);
-        assert_eq!(integrity_check(&con), "ok");
-    }
-    let _ = std::fs::remove_file(&path);
-}
-
-#[test]
-fn engine_wal_torn_tail_stops_at_commit_boundary() {
-    // Crash simulation: chop the sidecar mid-frame while the writer is
-    // NOT running. Readers must see the last COMPLETE commit, never a
-    // torn one (SQLite: frame checksum/size validation; engine:
-    // full-frame + commit marker).
-    let path = temp_path("wal_torn");
-    let wal = rustqlite::storage::sqlitefmt::reader::wal_path_of(&path);
-    let mut db = Database::open_sqlite_format(&path).unwrap();
-    db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)", ())
-        .unwrap();
-    // Four multi-row commits: the torn tail must roll back exactly the
-    // last one.
-    for base in (0..8).step_by(2) {
-        let values: Vec<String> = (1..=2).map(|k| format!("({})", base + k)).collect();
-        db.execute(&format!("INSERT INTO t VALUES {}", values.join(",")), ())
-            .unwrap();
-    }
-    let committed = 8i64;
-    // Torn tail: cut the last frame's final 100 bytes.
-    {
-        let len = std::fs::metadata(&wal).unwrap().len() as usize;
-        let mut data = std::fs::read(&wal).unwrap();
-        data.truncate(len - 100);
-        std::fs::write(&wal, &data).unwrap();
-    }
-    {
-        let con = rusqlite::Connection::open(&path).unwrap();
-        assert_eq!(integrity_check(&con), "ok");
-        let n: i64 = con
-            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(
-            n,
-            committed - 2,
-            "SQLite sees the last complete commit (the torn one held 2 rows)"
-        );
-    }
-    {
-        let db2 = Database::open(&path).unwrap();
-        let n: i64 = db2.query("SELECT count(*) FROM t", ()).unwrap()[0][0].as_integer();
-        assert_eq!(n, committed - 2, "engine sees the same boundary");
-    }
-    // The writer's close-time checkpoint HEALS the torn sidecar from
-    // its authoritative committed image (the torn frame was durable in
-    // the writer; only the sidecar's tail was damaged).
-    drop(db);
-    {
-        let con = rusqlite::Connection::open(&path).unwrap();
-        let n: i64 = con
-            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(n, committed, "checkpoint restores the writer's commit");
-        assert_eq!(integrity_check(&con), "ok");
-    }
-    let _ = std::fs::remove_file(&path);
-}
-
-#[test]
-fn engine_wal_checkpoint_pressure_folds_back() {
-    // Crossing the 1000-frame autocheckpoint pressure folds the sidecar
-    // into the main file (full atomic write) and starts fresh salts.
-    // Frame pressure is built with BULK statements: an UPDATE that
-    // appends 2 KiB to every row rewrites every leaf page — hundreds
-    // of frames per single commit (and a single fsync), instead of
-    // thousands of per-row autocommit fsyncs.
-    let path = temp_path("wal_ckpt");
-    let wal = rustqlite::storage::sqlitefmt::reader::wal_path_of(&path);
-    {
-        let mut db = Database::open_sqlite_format(&path).unwrap();
-        db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", ())
-            .unwrap();
-        // 900 rows in 3 multi-row commits.
-        for base in (0..900).step_by(300) {
-            let values: Vec<String> = (0..300)
-                .map(|k| {
-                    let i = base + k + 1;
-                    format!("({i}, 'v{i}-{}')", "y".repeat(40))
-                })
-                .collect();
-            db.execute(&format!("INSERT INTO t VALUES {}", values.join(",")), ())
-                .unwrap();
-        }
-        // Six bulk UPDATEs, each growing every row by 2 KiB: the image
-        // doubles repeatedly and the cumulative frame count crosses
-        // the 1000-frame threshold within a handful of commits.
-        for _ in 0..6 {
-            db.execute(
-                "UPDATE t SET v = v || ?1",
-                [Value::Text("z".repeat(2048).into())],
-            )
-            .unwrap();
-        }
-        let n: i64 = db.query("SELECT count(*) FROM t", ()).unwrap()[0][0].as_integer();
-        assert_eq!(n, 900);
-    }
-    // After the fold the sidecar is either absent or tiny; the main
-    // file holds everything.
-    let wal_len = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
-    assert!(
-        wal_len < 1000 * 4120,
-        "sidecar must not grow unbounded: {wal_len}"
-    );
-    {
-        let con = rusqlite::Connection::open(&path).unwrap();
-        assert_eq!(integrity_check(&con), "ok");
-        let n: i64 = con
-            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(n, 900);
-    }
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(&wal);
-}
-
-// ---------------------------------------------------------------------------
-// PRAGMA journal_mode for foreign SQLite-format files: the mode is the
-// FILE's (header 18/19 marker + live sidecar session), not the native
-// pager's. Loaded rollback-mode files report delete until the engine's
-// first write converts them to the WAL-managed path (2/2 header);
-// `PRAGMA journal_mode = delete` downgrades back (full-rewrite commits,
-// 1/1 header) — SQLite's mode semantics.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn foreign_journal_mode_reports_the_file_mode() {
@@ -1186,7 +960,11 @@ fn foreign_journal_mode_reports_the_file_mode() {
             .unwrap();
     }
     let db = Database::open(&wal_path).unwrap();
-    assert_eq!(mode_of(&db), "wal", "WAL-mode source file reports wal");
+    assert_eq!(
+        mode_of(&db),
+        "memory",
+        "a pending-adopt session is memory-backed (data in memory until adoption)"
+    );
     drop(db);
 
     // A rollback-mode source.
@@ -1200,24 +978,22 @@ fn foreign_journal_mode_reports_the_file_mode() {
     }
     {
         let mut db = Database::open(&del_path).unwrap();
+        // A pending-adopt session is memory-backed: "memory" until the
+        // first write adopts the path (then the adopted native file's
+        // own mode).
         assert_eq!(
             mode_of(&db),
-            "delete",
-            "rollback-mode source reports delete"
+            "memory",
+            "pending-adopt sessions are memory-backed"
         );
-        // Writing PRESERVES the mode (SQLite: opening a rollback-mode
-        // database and writing does not convert it): full atomic
-        // rewrites, header marker stays 1/1.
         db.execute("INSERT INTO t VALUES (2, 'two')", ()).unwrap();
-        assert_eq!(mode_of(&db), "delete", "writes preserve the file's mode");
-        let bytes = std::fs::read(&del_path).unwrap();
-        assert_eq!(
-            (&bytes[18], &bytes[19]),
-            (&1, &1),
-            "rollback marker preserved"
-        );
+        assert_eq!(mode_of(&db), "delete", "the adopted file is delete-mode");
+        // The adopted path is the native container now; the export puts
+        // the committed state back into real SQLite bytes (delete-mode
+        // marker included) for the verification below.
+        db.export_sqlite_format(&del_path).unwrap();
     }
-    // SQLite verifies the written file.
+    // SQLite verifies the written state.
     {
         let con = rusqlite::Connection::open(&del_path).unwrap();
         assert_eq!(integrity_check(&con), "ok");
@@ -1231,18 +1007,20 @@ fn foreign_journal_mode_reports_the_file_mode() {
         assert_eq!(m, "delete", "SQLite sees the preserved rollback mode");
     }
     // The EXPLICIT upgrade: PRAGMA journal_mode = WAL on the engine
-    // connection converts the file (2/2 marker + sidecar commits).
+    // connection. The reopen is PENDING (memory-backed — "memory", the
+    // SQLite `:memory:` parity); the first WRITE adopts the path into
+    // the native container, and the upgrade then arms the FILE's WAL.
     {
         let mut db = Database::open(&del_path).unwrap();
+        assert_eq!(mode_of(&db), "memory", "pending reopen is memory-backed");
+        db.execute("INSERT INTO t VALUES (5, 'five')", ()).unwrap();
+        assert_eq!(db.disk_format(), "native", "the write adopted the path");
         let res = db.query("PRAGMA journal_mode = WAL", ()).unwrap();
         match &res[0][0] {
             Value::Text(t) => assert_eq!(t.as_str(), "wal"),
             other => panic!("upgrade should return wal, got {other:?}"),
         }
-        db.execute("INSERT INTO t VALUES (5, 'five')", ()).unwrap();
         assert_eq!(mode_of(&db), "wal");
-        let bytes = std::fs::read(&del_path).unwrap();
-        assert_eq!((&bytes[18], &bytes[19]), (&2, &2), "upgraded WAL marker");
     }
 
     // Downgrade: PRAGMA journal_mode = delete on the engine connection.
@@ -1253,19 +1031,20 @@ fn foreign_journal_mode_reports_the_file_mode() {
             Value::Text(t) => assert_eq!(t.as_str(), "delete"),
             other => panic!("downgrade should return delete, got {other:?}"),
         }
-        // The next commit is a full atomic rewrite: 1/1 header, no sidecar.
+        // The downgrade checkpoints and disarms the WAL: no sidecar.
         db.execute("INSERT INTO t VALUES (3, 'three')", ()).unwrap();
         assert_eq!(mode_of(&db), "delete");
-        let bytes = std::fs::read(&del_path).unwrap();
-        assert_eq!(
-            (&bytes[18], &bytes[19]),
-            (&1, &1),
-            "downgraded header marker"
-        );
         assert!(
             !rustqlite::storage::sqlitefmt::reader::wal_path_of(&del_path).exists(),
             "no sidecar after the downgrade write"
         );
+    }
+    // The interchange export of the downgraded state verifies in real
+    // SQLite.
+    {
+        let db = Database::open(&del_path).unwrap();
+        db.export_sqlite_format(&del_path).unwrap();
+        drop(db);
     }
     {
         let con = rusqlite::Connection::open(&del_path).unwrap();
@@ -1276,47 +1055,40 @@ fn foreign_journal_mode_reports_the_file_mode() {
         assert_eq!(n, 4, "1,2,5 from before + 3 from the downgrade write");
     }
 
-    // Re-upgrade: journal_mode = WAL arms the sidecar again.
+    // Re-upgrade: journal_mode = WAL arms the NATIVE file's WAL again
+    // (the session adopted at its first write above).
     {
         let mut db = Database::open(&del_path).unwrap();
+        db.execute("INSERT INTO t VALUES (6, 'six')", ()).unwrap();
         db.execute("PRAGMA journal_mode = WAL", ()).unwrap();
         db.execute("INSERT INTO t VALUES (4, 'four')", ()).unwrap();
         assert_eq!(mode_of(&db), "wal");
-        let bytes = std::fs::read(&del_path).unwrap();
-        assert_eq!((&bytes[18], &bytes[19]), (&2, &2));
         let wal = rustqlite::storage::sqlitefmt::reader::wal_path_of(&del_path);
         assert!(wal.exists(), "sidecar live after re-upgrade");
+    }
+    // The engine's own reopen sees every committed row (the native WAL
+    // recovery path); the export verifies the state in real SQLite.
+    {
+        let db = Database::open(&del_path).unwrap();
+        let n = match &db.query("SELECT count(*) FROM t", []).unwrap()[0][0] {
+            Value::Integer(n) => *n,
+            other => panic!("non-integer count: {other:?}"),
+        };
+        assert_eq!(n, 6, "engine reopen sees the re-upgraded commits");
+        db.export_sqlite_format(&del_path).unwrap();
+        drop(db);
     }
     {
         let con = rusqlite::Connection::open(&del_path).unwrap();
         let n: i64 = con
             .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(n, 5, "SQLite recovers the re-upgraded sidecar");
+        assert_eq!(n, 6, "SQLite sees the re-upgraded state");
         assert_eq!(integrity_check(&con), "ok");
-    }
-
-    // Engine-created sqlite-format files are WAL-managed by design.
-    let fresh = temp_path("jm_fresh");
-    {
-        let mut db = Database::open_sqlite_format(&fresh).unwrap();
-        db.execute("CREATE TABLE t(a INTEGER PRIMARY KEY)", ())
-            .unwrap();
-        assert_eq!(mode_of(&db), "wal");
-        let bytes = std::fs::read(&fresh).unwrap();
-        assert_eq!((&bytes[18], &bytes[19]), (&2, &2));
-    }
-    {
-        let con = rusqlite::Connection::open(&fresh).unwrap();
-        let m: String = con
-            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(m, "wal");
     }
 
     let _ = std::fs::remove_file(&wal_path);
     let _ = std::fs::remove_file(&del_path);
-    let _ = std::fs::remove_file(&fresh);
 }
 
 // ---------------------------------------------------------------------------
@@ -1331,9 +1103,6 @@ fn foreign_journal_mode_reports_the_file_mode() {
 #[test]
 fn rtrim_index_writes_in_collation_order() {
     let path = temp_path("rtrim_order");
-    let wal = rustqlite::storage::sqlitefmt::reader::wal_path_of(&path);
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(&wal);
     {
         // Seed with real SQLite (so the file starts SQLite-format).
         let con = rusqlite::Connection::open(&path).unwrap();
@@ -1344,9 +1113,13 @@ fn rtrim_index_writes_in_collation_order() {
         .unwrap();
     }
     {
-        let mut db = Database::open_sqlite_format(&path).unwrap();
+        // Pending load -> index build (the write adopts the path) ->
+        // the interchange export puts the collation-ordered index into
+        // real SQLite bytes.
+        let mut db = Database::open(&path).unwrap();
         db.execute("CREATE INDEX ix ON t(s COLLATE RTRIM)", ())
             .unwrap();
+        db.export_sqlite_format(&path).unwrap();
     }
     let con = rusqlite::Connection::open(&path).unwrap();
     assert_eq!(integrity_check(&con), "ok");
@@ -1371,7 +1144,6 @@ fn rtrim_index_writes_in_collation_order() {
         ]
     );
     let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(&wal);
 }
 
 /// A plugin-registered CUSTOM collation orders the written index with
@@ -1403,7 +1175,7 @@ fn custom_collation_orders_written_index() {
         con.execute_batch("CREATE TABLE t (s TEXT);").unwrap();
     }
     {
-        let mut db = Database::open_sqlite_format(&path).unwrap();
+        let mut db = Database::open(&path).unwrap();
         db.create_collation(ReverseColl).unwrap();
         db.execute("CREATE INDEX ix ON t(s COLLATE REVERSE)", ())
             .unwrap();
@@ -1412,6 +1184,7 @@ fn custom_collation_orders_written_index() {
             (),
         )
         .unwrap();
+        db.export_sqlite_format(&path).unwrap();
     }
     let con = rusqlite::Connection::open(&path).unwrap();
     // SQLite needs the collation registered to verify/scan the index

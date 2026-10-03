@@ -126,6 +126,9 @@ fn sqlite_utf16_file_reads_and_writes_back() {
             .unwrap();
             let back = db.query("SELECT v FROM big WHERE id = 100", ()).unwrap()[0][0].clone();
             assert_eq!(back, Value::Text(long.into()));
+            // The writes adopted the path; the export puts the committed
+            // state back into real SQLite bytes (encoding intact).
+            db.export_sqlite_format(&path).unwrap();
         }
 
         // SQLite verifies: integrity, encoding preserved, data readable,
@@ -197,6 +200,8 @@ fn sqlite_utf16_nocase_index_and_without_rowid() {
             count_of(&db, "SELECT COUNT(*) FROM w"),
             (ADVERSARIAL.len() + 1) as i64
         );
+        // The writes adopted the path; the export restores the bytes.
+        db.export_sqlite_format(&path).unwrap();
     }
 
     // SQLite verifies: integrity, NOCASE lookups, WITHOUT ROWID lookups.
@@ -246,6 +251,9 @@ fn sqlite_utf16_schema_text_roundtrip() {
         assert_eq!(rows.len(), 1);
         db.execute("INSERT INTO \"t\u{00EB}bl\u{00EB}\" VALUES (2, 'mehr')", ())
             .unwrap();
+        // The write adopted the path; the export restores the bytes
+        // (schema text stays in the file encoding).
+        db.export_sqlite_format(&path).unwrap();
     }
     {
         let con = rusqlite::Connection::open(&path).unwrap();
@@ -278,8 +286,12 @@ fn sqlite_utf16_schema_text_roundtrip() {
 fn engine_creates_utf16_file_verified_by_sqlite() {
     for pragma_name in ["UTF-16le", "UTF-16be"] {
         let path = temp_path(&format!("b_create_{pragma_name}"));
+        Database::open_in_memory()
+            .unwrap()
+            .export_sqlite_format(&path)
+            .unwrap();
         {
-            let mut db = Database::open_sqlite_format(&path).unwrap();
+            let mut db = Database::open(&path).unwrap();
             db.execute("PRAGMA encoding = ?", [Value::Text(pragma_name.into())])
                 .unwrap();
             let reported = db.query("PRAGMA encoding", ()).unwrap();
@@ -304,6 +316,9 @@ fn engine_creates_utf16_file_verified_by_sqlite() {
                 )
                 .unwrap();
             }
+            // The writes adopted the path; the export materializes the
+            // committed state in the materialized encoding.
+            db.export_sqlite_format(&path).unwrap();
         }
 
         // SQLite opens the engine's file: encoding, integrity, index
@@ -325,6 +340,14 @@ fn engine_creates_utf16_file_verified_by_sqlite() {
                     .unwrap();
                 assert!(k >= 1, "WITHOUT ROWID lookup {s:?}");
             }
+        }
+
+        // Materialize the file in this encoding, then reload it.
+        // (The write above adopted the path; the export carries the
+        // materialized encoding.)
+        {
+            let db = Database::open(&path).unwrap();
+            db.export_sqlite_format(&path).unwrap();
         }
 
         // rustqlite re-opens its own UTF-16 file (writer->reader loop).
@@ -371,8 +394,12 @@ fn engine_utf16_order_by_matches_sqlite_byte_order() {
         };
 
         // Engine-created file with the same data.
+        Database::open_in_memory()
+            .unwrap()
+            .export_sqlite_format(&engine_path)
+            .unwrap();
         {
-            let mut db = Database::open_sqlite_format(&engine_path).unwrap();
+            let mut db = Database::open(&engine_path).unwrap();
             db.execute("PRAGMA encoding = ?", [Value::Text(pragma_name.into())])
                 .unwrap();
             db.execute("CREATE TABLE t(v TEXT)", ()).unwrap();
@@ -381,9 +408,10 @@ fn engine_utf16_order_by_matches_sqlite_byte_order() {
                 db.execute("INSERT INTO t VALUES (?)", [Value::Text(s.into())])
                     .unwrap();
             }
-            // THE ENGINE's OWN comparator (reopened: the pragma-era
-            // connection also works, reopen proves the header's encoding
-            // feeds the ordering).
+            // The writes adopted the path; the export materializes the
+            // committed state in the materialized encoding — and the
+            // reopen proves the header's encoding feeds the ordering.
+            db.export_sqlite_format(&engine_path).unwrap();
             let engine_order: Vec<String> = {
                 let db = Database::open(&engine_path).unwrap();
                 let rows = db.query("SELECT v FROM t ORDER BY v", ()).unwrap();
@@ -585,8 +613,10 @@ fn pragma_encoding_after_content_is_silently_ignored() {
         db.execute("PRAGMA encoding = 'CP1252'", ()).unwrap();
         let reported = db.query("PRAGMA encoding", ()).unwrap();
         assert_eq!(reported[0][0], Value::Text("UTF-16le".into()));
-        // A write dumps — encoding must remain UTF-16le on disk.
+        // A write adopts the path; the export carries the materialized
+        // encoding.
         db.execute("INSERT INTO t VALUES (2)", ()).unwrap();
+        db.export_sqlite_format(&path).unwrap();
     }
     {
         let con = rusqlite::Connection::open(&path).unwrap();
@@ -606,11 +636,14 @@ fn pragma_encoding_switches_only_while_empty() {
     let path = temp_path("p_empty_switch");
     {
         // Empty interop db: the encoding is settable (effective at the
-        // next dump).
-        let mut db = Database::open_sqlite_format(&path).unwrap();
+        // export).
+        let db = Database::open_in_memory().unwrap();
+        db.export_sqlite_format(&path).unwrap();
+        let mut db = Database::open(&path).unwrap();
         db.execute("PRAGMA encoding = 'UTF-16be'", ()).unwrap();
         db.execute("CREATE TABLE t(x)", ()).unwrap();
         db.execute("INSERT INTO t VALUES ('a')", ()).unwrap();
+        db.export_sqlite_format(&path).unwrap();
     }
     {
         let con = rusqlite::Connection::open(&path).unwrap();
@@ -619,13 +652,15 @@ fn pragma_encoding_switches_only_while_empty() {
         assert_eq!(integrity_check(&con), "ok");
     }
     // After content: further switches are ignored, even after the
-    // content is dropped (the header was materialized).
+    // content is dropped (the header was materialized). The DROP adopts
+    // the path; the export still carries the materialized encoding.
     {
         let mut db = Database::open(&path).unwrap();
         db.execute("DROP TABLE t", ()).unwrap();
         db.execute("PRAGMA encoding = 'UTF-8'", ()).unwrap();
         let reported = db.query("PRAGMA encoding", ()).unwrap();
         assert_eq!(reported[0][0], Value::Text("UTF-16be".into()));
+        db.export_sqlite_format(&path).unwrap();
     }
     {
         let con = rusqlite::Connection::open(&path).unwrap();

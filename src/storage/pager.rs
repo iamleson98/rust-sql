@@ -158,24 +158,6 @@ pub(crate) const COMMITTED_EPOCH_MARK: u64 = 1u64 << 47;
 /// no-hash fast path for every page of a normal database.
 const PAGE_VEC_DIRECT_LIMIT: usize = 1 << 20;
 
-/// Shard count for the per-root change-epoch map (see `Pager::root_epochs`).
-/// A power of two so sharding is a mask.
-const ROOT_EPOCH_SHARDS: usize = 16;
-
-/// Get-or-insert helper for one shard of the root-epoch map.
-fn root_epoch_shard(
-    shard: &Mutex<std::collections::HashMap<PageId, std::sync::Arc<std::sync::atomic::AtomicU64>>>,
-    root: PageId,
-) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
-    let mut g = shard.lock();
-    if let Some(slot) = g.get(&root) {
-        return slot.clone();
-    }
-    let slot = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    g.insert(root, slot.clone());
-    slot
-}
-
 /// PRAGMA parallel_scan default: tables at or above this estimated row
 /// count split their aggregate scans across worker threads
 /// (`executor::parallel`). 128k rows sits above every existing
@@ -563,12 +545,17 @@ impl Pager {
     /// In-memory stores never evict (the cache IS the store), so the
     /// DELETE-mode spill never engages for them.
     pub fn is_memory(&self) -> bool {
-        self.store.is_memory()
+        self.store.read().is_memory()
     }
 }
 
 pub struct Pager {
-    store: Store,
+    /// The backing store, behind a read-write lock: reads (page
+    /// cache misses, `len`, `sync_all`) take the shared mode; only
+    /// `set_len` and the one-shot `adopt_file_backing` rebind take
+    /// the exclusive mode. Uncontended parking_lot reads are ~15 ns
+    /// and are paid on cache misses only, never on cache hits.
+    store: parking_lot::RwLock<Store>,
     path: PathBuf,
     /// Page size in bytes (immutable after `open`).
     page_size: AtomicU32,
@@ -590,26 +577,6 @@ pub struct Pager {
     cache_capacity: AtomicUsize,
     /// Schema cookie, bumped on every schema change.
     schema_cookie: AtomicU32,
-    /// Per-b-tree-root change epochs — the SQLite-format container's
-    /// incremental-commit signal. Every b-tree mutation entry point
-    /// bumps its root's epoch; the sqlitefmt commit layer then compares
-    /// each schema object's root epoch against the value it recorded at
-    /// the last commit, so a commit rebuilds and rewrites ONLY the
-    /// objects whose trees were written (an O(changed) page splice,
-    /// never an O(database) image rebuild). The cells are
-    /// `Arc<AtomicU64>` cloned into each `Btree` handle at construction,
-    /// so bumping costs one relaxed fetch-add — no lock on the write
-    /// path. Sharded (16) by root id to keep handle construction
-    /// contention near zero.
-    root_epochs: [Mutex<
-        std::collections::HashMap<PageId, std::sync::Arc<std::sync::atomic::AtomicU64>>,
-    >; ROOT_EPOCH_SHARDS],
-    /// Whether the root-epoch bumps are live. Enabled ONLY on
-    /// SQLite-format (foreign-backed) databases — the commit layer's
-    /// splice decision consumes the epochs; native and in-memory
-    /// workloads skip the atomic entirely (a cached-flag branch on
-    /// the mutation path), keeping the insert hot path untouched.
-    epoch_tracking: std::sync::atomic::AtomicBool,
     /// True if this is a freshly created database (no header yet).
     is_new: AtomicBool,
     /// When true, `flush()` skips `file.sync_all()`. This is a HUGE perf win
@@ -1292,9 +1259,9 @@ impl Pager {
         self.schema_cookie
             .store(base.schema_cookie, Ordering::Release);
         let target_size = base.n_pages as u64 * self.page_size() as u64;
-        if let Ok(len) = self.store.len() {
+        if let Ok(len) = self.store.read().len() {
             if len > target_size {
-                self.store.set_len(target_size)?;
+                self.store.write().set_len(target_size)?;
             }
         }
         // Phase 5: restored content differs from disk → restored pages are
@@ -1501,7 +1468,7 @@ impl Drop for Pager {
         // WITHOUT Drop (std::mem::forget / a leak) keeps the lease and
         // later writers get SQLITE_BUSY — the same behavior a leaked
         // sqlite3* connection exhibits through its held POSIX locks.
-        if !self.store.is_memory() {
+        if !self.store.read().is_memory() {
             let sidecar = crate::storage::wal::wal_path_for(&self.path);
             crate::storage::wal::release_wal_lease(&sidecar, self.instance_id);
         }
@@ -1689,11 +1656,162 @@ impl Pager {
         Ok(pager)
     }
 
+    /// Open a pure in-memory pager bound to a REAL path — the
+    /// SQLite-format interop session's pre-adoption state (see
+    /// `Database::from_sqlite_file`). The store is the in-memory image
+    /// (nothing is ever written to `path` while the session stays
+    /// read-only); the path is the adoption target and what `path()`
+    /// reports — a session opened FROM a file names that file, like
+    /// SQLite's `PRAGMA database_list`. Every file-side behavior (WAL
+    /// sidecar, delete-spill, close-time teardown, WAL lease) is gated
+    /// on `store.is_memory()` and stays inert until
+    /// [`Self::adopt_file_backing`] flips the store to the file.
+    pub fn open_memory_at<P: AsRef<Path>>(path: P, cache_capacity: usize) -> Result<Self> {
+        let store = Store::Memory(std::sync::Mutex::new(Vec::new()));
+        let pager = Self::from_store(store, path.as_ref().to_path_buf(), cache_capacity, true)?;
+        pager.lazy_writeback.store(true, Ordering::Release);
+        Ok(pager)
+    }
+
+    /// Remove orphaned adoption staging files (`.{stem}.rsqladopt{pid}`)
+    /// beside `path` — leftovers of an adoption that crashed between
+    /// the temp write and the atomic rename. Best-effort; called at
+    /// every SQLite-format open.
+    pub(crate) fn sweep_adopt_temps(path: &Path) {
+        let Some(parent) = path.parent() else { return };
+        let Some(name) = path.file_name() else { return };
+        let prefix = format!(".{}.rsqladopt", name.to_string_lossy());
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            return;
+        };
+        for e in entries.flatten() {
+            if e.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+
+    /// Adopt `path` as this pager's durable backing store — the
+    /// adopt-on-write handoff for a session loaded from a SQLite-format
+    /// file (`Database::from_sqlite_file`).
+    ///
+    /// The session runs on the pure in-memory pager until its first
+    /// write commit; this method, called AT that commit boundary,
+    ///  1. snapshots the COMPLETE native-container image
+    ///     (`memory_image_current` — cache merged, header rewritten;
+    ///     exactly the bytes a fresh `Database::open` of the file
+    ///     re-reads, pages at their own ids),
+    ///  2. publishes it atomically (temp file beside the target, on the
+    ///     same filesystem, + fsync + rename over the SQLite original —
+    ///     the original bytes are never partially visible; a crash
+    ///     before the rename leaves them untouched),
+    ///  3. removes the SQLite sidecars the source may carry (`-wal` /
+    ///     `-shm` / `-journal`): their COMMITTED frames were folded
+    ///     into the image at LOAD, a hot `-journal` was replayed at
+    ///     open, and a stale `-wal` must never be mistaken for this
+    ///     container's own same-named WAL sidecar,
+    ///  4. rebinds the store to a read/write handle of the new file
+    ///     under the store write-lock, clearing the memory-only
+    ///     durability flags.
+    ///
+    /// The pager object's IDENTITY is unchanged: every `Arc<Pager>`
+    /// handle (statements, the C-ABI layer, `pager_handle()`) keeps
+    /// observing the same cache, the same MVCC state and the same page
+    /// ids — the image preserves page ids by construction (it IS the
+    /// pager's committed page set). After the swap the normal
+    /// file-backed machinery engages: the next commit writes changed
+    /// pages through the WAL / delete-journal paths, further sessions
+    /// may open the same file (MRMW), and `PRAGMA journal_mode` /
+    /// checkpoints behave exactly like any native file.
+    ///
+    /// Call contract: the engine's write-serialization critical section
+    /// (the commit boundary of the single pre-adoption connection) —
+    /// no statement is mid-flight, the same contract every other
+    /// commit-path mutation of pager state runs under. The store
+    /// write-lock additionally excludes page-cache misses for the
+    /// swap's duration.
+    pub fn adopt_file_backing(&self, path: &Path) -> Result<()> {
+        {
+            let store = self.store.read();
+            if !store.is_memory() {
+                return Err(Error::InvalidArgument(
+                    "adopt_file_backing on an already file-backed pager".into(),
+                ));
+            }
+        }
+        if self.wal.read().is_some() {
+            return Err(Error::InvalidArgument(
+                "adopt_file_backing with an armed WAL".into(),
+            ));
+        }
+        if self.codec.read().is_active() {
+            return Err(Error::InvalidArgument(
+                "adopt_file_backing with an active page codec".into(),
+            ));
+        }
+
+        // (1) The complete image.
+        let image = self.memory_image_current()?;
+
+        // (2) Atomic publish.
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let stem = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "db".to_string());
+        let tmp = parent.join(format!(".{}.rsqladopt{}", stem, std::process::id()));
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&image)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)?;
+        #[cfg(unix)]
+        {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+
+        // (3) The SQLite sidecars die with the format. Best-effort: a
+        // sidecar held by a LIVE foreign process must not fail the
+        // adoption — the next native open's WAL recovery resets a
+        // foreign-magic sidecar anyway (`Wal::recover`).
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut p = path.as_os_str().to_os_string();
+            p.push(suffix);
+            match std::fs::remove_file(&p) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {}
+            }
+        }
+
+        // (4) Rebind under the store write-lock.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)?;
+        {
+            let mut store = self.store.write();
+            *store = Store::File(file);
+        }
+        self.skip_fsync.store(false, Ordering::Release);
+        self.lazy_writeback.store(false, Ordering::Release);
+        self.memory_wal.store(false, Ordering::Release);
+        self.is_new.store(false, Ordering::Release);
+        self.committed_n_pages
+            .store(self.n_pages.load(Ordering::Acquire), Ordering::Release);
+        Ok(())
+    }
+
     /// The memory store's backing image (post-flush): the full byte
     /// sequence a file store would hold. VACUUM's page-level compact copy
     /// materializes its result this way.
     pub(crate) fn memory_store_image(&self) -> Result<Vec<u8>> {
-        match &self.store {
+        match &*self.store.read() {
             Store::Memory(m) => Ok(m.lock().unwrap_or_else(|e| e.into_inner()).clone()),
             Store::File(_) => Err(Error::InvalidArgument(
                 "memory_store_image on a file-backed pager".into(),
@@ -1713,7 +1831,7 @@ impl Pager {
     /// `open_memory_from_image` (or `open_in_memory_with_image`)
     /// reopens faithfully.
     pub(crate) fn memory_image_current(&self) -> Result<Vec<u8>> {
-        if !self.store.is_memory() {
+        if !self.store.read().is_memory() {
             return Err(Error::InvalidArgument(
                 "memory_image_current on a file-backed pager".into(),
             ));
@@ -1738,7 +1856,8 @@ impl Pager {
         // Base: whatever the store already holds (evicted pages).
         {
             let base_len = {
-                let m = match &self.store {
+                let store_guard = self.store.read();
+                let m = match &*store_guard {
                     Store::Memory(m) => m,
                     Store::File(_) => unreachable!("checked above"),
                 };
@@ -1802,7 +1921,7 @@ impl Pager {
         skip_sync: bool,
     ) -> Result<Self> {
         let pager = Self {
-            store,
+            store: parking_lot::RwLock::new(store),
             path,
             page_size: AtomicU32::new(DEFAULT_PAGE_SIZE),
             n_pages: AtomicU32::new(0),
@@ -1812,8 +1931,6 @@ impl Pager {
             lru: Mutex::new(VecDeque::new()),
             cache_capacity: AtomicUsize::new(cache_capacity),
             schema_cookie: AtomicU32::new(0),
-            root_epochs: Default::default(),
-            epoch_tracking: std::sync::atomic::AtomicBool::new(false),
             is_new: AtomicBool::new(false),
             skip_fsync: AtomicBool::new(skip_sync),
             memory_wal: AtomicBool::new(false),
@@ -1877,7 +1994,7 @@ impl Pager {
             legacy_index_format: std::sync::atomic::AtomicBool::new(false),
         };
 
-        let file_size = pager.store.len()?;
+        let file_size = pager.store.read().len()?;
         if file_size == 0 {
             pager.is_new.store(true, Ordering::Release);
             pager.initialize_new_db()?;
@@ -1904,7 +2021,7 @@ impl Pager {
             // silently reverted to DELETE mode (BEGIN CONCURRENT then
             // failed with "requires journal_mode=WAL" on every reopened
             // handle).
-            if !pager.store.is_memory() {
+            if !pager.store.read().is_memory() {
                 let wal_file = crate::storage::wal::wal_path_for(&pager.path);
                 let sidecar_leftover = wal_file.exists()
                     && std::fs::metadata(&wal_file)
@@ -2079,7 +2196,7 @@ impl Pager {
         // an fsync here costs ~0.4 ms on CI Linux, ~1.5 ms on macOS and
         // ~10 ms on Windows per open, and buys nothing.
         if !self.skip_fsync.load(Ordering::Acquire) {
-            self.store.sync_all()?;
+            self.store.read().sync_all()?;
         }
         self.n_pages.store(1, Ordering::Release);
         self.committed_n_pages.store(1, Ordering::Release);
@@ -2162,7 +2279,7 @@ impl Pager {
             .store(FileHeader::application_id(&header), Ordering::Release);
 
         // Verify file size matches the claimed page count.
-        let actual_size = self.store.len()?;
+        let actual_size = self.store.read().len()?;
         let expected_size = n_pages as u64 * page_size as u64;
         if actual_size < expected_size {
             return Err(Error::corruption(format!(
@@ -2264,11 +2381,11 @@ impl Pager {
             .copy_from_slice(&0u32.to_be_bytes());
         // Truncate the file to exactly one page at the NEW size: the old
         // header page may have been larger (or the file smaller).
-        let _ = self.store.set_len(size as u64);
+        let _ = self.store.write().set_len(size as u64);
         if self.write_file_at(0, &page0.data).is_err() {
             return false;
         }
-        let _ = self.store.sync_all();
+        let _ = self.store.read().sync_all();
         self.page_size.store(size, Ordering::Release);
         true
     }
@@ -2292,7 +2409,7 @@ impl Pager {
     /// Metadata of the underlying database file (size, mtime). Used by
     /// `PRAGMA integrity_check` to validate the file's shape.
     pub fn file_metadata(&self) -> Result<std::fs::Metadata> {
-        Ok(self.store.metadata()?)
+        Ok(self.store.read().metadata()?)
     }
 
     pub fn schema_cookie(&self) -> u32 {
@@ -2492,64 +2609,6 @@ impl Pager {
         self.write_version.load(Ordering::Relaxed)
     }
 
-    /// The change-epoch cell of one b-tree root (get-or-insert) — the
-    /// SQLite-format container's incremental-commit signal. Called once
-    /// per `Btree` handle construction; the handle then bumps the cell
-    /// on every mutation (lock-free fetch-add).
-    pub fn root_epoch_slot(&self, root: PageId) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
-        // Native / in-memory workloads never bump (the flag gates every
-        // mutation-site bump), so they share one static cell instead of
-        // paying the shard lock + hash per handle construction.
-        if !self.epoch_tracking.load(Ordering::Relaxed) {
-            static DISABLED: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicU64>> =
-                std::sync::OnceLock::new();
-            return DISABLED
-                .get_or_init(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)))
-                .clone();
-        }
-        let shard = (root as usize) & (ROOT_EPOCH_SHARDS - 1);
-        root_epoch_shard(&self.root_epochs[shard], root)
-    }
-
-    /// Whether root-epoch tracking is live (see `Pager::epoch_tracking`).
-    pub(crate) fn epoch_tracking_enabled(&self) -> &std::sync::atomic::AtomicBool {
-        &self.epoch_tracking
-    }
-
-    /// Enable root-epoch tracking (SQLite-format databases only —
-    /// their commit layer diffs the epochs per commit boundary).
-    pub(crate) fn enable_epoch_tracking(&self) {
-        self.epoch_tracking.store(true, Ordering::Release);
-    }
-
-    /// Alias one root's change-epoch cell onto another — a root split:
-    /// the new root CONTINUES the old root's object, so both page
-    /// identities must share one change signal. Reads keyed by either
-    /// the catalog's CREATE-time root or the live (post-split) root
-    /// then observe the same epoch (the sqlitefmt commit layer keys its
-    /// dirty detection by the catalog root; the writes flow through
-    /// whichever root the executor resolved).
-    pub(crate) fn alias_root_epoch(&self, old_root: PageId, new_root: PageId) {
-        if old_root == 0 || new_root == 0 || old_root == new_root {
-            return;
-        }
-        // Resolve the OLD root's slot first (multi-level splits chain:
-        // each alias points at the ORIGINAL object's cell).
-        let slot = self.root_epoch_slot(old_root);
-        let shard = (new_root as usize) & (ROOT_EPOCH_SHARDS - 1);
-        self.root_epochs[shard].lock().insert(new_root, slot);
-    }
-
-    /// Current change epoch of one b-tree root (0 = never written since
-    /// open). The sqlitefmt commit layer compares these per schema
-    /// object against its last-committed snapshot to decide which
-    /// objects to re-encode and splice.
-    pub fn root_epoch(&self, root: PageId) -> u64 {
-        let shard = (root as usize) & (ROOT_EPOCH_SHARDS - 1);
-        let g = self.root_epochs[shard].lock();
-        g.get(&root).map(|s| s.load(Ordering::Acquire)).unwrap_or(0)
-    }
-
     /// This pager's stable instance id (process-wide counter).
     pub(crate) fn instance_id(&self) -> u64 {
         self.instance_id
@@ -2701,7 +2760,7 @@ impl Pager {
     /// NOT the logical page count — the WAL may hold pages past this
     /// length, and `n_pages` may run ahead of it mid-transaction.
     pub(crate) fn store_len(&self) -> u64 {
-        self.store.len().unwrap_or(0)
+        self.store.read().len().unwrap_or(0)
     }
 
     /// Get a page by ID, reading from disk if not cached.
@@ -2931,7 +2990,7 @@ impl Pager {
             }
         });
         if seq_run >= 2
-            && !self.store.is_memory()
+            && !self.store.read().is_memory()
             && self
                 .wal
                 .read()
@@ -3014,7 +3073,7 @@ impl Pager {
     /// touches per get_page for nothing).
     #[inline]
     fn note_seq_access(&self, id: PageId, is_miss: bool) {
-        if self.store.is_memory() {
+        if self.store.read().is_memory() {
             return;
         }
         SEQ_RUN_TL.with(|c| {
@@ -3978,8 +4037,10 @@ impl Pager {
         // Memory stores: shrink the backing Vec now (it is only snapshot
         // scratch — the cache is the store — so there is nothing to
         // defer).
-        if self.store.is_memory() {
-            self.store.set_len(k as u64 * self.page_size() as u64)?;
+        if self.store.read().is_memory() {
+            self.store
+                .write()
+                .set_len(k as u64 * self.page_size() as u64)?;
             self.pending_truncate.store(0, Ordering::Release);
         }
         Ok(k)
@@ -3993,9 +4054,9 @@ impl Pager {
             return Ok(());
         }
         let want_len = k as u64 * self.page_size() as u64;
-        if let Ok(len) = self.store.len() {
+        if let Ok(len) = self.store.read().len() {
             if len > want_len {
-                self.store.set_len(want_len)?;
+                self.store.write().set_len(want_len)?;
             }
         }
         self.pending_truncate.store(0, Ordering::Release);
@@ -4116,7 +4177,7 @@ impl Pager {
         // protect — crash recovery and durable frames are meaningless for
         // a database that vanishes on drop. Record the mode (the pragma
         // round-trip must report "wal") and skip every file operation.
-        if self.store.is_memory() {
+        if self.store.read().is_memory() {
             self.memory_wal.store(true, Ordering::Release);
             return Ok(());
         }
@@ -4174,7 +4235,7 @@ impl Pager {
     /// checkpoint the WAL into the main file, then remove it.
     pub fn disable_wal(&self) -> Result<()> {
         // Logical WAL on a memory store: just clear the flag.
-        if self.store.is_memory() {
+        if self.store.read().is_memory() {
             self.memory_wal.store(false, Ordering::Release);
             return Ok(());
         }
@@ -4237,7 +4298,7 @@ impl Pager {
     /// durable immediately — a reopen of a WAL-mode file must come up in
     /// WAL mode (SQLite's persistent WAL, header bytes 18/19).
     fn persist_journal_mode_flag(&self, mode: u32) -> Result<()> {
-        if self.store.is_memory() {
+        if self.store.read().is_memory() {
             return Ok(());
         }
         // IDEMPOTENCE: the durable flag already says `mode` -> nothing to
@@ -4264,7 +4325,7 @@ impl Pager {
         let mut raw = [0u8; 4];
         raw.copy_from_slice(&mode.to_le_bytes());
         self.write_file_at(72, &raw)?;
-        self.store.sync_all()?;
+        self.store.read().sync_all()?;
         Ok(())
     }
 
@@ -4293,7 +4354,7 @@ impl Pager {
         // holds the log. `Ours` = we are the (sticky) owner — nested call,
         // the lease stays held; `Acquired` = the lease was free (no live
         // writer) — transient take, released below; `Foreign` = busy.
-        if !self.store.is_memory() {
+        if !self.store.read().is_memory() {
             let sidecar = crate::storage::wal::wal_path_for(&self.path);
             let acquired = match crate::storage::wal::acquire_wal_lease(&sidecar, self.instance_id)
             {
@@ -4486,9 +4547,9 @@ impl Pager {
         // only in the WAL until now), and apply any armed mass-delete
         // truncation (the file tail reclaims with the commit).
         let want_len = self.n_pages.load(Ordering::Acquire) as u64 * psz as u64;
-        let cur_len = self.store.len()?;
+        let cur_len = self.store.read().len()?;
         if want_len != cur_len {
-            self.store.set_len(want_len)?;
+            self.store.write().set_len(want_len)?;
         }
         self.pending_truncate.store(0, Ordering::Release);
         // SQLite WAL durability semantics at checkpoint: OFF never syncs;
@@ -4500,7 +4561,7 @@ impl Pager {
         // rotational-ish storage per VACUUM).
         let sync_mode = self.synchronous.load(Ordering::Acquire);
         if sync_mode >= 1 && !self.skip_fsync.load(Ordering::Acquire) {
-            self.store.sync_all()?;
+            self.store.read().sync_all()?;
         }
         state.wal.reset_synced(sync_mode >= 1)?;
         state.map.clear();
@@ -4538,7 +4599,7 @@ impl Pager {
         // every other handle's write attempt fails fast with a clean
         // busy-class error. Read-only handles attach freely (WAL frames
         // are plain positioned reads).
-        if !self.store.is_memory() {
+        if !self.store.read().is_memory() {
             let sidecar = crate::storage::wal::wal_path_for(&self.path);
             if let crate::storage::wal::WalLease::Foreign(f) =
                 crate::storage::wal::acquire_wal_lease(&sidecar, self.instance_id)
@@ -5256,7 +5317,7 @@ impl Pager {
         // committed-but-unwritten work. These pagers keep their committed
         // state ONLY in the cache — the restore is impossible; the
         // caller's row-level stmt_undo remains the recovery mechanism.
-        if self.lazy_writeback.load(Ordering::Acquire) || self.store.is_memory() {
+        if self.lazy_writeback.load(Ordering::Acquire) || self.store.read().is_memory() {
             return Ok(false);
         }
         // 1. The failed statement's sidecar spills are dead work (the
@@ -5324,9 +5385,9 @@ impl Pager {
         //    through the committed map), so the trim is harmless.
         let committed = self.committed_n_pages.load(Ordering::Acquire);
         let target_size = committed as u64 * self.page_size.load(Ordering::Acquire) as u64;
-        if let Ok(len) = self.store.len() {
+        if let Ok(len) = self.store.read().len() {
             if len > target_size {
-                let _ = self.store.set_len(target_size);
+                let _ = self.store.write().set_len(target_size);
             }
         }
         self.n_pages.store(committed, Ordering::Release);
@@ -5599,7 +5660,7 @@ impl Pager {
         // Skip the entire call to make in-memory mode match SQLite's `:memory:`
         // performance.
         if !self.skip_fsync.load(Ordering::Acquire) {
-            self.store.sync_all()?;
+            self.store.read().sync_all()?;
         }
         // Mass-delete tail truncation: shrink the file with the commit.
         self.apply_pending_truncate()?;
@@ -5644,7 +5705,7 @@ impl Pager {
             // images (captured at first fetch, non-destructive). Writing
             // the image here would only grow RSS by a second full copy of
             // the DB. File-backed lazy pagers keep the write-back.
-            if self.store.is_memory() {
+            if self.store.read().is_memory() {
                 return Ok(());
             }
             // Temporarily disable lazy mode and run the real flush with the
@@ -5722,9 +5783,9 @@ impl Pager {
 
         // 3. Truncate the file back if pages were allocated during the txn.
         let target_size = snap.n_pages as u64 * self.page_size() as u64;
-        let current_size = self.store.len()?;
+        let current_size = self.store.read().len()?;
         if current_size > target_size {
-            self.store.set_len(target_size)?;
+            self.store.write().set_len(target_size)?;
         }
 
         // 4. Reset the dirty counter.
@@ -5747,7 +5808,7 @@ impl Pager {
         // re-read on the next visit. This is SQLite's own `:memory:`
         // design: the pager array is the whole DB. It also caps RSS at
         // DB size (no double image + cache representation).
-        if self.store.is_memory() {
+        if self.store.read().is_memory() {
             return;
         }
         // Safety bound: if every cached page is dirty and unwritable (or
@@ -6063,11 +6124,11 @@ impl Pager {
     //       memory store serves reads/writes from its byte image. -----
 
     pub(crate) fn read_file_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        Ok(self.store.read_at(offset, buf)?)
+        Ok(self.store.read().read_at(offset, buf)?)
     }
 
     fn write_file_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
-        self.store.write_all_at(offset, buf)?;
+        self.store.read().write_all_at(offset, buf)?;
         Ok(())
     }
 

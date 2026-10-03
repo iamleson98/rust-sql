@@ -284,7 +284,7 @@ fn sniff(path: &str) -> Format {
 /// Open a sqlar archive as its own database (SQLite-format interop),
 /// with the CLI's function set registered (writefile & co).
 fn open_sqlar(path: &str) -> Result<Runner, String> {
-    let mut db = rustqlite::Database::open_sqlite_format(path).map_err(|_| {
+    let mut db = rustqlite::Database::open(path).map_err(|_| {
         // The oracle opens lazily and fails at the missing sqlar
         // table for every non-archive — byte-match that surface.
         "database does not contain an 'sqlar' table".to_string()
@@ -631,6 +631,21 @@ fn run_add(
                 for stmt in exec {
                     db.execute(&stmt).map_err(|e| format!("SQL error: {}", e))?;
                 }
+                // Archives are INTERCHANGE files: write the committed
+                // state back in SQLite's disk format (the session's
+                // first write adopted the path into the native container;
+                // the export restores the interchange bytes).
+                #[cfg(feature = "auth")]
+                if let Runner::Local(db) = &db {
+                    db.export_sqlite_format(f)
+                        .map_err(|e| format!("SQL error: {}", e))?;
+                }
+                #[cfg(not(feature = "auth"))]
+                {
+                    let Runner::Local(db) = &db;
+                    db.export_sqlite_format(f)
+                        .map_err(|e| format!("SQL error: {}", e))?;
+                }
                 Ok(())
             }
         },
@@ -811,6 +826,19 @@ fn run_remove(
                 }
                 let mut db = open_sqlar(f)?;
                 db.execute(&sql).map_err(|e| format!("SQL error: {}", e))?;
+                // Archives are INTERCHANGE files: the write adopted the
+                // path; the export restores the SQLite bytes.
+                #[cfg(feature = "auth")]
+                if let Runner::Local(db) = &db {
+                    db.export_sqlite_format(f)
+                        .map_err(|e| format!("SQL error: {}", e))?;
+                }
+                #[cfg(not(feature = "auth"))]
+                {
+                    let Runner::Local(db) = &db;
+                    db.export_sqlite_format(f)
+                        .map_err(|e| format!("SQL error: {}", e))?;
+                }
                 Ok(())
             }
         },

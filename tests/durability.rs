@@ -1735,13 +1735,12 @@ fn image_roundtrip_full_semantics() {
 }
 
 // ===========================================================================
-// SECTION D — the SQLite on-disk format gets the same battery.
-//
-// `open_sqlite_format` (foreign format) shares none of the load code
-// with the native format, so every durability property must be re-proven
-// there separately. This path has historically lagged the native one
-// (sqlite_sequence creation, image()/WAL staleness — see worklog) and
-// is exactly where a second silent-constraint-loss bug would hide.
+// SECTION D — the SQLite on-disk format: the LOAD/EXPORT round trip
+// gets the same battery. (The live in-place container is gone: a
+// SQLite-format file loads pending and its first write adopts the path
+// into the native container — see tests/adopt_on_write.rs. What must
+// still hold: the interchange writer's output loads back with every
+// constraint intact, and read-only sessions never touch the bytes.)
 // ===========================================================================
 
 /// The full constraint battery, foreign format: rowid alias PK, TEXT/uuid
@@ -1754,7 +1753,7 @@ fn sqlite_format_constraint_battery() {
     let path = path.with_extension("sqlitefmt.db");
     let _ = std::fs::remove_file(&path);
     {
-        let mut db = Database::open_sqlite_format(&path).unwrap();
+        let mut db = Database::open_in_memory().unwrap();
         db.execute(
             "CREATE TABLE users (user_id uuid_text NOT NULL PRIMARY KEY, email TEXT UNIQUE)",
             [],
@@ -1812,16 +1811,16 @@ fn sqlite_format_constraint_battery() {
             .unwrap();
         // seq: 10 is the historic max; delete it.
         db.execute("DELETE FROM seq WHERE id = 10", []).unwrap();
-        db.flush().unwrap();
+        db.export_sqlite_format(&path).unwrap();
         drop(db);
     }
 
-    // Reopen (foreign format) and probe everything.
-    let mut db = Database::open_sqlite_format(&path).unwrap();
+    // Reopen (the interchange reader) and probe everything.
+    let mut db = Database::open(&path).unwrap();
     assert_eq!(
         db.disk_format(),
         "sqlite",
-        "disk_format() must report sqlite"
+        "a loaded-not-yet-adopted session reports sqlite"
     );
     // TEXT/uuid PK.
     assert_eq!(one_i64(&db, "SELECT COUNT(*) FROM users"), 10);
@@ -1875,125 +1874,6 @@ fn sqlite_format_constraint_battery() {
     cleanup(&path);
 }
 
-/// Foreign format generation soak: 6 generations of churn + checksum,
-/// the trans2.test loop on the second serialization path.
-#[test]
-fn sqlite_format_generation_soak() {
-    let path = tmpdb("sqlitefmt_soak");
-    let path = path.with_extension("sqlitefmt.db");
-    let _ = std::fs::remove_file(&path);
-    let mut rng = Rng::new(0xF0D);
-    let mut ledger;
-
-    {
-        let mut db = Database::open_sqlite_format(&path).unwrap();
-        db.execute(
-            "CREATE TABLE g (id INTEGER PRIMARY KEY, k TEXT UNIQUE, n INTEGER)",
-            [],
-        )
-        .unwrap();
-        for i in 1..=50i64 {
-            db.execute(
-                "INSERT INTO g (k, n) VALUES (?, ?)",
-                [
-                    Value::Text(format!("k{:03}", i).into()),
-                    Value::Integer((rng.next_u64() % 500) as i64),
-                ],
-            )
-            .unwrap();
-        }
-        let rows = db.query("SELECT id, k, n FROM g ORDER BY id", []).unwrap();
-        ledger = row_checksum(&rows);
-        db.flush().unwrap();
-        drop(db);
-    }
-
-    for gen in 1..=6i64 {
-        let mut db = Database::open_sqlite_format(&path).unwrap();
-        // Ledger holds.
-        let rows = db.query("SELECT id, k, n FROM g ORDER BY id", []).unwrap();
-        assert_eq!(
-            row_checksum(&rows),
-            ledger,
-            "sqlite-fmt gen {}: ledger drift",
-            gen
-        );
-        // Constraints probe every generation.
-        let dup = db.execute(
-            "INSERT INTO g (k, n) VALUES ((SELECT k FROM g LIMIT 1), 0)",
-            [],
-        );
-        assert!(dup.is_err(), "sqlite-fmt gen {}: UNIQUE loosened", gen);
-        // Churn.
-        for i in 1..=20i64 {
-            let id = gen * 100 + i;
-            db.execute(
-                "INSERT INTO g (k, n) VALUES (?, ?)",
-                [
-                    Value::Text(format!("g{}-{:03}", gen, i).into()),
-                    Value::Integer(id),
-                ],
-            )
-            .unwrap();
-        }
-        db.execute("UPDATE g SET n = n + 2 WHERE id % 5 = 0", [])
-            .unwrap();
-        db.execute("DELETE FROM g WHERE id % 11 = 0", []).unwrap();
-        let rows = db.query("SELECT id, k, n FROM g ORDER BY id", []).unwrap();
-        ledger = row_checksum(&rows);
-        db.flush().unwrap();
-        drop(db);
-    }
-
-    let db = Database::open_sqlite_format(&path).unwrap();
-    let rows = db.query("SELECT id, k, n FROM g ORDER BY id", []).unwrap();
-    assert_eq!(
-        row_checksum(&rows),
-        ledger,
-        "sqlite-fmt: final ledger drift"
-    );
-    let ic = one_text(&db, "PRAGMA quick_check");
-    assert!(ic == "ok", "sqlite-fmt soak: quick_check: {}", ic);
-    drop(db);
-    cleanup(&path);
-}
-
-/// Foreign-format byte stability across idle reopen (same contract as
-/// the native format test).
-#[test]
-fn sqlite_format_idle_reopen_byte_stable() {
-    let path = tmpdb("sqlitefmt_stable");
-    let path = path.with_extension("sqlitefmt.db");
-    let _ = std::fs::remove_file(&path);
-    {
-        let mut db = Database::open_sqlite_format(&path).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
-            .unwrap();
-        for i in 1..=200i64 {
-            db.execute(
-                "INSERT INTO t (v) VALUES (?)",
-                [Value::Text(format!("row{}", i * 13).into())],
-            )
-            .unwrap();
-        }
-        db.flush().unwrap();
-        drop(db);
-    }
-    let first = std::fs::read(&path).unwrap();
-    for _ in 0..2 {
-        let db = Database::open_sqlite_format(&path).unwrap();
-        drop(db);
-        let now = std::fs::read(&path).unwrap();
-        assert!(
-            now == first,
-            "sqlite-fmt idle reopen rewrote the file ({} -> {} bytes)",
-            first.len(),
-            now.len()
-        );
-    }
-    cleanup(&path);
-}
-
 /// Rapid open/close churn: 40 open-verify-close cycles on one file with
 /// alternating readers/writers. Catches fd leaks, lock residue, and
 /// header-version drift that only appear across MANY cheap cycles
@@ -2025,41 +1905,31 @@ fn rapid_open_close_churn() {
     cleanup(&path);
 }
 
-/// One file, two formats, two contracts: a native-format file must NOT
-/// open via `open_sqlite_format` (fail fast, no silent misparse — and
-/// the failed open must not have damaged the file). The REVERSE is
-/// deliberately lenient: `Database::open` sniffs the SQLite magic and
-/// bridges sqlite-format files through the interop loader (documented
-/// behavior — see open_inner), which must yield the SAME data as
-/// `open_sqlite_format` on that file.
+/// A SQLite-format file through the native door: the interop bridge
+/// sniffs the magic and loads it pending (documented behavior — see
+/// open_inner), which must yield the same data the interchange writer
+/// wrote, and must never adopt on a read-only session.
 #[test]
 fn format_confusion_fails_cleanly() {
-    let path = tmpdb("fmt_confusion");
-    session(&path, |db| {
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", [])
-            .unwrap();
-        db.execute("INSERT INTO t VALUES (1)", []).unwrap();
-    });
-    // Native file through the sqlite-format door: must fail.
-    let wrong = Database::open_sqlite_format(&path);
-    assert!(wrong.is_err(), "native file must not open as sqlite-format");
-    // And the failed open must not have damaged the native file.
-    let db = Database::open(&path).unwrap();
-    assert_eq!(one_i64(&db, "SELECT COUNT(*) FROM t"), 1);
-    drop(db);
-    cleanup(&path);
+    // A garbage file (neither format) must fail the open cleanly.
+    let gpath = tmpdb("fmt_confusion_garbage");
+    std::fs::write(&gpath, b"not a database at all, just text").unwrap();
+    assert!(
+        Database::open(&gpath).is_err(),
+        "a garbage file must not open"
+    );
+    let _ = std::fs::remove_file(&gpath);
 
-    // And the reverse: sqlite-format file through the native door — the
-    // interop bridge sniffs the magic and loads it (documented behavior).
+    // And the real direction: sqlite-format file through the native
+    // door — the interop bridge sniffs the magic and loads it.
     let spath = tmpdb("fmt_confusion_sqlitefmt");
     let spath = spath.with_extension("sqlitefmt.db");
     let _ = std::fs::remove_file(&spath);
     {
-        let mut db = Database::open_sqlite_format(&spath).unwrap();
+        let mut db = Database::open_in_memory().unwrap();
         db.execute("CREATE TABLE s (x)", []).unwrap();
         db.execute("INSERT INTO s VALUES (2)", []).unwrap();
-        db.flush().unwrap();
-        drop(db);
+        db.export_sqlite_format(&spath).unwrap();
     }
     // Native open: bridged, not refused — and the bridge must see the
     // same rows the sqlite-format door sees.
@@ -2067,13 +1937,10 @@ fn format_confusion_fails_cleanly() {
     assert_eq!(
         db.disk_format(),
         "sqlite",
-        "bridge must report sqlite format"
+        "the bridge must report sqlite format"
     );
     assert_eq!(one_i64(&db, "SELECT COUNT(*) FROM s"), 1);
     assert_eq!(one_i64(&db, "SELECT x FROM s"), 2);
-    drop(db);
-    let db = Database::open_sqlite_format(&spath).unwrap();
-    assert_eq!(one_i64(&db, "SELECT COUNT(*) FROM s"), 1);
     drop(db);
     cleanup(&spath);
 }
@@ -2297,8 +2164,13 @@ fn staging_files(path: &std::path::Path) -> Vec<std::path::PathBuf> {
 #[test]
 fn atomic_write_leaves_no_staging_file() {
     let path = tmpdb("staging_clean");
+    // A REAL SQLite-format source, then an adopting write cycle.
+    Database::open_in_memory()
+        .unwrap()
+        .export_sqlite_format(&path)
+        .expect("fixture");
     {
-        let mut db = Database::open_sqlite_format(&path).expect("open sqlite format");
+        let mut db = Database::open(&path).expect("open pending");
         db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
             .expect("ddl");
         db.execute("INSERT INTO t (v) VALUES ('a')", [])
@@ -2331,12 +2203,12 @@ fn atomic_write_leaves_no_staging_file() {
 fn open_sweeps_orphaned_staging_files() {
     let path = tmpdb("staging_sweep");
     {
-        let mut db = Database::open_sqlite_format(&path).expect("create");
+        let mut db = Database::open_in_memory().unwrap();
         db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
             .expect("ddl");
         db.execute("INSERT INTO t (v) VALUES ('keep')", [])
             .expect("insert");
-        db.flush().expect("flush");
+        db.export_sqlite_format(&path).expect("export");
         drop(db);
     }
 
@@ -2355,7 +2227,7 @@ fn open_sweeps_orphaned_staging_files() {
     // A real SQLite database file with a prefix-shaped name — opening
     // it as its own database must keep working (and keep its data).
     {
-        let mut other = Database::open_sqlite_format(&foreign_db).expect("foreign open");
+        let mut other = Database::open(&foreign_db).expect("foreign open");
         other
             .execute("CREATE TABLE f (x)", [])
             .expect("foreign ddl");

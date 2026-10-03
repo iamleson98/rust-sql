@@ -314,14 +314,14 @@ fn multiway_split_root_and_right_edge() {
     assert_eq!(rows[0][0], Value::Integer(60));
 }
 
-/// The SQLite-format container runs the same engine b-tree code through
-/// its splice paths — the blob-replace workload must survive there too,
-/// and the result must verify in REAL SQLite.
+/// The blob-replace workload exported to REAL SQLite bytes: the
+/// result must reload through the interop reader and verify in the
+/// real sqlite3 CLI.
 #[test]
 fn multiway_split_sqlite_format_container() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("share.db");
-    let mut db = Database::open_sqlite_format(&path).unwrap();
+    let mut db = Database::open_in_memory().unwrap();
     db.execute(
         "CREATE TABLE m(id INTEGER PRIMARY KEY, a TEXT, b INTEGER, blob BLOB)",
         [],
@@ -372,6 +372,8 @@ fn multiway_split_sqlite_format_container() {
     }
     integrity_ok(&mut db);
     let n = db.query("SELECT count(*) FROM m", []).unwrap()[0][0].clone();
+    // Real SQLite bytes at `path` (the interchange writer).
+    db.export_sqlite_format(&path).unwrap();
     drop(db);
     // Real SQLite must open the file and agree (interop both directions).
     let sqlite_bin =

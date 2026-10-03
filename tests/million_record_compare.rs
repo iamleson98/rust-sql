@@ -165,7 +165,7 @@ fn million_record_differential() {
     let engine_path = temp_path("engine");
     let sqlite_path = temp_path("sqlite");
 
-    let mut db = rustqlite::Database::open_sqlite_format(&engine_path).unwrap();
+    let mut db = rustqlite::Database::open(&engine_path).unwrap();
     let rc = Connection::open(&sqlite_path).unwrap();
 
     // ---- Schema on both engines --------------------------------------
@@ -247,11 +247,16 @@ fn million_record_differential() {
 
     phase("user-churn");
     // ---- Two-way FILE verification ------------------------------------
-    // Close the engine (clean WAL fold), then real SQLite opens the
-    // ENGINE-written file and fully verifies it.
+    // Close the engine, export its committed state to a REAL SQLite
+    // file (the interchange writer), then real SQLite verifies it.
     drop(db);
+    let engine_export = temp_path("engine_export");
+    rustqlite::Database::open(&engine_path)
+        .unwrap()
+        .export_sqlite_format(&engine_export)
+        .unwrap();
     {
-        let v = Connection::open(&engine_path).unwrap();
+        let v = Connection::open(&engine_export).unwrap();
         let ic: String = v
             .query_row("PRAGMA integrity_check", [], |r| r.get(0))
             .unwrap();

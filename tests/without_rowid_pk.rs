@@ -227,7 +227,7 @@ fn without_rowid_pk_dump_excludes_internal_index() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("wr.db");
     {
-        let mut db = rustqlite::Database::open_sqlite_format(&path).unwrap();
+        let mut db = rustqlite::Database::open_in_memory().unwrap();
         db.execute(
             "CREATE TABLE wr (k TEXT PRIMARY KEY, v INT) WITHOUT ROWID",
             (),
@@ -235,7 +235,8 @@ fn without_rowid_pk_dump_excludes_internal_index() {
         .unwrap();
         db.execute("INSERT INTO wr VALUES ('a', 1), ('b', 2)", ())
             .unwrap();
-        // Drop: the pending dump materializes the SQLite-format file.
+        // The interchange writer materializes the SQLite-format file.
+        db.export_sqlite_format(&path).unwrap();
     }
 
     let rc = Connection::open(&path).unwrap();
@@ -262,7 +263,7 @@ fn without_rowid_pk_dump_excludes_internal_index() {
         "SQLite enforces the PK on the dumped file"
     );
     // And the engine re-opens its own dump with the PK intact.
-    let mut again = rustqlite::Database::open_sqlite_format(&path).unwrap();
+    let mut again = rustqlite::Database::open(&path).unwrap();
     let dup2 = again
         .execute("INSERT INTO wr VALUES ('a', 9)", ())
         .err()

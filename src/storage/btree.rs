@@ -1729,12 +1729,6 @@ pub struct Btree<'a> {
     pub pager: &'a Pager,
     pub root: PageId,
     pub is_index: bool,
-    /// This root's change-epoch cell (see `Pager::root_epochs`) —
-    /// bumped once per mutation entry point so the SQLite-format
-    /// container's commit layer can splice only the objects whose
-    /// trees were actually written. Cloned once at construction; the
-    /// bump is a lock-free relaxed fetch-add.
-    root_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Row-journal suppression for the APPEND family: the append entry
     /// points journal the whole op at THEIR boundary (after success) and
     /// must not double-record when their slow paths fall back to
@@ -1964,12 +1958,10 @@ enum AppendTry {
 
 impl<'a> Btree<'a> {
     pub fn new(pager: &'a Pager, root: PageId, is_index: bool) -> Self {
-        let root_epoch = pager.root_epoch_slot(root);
         Self {
             pager,
             root,
             is_index,
-            root_epoch,
             journal_suppress: false,
             pinned_root: None,
             pinned_epoch: 0,
@@ -2008,26 +2000,6 @@ impl<'a> Btree<'a> {
     fn note_freed(&mut self, id: PageId) {
         if self.collect_frees && id != 0 {
             self.freed_during_op.push(id);
-        }
-    }
-
-    /// Mark this root as written (the sqlitefmt incremental-commit
-    /// signal — see `Btree::root_epoch`). Bumped on the SUCCESS side of
-    /// every mutation entry point, AFTER the pages are live: a commit
-    /// snapshot can then never record an epoch AHEAD of the data it
-    /// collected (the publish-race closure). Gated by the pager's
-    /// epoch-tracking flag — only SQLite-format (foreign-backed)
-    /// databases pay the atomic; native and in-memory workloads take
-    /// the not-taken branch.
-    #[inline]
-    fn note_root_epoch(&self) {
-        if self
-            .pager
-            .epoch_tracking_enabled()
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            self.root_epoch
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -2310,7 +2282,6 @@ impl<'a> Btree<'a> {
             pager,
             root,
             is_index,
-            root_epoch: pager.root_epoch_slot(root),
             journal_suppress: false,
             pinned_root: None,
             pinned_epoch: 0,
@@ -2979,10 +2950,6 @@ impl<'a> Btree<'a> {
         // conflict), never a bogus merge.
         let r = self.insert_table_inner(rowid, payload);
         if r.is_ok() {
-            // EXIT bump (see `Btree::root_epoch`): the mutation's pages
-            // are live, so a concurrent publish can never record an
-            // epoch AHEAD of the data it collected.
-            self.note_root_epoch();
             if !self.journal_suppress {
                 self.pager.note_row_write(
                     self.root,
@@ -3159,7 +3126,6 @@ impl<'a> Btree<'a> {
     ) -> Result<T> {
         match r {
             Ok(v) => {
-                self.note_root_epoch(); // exit bump — pages live (see root_epoch)
                 if !self.journal_suppress {
                     self.pager
                         .note_row_write(root, false, kind, rowid, key, payload);
@@ -3212,9 +3178,6 @@ impl<'a> Btree<'a> {
         self.journal_suppress = false;
         match r {
             Ok(v) => {
-                if v.is_some() {
-                    self.note_root_epoch(); // exit bump — pages live (see root_epoch)
-                }
                 if v.is_some() && self.pager.armed_writer_scope().is_some() {
                     // The journal needs the FULL payload — but ONLY when a
                     // concurrent writer's row journal is actually armed
@@ -3853,7 +3816,6 @@ impl<'a> Btree<'a> {
         self.journal_suppress = false;
         match r {
             Ok(v) => {
-                self.note_root_epoch(); // exit bump — pages live (see root_epoch)
                 if !self.journal_suppress {
                     self.pager
                         .note_row_write(root, true, JournalKind::Insert, rowid, key, &[]);
@@ -4143,7 +4105,6 @@ impl<'a> Btree<'a> {
         let r = self.update_table_bulk_inner(updates, deferred);
         match r {
             Ok(()) => {
-                self.note_root_epoch(); // exit bump — pages live (see root_epoch)
                 if !self.journal_suppress {
                     // Deferred (size-changed) rows are re-applied by the
                     // caller as delete+insert — journaled there. Their
@@ -4349,7 +4310,6 @@ impl<'a> Btree<'a> {
         let r = self.update_table_inner(rowid, new_payload);
         match r {
             Ok(did) => {
-                self.note_root_epoch(); // exit bump — pages live (see root_epoch)
                 if !self.journal_suppress {
                     self.pager.note_row_write(
                         root,
@@ -6890,7 +6850,6 @@ impl<'a> Btree<'a> {
         let r = self.delete_table_inner(rowid);
         match r {
             Ok(did) => {
-                self.note_root_epoch(); // exit bump — pages live (see root_epoch)
                 if !self.journal_suppress {
                     self.pager
                         .note_row_write(root, false, JournalKind::Delete, rowid, &[], &[]);
@@ -6921,7 +6880,6 @@ impl<'a> Btree<'a> {
         let r = self.delete_table_get_payload_inner(rowid);
         match r {
             Ok(payload) => {
-                self.note_root_epoch(); // exit bump — pages live (see root_epoch)
                 if !self.journal_suppress {
                     self.pager
                         .note_row_write(root, false, JournalKind::Delete, rowid, &[], &[]);
@@ -7094,7 +7052,6 @@ impl<'a> Btree<'a> {
         let r = self.delete_rowids_inorder_inner(rowids);
         match r {
             Ok(deleted) => {
-                self.note_root_epoch(); // exit bump — pages live (see root_epoch)
                 if !self.journal_suppress {
                     if deleted as usize == rowids.len() {
                         // Every requested rowid actually removed — the
@@ -9490,7 +9447,6 @@ impl<'a> Btree<'a> {
         let root = self.root;
         let r = self.insert_index_inner(key, rowid);
         if r.is_ok() {
-            self.note_root_epoch(); // exit bump — pages live (see root_epoch)
             if !self.journal_suppress {
                 self.pager
                     .note_row_write(root, true, JournalKind::Insert, rowid, key, &[]);
@@ -9589,7 +9545,6 @@ impl<'a> Btree<'a> {
         let r = self.delete_index_inner(key, rowid);
         match r {
             Ok(did) => {
-                self.note_root_epoch(); // exit bump — pages live (see root_epoch)
                 if !self.journal_suppress {
                     self.pager
                         .note_row_write(root, true, JournalKind::Delete, rowid, key, &[]);

@@ -1831,7 +1831,7 @@ fn abi_deserialize_real_sqlite_image() {
             .subsec_nanos()
     ));
     {
-        let mut src = rustqlite::Database::open_sqlite_format(&path).unwrap();
+        let mut src = rustqlite::Database::open_in_memory().unwrap();
         src.execute("CREATE TABLE s (a INTEGER PRIMARY KEY, b TEXT)", ())
             .unwrap();
         src.execute(
@@ -1839,6 +1839,7 @@ fn abi_deserialize_real_sqlite_image() {
             (),
         )
         .unwrap();
+        src.export_sqlite_format(&path).unwrap();
     }
     let image = std::fs::read(&path).unwrap();
     let _ = std::fs::remove_file(&path);

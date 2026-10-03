@@ -302,11 +302,6 @@ opt-level = 1
 name = "probe_write_amp"
 path = "examples/probe_write_amp.rs"
 
-# Trace the SQLite-format (foreign) persistence path per statement.
-[[example]]
-name = "probe_foreign_trace"
-path = "examples/probe_foreign_trace.rs"
-
 # Post-fix verification: open an engine-written DELETE-mode file with
 # real SQLite (integrity_check + row counts + journal mode).
 [[example]]

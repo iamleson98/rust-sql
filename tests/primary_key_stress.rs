@@ -551,7 +551,7 @@ fn autoincrement_reopen_durability() {
     // SQLite-format file: real SQLite reads the same sequence semantics.
     let sfmt = dir.path().join("ai_sfmt.db");
     {
-        let mut db = rustqlite::Database::open_sqlite_format(&sfmt).unwrap();
+        let mut db = rustqlite::Database::open_in_memory().unwrap();
         db.execute(
             "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)",
             (),
@@ -564,6 +564,7 @@ fn autoincrement_reopen_durability() {
             )
             .unwrap();
         }
+        db.export_sqlite_format(&sfmt).unwrap();
     }
     let rc = Connection::open(&sfmt).unwrap();
     let seq: i64 = rc
@@ -584,7 +585,7 @@ fn autoincrement_reopen_durability() {
         .unwrap();
     assert_eq!(nid, 501, "SQLite continues the engine's sequence");
     // And the engine reopens its own file with the bumped sequence.
-    let mut db3 = rustqlite::Database::open_sqlite_format(&sfmt).unwrap();
+    let mut db3 = rustqlite::Database::open(&sfmt).unwrap();
     db3.execute("INSERT INTO t (v) VALUES ('again')", ())
         .unwrap();
     let nid2 = match &db3.query("SELECT id FROM t WHERE v = 'again'", ()).unwrap()[0][0] {

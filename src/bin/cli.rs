@@ -4,7 +4,6 @@
 //!   rustqlite-cli [OPTIONS] [DB_PATH]
 //!
 //! Database options:
-//!   --sqlite-format     Create the database file in SQLite's own disk
 //!                       format (fileformat2) — openable by the `sqlite3`
 //!                       CLI and every SQLite driver. Existing SQLite files
 //!                       are detected automatically regardless of the flag.
@@ -82,6 +81,7 @@ enum BatchOp {
     ExportSchema(Option<String>),
     ExportData(Option<String>),
     Backup(String),
+    ExportSqlite(String),
     Import(String),
     ImportCsv(String, String),
 }
@@ -95,8 +95,6 @@ fn print_cli_help() {
     println!("Usage: rustqlite-cli [OPTIONS] [DB_PATH]");
     println!("  (no DB_PATH: in-memory database)");
     println!();
-    println!("Database:");
-    println!("  --sqlite-format         Create the file in SQLite's disk format");
     println!();
     println!("Remote mode:");
     println!("  --connect URL           Attach to a rustqlite-server");
@@ -108,6 +106,7 @@ fn print_cli_help() {
     println!("  --export-schema FILE    CREATE statements only");
     println!("  --export-data FILE      INSERT statements only");
     println!("  --backup FILE           Physical byte-copy backup");
+    println!("  --export-sqlite FILE    Write a REAL SQLite-format copy");
     println!("  --import FILE           Execute an SQL script");
     println!("  --import-csv FILE TABLE Load CSV into TABLE");
     println!();
@@ -116,7 +115,6 @@ fn print_cli_help() {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let mut sqlite_format = false;
     let mut path: Option<String> = None;
     let mut connect: Option<String> = None;
     let mut user: Option<String> = None;
@@ -131,7 +129,6 @@ fn main() {
             args.get(*i).cloned()
         };
         match arg {
-            "--sqlite-format" => sqlite_format = true,
             "--connect" | "--server" => {
                 if let Some(v) = value(&mut i) {
                     connect = Some(v);
@@ -154,6 +151,13 @@ fn main() {
                 Some(v) => batch = Some(BatchOp::Backup(v)),
                 None => {
                     eprintln!("error: --backup needs a FILE argument");
+                    std::process::exit(1);
+                }
+            },
+            "--export-sqlite" => match value(&mut i) {
+                Some(v) => batch = Some(BatchOp::ExportSqlite(v)),
+                None => {
+                    eprintln!("error: --export-sqlite needs a FILE argument");
                     std::process::exit(1);
                 }
             },
@@ -204,7 +208,7 @@ fn main() {
         });
         Runner::connect_remote(&url, &user, password_flag.as_deref())
     } else {
-        open_local(path.as_deref(), sqlite_format)
+        open_local(path.as_deref())
     };
     #[cfg(not(feature = "auth"))]
     let runner: Result<Runner, String> = if connect.is_some() {
@@ -213,7 +217,7 @@ fn main() {
                 .to_string(),
         )
     } else {
-        open_local(path.as_deref(), sqlite_format)
+        open_local(path.as_deref())
     };
     #[cfg(not(feature = "auth"))]
     {
@@ -586,6 +590,21 @@ impl Runner {
         }
     }
 
+    /// Write a REAL SQLite-format copy of the local database (the
+    /// interchange writer — the file opens in the sqlite3 CLI).
+    fn export_sqlite_image(&mut self, file: &str) -> Result<(), String> {
+        match self {
+            Runner::Local(db) => db
+                .export_sqlite_format(file)
+                .map_err(|e| format!("cannot write {}: {}", file, e)),
+            #[cfg(feature = "auth")]
+            Runner::Remote { .. } => Err(
+                "--export-sqlite needs a local database file (remote sessions cannot export the server's disk image)"
+                    .to_string(),
+            ),
+        }
+    }
+
     /// Open a remote session with the full SCRAM-SHA-256 handshake,
     /// verifying the server's signature (mutual authentication).
     #[cfg(feature = "auth")]
@@ -699,13 +718,13 @@ fn normalize_url(url: &str) -> String {
     }
 }
 
-fn open_local(path: Option<&str>, sqlite_format: bool) -> Result<Runner, String> {
+fn open_local(path: Option<&str>) -> Result<Runner, String> {
     let path = path.unwrap_or(":memory:");
     let mut db = if path == ":memory:" {
         Database::open_in_memory()
-    } else if sqlite_format {
-        Database::open_sqlite_format(path)
     } else {
+        // A SQLite-format file sniffs and loads for interop; its first
+        // write adopts the path into the native container.
         Database::open(path)
     }
     .map_err(|e| format!("error opening {}: {}", path, e))?;
@@ -2206,6 +2225,11 @@ fn run_batch_op_inner(
             let image = runner.backup_image()?;
             std::fs::write(file, &image).map_err(|e| format!("cannot write {}: {}", file, e))?;
             println!("backup written: {} ({} bytes)", file, image.len());
+            Ok(())
+        }
+        BatchOp::ExportSqlite(file) => {
+            runner.export_sqlite_image(file)?;
+            println!("sqlite-format export written: {}", file);
             Ok(())
         }
         BatchOp::Import(file) => {

@@ -1,30 +1,14 @@
-//! Write-amplification and crash-atomicity regression tests for the
-//! SQLite-format (foreign) persistence path.
-//!
-//! These pin the fix for the reported production disaster: "the engine
-//! persists every COMMIT as an atomic full-image rewrite of the DB file
-//! (DELETE journal mode, single-file-at-rest); ~5 autocommit statements
-//! per page = ~5 full-file rewrites per page; a 40k-page bulk parse
-//! wrote 2.32 TB cumulatively (/proc write_bytes)".
-//!
-//! The engine now follows SQLite's own documented commit protocols
-//! (atomiccommit.html / fileformat2.html §3 / wal.html):
-//!
-//! * DELETE journal mode — a rollback journal takes PRE-images of the
-//!   pages a commit changes, the changed pages are written IN PLACE
-//!   into the main file, both are fsynced in that order, and the
-//!   journal's deletion is the commit point. Single file at rest.
-//! * WAL mode — changed pages append as frames to a `-wal` sidecar;
-//!   crossing SQLite's 1000-frame autocheckpoint pressure folds them
-//!   back INCREMENTALLY (page copies), never a full-image rewrite.
-//! * A hot journal (crashed engine commit, or a crashed real SQLite
-//!   writer on the same file) is replayed at open, restoring the
-//!   pre-transaction state — byte-exact with the sqlite3 CLI's own
-//!   recovery.
-//!
-//! Oracle: `rusqlite` (bundled real SQLite) seeds and validates files.
+//! Hot-journal crash recovery for SQLite-format files: a rollback
+//! journal left by a crashed REAL SQLite writer (or forged to the
+//! same spec) is replayed at open, restoring the pre-transaction
+//! state byte-exactly — the surviving half of the old foreign
+//! durability suite. (The engine's own in-place SQLite-format COMMIT
+//! machinery — WAL sidecar, rollback journals, checkpoints — is gone
+//! with the live container: a SQLite-format file now loads pending
+//! and its first write ADOPTS the path into the native container; see
+//! tests/adopt_on_write.rs. What must keep working: OPENING a file
+//! whose last writer crashed mid-commit.)
 
-use rustqlite::{Database, Value};
 use std::path::{Path, PathBuf};
 
 fn temp_path(name: &str) -> PathBuf {
@@ -54,109 +38,18 @@ fn cleanup(path: &Path) {
     }
 }
 
-/// Seed a real-SQLite-written database in its DEFAULT rollback (DELETE)
-/// journal mode — the production shape (a plain .db, no sidecars).
-fn seed_sqlite_delete_mode(path: &Path) {
-    let conn = rusqlite::Connection::open(path).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
-        .unwrap();
-    conn.execute("INSERT INTO t (v) VALUES ('seed')", [])
-        .unwrap();
-    drop(conn);
-    assert!(!wal_path(path).exists(), "seed must be single-file-at-rest");
-}
-
-fn wal_path(path: &Path) -> PathBuf {
-    let mut p = path.as_os_str().to_os_string();
-    p.push("-wal");
-    PathBuf::from(p)
-}
-
 fn journal_path(path: &Path) -> PathBuf {
     let mut p = path.as_os_str().to_os_string();
     p.push("-journal");
     PathBuf::from(p)
 }
 
-fn insert_rows(db: &mut Database, from: i64, to: i64) {
-    for i in from..=to {
-        db.execute(
-            "INSERT INTO t (v) VALUES (?)",
-            [Value::Text(format!("row-{i}").into())],
-        )
-        .unwrap();
+fn count(db: &rustqlite::Database) -> i64 {
+    match &db.query("SELECT COUNT(*) FROM t", []).unwrap()[0][0] {
+        rustqlite::Value::Integer(n) => *n,
+        other => panic!("non-integer count: {other:?}"),
     }
 }
-
-fn count(db: &Database) -> i64 {
-    db.query("SELECT COUNT(*) FROM t", []).unwrap()[0][0].as_integer()
-}
-
-#[cfg(unix)]
-fn file_id(path: &Path) -> (u64, u64) {
-    use std::os::unix::fs::MetadataExt;
-    let m = std::fs::metadata(path).unwrap();
-    (m.dev(), m.ino())
-}
-
-// ---------------------------------------------------------------------------
-// 1. DELETE-mode autocommit commits are incremental, not full rewrites
-// ---------------------------------------------------------------------------
-
-#[test]
-fn delete_mode_autocommit_commits_are_incremental() {
-    let path = temp_path("incremental");
-    seed_sqlite_delete_mode(&path);
-    {
-        let mut db = Database::open(&path).unwrap();
-        // The FIRST engine commit re-publishes the file under the
-        // engine's dense page layout (one full atomic write — a format
-        // migration, same as the old behavior for the first commit).
-        insert_rows(&mut db, 1, 5);
-        #[cfg(unix)]
-        let base = file_id(&path);
-        // Every subsequent autocommit commit must edit the file IN
-        // PLACE: the inode (rename would replace it) must stay stable.
-        for batch in 0..12 {
-            insert_rows(&mut db, 6 + batch * 10, 15 + batch * 10);
-            #[cfg(unix)]
-            assert_eq!(
-                file_id(&path),
-                base,
-                "autocommit commit {} replaced the file (full-image rewrite regression)",
-                batch + 1
-            );
-        }
-        assert_eq!(count(&db), 126);
-    }
-    // Single file at rest: no sidecars, no staging leftovers.
-    assert!(!wal_path(&path).exists(), "no -wal sidecar in delete mode");
-    assert!(!journal_path(&path).exists(), "no -journal at rest");
-    // The file stays a first-class SQLite citizen.
-    let conn = rusqlite::Connection::open(&path).unwrap();
-    let mode: String = conn
-        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(mode, "delete");
-    let n: i64 = conn
-        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(n, 126, "real SQLite must see every committed row");
-    let ic: String = conn
-        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(ic, "ok", "real SQLite integrity_check");
-    drop(conn);
-    // Engine reopen sees the same state.
-    let db = Database::open(&path).unwrap();
-    assert_eq!(count(&db), 126);
-    drop(db);
-    cleanup(&path);
-}
-
-// ---------------------------------------------------------------------------
-// 2. Hot rollback journal: a crashed commit restores the pre-state
-// ---------------------------------------------------------------------------
 
 /// SQLite's documented journal page-record checksum (fileformat2.html
 /// §3), reimplemented from the spec text independently of the engine.
@@ -193,27 +86,34 @@ fn craft_journal(path: &Path, old_pages: &[(u32, Vec<u8>)], initial_db_pages: u3
 #[test]
 fn hot_rollback_journal_restores_pre_transaction_state() {
     let path = temp_path("hotjournal");
-    seed_sqlite_delete_mode(&path);
-    // State S1: a few engine commits (the first re-published the file
-    // under the engine's layout, the rest were incremental).
+
+    // State S1, written by REAL SQLite (DELETE journal mode, one file).
     {
-        let mut db = Database::open(&path).unwrap();
-        insert_rows(&mut db, 1, 10);
-        assert_eq!(count(&db), 11);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY);\n\
+             INSERT INTO t VALUES (0);\n\
+             INSERT INTO t SELECT i FROM (SELECT 1 AS i UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10);",
+        )
+        .unwrap();
     }
     let s1 = std::fs::read(&path).unwrap();
-    // State S2: one more committed transaction.
+
+    // State S2: one more committed transaction by real SQLite.
     {
-        let mut db = Database::open(&path).unwrap();
-        insert_rows(&mut db, 11, 30);
-        assert_eq!(count(&db), 31);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO t SELECT i FROM (SELECT 11 AS i UNION ALL SELECT 12 UNION ALL SELECT 13 UNION ALL SELECT 14 UNION ALL SELECT 15 UNION ALL SELECT 16 UNION ALL SELECT 17 UNION ALL SELECT 18 UNION ALL SELECT 19 UNION ALL SELECT 20);",
+        )
+        .unwrap();
     }
     let s2 = std::fs::read(&path).unwrap();
     assert_ne!(s1, s2, "the S2 transaction must have changed the file");
+
     // Simulate a crash MID-COMMIT of a third transaction: the journal
     // holds S2 pre-images of the changed pages, and the main file has
-    // been partially updated (a few pages already carry garbage that is
-    // neither S2 nor S3 — torn writes).
+    // been partially updated (torn writes — a few pages already carry
+    // garbage that is neither S2 nor S3).
     let ps = 4096usize;
     assert!(s2.len() % ps == 0 && s2.len() >= 2 * ps, "page geometry");
     let mut changed: Vec<(u32, Vec<u8>)> = Vec::new();
@@ -222,7 +122,6 @@ fn hot_rollback_journal_restores_pre_transaction_state() {
             changed.push(((i + 1) as u32, a.to_vec()));
         }
     }
-    // Pages only in S2 (growth) roll back via the header's page count.
     assert!(
         !changed.is_empty(),
         "the S2 transaction changed at least one existing page"
@@ -238,11 +137,12 @@ fn hot_rollback_journal_restores_pre_transaction_state() {
             f.write_all(&vec![0xA5u8; ps]).unwrap();
         }
     }
-    // Reopen: the engine replays the hot journal and must land exactly
-    // on S1 — the S2 transaction was never committed (its journal
-    // deletion never happened), so its rows are GONE, and the torn
-    // garbage is repaired from the pre-images.
-    let db = Database::open(&path).unwrap();
+
+    // Reopen with THIS engine: the hot journal replays and the file
+    // lands exactly on S1 — the S2 transaction was never committed
+    // (its journal deletion never happened), so its rows are GONE, and
+    // the torn garbage is repaired from the pre-images.
+    let db = rustqlite::Database::open(&path).unwrap();
     assert_eq!(
         count(&db),
         11,
@@ -264,163 +164,5 @@ fn hot_rollback_journal_restores_pre_transaction_state() {
         !journal_path(&path).exists(),
         "journal consumed by rollback"
     );
-    cleanup(&path);
-}
-
-// ---------------------------------------------------------------------------
-// 3. WAL autocheckpoint is incremental and leaves a valid file
-// ---------------------------------------------------------------------------
-
-#[test]
-fn wal_mode_checkpoints_and_close_leave_valid_single_image() {
-    let path = temp_path("walckpt");
-    seed_sqlite_delete_mode(&path);
-    {
-        let mut db = Database::open(&path).unwrap();
-        db.execute("PRAGMA journal_mode = WAL", []).unwrap();
-        let mode = db.query("PRAGMA journal_mode", []).unwrap()[0][0]
-            .as_text()
-            .to_string();
-        assert_eq!(mode, "wal");
-        // Enough commits to cross SQLite's 1000-frame autocheckpoint
-        // several times (each commit changes >= 2 pages: the touched
-        // leaf + page 1 header).
-        insert_rows(&mut db, 1, 1500);
-        assert_eq!(count(&db), 1501);
-        // Mid-session state must be readable through the sidecar.
-        let wal = wal_path(&path);
-        assert!(wal.exists(), "WAL sidecar alive mid-session");
-    }
-    // Clean close: last-connection checkpoint folds the sidecar back and
-    // retires it — a self-contained single file again.
-    assert!(!wal_path(&path).exists(), "clean close retires the -wal");
-    assert!(!journal_path(&path).exists());
-    let conn = rusqlite::Connection::open(&path).unwrap();
-    let n: i64 = conn
-        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(n, 1501, "real SQLite sees all rows after close-checkpoint");
-    let ic: String = conn
-        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(ic, "ok");
-    drop(conn);
-    let db = Database::open(&path).unwrap();
-    assert_eq!(count(&db), 1501);
-    drop(db);
-    cleanup(&path);
-}
-
-// ---------------------------------------------------------------------------
-// 4. Journal-mode switches keep the data and the file valid
-// ---------------------------------------------------------------------------
-
-#[test]
-fn journal_mode_switches_keep_data_valid() {
-    let path = temp_path("modeswitch");
-    seed_sqlite_delete_mode(&path);
-    {
-        let mut db = Database::open(&path).unwrap();
-        insert_rows(&mut db, 1, 40);
-        db.execute("PRAGMA journal_mode = WAL", []).unwrap();
-        insert_rows(&mut db, 41, 90);
-        db.execute("PRAGMA journal_mode = DELETE", []).unwrap();
-        insert_rows(&mut db, 91, 150);
-        assert_eq!(count(&db), 151);
-    }
-    assert!(!wal_path(&path).exists());
-    assert!(!journal_path(&path).exists());
-    let conn = rusqlite::Connection::open(&path).unwrap();
-    let mode: String = conn
-        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(mode, "delete", "final mode is delete (header 18/19 = 1/1)");
-    let n: i64 = conn
-        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(n, 151);
-    let ic: String = conn
-        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(ic, "ok");
-    drop(conn);
-    cleanup(&path);
-}
-
-// ---------------------------------------------------------------------------
-// 5. Explicit transactions dump once per COMMIT (batching)
-// ---------------------------------------------------------------------------
-
-#[cfg(unix)]
-#[test]
-fn batched_transaction_commits_once_per_commit() {
-    let path = temp_path("batched");
-    seed_sqlite_delete_mode(&path);
-    {
-        let mut db = Database::open(&path).unwrap();
-        // Establish the session (first commit = one re-publish).
-        db.execute("BEGIN", []).unwrap();
-        insert_rows(&mut db, 1, 5);
-        db.execute("COMMIT", []).unwrap();
-        let base = file_id(&path);
-        // 200 statements in ONE transaction: exactly one in-place commit
-        // (inode may stay stable — in-place writes; the point is at most
-        // one commit's worth of page writes, not 200).
-        db.execute("BEGIN", []).unwrap();
-        insert_rows(&mut db, 6, 205);
-        db.execute("COMMIT", []).unwrap();
-        let after = file_id(&path);
-        // A batched commit is also in-place now; both must hold:
-        assert_eq!(count(&db), 206);
-        // (Inode stability asserted for the autocommit test; here the
-        // semantic under test is: COMMIT is the only dump boundary —
-        // covered by the row counts and the file-length growth below.)
-        let _ = (base, after);
-    }
-    let len_after_one_commit = std::fs::metadata(&path).unwrap().len();
-    // The file is far smaller than 200 individual rewrites would leave
-    // (each rewrite is the full image; 200 rewrites would still leave
-    // the same length, so also assert data + validity through SQLite).
-    let conn = rusqlite::Connection::open(&path).unwrap();
-    let n: i64 = conn
-        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(n, 206);
-    let ic: String = conn
-        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(ic, "ok");
-    drop(conn);
-    assert!(len_after_one_commit > 0);
-    cleanup(&path);
-}
-
-// ---------------------------------------------------------------------------
-// 6. Durability across reopen after incremental commits
-// ---------------------------------------------------------------------------
-
-#[test]
-fn reopen_sees_every_incrementally_committed_row() {
-    let path = temp_path("reopen");
-    seed_sqlite_delete_mode(&path);
-    for round in 0..5 {
-        let mut db = Database::open(&path).unwrap();
-        insert_rows(&mut db, round * 30 + 1, round * 30 + 30);
-        assert_eq!(count(&db), 31 + round * 30);
-        // Drop = clean close; the next open reads the committed file.
-    }
-    let db = Database::open(&path).unwrap();
-    assert_eq!(count(&db), 151);
-    drop(db);
-    let conn = rusqlite::Connection::open(&path).unwrap();
-    let n: i64 = conn
-        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(n, 151);
-    let ic: String = conn
-        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(ic, "ok");
-    drop(conn);
     cleanup(&path);
 }

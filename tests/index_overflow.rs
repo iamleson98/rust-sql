@@ -219,13 +219,15 @@ fn overflow_index_sqlite_file_interop_roundtrip() {
             .query("SELECT COUNT(*) FROM t WHERE long_text > ''", [])
             .unwrap();
         assert_eq!(rows[0][0], Value::Integer(20));
-        // Autocommit write -> the file is re-dumped in SQLite format
-        // (the writer emits overflow index cells byte-exactly).
+        // Autocommit write -> the path is ADOPTED into the native
+        // container; the interchange export re-materializes SQLite
+        // bytes (overflow index cells byte-exact).
         db.execute("INSERT INTO t (id, long_text) VALUES (100, 'small')", [])
             .unwrap();
+        db.export_sqlite_format(out_path.to_str().unwrap()).unwrap();
     }
     {
-        // The engine's own written file: reload + real SQLite verifies.
+        // The engine's written state: reload + real SQLite verifies.
         let db = Database::open(sq_path.to_str().unwrap()).unwrap();
         // 20 overflow-key rows + the small row just inserted (matches > '').
         let rows = db
@@ -233,7 +235,7 @@ fn overflow_index_sqlite_file_interop_roundtrip() {
             .unwrap();
         assert_eq!(rows[0][0], Value::Integer(21));
         drop(db);
-        let conn = rusqlite::Connection::open(sq_path.to_str().unwrap()).unwrap();
+        let conn = rusqlite::Connection::open(out_path.to_str().unwrap()).unwrap();
         let (n, probe): (i64, String) = conn
             .query_row("SELECT COUNT(*), long_text FROM t WHERE id = 7", [], |r| {
                 Ok((r.get(0)?, r.get(1)?))

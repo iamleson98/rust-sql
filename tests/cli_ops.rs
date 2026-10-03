@@ -205,22 +205,26 @@ fn dump_roundtrip_sqlite_format_target() {
         None,
     );
     assert!(ok, "{} {}", out, err);
-    // Native dump -> SQLite-format target (dumps are pure SQL; the target
-    // format is irrelevant to the dump path).
+    // Native dump -> import -> --export-sqlite: the result must be a
+    // REAL SQLite file readable by real SQLite.
     let (out, err, ok) = run_cli(
-        &[
-            "--sqlite-format",
-            "--import",
-            dump.to_str().unwrap(),
-            dst.to_str().unwrap(),
-        ],
+        &["--import", dump.to_str().unwrap(), dst.to_str().unwrap()],
         None,
     );
     assert!(ok, "{} {}", out, err);
     assert_eq!(schema_fingerprint(&src), schema_fingerprint(&dst));
     assert_eq!(user_rows(&src), user_rows(&dst));
-    // The SQLite-format result must ALSO be readable by real SQLite.
-    let sqlite = rusqlite::Connection::open(dst.to_str().unwrap()).unwrap();
+    let sqdst = dir.path().join("dst.sqlite");
+    let (out, err, ok) = run_cli(
+        &[
+            "--export-sqlite",
+            sqdst.to_str().unwrap(),
+            dst.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(ok, "{} {}", out, err);
+    let sqlite = rusqlite::Connection::open(sqdst.to_str().unwrap()).unwrap();
     let n: i64 = sqlite
         .query_row("SELECT count(*) FROM users", [], |r| r.get(0))
         .unwrap();
@@ -309,10 +313,7 @@ fn backup_physical_copy() {
     // Backup of a SQLite-format database is a real SQLite file.
     let sqsrc = dir.path().join("sq.db");
     let sqdst = dir.path().join("sq-backup.db");
-    let (out, err, ok) = run_cli(
-        &["--sqlite-format", "--import-sqlite-never", "unused"],
-        None,
-    );
+    let (out, err, ok) = run_cli(&["--no-such-flag", "--import-sqlite-never", "unused"], None);
     assert!(!ok, "unknown flags must be rejected: {} {}", out, err);
     let _ = out;
     // Build the SQLite-format db via CLI import of the dump.
@@ -322,17 +323,18 @@ fn backup_physical_copy() {
         None,
     );
     let (_, err, ok) = run_cli(
-        &[
-            "--sqlite-format",
-            "--import",
-            dump.to_str().unwrap(),
-            sqsrc.to_str().unwrap(),
-        ],
+        &["--import", dump.to_str().unwrap(), sqsrc.to_str().unwrap()],
         None,
     );
     assert!(ok, "{}", err);
+    // A SQLite-READABLE copy of the (now native) source: the
+    // interchange writer, not the byte-copy backup.
     let (out, err, ok) = run_cli(
-        &["--backup", sqdst.to_str().unwrap(), sqsrc.to_str().unwrap()],
+        &[
+            "--export-sqlite",
+            sqdst.to_str().unwrap(),
+            sqsrc.to_str().unwrap(),
+        ],
         None,
     );
     assert!(ok, "{} {}", out, err);
