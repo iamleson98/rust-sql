@@ -1836,3 +1836,19 @@ Work Log:
 
 Stage Summary:
 - The last correctness cliff of the round: a latent same-thread read->write inversion on the install gate, exposed by the content-aware probe's first real firing. The step path now provably cannot self-deadlock against the freshness machinery.
+
+---
+Task ID: 81
+Agent: main (Super Z)
+Task: The storm round — run 37142144108's trace paid for itself on its first outing; the empty-sidecar shrink false positive and the reopen storm it caused.
+
+Work Log:
+- Run 37142144108 (443c253, the trace-enabled round): ubuntu default failed the hammer test with "saw 9 [writer=alive, max p1-count marker=0, sidecar len=995762832]". The trace told two stories:
+  (a) 209 `resync: sidecar SHRUNK under horizon expected=32 len=0 -> full reopen` lines from one helper process, four per probe cycle, over a hundred seconds — a REOPEN STORM against a sidecar that was empty the whole time. expected=32 is the 0-frame fresh-start state (the deferred-header path keeps the header in memory until the first append); a 0-byte sidecar next to it is not a reset, there IS no horizon to lose. The check `meta.len() < expected` flagged it on EVERY probe: full cache clear + Wal::open_shared + committed-map rebuild per statement, forever, on fresh databases.
+  (b) The "max p1-count marker=0" was a PARSING lie: the state-dump parser matched `p1-count-N` but the files are named `p1-count-N.marker` — the writer had very likely hammered at full speed (~1 GB of frames in 60s at ~1000 commits/s) while the reader froze at 9. The reader-side freeze diagnosis needs a clean trace round (the storm's own log spam is gone now); the always-on CI tracing will show the reader's probe decisions verbatim if it recurs.
+- Fixes (f3f75af): shrink requires a REAL horizon (expected > WAL_HEADER_SIZE — at least one absorbed frame; with 0 frames the length comparison alone decides, exactly the pre-round behavior for fresh logs); the marker parser strips ".marker".
+- Local gates: cross_process 9/9, compat backup 8/8, zero spurious SHRUNK lines under trace.
+- Run 37143448300 (f3f75af): 35/36 green with the sole remaining job (limit-stress windows, the 1M-row scale job) still running — every prior failing front green on this run: all three OSes' test matrices, both interop jobs on all three OSes, bench gates, torture, million-record.
+
+Stage Summary:
+- The content-aware probe's false-positive class is closed (fresh logs no longer storm); the diagnostics now parse truthfully; CI runs permanently trace-armed for the xlock protocol.
