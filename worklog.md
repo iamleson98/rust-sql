@@ -1727,3 +1727,17 @@ Work Log:
 
 Stage Summary:
 - The windows ghost-handle hole is closed with the platform-split identity check; the regression test pins the full-publish recovery contract (visible-on-reopen, not clean-error). Pushing for CI — the windows test matrix is the verdict.
+---
+Task ID: 75-ci
+Agent: main (Super Z)
+Task: Track 1c3f3b6's CI run to the verdict; fold the results into the README.
+
+Work Log:
+- CI run 37091297129 on 1c3f3b6: COMPLETED / SUCCESS — 34/34 jobs green on all three OSes (the 33-job matrix plus the round's new cargo-audit job, green on its first run).
+- The round's target verdict — macOS-ARM torture S06 (range 100k rows materialized): **1.19x WIN** (rq 3.3 ms vs sq 4.0 ms), up from 0.91x the previous round — the last sub-1.0 step-path draw is closed. The same run's board: S02 2.94x, S07 1.14x, S12 1.09x, S16 9.21x, gate failures 0 (memory columns reported-not-gated as designed).
+- The bench boards on every OS, ZERO losses: mac 18W/0T/0L + 19W/1T/0L + criterion 8/8 + sqlx 12/12; ubuntu bench_compare 18W/2T/0L; windows bench_compare 20W/0T/0L. The macOS range-scan rows drew 1.12-1.36x — the step-path fix carried through the whole shape family.
+- The windows test matrix (the 75-fix verdict): all three configs GREEN on foreign_incremental including the new sidecar_reset_mid_session_recovers_via_full_publish regression test.
+- README: the S06 bullet REMOVED from the Remaining-gaps ledger (a win on every platform now) with the closure recorded on the per-commit residual bullet; the ledger's Performance family is down to the SQLite-format small-file per-commit shape, the 1.18x-warm 2-table PK join note, and the 8-conn mixed R/W fsync caveat.
+
+Stage Summary:
+- The per-pull gate round is landed and fully green with zero bench losses on any OS; master is at 1c3f3b6 plus this docs commit. The remaining ledger: the sqlitefmt per-commit fixed cost, the resource trade-offs (evidenced), the architectural concurrency items, and the feature surface (super-journal design recorded in task 75's entry).
