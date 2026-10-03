@@ -180,6 +180,11 @@ pub struct Statement<'a> {
     /// point lookup / driver scan would read the COMMITTED state instead
     /// of its own shadows — a read-your-own-writes breach.
     writer_guard: Option<crate::storage::concurrent::WriterScopeGuard<'a>>,
+    /// Cross-process read scope (storage::xlock) held for the whole
+    /// step-driven statement: freshness probe ran once at start(); the
+    /// shared READ byte stays held until the statement drops so a
+    /// checkpointing peer cannot rewrite main-file pages mid-walk.
+    xread_scope: Option<Vec<crate::storage::xlock::XReadGuard>>,
     /// The file text encoding armed for this statement's WHOLE streaming
     /// lifetime (RAII: dropped on reset/finalize, restoring the previous
     /// tag). The first `step()`'s `start()` runs comparisons under it,
@@ -291,6 +296,7 @@ impl<'a> Statement<'a> {
             changes_at_start: db.total_changes(),
             view_guard: None,
             writer_guard: None,
+            xread_scope: None,
             enc_guard: None,
         })
     }
@@ -730,6 +736,11 @@ impl<'a> Statement<'a> {
         {
             let _ = self.db.pager.flush();
         }
+        // Cross-process read scope (storage::xlock): foreign-commit
+        // freshness + the shared READ byte for the whole step-driven
+        // statement (the Database-level entries take the same scope for
+        // their one-shot paths).
+        self.xread_scope = self.db.xread_scope()?;
 
         // Committed-view arming (SELECT statements only): while a
         // foreign write transaction is open on this database, the pager

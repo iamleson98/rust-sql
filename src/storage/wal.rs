@@ -42,6 +42,21 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()
     file.read_exact_at(buf, offset)
 }
 
+/// Positioned read that reports FULLness instead of erroring on a
+/// short read (the foreign-growth walk's tolerance for mid-append
+/// frames: `Ok(false)` = torn tail, stop here, nothing is visible).
+#[cfg(unix)]
+fn read_at_full(file: &File, buf: &mut [u8], offset: u64) -> Result<bool> {
+    use std::os::unix::fs::FileExt;
+    Ok(file.read_at(buf, offset)? == buf.len())
+}
+
+#[cfg(windows)]
+fn read_at_full(file: &File, buf: &mut [u8], offset: u64) -> Result<bool> {
+    use std::os::windows::fs::FileExt;
+    Ok(file.seek_read(buf, offset)? == buf.len())
+}
+
 #[cfg(windows)]
 fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     use std::os::windows::fs::FileExt;
@@ -503,7 +518,29 @@ impl Wal {
     }
 
     /// Open or create the WAL file alongside the main database file.
+    /// The writer-owned recovery: a torn tail (frames without a commit
+    /// mark) is TRUNCATED — safe only when no other process can be
+    /// mid-append (writer-lease-held paths: the close-time refresh).
     pub fn open<P: AsRef<Path>>(db_path: P, page_size: u32) -> Result<Self> {
+        Self::open_impl(db_path, page_size, true)
+    }
+
+    /// Open with NON-TRUNCATING recovery — for paths where a writer in
+    /// ANOTHER process may be mid-append (a shared reader attaching the
+    /// log: `enable_wal`, the freshness resync). Truncating the torn
+    /// tail there would cut the foreign writer's in-flight frames; its
+    /// next positioned append would then extend the file past a zero
+    /// gap, and any later recovery — theirs or ours — stops at the
+    /// gap's checksum mismatch, stranding their commit mark: committed
+    /// data loss. Skipping the truncate is always safe: appends
+    /// OVERWRITE the torn tail at the same offsets anyway, and recovery
+    /// bounds visibility to the last commit frame regardless of file
+    /// length.
+    pub fn open_shared<P: AsRef<Path>>(db_path: P, page_size: u32) -> Result<Self> {
+        Self::open_impl(db_path, page_size, false)
+    }
+
+    fn open_impl<P: AsRef<Path>>(db_path: P, page_size: u32, truncate_torn: bool) -> Result<Self> {
         let path = wal_path_for(db_path);
         let file = OpenOptions::new()
             .read(true)
@@ -523,12 +560,12 @@ impl Wal {
             header_dirty: false,
         };
 
-        wal.recover()?;
+        wal.recover(truncate_torn)?;
         Ok(wal)
     }
 
     /// Recover the WAL: read the header and validate frames.
-    fn recover(&mut self) -> Result<()> {
+    fn recover(&mut self, truncate_torn: bool) -> Result<()> {
         let file_size = self.file.metadata()?.len();
         if file_size == 0 {
             // Fresh WAL: header stays IN MEMORY (header_dirty) — the
@@ -599,8 +636,10 @@ impl Wal {
         // discarded. This is the WAL's atomic-commit guarantee.
         self.n_frames = last_commit_frame;
         self.checksum = running_checksum;
-        // Truncate torn trailing frames so future appends overwrite them.
-        if last_commit_frame < last_valid_frame {
+        // Truncate torn trailing frames so future appends overwrite
+        // them (WRITER-OWNED recovery only — see `open_shared` for why
+        // shared readers must not).
+        if truncate_torn && last_commit_frame < last_valid_frame {
             let end = WAL_HEADER_SIZE as u64
                 + last_commit_frame as u64 * (FRAME_HEADER_SIZE + self.page_size) as u64;
             self.file.set_len(end)?;
@@ -748,6 +787,92 @@ impl Wal {
         self.file.write_all(data)?;
         self.n_frames += 1;
         Ok(offset)
+    }
+
+    /// Incrementally absorb FOREIGN-COMMITTED growth (the cross-process
+    /// reader freshness path): walk frames past `n_frames`, verifying
+    /// the salt + chained checksums, and advance visibility to the last
+    /// COMMIT frame found. Returns the new frames' (page_id, offset)
+    /// pairs — the caller merges them into its committed map — and is
+    /// O(growth), not O(log): a reader polling a hammering writer pays
+    /// only for the frames committed since its last statement.
+    ///
+    /// Never touches the file (no truncate, no rewrite): the walk stops
+    /// at the first torn/mismatched frame, and uncommitted trailing
+    /// frames are left exactly as written — the (possibly foreign)
+    /// writer overwrites them at these same offsets on its next append.
+    /// A salt mismatch (the log was RESET by a writer — impossible while
+    /// a LIVE-shared reader holds the file, but checked anyway) returns
+    /// `Ok(None)`: the caller falls back to a full shared reopen.
+    pub fn absorb_foreign_growth(&mut self) -> Result<Option<Vec<(PageId, u64)>>> {
+        let frame_size = (FRAME_HEADER_SIZE + self.page_size) as u64;
+        let file_len = self.file.metadata()?.len();
+        let first_new = self.n_frames as u64;
+        let mut absorbed: Vec<(PageId, u64)> = Vec::new();
+        let mut running = self.checksum;
+        let mut last_commit_chain = self.checksum;
+        let mut last_commit_frame = self.n_frames;
+        let mut i = first_new;
+        loop {
+            let offset = WAL_HEADER_SIZE as u64 + i * frame_size;
+            if offset + frame_size > file_len {
+                break; // past the written data (or a mid-append torn tail)
+            }
+            let mut fh_buf = [0u8; FRAME_HEADER_SIZE as usize];
+            if !read_at_full(&self.file, &mut fh_buf, offset)? {
+                break; // torn header mid-append
+            }
+            let fh = match FrameHeader::decode(&fh_buf) {
+                Ok(fh) => fh,
+                Err(_) => break,
+            };
+            if fh.salt1 != self.header.salt1 || fh.salt2 != self.header.salt2 {
+                // The log was reset under us — full reopen territory.
+                return Ok(None);
+            }
+            let mut page_buf = vec![0u8; self.page_size as usize];
+            if !read_at_full(&self.file, &mut page_buf, offset + FRAME_HEADER_SIZE as u64)? {
+                break; // torn page mid-append
+            }
+            let mut check_data = Vec::with_capacity(8 + page_buf.len());
+            check_data.extend_from_slice(&fh_buf[0..8]);
+            check_data.extend_from_slice(&page_buf);
+            let (c1, c2) = crc32(running.0, running.1, &check_data);
+            if c1 != fh.checksum1 || c2 != fh.checksum2 {
+                break; // torn / not-yet-complete frame — invisible
+            }
+            running = (c1, c2);
+            if fh.commit != 0 {
+                last_commit_frame = (i + 1) as u32;
+                last_commit_chain = running;
+                absorbed.push((fh.page_id, offset));
+            }
+            i += 1;
+        }
+        if last_commit_frame == self.n_frames {
+            // Growth was an uncommitted in-flight tail only: nothing
+            // visible changed. (The frames stay on disk; a later absorb
+            // re-verifies them when their commit mark lands.)
+            return Ok(Some(Vec::new()));
+        }
+        // Frames BETWEEN the old n_frames and the last commit that were
+        // absorbed before the commit mark also became visible — rebuild
+        // the full visible list for the caller's map merge.
+        let mut visible: Vec<(PageId, u64)> =
+            Vec::with_capacity((last_commit_frame - self.n_frames) as usize);
+        for j in self.n_frames as u64..last_commit_frame as u64 {
+            let offset = WAL_HEADER_SIZE as u64 + j * frame_size;
+            let mut fh_buf = [0u8; FRAME_HEADER_SIZE as usize];
+            if !read_at_full(&self.file, &mut fh_buf, offset)? {
+                break;
+            }
+            if let Ok(fh) = FrameHeader::decode(&fh_buf) {
+                visible.push((fh.page_id, offset));
+            }
+        }
+        self.n_frames = last_commit_frame;
+        self.checksum = last_commit_chain;
+        Ok(Some(visible))
     }
 
     /// Iterate over all valid frames in the WAL. The closure receives

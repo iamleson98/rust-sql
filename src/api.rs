@@ -3943,7 +3943,10 @@ impl Database {
             && self.pager.active_page_codec().is_none()
             && self.pager.wal_active();
         if !wal_install {
-            self.pager.checkpoint_wal()?;
+            // URGENT: the image swap below rebinds the store to the main
+            // file — a deferred fold would leave stale frames as the
+            // crash-recovery base.
+            self.pager.checkpoint_wal_now()?;
         }
 
         // IN-PLACE FAST PATH (WAL install only): compact the live pages
@@ -5784,6 +5787,11 @@ impl Database {
                 }
             }
         }
+        // Cross-process read scope (freshness + READ byte) for the
+        // whole statement — DML reads main-file pages too, and a
+        // reader-role handle's INSERT..SELECT walks the pager exactly
+        // like a SELECT (see `xread_scope`).
+        let _xread = self.xread_scope()?;
         // A writer must never read the BEGIN-time (committed) state: a
         // leaked read-view preference or pager scope on this thread is
         // cleared here — `execute` takes `&mut`, so exclusive with every
@@ -7020,6 +7028,212 @@ impl Database {
         self.query_inner(sql, params)
     }
 
+    /// Foreign-commit follow-through (storage::xlock): after the pager
+    /// absorbed another process's (or another handle's) committed WAL
+    /// frames, the CATALOG-level consequences are handled here —
+    ///
+    /// - **Root moves** (a foreign INSERT split a b-tree root: the
+    ///   schema row's root page moved): the catalog's `Arc<Table>`
+    ///   snapshots still carry the OLD root, so the new roots are
+    ///   written into the root-override map (`maps.roots` — the same
+    ///   mechanism the live-write path uses for its own splits) and the
+    ///   plan/serve caches that embed roots are dropped. Transparent:
+    ///   existing tables, just newer layout.
+    /// - **Schema changes** (the schema cookie moved — foreign DDL): a
+    ///   live catalog swap is not possible on the `&self` read paths,
+    ///   so the statement fails with the SQLITE_SCHEMA-class error
+    ///   SQLite itself uses for cross-connection schema changes —
+    ///   close and reopen the connection (SQLite's own pre-hot-reload
+    ///   contract for SQLITE_SCHEMA was re-PREPARE; our prepare does
+    ///   not reload, so reopen is the honest retry).
+    fn refresh_foreign_roots_and_schema(&self) -> Result<()> {
+        // NOTE on cookies: the catalog's `schema_cookie` and the file
+        // header's are DIFFERENT accountings (every `add_table`/
+        // `add_index`/`add_view` during a load bumps the catalog's own
+        // counter), so a cookie comparison cannot detect foreign DDL.
+        // Instead: re-read the schema table (root is fixed at page 0;
+        // the absorbed map serves the fresh pages) into a scratch
+        // catalog and compare the OBJECT SETS — any name added, dropped
+        // or re-created, or any VIEW/TRIGGER body change, is foreign
+        // DDL. Existing tables whose ROOT moved (a DML root split
+        // rewrites the schema row's root column WITHOUT touching the
+        // cookie — SQLite semantics) are handled transparently via the
+        // root-override map.
+        let mut scratch = Catalog::new();
+        load_schema(&self.pager, &mut scratch)?;
+
+        let cat_tables: std::collections::BTreeMap<String, u32> = self
+            .catalog
+            .all_tables()
+            .into_iter()
+            .map(|(n, t)| (n.to_ascii_lowercase(), t.root_page))
+            .collect();
+        let scratch_tables: std::collections::BTreeMap<String, u32> = scratch
+            .all_tables()
+            .into_iter()
+            .map(|(n, t)| (n.to_ascii_lowercase(), t.root_page))
+            .collect();
+        let cat_indexes: std::collections::BTreeMap<String, u32> = self
+            .catalog
+            .all_indexes()
+            .into_iter()
+            .map(|(n, ix)| (n.to_ascii_lowercase(), ix.root_page))
+            .collect();
+        let scratch_indexes: std::collections::BTreeMap<String, u32> = scratch
+            .all_indexes()
+            .into_iter()
+            .map(|(n, ix)| (n.to_ascii_lowercase(), ix.root_page))
+            .collect();
+        let cat_views: Vec<String> = self
+            .catalog
+            .all_views()
+            .into_iter()
+            .map(|(n, _)| n.to_ascii_lowercase())
+            .collect();
+        let scratch_views: Vec<String> = scratch
+            .all_views()
+            .into_iter()
+            .map(|(n, _)| n.to_ascii_lowercase())
+            .collect();
+        let cat_triggers: Vec<String> = self
+            .catalog
+            .all_triggers()
+            .into_iter()
+            .map(|(n, _)| n.to_ascii_lowercase())
+            .collect();
+        let scratch_triggers: Vec<String> = scratch
+            .all_triggers()
+            .into_iter()
+            .map(|(n, _)| n.to_ascii_lowercase())
+            .collect();
+        if cat_tables.keys().ne(scratch_tables.keys())
+            || cat_indexes.keys().ne(scratch_indexes.keys())
+            || cat_views != scratch_views
+            || cat_triggers != scratch_triggers
+        {
+            return Err(Error::Transaction(format!(
+                "database schema changed (SQLITE_SCHEMA): another connection modified the \
+                 schema of {}; close and reopen this connection",
+                self.path.display()
+            )));
+        }
+        let mut roots_moved = false;
+        let mut new_roots: HashMap<String, u32> = HashMap::new();
+        let mut new_index_roots: HashMap<String, u32> = HashMap::new();
+        let maps = self.maps.read().clone();
+        {
+            for (lc, cat_root) in &cat_tables {
+                if let Some(&fresh_root) = scratch_tables.get(lc) {
+                    let current = maps.roots.get(lc).copied().unwrap_or(*cat_root);
+                    if fresh_root != current {
+                        new_roots.insert(lc.clone(), fresh_root);
+                        roots_moved = true;
+                    }
+                }
+            }
+            for (lc, cat_root) in &cat_indexes {
+                if let Some(&fresh_root) = scratch_indexes.get(lc) {
+                    let current = maps.index_roots.get(lc).copied().unwrap_or(*cat_root);
+                    if fresh_root != current {
+                        new_index_roots.insert(lc.clone(), fresh_root);
+                        roots_moved = true;
+                    }
+                }
+            }
+        }
+        if roots_moved {
+            {
+                let mut m = self.maps.write();
+                let bk = Arc::make_mut(&mut *m);
+                bk.roots.extend(new_roots);
+                bk.index_roots.extend(new_index_roots);
+            }
+            // The fast paths resolve root overrides ONLY when
+            // `maps_populated` is set (the empty-map atomic check on
+            // the hottest OLTP path) — without this store the override
+            // above exists but is invisible to every FastPath, and the
+            // plan's stale baked-in root serves a truncated tree.
+            self.maps_populated.store(true, Ordering::Release);
+            // Cached plans embed pre-move Arc<Table> roots; the count
+            // memo keys on write_epoch (bumped by the caller); join
+            // builds embed roots; committed-view readers key on the
+            // schema epoch (the adopt_catalog_after_vacuum recipe).
+            self.invalidate_stmt_cache();
+            self.seen_hashes.lock().clear();
+            self.schema_epoch.fetch_add(1, Ordering::AcqRel);
+            self.pager.join_build_cache().lock().clear();
+        }
+        Ok(())
+    }
+
+    /// CROSS-PROCESS READ SCOPE (storage::xlock): one statement on a
+    /// file-backed WAL database that this handle does not hold the
+    /// writer role for — (a) absorb any foreign-committed WAL growth
+    /// (freshness probe; see `Pager::resync_foreign_commits_if_stale`)
+    /// and then (b) hold the shared READ byte for the statement's
+    /// duration, so a concurrently-checkpointing process can never
+    /// rewrite main-file pages under this statement's page reads.
+    /// Covers the MAIN pager plus every attached engine's pager. The
+    /// writer handle, in-memory stores and DELETE-mode files get `None`
+    /// — the single-connection fast path pays nothing.
+    ///
+    /// Inside an explicit BEGIN..COMMIT the freshness probe is skipped
+    /// (the BEGIN-time snapshot stands — SQLite read-transaction
+    /// semantics); the READ byte is still taken per statement so a
+    /// checkpointing peer cannot tear main-file reads.
+    pub(crate) fn xread_scope(&self) -> Result<Option<Vec<crate::storage::xlock::XReadGuard>>> {
+        if self.pager.xlock_handle().is_none() {
+            return Ok(None);
+        }
+        let mut guards = Vec::new();
+        let in_txn = self.in_transaction.load(Ordering::Acquire);
+        // If a resync below fails on a hard error (sidecar unreadable),
+        // the statement must not run against silently stale state —
+        // propagate. `?` on the outer call sites.
+        if !self.pager.xlock_is_writer() {
+            if !in_txn {
+                // Foreign committed state advanced: bump the cache
+                // generation — the count memo and the advisory join /
+                // leaf caches key on `write_epoch` and must all miss
+                // (a memoized COUNT(*) from before the foreign commit
+                // would be a silently stale answer) — then handle the
+                // catalog-level consequences (root moves / schema
+                // changes).
+                if self.pager.resync_foreign_commits_if_stale()? {
+                    self.write_epoch.fetch_add(1, Ordering::AcqRel);
+                    self.refresh_foreign_roots_and_schema()?;
+                }
+            }
+            if let Some(g) = self.pager.xlock_begin_read() {
+                guards.push(g);
+            }
+        }
+        // Attached engines: a mixed-schema statement walks THEIR pagers
+        // too — the same freshness + read byte, per pager.
+        if self.has_attached() {
+            for (_, eng) in self.attached_snapshot() {
+                if let Some(db) = eng.try_read() {
+                    if !db.pager.xlock_is_writer() {
+                        if !db.in_transaction.load(Ordering::Acquire)
+                            && db.pager.resync_foreign_commits_if_stale()?
+                        {
+                            db.write_epoch.fetch_add(1, Ordering::AcqRel);
+                            db.refresh_foreign_roots_and_schema()?;
+                        }
+                        if let Some(g) = db.pager.xlock_begin_read() {
+                            guards.push(g);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(if guards.is_empty() {
+            None
+        } else {
+            Some(guards)
+        })
+    }
+
     /// [`Self::query`]'s body (the wrapper handles delta-journal
     /// poisoning on statement failure — DML-RETURNING through this
     /// surface journals too).
@@ -7046,6 +7260,9 @@ impl Database {
         if self.deferred_flush.load(Ordering::Acquire) && self.pager.has_dirty_pages() {
             let _ = self.pager.flush();
         }
+        // Cross-process read scope (freshness + READ byte) for the whole
+        // statement — see `xread_scope`.
+        let _xread = self.xread_scope()?;
         let cached = self.get_or_cache_stmt(sql)?;
         // Cross-database trigger firing on LOCAL tables (query path /
         // DML-RETURNING): the thread-db bridge + a spanning aux
@@ -7874,7 +8091,10 @@ impl Database {
             // writes + serialize/`.backup` produced the STALE pre-WAL
             // image: a real data-loss bug for any WAL-mode backup.)
             self.pager.flush()?;
-            self.pager.checkpoint_wal()?;
+            // URGENT: serialize returns the MAIN file bytes — a deferred
+            // fold would serialize the stale pre-WAL image (the very bug
+            // this path fixed).
+            self.pager.checkpoint_wal_now()?;
             std::fs::read(&self.path).map_err(Error::from)
         } else {
             // A flush failure on a read-only handle must not fail the
@@ -14322,7 +14542,9 @@ impl Database {
                     // now (a pending-adopt session is memory-backed: a
                     // no-op there; post-adoption it is the file's own
                     // WAL).
-                    ctx.pager.checkpoint_wal()?;
+                    // URGENT: an explicit user checkpoint request —
+                    // defer-and-say-nothing would be a silent no-op.
+                    ctx.pager.checkpoint_wal_now()?;
                 }
                 "cache_size" => {
                     // SQLite semantics: positive N = N pages, negative N =

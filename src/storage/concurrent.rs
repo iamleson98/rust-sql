@@ -922,6 +922,15 @@ impl Pager {
     /// (owners) must NOT take this guard: their fetch-time version-stamp
     /// validation is the isolation mechanism, and an owner's statement
     /// may legitimately run while a sibling commits.
+    /// The write side of the install gate — used by cross-process
+    /// freshness resyncs (`Pager::resync_foreign_commits_if_stale`):
+    /// absorbing a foreign process's committed WAL growth changes
+    /// committed pages, exactly like an in-process install, so in-flight
+    /// walker pulls finish before the map/cache swap and new pulls wait.
+    pub(crate) fn install_gate_write(&self) -> parking_lot::RwLockWriteGuard<'_, ()> {
+        self.concurrent.install_gate.write()
+    }
+
     pub fn plain_reader_gate(&self) -> Option<parking_lot::RwLockReadGuard<'_, ()>> {
         // Gate condition: the regime is active OR the engine is
         // regime-CAPABLE (WAL attached, sticky). `any_active()` alone is

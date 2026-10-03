@@ -413,6 +413,14 @@ pub struct WalState {
 /// count).
 const WAL_AUTOCHECKPOINT_FRAMES: u32 = 1000;
 
+/// How long an URGENT fold (`checkpoint_wal_now`) waits for every other
+/// handle on the file — any process — to close before returning busy.
+/// Generous on purpose: the close-time best-effort folds make the common
+/// single-writer case instant; this bound only bites when a user asks for
+/// an explicit checkpoint/DELETE-mode switch while other connections are
+/// genuinely long-lived.
+const XLOCK_URGENT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Leader/follower fsync coordinator for GROUP COMMIT.
 ///
 /// Under `PRAGMA synchronous=FULL`, every COMMIT's durability point is an
@@ -807,6 +815,17 @@ pub struct Pager {
     /// under the write lock. `Wal` itself is writer-only; the read path
     /// goes through `Wal::read_frame_at` on a shared handle.
     pub(crate) wal: RwLock<Option<WalState>>,
+    /// Cross-process lock file handle (WAL-mode file-backed pagers only,
+    /// set once by `enable_wal`): byte-0 LIVE shared for the handle's
+    /// whole life, byte-1 WRITE exclusive while this pager holds the WAL
+    /// writer role, byte-2 READ shared per statement on non-writer
+    /// handles. See `storage::xlock` for the full protocol.
+    pub(crate) xlock: std::sync::OnceLock<std::sync::Arc<crate::storage::xlock::XLock>>,
+    /// True while this pager holds the cross-process WRITE byte — the
+    /// fast-path check that lets writer handles skip per-statement read
+    /// gating + freshness probes entirely (they are the only possible
+    /// writer, and their own commits maintain their committed map).
+    xlock_write_held: std::sync::atomic::AtomicBool,
     /// DELETE-mode mid-transaction page spill (see `DeleteSpill`):
     /// `None` until the first cache-pressure eviction of a dirty page
     /// during a write transaction; dropped (file deleted) at COMMIT
@@ -1593,6 +1612,11 @@ impl Drop for Pager {
         if !self.store.read().is_memory() {
             let sidecar = crate::storage::wal::wal_path_for(&self.path);
             crate::storage::wal::release_wal_lease(&sidecar, self.instance_id);
+            // The cross-process WRITE byte releases with it — the OS
+            // analogue of the release above (a handle dropped WITHOUT
+            // Drop leaks both, exactly like a leaked sqlite3* connection
+            // holds its locks; process death releases the OS byte).
+            self.xlock_drop_writer_role();
         }
         //
         // A RETIRED pager skips the rest: the close-time bookkeeping would
@@ -1635,10 +1659,24 @@ impl Drop for Pager {
             // the live owner appends would otherwise truncate the log
             // under it (the same datxevui class, intra-process).
             let sidecar = crate::storage::wal::wal_path_for(&self.path);
-            let am_owner = !matches!(
+            let mut am_owner = !matches!(
                 crate::storage::wal::acquire_wal_lease(&sidecar, self.instance_id),
                 crate::storage::wal::WalLease::Foreign(_)
             );
+            if am_owner {
+                // CROSS-PROCESS WRITER ROLE: a writer in ANOTHER process
+                // owns the log's appends — our fold+remove would race its
+                // committed frames. Skip both (frames stay durable in the
+                // sidecar; that process's own teardown folds them). The
+                // in-process lease this block just took is released: we
+                // were a transient taker (a sticky writer holds byte-1
+                // already, so its re-take cannot fail), and leaking it
+                // would busy-lock this path in-process forever.
+                if self.xlock_take_writer_role().is_err() {
+                    crate::storage::wal::release_wal_lease(&sidecar, self.instance_id);
+                    am_owner = false;
+                }
+            }
             if am_owner {
                 // REFRESH the committed map from the sidecar before the
                 // fold: our map was built at OUR open (+ our own
@@ -1671,21 +1709,43 @@ impl Drop for Pager {
                         }
                     }
                 }
-                if let Err(e) = self.checkpoint_wal() {
-                    eprintln!("close-time WAL checkpoint failed (frames stay durable in the sidecar; the next open replays them): {e}");
-                }
-                // Ownership-checked removal: delete the sidecar only when
-                // the path still holds OUR file (same inode). A newer
-                // generation's WAL must survive our retirement.
-                let mine = {
-                    let g = self.wal.read();
-                    g.as_ref().and_then(|s| s.wal.identity())
+                // SOLE-GATED FOLD + REMOVAL (storage::xlock): the
+                // main-file writes of the fold must not race another
+                // handle's in-flight main-file page reads (any process),
+                // and the sidecar removal is only safe when the fold
+                // ACTUALLY HAPPENED — removing a sidecar whose committed
+                // frames never landed in the main file would silently
+                // discard them. Not sole (another handle open) or fold
+                // error: DEFER both — the frames stay durable in the
+                // sidecar and the next sole generation (the last handle's
+                // close, or a fresh open's recovery) folds them. (The
+                // fold-failure deferral also tightens a pre-existing
+                // hazard: this block used to remove the sidecar even
+                // after an eprintln'd fold failure.)
+                let folded = match self.xlock_sole_gate() {
+                    Ok(Some(_sole)) => self.checkpoint_wal_locked().is_ok(),
+                    _ => false,
                 };
-                crate::storage::wal::remove_file_if_owned(
-                    &crate::storage::wal::wal_path_for(&self.path),
-                    mine,
-                );
+                if !folded {
+                    eprintln!(
+                        "close-time WAL checkpoint deferred (frames stay durable in the \
+                         sidecar; the next sole close or open replays them)"
+                    );
+                } else {
+                    // Ownership-checked removal: delete the sidecar only
+                    // when the path still holds OUR file (same inode). A
+                    // newer generation's WAL must survive our retirement.
+                    let mine = {
+                        let g = self.wal.read();
+                        g.as_ref().and_then(|s| s.wal.identity())
+                    };
+                    crate::storage::wal::remove_file_if_owned(
+                        &crate::storage::wal::wal_path_for(&self.path),
+                        mine,
+                    );
+                }
                 crate::storage::wal::release_wal_lease(&sidecar, self.instance_id);
+                self.xlock_drop_writer_role();
             }
         }
         // DELETE-mode spill sidecar: uncommitted cache-pressure records.
@@ -2090,6 +2150,8 @@ impl Pager {
             dirty_pages: Mutex::new(PageIdSet::default()),
             write_version: std::sync::atomic::AtomicU64::new(0),
             wal: RwLock::new(None),
+            xlock: std::sync::OnceLock::new(),
+            xlock_write_held: AtomicBool::new(false),
             delete_spill: Mutex::new(None),
             ckpt_scratch: Mutex::new(Vec::new()),
             synchronous: std::sync::atomic::AtomicU8::new(2),
@@ -4301,6 +4363,254 @@ impl Pager {
         self.write_file_at(offset, &out)
     }
 
+    // ============================================================ xlock ==
+    // Cross-process locking (see storage::xlock for the protocol). All of
+    // these are no-ops for pagers without a lock file (in-memory stores,
+    // DELETE-mode files) — the OnceLock is simply never set.
+
+    /// Take the cross-process WRITE byte — the OS-level half of the WAL
+    /// writer lease. Pairs with `acquire_wal_lease` at every site that
+    /// takes the in-process lease: a foreign holder (another process is
+    /// the writer) is the same busy-class condition as a foreign
+    /// in-process lease. Idempotent while held (a same-fd OFD request on
+    /// a range the fd already locks succeeds without state change).
+    fn xlock_take_writer_role(&self) -> Result<()> {
+        if let Some(xl) = self.xlock.get() {
+            let got = xl
+                .try_lock_exclusive(crate::storage::xlock::WRITE_BYTE)
+                .map_err(crate::error::Error::Io)?;
+            if !got {
+                return Err(crate::error::Error::Transaction(format!(
+                    "database is locked (SQLITE_BUSY): the WAL writer lease for {} is held \
+                     by a connection in ANOTHER process; cross-process WAL writes are \
+                     serialized — route writes through one process, or retry after the \
+                     other process closes its connection",
+                    crate::storage::wal::wal_path_for(&self.path).display()
+                )));
+            }
+            self.xlock_write_held.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// Release the cross-process WRITE byte. Pairs with every
+    /// `release_wal_lease` site. No-op without a lock file.
+    fn xlock_drop_writer_role(&self) {
+        if let Some(xl) = self.xlock.get() {
+            let _ = xl.unlock(crate::storage::xlock::WRITE_BYTE);
+            self.xlock_write_held.store(false, Ordering::Release);
+        }
+    }
+
+    /// True when this pager currently holds the cross-process WRITE byte
+    /// (fast path: writer handles skip per-statement read gating and
+    /// freshness probes — they are the only possible writer system-wide,
+    /// and their own commits maintain their committed map in-process).
+    pub fn xlock_is_writer(&self) -> bool {
+        self.xlock_write_held.load(Ordering::Acquire)
+    }
+
+    /// The shared lock-file handle, if this pager has one (WAL-mode
+    /// file-backed only).
+    pub fn xlock_handle(&self) -> Option<std::sync::Arc<crate::storage::xlock::XLock>> {
+        self.xlock.get().cloned()
+    }
+
+    /// Take the per-statement cross-process READ byte (shared). Held by
+    /// NON-writer handles for the duration of a statement: it is what a
+    /// concurrently-checkpointing process would otherwise race — a reader
+    /// paging from the MAIN file mid-statement while the checkpoint
+    /// overwrites those very pages. Writers skip it entirely (they hold
+    /// WRITE, so no foreign checkpoint can exist), which keeps the
+    /// single-connection fast path lock-free per statement.
+    pub fn xlock_begin_read(&self) -> Option<crate::storage::xlock::XReadGuard> {
+        let xl = self.xlock.get().cloned()?;
+        if self.xlock_is_writer() {
+            return None;
+        }
+        match xl.lock_shared(crate::storage::xlock::READ_BYTE) {
+            Ok(()) => Some(crate::storage::xlock::XReadGuard::new(xl)),
+            Err(_) => None, // see XReadGuard docs: protocol best-effort on lock-file errors
+        }
+    }
+
+    /// SOLE-HANDLE CHECKPOINT GATE: upgrade the LIVE byte to exclusive.
+    /// Returns `Ok(Some(guard))` when this handle is the only one on the
+    /// database in the whole system (any process) — main-file writes may
+    /// proceed, and the guard restores the shared LIVE lock when dropped.
+    /// `Ok(None)` = another handle holds the file open (the fold must be
+    /// deferred or, for explicit requests, retried — see
+    /// [`Self::xlock_wait_sole`]). Without a lock file (in-memory,
+    /// DELETE-mode): `Ok(Some(guard))` vacuously — same as today.
+    fn xlock_sole_gate(&self) -> Result<Option<crate::storage::xlock::XSoleGuard>> {
+        if let Some(xl) = self.xlock.get().cloned() {
+            let sole = xl.try_upgrade_sole().map_err(crate::error::Error::Io)?;
+            if sole {
+                Ok(Some(crate::storage::xlock::XSoleGuard::new(xl)))
+            } else {
+                Ok(None)
+            }
+        } else {
+            Ok(Some(crate::storage::xlock::XSoleGuard::none()))
+        }
+    }
+
+    /// Blocking variant for EXPLICIT requests (`PRAGMA
+    /// wal_checkpoint`, `journal_mode=DELETE`): wait up to `deadline` for
+    /// every other handle on the file to close. A FAILED upgrade attempt
+    /// never strips this fd's own shared lock (POSIX: an unsuccessful
+    /// SETLK leaves existing locks untouched), so the poll loop keeps
+    /// LIVE-shared between attempts and the file stays openable. Returns
+    /// the sole guard, or `None` if still busy at the deadline.
+    fn xlock_wait_sole(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<Option<crate::storage::xlock::XSoleGuard>> {
+        if let Some(xl) = self.xlock.get().cloned() {
+            loop {
+                let sole = xl.try_upgrade_sole().map_err(crate::error::Error::Io)?;
+                if sole {
+                    return Ok(Some(crate::storage::xlock::XSoleGuard::new(xl)));
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        } else {
+            Ok(Some(crate::storage::xlock::XSoleGuard::none()))
+        }
+    }
+
+    // ===================================================== freshness ==
+    // Cross-process reader freshness (storage::xlock protocol): absorb
+    // WAL growth committed by a writer in ANOTHER process (or — bonus —
+    // a second handle in this one, which previously kept a stale
+    // committed map for its whole life).
+
+    /// The sidecar size that matches this pager's CURRENT view of the
+    /// log (header + the frames its `Wal` instance knows about). A stat
+    /// reporting exactly this means nobody else has appended.
+    fn xlock_expected_sidecar_len(&self) -> Option<u64> {
+        let g = self.wal.read();
+        let s = g.as_ref()?;
+        let frame = (crate::storage::wal::FRAME_HEADER_SIZE + s.wal.page_size()) as u64;
+        Some(crate::storage::wal::WAL_HEADER_SIZE as u64 + s.wal.n_frames() as u64 * frame)
+    }
+
+    /// Statement-start freshness probe: if the sidecar on disk grew past
+    /// what this pager's `Wal` knows (a foreign process committed), fold
+    /// the growth into the committed map and drop stale cached pages —
+    /// under the SAME install-gate discipline an in-process concurrent
+    /// commit uses, so in-flight walker pulls finish first.
+    ///
+    /// Never runs on the writer handle (its own commits maintain its
+    /// map; no foreign writer can exist while byte-1 is held) and never
+    /// with local dirty state (mid-write-transaction handles are the
+    /// writer by construction, but belt-and-braces).
+    /// Statement-start freshness probe: if the sidecar on disk grew past
+    /// what this pager's `Wal` knows (a foreign process committed), fold
+    /// the growth into the committed map and drop the stale cached
+    /// versions of exactly the affected pages — under the SAME
+    /// install-gate discipline an in-process concurrent commit uses, so
+    /// in-flight walker pulls finish first. Returns `true` when foreign
+    /// committed state actually advanced (the caller bumps its cache
+    /// generation so memoized counts/join caches miss).
+    ///
+    /// Never runs on the writer handle (its own commits maintain its
+    /// map; no foreign writer can exist while byte-1 is held) and never
+    /// with local dirty state (mid-write-transaction handles are the
+    /// writer by construction, but belt-and-braces).
+    pub fn resync_foreign_commits_if_stale(&self) -> Result<bool> {
+        if self.xlock.get().is_none() || self.xlock_is_writer() {
+            return Ok(false);
+        }
+        if self.has_dirty_pages() {
+            return Ok(false);
+        }
+        let Some(expected) = self.xlock_expected_sidecar_len() else {
+            return Ok(false);
+        };
+        let sidecar = crate::storage::wal::wal_path_for(&self.path);
+        let meta = match std::fs::metadata(&sidecar) {
+            Ok(m) => m,
+            Err(_) => return Ok(false),
+        };
+        if meta.len() <= expected {
+            // Fresh (or a torn tail a foreign writer is appending right
+            // now — uncommitted, invisible; the next growth re-probes).
+            return Ok(false);
+        }
+        let _gate = self.install_gate_write();
+        // INCREMENTAL absorb — O(growth), not O(log): a reader polling a
+        // hammering writer pays only for the frames committed since its
+        // last statement. `None` (salt reset — protocol-impossible while
+        // we hold the LIVE byte, checked anyway) falls back to a full
+        // shared reopen.
+        let absorbed = {
+            let mut g = self.wal.write();
+            match g.as_mut() {
+                Some(state) => state.wal.absorb_foreign_growth()?,
+                None => return Ok(false),
+            }
+        };
+        let visible = match absorbed {
+            Some(v) => v,
+            None => {
+                let mut fresh =
+                    crate::storage::wal::Wal::open_shared(&self.path, self.page_size())?;
+                let map = fresh.committed_page_map()?.into_iter().collect();
+                {
+                    let mut g = self.wal.write();
+                    if let Some(state) = g.as_mut() {
+                        state.wal = fresh;
+                        state.map = map;
+                    }
+                }
+                self.cache.write().clear();
+                self.lru.lock().clear();
+                self.reload_header_from_committed()?;
+                return Ok(true);
+            }
+        };
+        if visible.is_empty() {
+            // Growth was an uncommitted in-flight tail only.
+            return Ok(false);
+        }
+        {
+            let mut g = self.wal.write();
+            if let Some(state) = g.as_mut() {
+                for &(id, off) in &visible {
+                    state.map.insert(id, off);
+                }
+            }
+        }
+        // Targeted eviction: drop ONLY the cached versions of the pages
+        // whose committed truth moved (the rest of the cache survives —
+        // a polling reader keeps its working set warm).
+        let ids: std::collections::HashSet<PageId> = visible.iter().map(|&(id, _)| id).collect();
+        {
+            let mut cache = self.cache.write();
+            for id in &ids {
+                cache.remove(*id);
+            }
+        }
+        self.lru.lock().retain(|id| !ids.contains(id));
+        self.reload_header_from_committed()?;
+        // Committed frames past the new committed n_pages (a foreign
+        // tail-truncation commit): unreachable by the bounds check, and
+        // a later checkpoint must not transiently re-extend the file
+        // with them (the enable_Wal precedent — see enable_wal).
+        let bound = self.n_pages.load(Ordering::Acquire);
+        {
+            let mut g = self.wal.write();
+            if let Some(state) = g.as_mut() {
+                state.map.retain(|&id, _| id < bound);
+            }
+        }
+        Ok(true)
+    }
+
     pub fn enable_wal(&self) -> Result<()> {
         {
             let guard = self.wal.read();
@@ -4332,9 +4642,28 @@ impl Pager {
         // freshly created WAL out from under the live engine in the
         // 2026-09-18 datxevui.com outage.
         let _guard = crate::storage::wal::lifecycle_guard().lock();
+        // CROSS-PROCESS LIVE MARK (storage::xlock): open the lock file
+        // and hold byte-0 shared for this handle's whole life, BEFORE
+        // the sidecar is opened — from this point on, any other process
+        // that opens the same database coexists under the xlock
+        // protocol (writer serialization + checkpoint sole-gating +
+        // reader freshness). Best-effort idempotence: `set` keeps the
+        // first handle if enable_wal ever re-ran for this pager.
+        if self.xlock.get().is_none() {
+            let xl = std::sync::Arc::new(
+                crate::storage::xlock::XLock::open(&self.path).map_err(crate::error::Error::Io)?,
+            );
+            xl.lock_shared(crate::storage::xlock::LIVE_BYTE)
+                .map_err(crate::error::Error::Io)?;
+            let _ = self.xlock.set(xl);
+        }
         // Flush pending dirty pages in DELETE mode first.
         self.flush()?;
-        let mut wal = crate::storage::wal::Wal::open(&self.path, self.page_size())?;
+        // SHARED (non-truncating) recovery: a writer in another process
+        // may be mid-append at this exact moment (the LIVE byte above
+        // does not stop writers, only checkpoints) — a truncating
+        // recovery would cut its in-flight frames (see Wal::open_shared).
+        let mut wal = crate::storage::wal::Wal::open_shared(&self.path, self.page_size())?;
         let map: std::collections::HashMap<PageId, u64, PageIdHashBuild> =
             wal.committed_page_map()?.into_iter().collect();
         let n = wal.n_frames();
@@ -4404,14 +4733,27 @@ impl Pager {
                 crate::storage::wal::wal_lease_busy(f)
             )));
         }
+        // CROSS-PROCESS WRITER ROLE (storage::xlock): the mode switch
+        // folds + REMOVES the sidecar — a writer-class operation. A
+        // foreign process writer blocks it; a foreign reader blocks the
+        // FOLD itself (checked inside), matching SQLite's "cannot change
+        // journal_mode while another connection is open" busy class.
+        if let Err(e) = self.xlock_take_writer_role() {
+            crate::storage::wal::release_wal_lease(&sidecar, self.instance_id);
+            return Err(e);
+        }
         let result = self.disable_wal_locked();
         crate::storage::wal::release_wal_lease(&sidecar, self.instance_id);
+        self.xlock_drop_writer_role();
         result
     }
 
     /// `disable_wal` with the lifecycle + writer leases already held.
     fn disable_wal_locked(&self) -> Result<()> {
-        self.checkpoint_wal()?;
+        // URGENT: journal_mode=DELETE must actually fold + remove the
+        // sidecar, or the persisted-mode flip below would lie (the next
+        // open would come up in WAL mode with a pre-fold main file).
+        self.checkpoint_wal_now()?;
         // The mode flip is durable: clear the persisted WAL marker in the
         // header (in-cache page 0, flagged dirty for the next DELETE-mode
         // flush, AND the raw file bytes + fsync now) — a reopen of this
@@ -4512,14 +4854,84 @@ impl Pager {
                 crate::storage::wal::WalLease::Acquired => true,
                 crate::storage::wal::WalLease::Ours => false,
             };
-            let r = self.checkpoint_wal_locked();
+            // CROSS-PROCESS WRITER ROLE: the fold is a writer-class
+            // operation (main-file writes + sidecar reset). Pair byte-1
+            // with the in-process lease; a foreign process writer is the
+            // same busy condition. Idempotent while this pager already
+            // holds the sticky role from `flush_wal_opts`.
+            if let Err(e) = self.xlock_take_writer_role() {
+                if acquired {
+                    crate::storage::wal::release_wal_lease(&sidecar, self.instance_id);
+                }
+                return Err(e);
+            }
+            // CROSS-PROCESS SOLE GATE (storage::xlock): main-file writes
+            // must not race another handle's in-flight main-file page
+            // reads — in this process OR any other. Sole handles fold
+            // freely; otherwise this BEST-EFFORT fold DEFERS (the frames
+            // stay durable in the sidecar; the next sole generation folds
+            // them — the close-time teardown or an explicit
+            // `checkpoint_wal_now` from a sole moment).
+            let r = match self.xlock_sole_gate()? {
+                Some(_sole) => self.checkpoint_wal_locked(),
+                None => Ok(()),
+            };
             if acquired {
                 crate::storage::wal::release_wal_lease(&sidecar, self.instance_id);
+                self.xlock_drop_writer_role();
             }
             r
         } else {
             self.checkpoint_wal_locked()
         }
+    }
+
+    /// URGENT checkpoint (`PRAGMA wal_checkpoint`, `journal_mode=DELETE`,
+    /// VACUUM, `serialize`): unlike the best-effort [`Self::checkpoint_wal`],
+    /// which silently defers while other handles (any process) hold the
+    /// file open, this waits up to `XLOCK_URGENT_DEADLINE` for sole-ness
+    /// and then fails with a busy-class error — SQLite's own "cannot
+    /// checkpoint / change journal_mode while another connection is open"
+    /// behavior class. Callers that CANNOT tolerate a deferred fold use
+    /// this; auto-checkpoints and close-time folds stay best-effort.
+    pub fn checkpoint_wal_now(&self) -> Result<()> {
+        let _lifecycle = crate::storage::wal::lifecycle_guard().lock();
+        if self.store.read().is_memory() {
+            return self.checkpoint_wal_locked();
+        }
+        let sidecar = crate::storage::wal::wal_path_for(&self.path);
+        let acquired = match crate::storage::wal::acquire_wal_lease(&sidecar, self.instance_id) {
+            crate::storage::wal::WalLease::Foreign(f) => {
+                return Err(crate::error::Error::Transaction(format!(
+                    "database is locked (SQLITE_BUSY): {}",
+                    crate::storage::wal::wal_lease_busy(f)
+                )))
+            }
+            crate::storage::wal::WalLease::Acquired => true,
+            crate::storage::wal::WalLease::Ours => false,
+        };
+        if let Err(e) = self.xlock_take_writer_role() {
+            if acquired {
+                crate::storage::wal::release_wal_lease(&sidecar, self.instance_id);
+            }
+            return Err(e);
+        }
+        let gate = self.xlock_wait_sole(std::time::Instant::now() + XLOCK_URGENT_DEADLINE)?;
+        let r = match gate {
+            Some(_sole) => self.checkpoint_wal_locked(),
+            None => Err(crate::error::Error::Transaction(format!(
+                "database is locked (SQLITE_BUSY): cannot checkpoint {} while another \
+                 connection (this process or another) holds the database open; committed \
+                 frames stay durable in the WAL sidecar and fold at the next sole \
+                 checkpoint",
+                self.path.display()
+            ))),
+        };
+        if acquired {
+            crate::storage::wal::release_wal_lease(&sidecar, self.instance_id);
+            self.xlock_drop_writer_role();
+        }
+        r
     }
 
     /// [`Self::checkpoint_wal`] with the writer lease already held.
@@ -4753,6 +5165,16 @@ impl Pager {
                     "database is locked (SQLITE_BUSY): {}",
                     crate::storage::wal::wal_lease_busy(f)
                 )));
+            }
+            // CROSS-PROCESS WRITER ROLE (storage::xlock): the OS-level
+            // twin of the lease above — sticky until this pager retires,
+            // so a concurrent WRITER PROCESS fails fast with the same
+            // busy class instead of interleaving frames at clashing
+            // offsets. (A sticky take never fails: if we already hold
+            // byte-1 the same-fd request re-succeeds.)
+            if let Err(e) = self.xlock_take_writer_role() {
+                crate::storage::wal::release_wal_lease(&sidecar, self.instance_id);
+                return Err(e);
             }
         }
         self.flush_wal_opts_locked(sync, checkpoint, psz)
@@ -5212,8 +5634,10 @@ impl Pager {
         // 5. Copy the compact pages into the main file, apply the armed
         //    tail truncation, sync, and reset the WAL. The main file IS
         //    the compact database afterwards; the sidecar holds only its
-        //    fresh header.
-        self.checkpoint_wal()?;
+        //    fresh header. URGENT: the swap below rebinds the store to
+        //    this file — a deferred fold would leave the pre-VACUUM main
+        //    image as the crash-recovery base.
+        self.checkpoint_wal_now()?;
 
         // 6. Stale BEGIN-time pre-images from earlier committed-view
         //    scopes must not serve old-tree bytes over the compact
@@ -5373,8 +5797,9 @@ impl Pager {
         //    every moved page as WAL frames.
         self.flush()?;
         // 7. Copy the committed frames into the main file, apply the
-        //    armed truncation, and reset the WAL.
-        self.checkpoint_wal()?;
+        //    armed truncation, and reset the WAL. URGENT — same reason as
+        //    the page-level path's step 5.
+        self.checkpoint_wal_now()?;
         // 8. Stale BEGIN-time pre-images from earlier committed-view
         //    scopes must not serve old-tree bytes over the compact state.
         self.clear_committed_view();

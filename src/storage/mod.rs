@@ -16,6 +16,7 @@ pub mod sqlitefmt;
 pub mod tempstore;
 pub mod vacuum;
 pub mod wal;
+pub mod xlock;
 
 pub use btree::{Btree, LookupResult};
 pub use page::{Page, PageId, PageType, DEFAULT_PAGE_SIZE};
