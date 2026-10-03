@@ -1761,3 +1761,19 @@ Work Log:
 
 Stage Summary:
 - The live SQLite-format container is gone: storage is the native container, period. Three gap families closed by construction; compatibility PRESERVED (SQLite files open with full SQL surface, exports are integrity_check-clean real SQLite files, UTF-16/collations/ptrmap round-trip). Binary 4.5% smaller. All matrices green locally. Remaining ledger: PK join 1.18x, mixed-R/W fsync caveat, mimalloc RSS floor, single-process native files, BEGIN CONCURRENT DDL, temp namespace, dbdata shape, extension ABI, cross-db trigger edges, .archive DEFLATED writes, multi-DB sequential commits, mixed-schema materialization.
+
+---
+Task ID: 76-ci
+Agent: main (Super Z)
+Task: CI verdicts for the SQLite-format container drop round (task 76).
+
+Work Log:
+- c66e68f (the drop): run 37107566555 — the ubuntu interop job caught interop_cli.sh section 1 (the engine's writes adopt the path; sqlite3 then could not read the native bytes) and windows stress caught the adoption rename colliding with a live cross-process handle on the path (os error 5). Both fixed:
+  - 51b3a97: section 1 exports back to SQLite bytes (two-step, Windows-safe) after the engine's writes.
+  - c906c71: the adoption publish ladder — rename, then remove+rename, then the in-place overwrite (the interchange writer's own Windows ladder, reused).
+- The owner's PR #6 (persist engine pragmas across recreation) merged on top as 455d1ba but predated the drop's RwLock<Store> wrap — two store probes did not compile. b3c5b0a adapted them (`.read().is_memory()`); the PR's own suite (engine_settings_persistence, 3 tests) green.
+- b3c5b0a: run 37108625561 — 32/34 green; the one real failure was limit_memory_flatness on windows no-default (round wall time degraded 186ms -> 2081ms tail-min) with RSS perfectly flat, integrity ok, the same suite green in the default config in the same run, and no-default green on linux locally — the signature of the three parallel heavy windows jobs hammering shared 2-core runners (the suite's own s2-gate docs describe the class). Job-level rerun: ALL 34/34 GREEN including ci-ok.
+- Bench gates: zero losses on ubuntu/windows/macos. Torture: green on all three OSes. Million-record, limit-stress, interop (3 OSes), sqlx, no-default, oom-injection, compat-ABI, cargo-audit: all green.
+
+Stage Summary:
+- Master at b3c5b0a: 34/34 CI green, zero bench losses on any OS. The container drop is fully landed: the native container is the only storage, SQLite format is the interchange (read + one-shot write), adopt-on-write is the handoff, and the Windows pinned-path edge is handled by the same ladder the interchange writer uses.
