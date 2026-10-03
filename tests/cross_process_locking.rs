@@ -110,6 +110,38 @@ fn open_wal(db_path: &Path) -> Database {
     db
 }
 
+/// One-line state dump for the hammer test's failure messages: the
+/// writer child's liveness, its highest `p1-count-N` marker (committed
+/// progress), and the sidecar's path-stat — enough to tell a DEAD
+/// writer (helper panic — its stderr is inherited only under
+/// RSQL_XPROC_TRACE) from a FROZEN reader (markers advancing, the
+/// reader's count stuck).
+fn hammer_state(dir: &Path, writer: &mut std::process::Child) -> String {
+    let mut max_marker = 0i64;
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if let Some(n) = name
+                .strip_prefix("p1-count-")
+                .and_then(|s| s.parse::<i64>().ok())
+            {
+                max_marker = max_marker.max(n);
+            }
+        }
+    }
+    let sidecar = dir.join(format!("{DB_NAME}-wal"));
+    let sc = std::fs::metadata(&sidecar)
+        .map(|m| format!("len={}", m.len()))
+        .unwrap_or_else(|e| format!("MISSING ({e})"));
+    let child = match writer.try_wait() {
+        Ok(Some(st)) => format!("EXITED ({st})"),
+        Ok(None) => "alive".to_string(),
+        Err(e) => format!("try_wait error: {e}"),
+    };
+    format!("writer={child}, max p1-count marker={max_marker}, sidecar {sc}")
+}
+
 // ---------------------------------------------------------------------------
 // the dispatcher test (children run ONLY this)
 // ---------------------------------------------------------------------------
@@ -364,7 +396,11 @@ fn concurrent_reader_never_sees_torn_or_lost_state() {
             break;
         }
     }
-    assert!(last >= 25, "reader should have observed growth, saw {last}");
+    assert!(
+        last >= 25,
+        "reader should have observed growth, saw {last} [{}]",
+        hammer_state(&dir, &mut writer)
+    );
     // Phase 2 — one more second of overlap reading (monotonicity under
     // continued hammering), then drain.
     let t1 = Instant::now();
@@ -378,14 +414,22 @@ fn concurrent_reader_never_sees_torn_or_lost_state() {
     }
 
     write_marker(&dir, "stop");
-    assert!(wait_marker(&dir, "p1-done", Duration::from_secs(60)));
+    assert!(
+        wait_marker(&dir, "p1-done", Duration::from_secs(60)),
+        "writer never drained [{}]",
+        hammer_state(&dir, &mut writer)
+    );
     let _ = writer.wait();
 
     let final_n: i64 = db2.query("SELECT COUNT(*) FROM t", []).unwrap()[0]
         .first()
         .unwrap()
         .as_integer();
-    assert!(final_n >= last, "final {final_n} < last observed {last}");
+    assert!(
+        final_n >= last,
+        "final {final_n} < last observed {last} [{}]",
+        hammer_state(&dir, &mut writer)
+    );
     db2.execute("PRAGMA integrity_check", []).unwrap();
 
     // Fresh open: same count (the sidecar or the folded main file —

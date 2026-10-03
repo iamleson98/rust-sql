@@ -142,6 +142,10 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
+      # Cross-process protocol tracing (storage::xlock): zero output on
+      # green runs (cargo captures per-test stderr), the full story —
+      # both processes' sides, helper panics included — on any red one.
+      RSQL_XPROC_TRACE: "1"
       # The limit_stress suite runs at FULL scale in its dedicated
       # limit-stress job (release, LIMIT_ROWS=1000000); here it is a
       # quick smoke of every section's code paths.
@@ -193,6 +197,7 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
+      RSQL_XPROC_TRACE: "1"
       LIMIT_ROWS: "20000"
     steps:
       - uses: actions/checkout@v7
@@ -217,6 +222,7 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
+      RSQL_XPROC_TRACE: "1"
       LIMIT_ROWS: "20000"
     steps:
       - uses: actions/checkout@v7

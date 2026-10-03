@@ -1809,3 +1809,30 @@ Work Log:
 
 Stage Summary:
 - The xlock protocol now behaves identically through Linux OFD and Windows LockFileEx semantics via the userspace held-mode mirror; the READ byte gained proper per-statement counting. Awaiting the 26b1eee CI verdict — every prior front is already green.
+
+---
+Task ID: 79
+Agent: main (Super Z)
+Task: The windows interop linker fix (run 37130151733's one remaining front) + the oom-config hammer-pace fix (run 37131244249's one remaining front).
+
+Work Log:
+- Run 37130151733 (26b1eee): every windows TEST job green (the held-mode mirror fixed concurrent_edge_interleavings); the one failure was `sqlx + sea-orm interop (windows-latest)` — LINK-time, LNK2005 duplicate __rust_alloc linking sqlx_macros.dll. Root cause: MSVC link.exe resolves `dylib=sqlite3` to the literal `sqlite3.lib` — cargo's STATICLIB artifact for the compat crate (crate-type = ["cdylib","staticlib","rlib"]), a FULL engine archive whose #[global_allocator] shims collide with the proc-macro host DLL's own std. Fix (cb9a2dd): on windows-msvc the default-name link names the cdylib's IMPORT LIBRARY by its exact artifact — `dylib=sqlite3.dll` → link.exe looks for `sqlite3.dll.lib` (cargo leaves it in <profile>/deps/, which joins the search path); the import table still references sqlite3.dll and copy_engine_dll_for_runtime already plants the DLL next to the exes and the proc-macro cdylibs. Unix and RUSTQLITE_LINK_NAME paths unchanged. Validated on linux: all four interop bins green (sqlx core incl. step-11 read-only, migrate, sea-orm, sea-orm relations).
+- Run 37131244249 (cb9a2dd): 33 green including ALL THREE OSes' interop jobs — the MSVC fix landed. The one failure: the ubuntu oom-injection job's concurrent_reader panicked at "reader should have observed growth, saw 14" — not a correctness failure: that config runs the suite on the System allocator and the binary runs ~20 processes on a 2-core shared runner; the WRITER's pace collapsed below the fixed "25 rows in 3s" wall-clock threshold (the same test passed the same config at 172c883 on a better draw). Fix (f5f0da3): the growth floor keys on the writer's own p1-count-25 marker (poll-until-marker with a 60s ceiling + 1s overlap), keeping monotonicity/freshness/final-agreement asserts load-independent; idle runtime ~3s -> ~1s. Both configs 9/9 locally.
+
+Stage Summary:
+- Three CI rounds, three one-root-cause fixes: the macOS reader freeze (content-aware probe), the windows xlock re-lock semantics (held-mode mirror), the windows MSVC staticlib/import-lib link (import-library-by-exact-name), plus the runner-load-robust hammer test. Every job family has been green on its most recent run; f5f0da3 is the consolidating verdict run.
+
+---
+Task ID: 80
+Agent: main (Super Z)
+Task: The run-37132751049 verdict chase — a macOS bench-gate noise row, a thrice-cancelled compat job that was actually a HANG, and the step-path read->write self-deadlock underneath it.
+
+Work Log:
+- Run 37132751049 (f5f0da3): one bench-gate (macos) failure — UPDATE-by-id 0.84x — on a commit whose only change was a TEST file; the same row measured 1.09x WIN on the code-identical cb9a2dd run 25 minutes earlier (rustqlite 1.04M -> 700K ops/s between two runs of the same binary = runner noise). Job-level rerun: GREEN.
+- The ubuntu compat-ABI job was cancelled at its 20-minute timeout three times — NOT runner luck: compat's backup_wal_mode_source hangs. Reproduced locally (timeout 180 -> EXIT=124); gdb pinned it: the test thread sat in parking_lot's wait_for_readers via install_gate_write <- resync_foreign_commits_if_stale <- xread_scope <- Statement::start <- step_inner, with only the harness thread otherwise alive — the read-guard holder blocking the write was the thread itself.
+- Root cause: step_inner held the start-section pull gate (the install gate's READ side, armed whenever the concurrent regime is active/capable — the C ABI's writes arm it implicitly, and the compat backup wrote the destination through exactly that path) across the whole of start(), whose first call is xread_scope -> the freshness resync -> the install gate's WRITE side whenever foreign state changed. parking_lot read->write on one thread waits for itself. LATENT in the growth-absorb path all along; this round's content-aware probe made the post-backup destination (a reset sidecar under a stale horizon) the first shape that ever fired the write gate on that path.
+- Fix (f807b05): the start-section pull gate moved INSIDE start(), immediately after the xread scope — the resync's write gate can never run under this thread's own read guard; the gate still covers every pager-walking section of start() and the per-pull gates in step_inner are unchanged. Both one-shot Database paths audited: they call xread_scope before any gate.
+- Local gates: backup 8/8 (hang gone, <1s), cross_process 9/9, fmt clean, clippy -D warnings clean, full default matrix riding (full_matrix3.log).
+
+Stage Summary:
+- The last correctness cliff of the round: a latent same-thread read->write inversion on the install gate, exposed by the content-aware probe's first real firing. The step path now provably cannot self-deadlock against the freshness machinery.
