@@ -33,11 +33,133 @@
 use crate::error::{Error, Result};
 use crate::storage::page::{FileHeader, Page, PageId, DB_HEADER_SIZE, DEFAULT_PAGE_SIZE};
 use parking_lot::{Mutex, RwLock};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+
+// ─────────────────────────────────────────────────────────────────────────
+// Engine-wide PRAGMA settings remembered per database FILE
+// ─────────────────────────────────────────────────────────────────────────
+//
+// ## Why this exists (the 2026-10-03 datxevui.com incident)
+//
+// The compat layer (`rustqlite-compat`) keeps ONE shared `Engine` per
+// database file behind `Weak` references (its `engines()` registry).
+// When the LAST connection to a file closes — a pool's idle-timeout
+// sweep or max-lifetime recycle can transiently take the count to
+// zero — the engine is dropped, and the next open RECREATES it via
+// `Pager::open_opts(.., DEFAULT_CACHE_PAGES, ..)`.
+//
+// Runtime PRAGMAs the previous engine had absorbed (`cache_size`,
+// `synchronous`, `temp_store`) died with it: the new engine came up
+// with the built-in defaults. Production sat at a permanently full
+// 2 MiB page cache (SQLite's default) on a 633 MB database with a
+// 2.5% hit rate for a day — the app's startup-time `PRAGMA
+// cache_size=-65536` had run on the FIRST engine generation only.
+//
+// In C SQLite each CONNECTION owns its page cache and applies its own
+// pragmas, so "settings follow the connection" is automatic. In this
+// engine those settings live on the shared PAGER — and the registry's
+// transparent recreation silently resets them. The fix mirrors the
+// shared-engine model: remember the last engine-wide settings per
+// file, and re-apply them when a new engine opens that file.
+//
+// Semantics:
+// - In-memory / `:memory:` pagers never participate (their cache IS
+//   the store; `cache_size` is a no-op for them anyway).
+// - The key is the canonicalized path (same file ⇒ same settings,
+//   regardless of the path string the opener used). Files that do
+//   not exist yet canonicalize to themselves — consistent on both
+//   sides of the create-flip, matching the compat registry's
+//   `engine_file_key` discipline.
+// - Deletion/recreation of a file at the same path inherits the old
+//   settings (harmless: a fresh file gets re-configured by its next
+//   PRAGMA anyway; SQLite has the same cross-connection stickiness).
+// - Best-effort: a lock failure or a pathological number of distinct
+//   paths degrades to "no persistence", never to an error.
+
+/// Last-known engine-wide settings for one database file.
+#[derive(Default, Clone, Debug)]
+struct PersistedFileSettings {
+    /// `PRAGMA cache_size` resolved to pages (positive form).
+    cache_capacity_pages: Option<usize>,
+    /// `PRAGMA cache_size` as SET (negative = KiB, SQLite convention).
+    cache_size_setting: Option<i64>,
+    /// `PRAGMA synchronous` (0=OFF, 1=NORMAL, 2=FULL, 3=EXTRA).
+    synchronous: Option<u8>,
+    /// `PRAGMA temp_store` (0/1/2).
+    temp_store: Option<i64>,
+}
+
+/// Hard cap on remembered files — one entry per distinct database path
+/// the process has configured via PRAGMA. Guard against unbounded
+/// growth in exotic test/tooling shapes; clearing loses persistence
+/// (a performance nicety), never correctness.
+const MAX_REMEMBERED_FILES: usize = 1024;
+
+/// Process-global memory of per-file engine-wide PRAGMA settings.
+static FILE_SETTINGS: OnceLock<StdMutex<HashMap<PathBuf, PersistedFileSettings>>> = OnceLock::new();
+
+fn file_settings() -> &'static StdMutex<HashMap<PathBuf, PersistedFileSettings>> {
+    FILE_SETTINGS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+/// Canonical key for a database path (see the module notes above).
+fn settings_key(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+impl Pager {
+    /// Record an engine-wide setting for THIS pager's file (file-backed
+    /// pagers only). Called from the PRAGMA setters so every write path
+    /// — SQL pragmas, the Rust API, future call sites — is covered.
+    fn persist_file_setting(&self, f: impl FnOnce(&mut PersistedFileSettings)) {
+        if self.store.is_memory() {
+            return;
+        }
+        let mut map = file_settings().lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() >= MAX_REMEMBERED_FILES && !map.contains_key(&self.path) {
+            // Degrade to forgetting everything rather than growing
+            // without bound; the hot path (a handful of stable DB
+            // paths) never reaches this.
+            map.clear();
+        }
+        let key = settings_key(&self.path);
+        f(map.entry(key).or_default());
+    }
+
+    /// Re-apply remembered engine-wide settings after construction
+    /// (file-backed pagers only). A brand-new engine for a file whose
+    /// previous generation had absorbed PRAGMAs comes up configured,
+    /// not reset to the built-in defaults.
+    fn apply_persisted_file_settings(&self) {
+        if self.store.is_memory() {
+            return;
+        }
+        let key = settings_key(&self.path);
+        let saved = {
+            let map = file_settings().lock().unwrap_or_else(|e| e.into_inner());
+            match map.get(&key) {
+                Some(s) => s.clone(),
+                None => return,
+            }
+        };
+        if let Some(pages) = saved.cache_capacity_pages {
+            self.cache_capacity.store(pages.max(1), Ordering::Relaxed);
+        }
+        if let Some(k) = saved.cache_size_setting {
+            self.cache_size_setting.store(k, Ordering::Release);
+        }
+        if let Some(level) = saved.synchronous {
+            self.synchronous.store(level.min(3), Ordering::Release);
+        }
+        if let Some(ts) = saved.temp_store {
+            self.temp_store.store(ts.clamp(0, 2), Ordering::Release);
+        }
+    }
+}
 
 /// A shared mutable reference to a page.
 ///
@@ -1927,6 +2049,12 @@ impl Pager {
                 }
             }
         }
+        // Engine-wide PRAGMA settings this file absorbed in a PREVIOUS
+        // engine generation (cache_size / synchronous / temp_store):
+        // re-apply so the weak-upgrade-or-recreate registry's silent
+        // engine swap does not reset them to the built-in defaults
+        // (the 2026-10-03 prod incident — see the module notes).
+        pager.apply_persisted_file_settings();
         Ok(pager)
     }
 
@@ -5936,8 +6064,12 @@ impl Pager {
     }
 
     /// PRAGMA synchronous level: 0=OFF, 1=NORMAL, 2=FULL (default).
+    /// Persisted per-file (engine recreation inherits it — see the
+    /// `FILE_SETTINGS` notes at the top of this file).
     pub fn set_synchronous(&self, level: u8) {
-        self.synchronous.store(level.min(3), Ordering::Release);
+        let level = level.min(3);
+        self.synchronous.store(level, Ordering::Release);
+        self.persist_file_setting(|s| s.synchronous = Some(level));
     }
 
     pub fn synchronous(&self) -> u8 {
@@ -5988,6 +6120,7 @@ impl Pager {
         let v = v.clamp(0, 2);
         self.temp_store
             .store(v, std::sync::atomic::Ordering::Release);
+        self.persist_file_setting(|s| s.temp_store = Some(v));
     }
 
     pub fn cache_bytes(&self) -> usize {
@@ -6017,6 +6150,7 @@ impl Pager {
     /// Store the raw PRAGMA cache_size setting.
     pub fn set_cache_size_setting(&self, k: i64) {
         self.cache_size_setting.store(k, Ordering::Release);
+        self.persist_file_setting(|s| s.cache_size_setting = Some(k));
     }
 
     /// The database file's path (None for in-memory / `:memory:`).
@@ -6053,7 +6187,9 @@ impl Pager {
     /// NEXT cache insert's eviction pass trims an over-capacity cache.
     /// In-memory databases ignore it (cache-is-the-store).
     pub fn set_cache_capacity(&self, pages: usize) {
-        self.cache_capacity.store(pages.max(1), Ordering::Relaxed);
+        let pages = pages.max(1);
+        self.cache_capacity.store(pages, Ordering::Relaxed);
+        self.persist_file_setting(|s| s.cache_capacity_pages = Some(pages));
     }
 
     // ----- File I/O helpers: positioned I/O so multiple threads can
