@@ -300,6 +300,16 @@ impl FileIo {
     /// pathname resolution on every autocommit. Any surprise returns
     /// false and the caller takes the fully verified slow path, which
     /// re-establishes ground truth BY PATH (open + stat + salt check).
+    ///
+    /// UNIX ONLY: the nlink half is the whole replacement story, and
+    /// non-unix has no st_nlink — there the caller keeps the ORIGINAL
+    /// path-stat check (see [`wal_identity_ok`]): Rust's std opens
+    /// files on Windows with FILE_SHARE_DELETE, so an external reset
+    /// CAN rename a fresh sidecar over ours while this handle stays
+    /// open on the unlinked original, and a handle-relative stat would
+    /// happily keep writing into that ghost (the windows CI failure
+    /// this split closes).
+    #[cfg(unix)]
     fn self_stat_ok(&self) -> bool {
         let Ok(m) = self.file.metadata() else {
             return false;
@@ -1884,15 +1894,47 @@ pub fn publish_phase_snapshot() -> [u64; 5] {
     ]
 }
 
-/// Append a WAL commit through the cached sidecar handle: one HANDLE
-/// fstat (an external replacement / truncation / growth trips the fully
-/// verified slow path — see [`FileIo::self_stat_ok`]) + one positioned
-/// write at the writer's tracked length — SQLite's own discipline (the
-/// sidecar descriptor stays open for the session's life; the engine
-/// never re-opens, re-stats the PATH and re-verifies the salts per
-/// commit). Falls back to `append_wal_open` whenever the cache is cold
-/// or the identity moved, then keeps the handle it used warm for the
-/// next commit.
+/// The per-commit sidecar identity check, platform-split:
+///
+/// - **unix** — the cached handle's OWN fstat (`FileIo::self_stat_ok`):
+///   no path walk per commit (SQLite's own discipline — the sidecar
+///   descriptor stays open for the session's life). Replacement is
+///   caught by the unlinked inode's `nlink == 0`; external appends by
+///   the length mismatch.
+/// - **non-unix (windows)** — the ORIGINAL path stat + length compare:
+///   Rust's std opens files on Windows with FILE_SHARE_DELETE, so an
+///   external checkpoint/reset can rename a fresh sidecar over ours
+///   while the cached handle stays open on the unlinked original — a
+///   handle-relative stat there would keep writing into that ghost
+///   file, and the commit would be invisible to every other reader
+///   (the windows CI failure of the fstat-only cut). The PATH stat
+///   sees the replacement: the new file's length differs from the
+///   tracked write position, and the fully verified slow path
+///   re-establishes ground truth.
+#[inline]
+fn wal_identity_ok(st: &ContainerState, path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        // The handle's own stat carries the identity — no path walk.
+        let _ = path;
+        st.wal_io
+            .as_ref()
+            .map(|io| io.self_stat_ok())
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::metadata(path)
+            .map(|m| st.wal_io.as_ref().map(|io| io.matches(&m)).unwrap_or(false))
+            .unwrap_or(false)
+    }
+}
+
+/// Append a WAL commit through the cached sidecar handle: the identity
+/// check (see [`wal_identity_ok`]) + one positioned write at the
+/// writer's tracked length. Falls back to `append_wal_open` whenever
+/// the cache is cold or the identity moved, then keeps the handle it
+/// used warm for the next commit.
 fn append_wal_cached(
     st: &mut ContainerState,
     path: &Path,
@@ -1901,12 +1943,7 @@ fn append_wal_cached(
     bytes: &[u8],
     sync: bool,
 ) -> Result<(), String> {
-    let identity_ok = !wal_fastpath_disabled()
-        && st
-            .wal_io
-            .as_ref()
-            .map(|io| io.self_stat_ok())
-            .unwrap_or(false);
+    let identity_ok = !wal_fastpath_disabled() && wal_identity_ok(st, path);
     if identity_ok {
         let t0 = std::time::Instant::now();
         let io = st.wal_io.as_mut().expect("checked above");

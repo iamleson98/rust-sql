@@ -530,3 +530,63 @@ fn counters_and_pragmas_track_the_page_space() {
     }
     let _ = std::fs::remove_file(&path);
 }
+
+// ---------------------------------------------------------------------------
+// External sidecar reset mid-session — the ghost-handle regression.
+//
+// The cached WAL append handle's sidecar can be deleted underneath it
+// (the engine's own checkpoint resets it with remove_file, and real
+// SQLite's close-on-last-connection deletes it too; on Windows that
+// delete succeeds under our open handle because Rust's std opens with
+// FILE_SHARE_DELETE). The identity check MUST see the deletion — unix
+// via the unlinked inode's nlink == 0, windows via the path stat — so
+// the WAL append declines and the commit falls through to the atomic
+// FULL PUBLISH (temp + fsync + rename). The fstat-only cut of the
+// check wrote into the ghost on Windows instead: the commit "succeeded"
+// into the unlinked inode and the reopen saw the pre-reset state (live
+// 56 rows vs reopened 48, CI run 37088596166).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sidecar_reset_mid_session_recovers_via_full_publish() {
+    let path = temp_path("walreplaced");
+    let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+    {
+        let mut db = Database::open_sqlite_format(&path).unwrap();
+        db.execute("PRAGMA journal_mode = WAL", []).unwrap();
+        db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x INT)", [])
+            .unwrap();
+        for i in 0..25 {
+            db.execute("INSERT INTO t(x) VALUES (?)", [Value::Integer(i)])
+                .unwrap();
+        }
+        // The external reset, in the shape it actually happens: the
+        // sidecar is DELETED under the live session's cached handle.
+        std::fs::remove_file(&wal).unwrap();
+        // The next commit must NOT write into the ghost: the append
+        // declines and the commit lands via the atomic full publish.
+        db.execute("INSERT INTO t(x) VALUES (99)", []).unwrap();
+        let live: i64 = db.query("SELECT count(*) FROM t", []).unwrap()[0][0].as_integer();
+        assert_eq!(live, 26);
+    }
+    // The reopen must SEE the post-reset commit: 26 rows including the
+    // x = 99 marker. A ghost write would leave the main file at the
+    // pre-reset state (the deleted sidecar held the un-checkpointed
+    // frames) — the reopened count would come up short.
+    let db2 = Database::open(&path).unwrap();
+    let n: i64 = db2.query("SELECT count(*) FROM t", []).unwrap()[0][0].as_integer();
+    assert_eq!(n, 26, "the post-reset commit must be visible on reopen");
+    let marker: i64 = db2
+        .query("SELECT count(*) FROM t WHERE x = 99", [])
+        .unwrap()[0][0]
+        .as_integer();
+    assert_eq!(
+        marker, 1,
+        "the post-reset row itself must be the one visible"
+    );
+    drop(db2);
+    // And real SQLite must agree on what survived.
+    let con = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(integrity(&con), "ok");
+    assert_eq!(count(&con, "t"), 26);
+}
