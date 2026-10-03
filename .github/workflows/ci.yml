@@ -64,6 +64,27 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
+  # ---------------------------------------------------------------- security
+  # Supply-chain gate: every push is scanned against the RustSec
+  # advisory database (all lockfile dependencies — the engine, the bench
+  # harnesses, the sqlx interop surface). Paired with the engine's own
+  # security posture (pure-Rust memory safety, SCRAM-SHA-256 auth,
+  # constant-time compares, fuzzers seeded and run per push), this keeps
+  # "zero known RUSTSEC advisories" a CI-enforced property instead of a
+  # one-time claim.
+  audit:
+    name: cargo audit (RUSTSEC advisories)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: cargo audit (dependency advisories)
+        run: cargo audit
+
   # ------------------------------------------------------------------- linting
   clippy:
     name: clippy (${{ matrix.config }})

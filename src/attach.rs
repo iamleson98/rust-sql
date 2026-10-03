@@ -26,9 +26,13 @@
 //!   aggregate / set-op machinery runs unchanged over them.
 //! - **Transactions**: BEGIN / COMMIT / ROLLBACK / SAVEPOINT / RELEASE
 //!   propagate to every attached engine, so `BEGIN; INSERT INTO aux..;
-//!   INSERT INTO main..; ROLLBACK;` undoes both. Commits apply the
-//!   attached engines first and main last (sequential, not a SQLite
+//!   INSERT INTO main..; ROLLBACK;` undoes both. COMMIT applies MAIN
+//!   first, the attached engines after (sequential, not a SQLite
 //!   super-journal — the divergence is documented in the README).
+//!   Main-first is the safe sequential order: a failed main COMMIT
+//!   aborts the whole multi-engine transaction before any aux engine
+//!   is durable, so aux commits only ever follow a main commit that
+//!   already succeeded.
 //! - **Name resolution** matches SQLite exactly: unqualified names
 //!   search temp → main → attached in ATTACH order; `aux.t.c` three-part
 //!   column references resolve; unknown schemas error
@@ -239,8 +243,11 @@ impl Database {
         }
     }
 
-    /// COMMIT propagation: attached engines commit FIRST, main LAST (the
-    /// primary's commit is the anchor a caller observes).
+    /// COMMIT propagation: MAIN commits first (in the executor, before
+    /// this epilogue runs), the attached engines after. Main-first is
+    /// the safe sequential order — a failed main COMMIT aborts the
+    /// multi-engine transaction before any aux engine is durable (this
+    /// epilogue only runs on `result.is_ok()`).
     pub(crate) fn attached_commit(&self) -> Result<()> {
         for (_, engine) in self.attached_snapshot() {
             let mut aux = engine.write();

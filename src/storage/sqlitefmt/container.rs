@@ -275,6 +275,48 @@ impl FileIo {
             true
         }
     }
+
+    /// Handle-OWN identity check (fstat — no path resolution): the
+    /// append fast path's per-commit sidecar guard. Both properties the
+    /// old per-commit path statx established are readable from the
+    /// descriptor itself:
+    ///
+    /// - **replacement**: an unlinked / renamed-over inode reports
+    ///   `nlink == 0` while our descriptor stays open (unix
+    ///   `st_nlink`) — a temp+rename replacement, `rename()` over the
+    ///   path, or an unlink all drop the link count of the inode we
+    ///   hold. On non-unix (windows) replacement is impossible while
+    ///   we hold the handle at all: std opens WITHOUT FILE_SHARE_DELETE
+    ///   (rename-over fails with a sharing violation), so the length
+    ///   check below is the whole story there — the same guarantee the
+    ///   old path-stat `matches()` gave non-unix (length-only).
+    /// - **external append**: any other descriptor growing (or
+    ///   truncating) the same inode moves `len` away from the tracked
+    ///   write position.
+    ///
+    /// This is SQLite's own WAL discipline (the sidecar descriptor
+    /// stays open for the session's life; the writer never re-stats
+    /// the path per commit) — the path statx cost 2-6 us of pure
+    /// pathname resolution on every autocommit. Any surprise returns
+    /// false and the caller takes the fully verified slow path, which
+    /// re-establishes ground truth BY PATH (open + stat + salt check).
+    fn self_stat_ok(&self) -> bool {
+        let Ok(m) = self.file.metadata() else {
+            return false;
+        };
+        if m.len() != self.len {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            m.nlink() >= 1
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
 }
 
 /// Positioned read that does not move a shared cursor (pread on unix,
@@ -1842,14 +1884,15 @@ pub fn publish_phase_snapshot() -> [u64; 5] {
     ]
 }
 
-/// Append a WAL commit through the cached sidecar handle: one path stat
-/// (an external replacement / truncation / growth trips the fully
-/// verified slow path) + one positioned write at the writer's tracked
-/// length — SQLite's own discipline (the sidecar descriptor stays open
-/// for the session's life; the engine never re-opens, re-stats and
-/// re-verifies the salts per commit). Falls back to `append_wal_open`
-/// whenever the cache is cold or the identity moved, then keeps the
-/// handle it used warm for the next commit.
+/// Append a WAL commit through the cached sidecar handle: one HANDLE
+/// fstat (an external replacement / truncation / growth trips the fully
+/// verified slow path — see [`FileIo::self_stat_ok`]) + one positioned
+/// write at the writer's tracked length — SQLite's own discipline (the
+/// sidecar descriptor stays open for the session's life; the engine
+/// never re-opens, re-stats the PATH and re-verifies the salts per
+/// commit). Falls back to `append_wal_open` whenever the cache is cold
+/// or the identity moved, then keeps the handle it used warm for the
+/// next commit.
 fn append_wal_cached(
     st: &mut ContainerState,
     path: &Path,
@@ -1859,8 +1902,10 @@ fn append_wal_cached(
     sync: bool,
 ) -> Result<(), String> {
     let identity_ok = !wal_fastpath_disabled()
-        && std::fs::metadata(path)
-            .map(|m| st.wal_io.as_ref().map(|io| io.matches(&m)).unwrap_or(false))
+        && st
+            .wal_io
+            .as_ref()
+            .map(|io| io.self_stat_ok())
             .unwrap_or(false);
     if identity_ok {
         let t0 = std::time::Instant::now();

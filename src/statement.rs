@@ -487,27 +487,54 @@ impl<'a> Statement<'a> {
         if self.done {
             return Ok(StepResult::Done);
         }
+        // ── CELL-SERVE FAST PATH ──────────────────────────────────────
+        // The hot streaming shape — rows already copied into this
+        // statement's arena by a previous pull — served through ONE
+        // predicted branch: no gate probe, no Fresh check, no pending
+        // dequeue, no stream match. Serving reads only the statement's
+        // OWN arena bytes (copied under the pull's reader gate), so the
+        // concurrent-regime guard below is not needed on this path; the
+        // pager-walking sections (statement start, driver pulls) take
+        // it instead. Invariants: `cell_mode` ⇒ the stream is a live
+        // Driver and `pending` is empty (materialized batches only fill
+        // `pending` after cell serving was refused, which disarms
+        // cell_mode and clears the batch); `reset()` clears it all.
+        if self.cell_mode && self.cell_idx < self.cells.len() {
+            let plan = self.cell_plan.as_ref().expect("cell pull installed a plan");
+            if serve_cell_row(
+                plan,
+                &self.cell_arena,
+                &self.cells,
+                &mut self.cell_idx,
+                &mut self.serve_row,
+            ) {
+                self.cell_row_live = true;
+                return Ok(StepResult::Row);
+            }
+            // Rest of the batch failed to decode (corrupt rows skip,
+            // mirroring the pooled scan's tolerance): fall through and
+            // pull the next cell batch below — NOT the materialized
+            // path, which would double-advance the driver cursor.
+            self.cell_row_live = false;
+        }
+        // DML classification for the pull gates below (computed only on
+        // pull steps — the fast path returns before it for cell serves).
+        let stmt_is_dml = matches!(
+            self.stmt.as_ref(),
+            AstStatement::Insert(_) | AstStatement::Update(_) | AstStatement::Delete(_)
+        );
         // ── CONCURRENT-REGIME READER GATE ─────────────────────────────
         // On a bare shared `Arc<Database>` (the `&self` concurrent-transaction
         // API — no outer RwLock), a plain reader's multi-page walk could
         // otherwise straddle a concurrent COMMIT's shadow install (root
         // fetched before the install, leaf after) and observe a torn tree.
-        // The guard spans this whole step call (each step's batch is the
-        // documented atomicity unit for streaming drivers). DML never
-        // holds it (the plain-DML tripwire serializes plain writers, and
-        // concurrent-regime owners are stamp-protected instead); with the
-        // regime off the whole probe is one atomic load (None).
-        let _reader_gate = {
-            let is_dml = matches!(
-                self.stmt.as_ref(),
-                AstStatement::Insert(_) | AstStatement::Update(_) | AstStatement::Delete(_)
-            );
-            if !is_dml && self.db.concurrent_txn_for_caller().is_none() {
-                self.db.pager.plain_reader_gate()
-            } else {
-                None
-            }
-        };
+        // The guard is taken at the PAGER-WALKING sections of the step
+        // path — statement start and every driver pull (each pull's
+        // copied batch is the atomicity unit the consumer observes; the
+        // arena serves inside it need no guard). DML never holds it
+        // (the plain-DML tripwire serializes plain writers, and
+        // concurrent-regime owners are stamp-protected instead); with
+        // the regime off the whole probe is one atomic load (None).
         if matches!(self.stream, StreamState::Fresh) {
             // A hot INSERT chain owns the table's live root / max-rowid
             // while the shared maps hold stale values — break (flush) it
@@ -523,7 +550,10 @@ impl<'a> Statement<'a> {
             self.enc_guard = Some(crate::executor::ConnEncGuard::install(
                 self.db.conn_text_enc(),
             ));
-            self.start()?;
+            let gate = pull_gate_for(self.db, stmt_is_dml);
+            let started = self.start();
+            drop(gate);
+            started?;
         }
         // Serve one buffered row. The PREVIOUS current_row's consumer
         // reference is dead by now (row()/column_value() borrow self),
@@ -544,27 +574,10 @@ impl<'a> Statement<'a> {
         match &mut self.stream {
             StreamState::Driver(drv) => {
                 let db = self.db;
-                // (1) Serve from a live cell batch: decode the next entry
-                // into the serve buffer (zero row materialization). The
-                // accessors read serve_row until the batch drains.
-                if self.cell_mode && self.cell_idx < self.cells.len() {
-                    let plan = self.cell_plan.as_ref().expect("cell pull installed a plan");
-                    if serve_cell_row(
-                        plan,
-                        &self.cell_arena,
-                        &self.cells,
-                        &mut self.cell_idx,
-                        &mut self.serve_row,
-                    ) {
-                        self.cell_row_live = true;
-                        return Ok(StepResult::Row);
-                    }
-                    // Rest of the batch failed to decode (corrupt rows
-                    // skip, mirroring the pooled scan's tolerance): pull
-                    // the next cell batch below — NOT the materialized
-                    // path, which would double-advance the driver cursor.
-                    self.cell_row_live = false;
-                }
+                // (1) The cell serve lives at the TOP of step_inner now
+                // (the one-branch fast path; serving needs no reader
+                // gate). Reaching this point means the live batch is
+                // drained — or its tail was undecodable — so pull.
                 let params = self.params.clone();
                 let named = self.named.clone();
                 // (2) Undecoded-cell pulls — only while the driver has
@@ -575,6 +588,10 @@ impl<'a> Statement<'a> {
                 if !self.cells_refused {
                     loop {
                         let pull = {
+                            // Reader gate around the pager walk: the
+                            // pull copies its batch under the guard, and
+                            // the arena serves above run gate-free.
+                            let _gate = pull_gate_for(db, stmt_is_dml);
                             let arena = &mut self.cell_arena;
                             let entries = &mut self.cells;
                             drv.next_cells(db, &params, &named, SCAN_BATCH_ROWS, arena, entries)?
@@ -634,8 +651,10 @@ impl<'a> Statement<'a> {
                 // instead of 64. Wrapper drivers still receive exact
                 // budgets from THEIR callers, so LIMIT/OFFSET accounting
                 // is unaffected.
-                let batch =
-                    drv.next_batch(db, &params, &named, SCAN_BATCH_ROWS, &mut self.row_pool)?;
+                let batch = {
+                    let _gate = pull_gate_for(db, stmt_is_dml);
+                    drv.next_batch(db, &params, &named, SCAN_BATCH_ROWS, &mut self.row_pool)?
+                };
                 if batch.is_empty() {
                     self.done = true;
                     self.stream = StreamState::Exhausted;
@@ -1537,6 +1556,23 @@ impl CellPlan {
 /// same tolerance the pooled b-tree scan always had). A free function so
 /// `step` can hand it disjoint statement fields (plan / arena / cells /
 /// idx / serve buffer) while the driver borrow is live.
+/// The concurrent-regime reader gate for the step path's PAGER-WALKING
+/// sections (statement `start()`, driver pulls) — the same conditions
+/// the old whole-step gate used: DML statements and concurrent-regime
+/// owners are exempt (the plain-DML tripwire / owner stamps protect
+/// them); with the regime off this is one atomic load returning None.
+/// Cell-mode row serving (rows already copied into the statement's own
+/// arena by a gated pull) does NOT take it — that per-row probe was the
+/// S06 step-path residual the macOS-ARM fleet amplified.
+#[inline]
+fn pull_gate_for(db: &Database, is_dml: bool) -> Option<parking_lot::RwLockReadGuard<'_, ()>> {
+    if !is_dml && db.concurrent_txn_for_caller().is_none() {
+        db.pager.plain_reader_gate()
+    } else {
+        None
+    }
+}
+
 fn serve_cell_row(
     plan: &CellPlan,
     arena: &[u8],
