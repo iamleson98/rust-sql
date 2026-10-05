@@ -6377,15 +6377,16 @@ impl Pager {
             return Ok(());
         }
         // LAZY WRITE-BACK MODE (in-memory databases): pure no-op. Do NOT
-        // clear the dirty bookkeeping — the dirty_pages set and count are
-        // the record of what a future REAL flush (flush_before_snapshot at
-        // BEGIN, or eviction) must write. Clearing them here while pages
-        // keep their in-cache `.dirty` flag would orphan those pages: the
-        // next real flush would skip them, and ROLLBACK (which restores by
-        // clearing the cache and re-reading from the file) would hit short
-        // reads. All reads go through the cache, so skipping the file
-        // writes is safe; the temp file is deleted on close anyway.
-        if self.lazy_writeback.load(Ordering::Acquire) {
+        // LAZY WRITE-BACK SKIP — MEMORY STORES ONLY. The flag was built
+        // for in-memory pagers (the file is never the committed state, so
+        // flushing to it is meaningless; the store's Vec IS the image).
+        // A FILE-backed pager with lazy evictions (the VACUUM temp — its
+        // disposability makes in-place eviction writes right) still needs
+        // THIS flush to write every dirty page that never overflowed the
+        // cache: the file IS its committed state (the install reads it
+        // back). The ungated skip published incomplete images and lost
+        // whole tables (CI 37301225862's vacuum_then_reopen).
+        if self.lazy_writeback.load(Ordering::Acquire) && self.store.read().is_memory() {
             return Ok(());
         }
         // O(1) fast path: if no writes happened since the last flush, skip
