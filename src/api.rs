@@ -4421,6 +4421,16 @@ impl Database {
         let _ = std::fs::remove_file(&tmp_path);
         let build = (|| -> Result<CompactSrc> {
             let mut tmp = Database::open(&tmp_path)?;
+            // THE TEMP IS DISPOSABLE — arm lazy write-back. Its cache
+            // evictions then write dirty pages IN PLACE instead of
+            // spilling them to the delete-journal sidecar (an
+            // append-only log: the copy's index rebuild re-dirties the
+            // same leaves across k-cycles, and the re-spill versioning
+            // is quadratic in scale — 73 GB of sidecar next to a 2.5 GB
+            // image at 100M rows, ~86 MB at 10M where nobody noticed).
+            // A failed vacuum drops the whole temp file; it never rolls
+            // back, so in-place overwrites are exactly right here.
+            tmp.pager.lazy_writeback.store(true, Ordering::Release);
             if let Some(c) = self.pager.active_page_codec() {
                 tmp.pager.set_codec(Some(c))?;
             }
