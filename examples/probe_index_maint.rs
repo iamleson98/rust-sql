@@ -318,9 +318,7 @@ fn experiment_f(keys_cycle: u64, touched: u64, shift: i64) {
         }
     });
 
-    println!(
-        "[F] raw per-op API on a {keys_cycle}-entry index ({build_ms:.0} ms bulk build):"
-    );
+    println!("[F] raw per-op API on a {keys_cycle}-entry index ({build_ms:.0} ms bulk build):");
     println!(
         "    rowid-order (today):        {:>9.1} ms  ({:.2} us/op-pair)",
         f1_ms,
