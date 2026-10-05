@@ -484,9 +484,22 @@ jobs:
           - os: ubuntu-latest
             rows: "10000000"
             vs: "1"
+          # rate_floor: the Windows runner-disk family runs the M1 bulk
+          # build ~10x slower than ubuntu/macOS for the SAME code (the
+          # commit path is fsync-bound): three code-identical CI samples
+          # measured 38.8k / 52.3k / 81.8k rows/s — the default 60k floor
+          # sat ABOVE the healthy Windows band and flapped (runs
+          # 37325065383 + 37301225862 both failed it on slow draws while
+          # 37305068286 passed at 81.8k). 20k is the anti-collapse bound
+          # for THIS platform: ~2x below the worst observed healthy draw,
+          # still 4x+ above a real regression collapse (quadratic insert
+          # / write-amp shapes measure <10k at 5M rows); the degradation
+          # and commit-latency ratio gates carry the shape-collapse duty
+          # load-independently either way.
           - os: windows-latest
             rows: "5000000"
             vs: "0"
+            rate_floor: "20000"
           - os: macos-latest
             rows: "5000000"
             vs: "0"
@@ -503,6 +516,9 @@ jobs:
           MEGA_ROWS: ${{ matrix.rows }}
           MEGA_VS_SQLITE: ${{ matrix.vs }}
           MEGA_PROBES: "2000"
+          # Empty on non-windows entries -> the test's parse falls back
+          # to its default floor (60k non-lean / 100k lean).
+          MEGA_RATE_FLOOR: ${{ matrix.rate_floor }}
 
   # The 100M-row discipline: weekly (schedule) + manual dispatch only —
   # a 100M build takes hours on shared runners and burns the runner-disk
