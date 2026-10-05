@@ -1919,3 +1919,21 @@ Work Log:
 Stage Summary:
 - The user's contract is CI-enforced: the weekly + dispatch 100M job proves outperformance (win gates on build/aggregate/group97, anti-collapse on the documented residuals, flat RSS, exact answers) at 100,000,000 rows.
 - Four engine fixes/findings this round: the WAL checksum-chain invariant (reader freeze + post-recovery invisibility), the double-ROLLBACK-TO poison (pre-existing tree corruption), the savepoint pre-image spill (bounded undo RAM at any scale), and the vacuum temp's lazy write-back (the 73 GB sidecar). The sorted-batch index apply now owns three documented manifestations (band-update ratio, vacuum index fill, WAL re-spill versioning) — the scoped next round.
+
+---
+Task ID: mega-5
+Agent: main (Super Z)
+Task: The CI verdict chase at 5418a2a — run 37305068286's macOS bench-gate flip (Point lookup by indexed col, 0.65x) and the steady-state discipline the four point-lookup rows were missing.
+
+Work Log:
+- Run 37305068286 (5418a2a): 39/41 green; the sole real failure was bench-gate (macos) — bench_compare's "Point lookup by indexed col (1000 ops)" at 697.54 µs vs SQLite 455.00 µs (0.65x LOSS); ci-ok rode along. The same gate was green on ubuntu (1.27x) and windows (1.25x) in the same run.
+- History of the row on macOS: 368.67 µs (1.23x WIN, 9cd03e6 run 37263693498) -> 558/557 µs (0.84x/0.81x TIE, 28c833f/e5d16d2) -> 697.54 µs (0.65x LOSS, 5418a2a) — while macOS SQLite sat DEAD STABLE at 452-470 µs across all four runs. Same runner image (macos-26-arm64) throughout.
+- Code-vs-environment isolation on identical hardware (the dev server): HEAD 712-865 µs vs 9cd03e6 675-989 µs single-pass — NO regression (HEAD if anything slightly ahead); both engines vary ±20% run to run on this row single-pass.
+- The smoking gun was already in the failed run's own log: probe_point_shapes measured the SAME binary + SAME shape at 346.792 µs/1000 best-of-10 on the same runner that had just measured the bench row at 697.54 µs single-pass — the engine's steady state beats SQLite (346 ns vs 455 ns per query); the single timed pass never reaches steady state because it runs right after the section battery + CREATE INDEX and pays mimalloc deferred-free purges inside its only window.
+- Root cause: the four point-lookup harnesses (rowid + indexed, both engines) were the ONLY single-pass rows left in bench_compare — every range-scan row already used best_of::<7> with adaptive warmup, and the file's own best_of doc states the convention ("applied to BOTH engines identically"). The rowid twin survived single-pass only because it runs early (little accumulated garbage); the indexed twin runs right after CREATE INDEX's allocation storm.
+- Fix (d6b90b8): all four point-lookup harnesses converted to best_of::<7> — same 1000 real queries, same fair-work decode parity, identical discipline on both engines (SQLite keeps its prepare-outside-the-timer and gains best-of too). No tolerance changes, no gate pins touched, row names/format unchanged (parser unaffected).
+- Local verification: fmt clean; clippy --examples -D warnings clean; the gate script run locally: Point lookup by indexed col 544.74 µs vs 784.56 µs = 1.44x WIN, Point lookup by rowid 338.93 µs vs 496.38 µs = 1.46x WIN (the shared-VPS noise rows — Mixed 80/20 0.71x, Multi-row VALUES 0.94x — measure 1.00x-1.35x on every CI OS and were untouched by this change).
+- Pushed d6b90b8; tracking run 37325065383 to the verdict.
+
+Stage Summary:
+- The last single-pass measurement in bench_compare is gone; the gate now measures the same steady state on both engines that the range-scan rows always measured. The macOS flip class (a one-time-cost window landing inside a single timed pass) is closed for this family.
