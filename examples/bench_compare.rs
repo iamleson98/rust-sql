@@ -566,16 +566,29 @@ fn sqlite_join_2table(conn: &rusqlite::Connection) -> Duration {
     // Like-for-like with `Database::query` (which materializes Vec<Row>):
     // materialize typed rows on the SQLite side too. Stepping without
     // reading values would compare DIFFERENT amounts of work.
+    //
+    // 1000-query loop (the point-lookup rows' shape): the row's
+    // single-shot ~2 µs window measured the runner's micro-state, not
+    // the engine — the macOS gate flip of run 37340548292 measured it
+    // at 4.96 µs (0.43x LOSS) while the 3-table sibling (the same join
+    // machinery, 7x the work) won 1.14x in the SAME job: no per-query
+    // constant, pure window-scale noise (the gate's own micro-row doc
+    // documents the class — timer granularity + scheduler quanta own a
+    // 2 µs loop). The loop lifts the row to the ms regime where best_of
+    // converges and the strict band applies. Identical treatment on
+    // both engines.
     best_of::<5>(|| {
         let start = Instant::now();
-        let rows: Vec<(String, i64)> = stmt
-            .query_map(params![500], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-            })
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
-        std::hint::black_box(&rows);
+        for _ in 0..1000 {
+            let rows: Vec<(String, i64)> = stmt
+                .query_map(params![500], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                })
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            std::hint::black_box(&rows);
+        }
         start.elapsed()
     })
 }
@@ -977,9 +990,15 @@ fn rustqlite_join_2table(db: &mut rustqlite::Database) -> Duration {
         "SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = ?";
     // Steady-state warmup (see rustqlite_range_scan).
     let _ = db.query(sql, [Value::Integer(1)]).unwrap();
+    // 1000-query loop — see the SQLite twin for the full rationale
+    // (the macOS gate flip of run 37340548292: single-shot 2 µs window
+    // = runner micro-state, not engine cost; the 3-table sibling won
+    // 1.14x in the same job). Same treatment on both engines.
     best_of::<5>(|| {
         let start = Instant::now();
-        let _ = db.query(sql, [Value::Integer(500)]).unwrap();
+        for _ in 0..1000 {
+            let _ = db.query(sql, [Value::Integer(500)]).unwrap();
+        }
         start.elapsed()
     })
 }
@@ -1337,7 +1356,7 @@ fn main() {
         let d_s = sqlite_join_2table(&conn_j);
         println!(
             "{:<50} {:>12} {:>12}",
-            "2-table join (filter by PK, ~10 rows out)",
+            "2-table join (filter by PK, 1000 ops)",
             fmt_dur(d_r),
             fmt_dur(d_s)
         );
