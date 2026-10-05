@@ -394,7 +394,12 @@ jobs:
   limit-stress:
     name: limit-stress (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # 120 min: the Windows runner-disk family runs this fsync-heavy
+    # marathon 6-12x slower than ubuntu/macOS (4-7 min there), and the
+    # observed Windows draws were 28 / 38.8 / 60.3+ min (run 37331278752
+    # hit the old 60-min ceiling mid-suite and cancelled). The ceiling
+    # only binds on slow Windows draws — typical draws finish in ~30-40.
+    timeout-minutes: 120
     env:
       CARGO_PROFILE_RELEASE_DEBUG: "0"
       LIMIT_ROWS: "1000000"
