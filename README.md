@@ -42,6 +42,7 @@ Every claim below is a CI-gated, answer-equality-asserted measurement against bu
 - Serial OLTP: single-row autocommit inserts **2.1x**, DELETE by PK **2.6x**, point lookups **1.6–1.8x**, UPDATE by PK **1.5x**, mixed R/W **1.14x**.
 - Analytics: aggregates **3.3x**, GROUP BY **1.6x**, range scans **1.75x**, bare `COUNT(*)` **26x** (memoized on the B+tree).
 - Specialized indexes SQLite does not have: Postgres-style GIN full-text **850x** on rare-term queries, geospatial KNN **320x**.
+- **The win GROWS with scale — at 100M rows** (weekly CI job, win-enforced gates): bulk build **1.52x** (74.5k vs 48.9k rows/s), full-band aggregate **1.3x faster**, GROUP BY over the full band **5.1x faster** — with peak RSS **flat at 162 MB** through the whole 100M marathon (build + churn storm + `BEGIN CONCURRENT` soak + mass-DELETE + VACUUM + reopen cycles; the per-row RSS budget holds at every scale). At 10M rows the build sat at 0.69x — SQLite's own cyclic-index insert cost degraded harder as the row count grew.
 
 **Parallel execution — SQLite's executor is single-threaded by design.** rustqlite splits scans, sorts, top-N, group-bys and join probes across worker threads (`PRAGMA parallel_scan`, bit-identical output, serial fallback): 1M-row aggregates **5.8–8.8x**, top-N **2.2–2.6x**, `COUNT(*)` over an 8.3M-row hash join **14x**.
 
@@ -164,6 +165,22 @@ rustqlite splits scans across worker threads; SQLite's executor is single-thread
 - **Joins**: fused streaming hash join (build once, parallel probe split), multi-key composite hashing with value verification, non-equi conditions compiled to allocation-free positional terms, join reordering + subset-DP cost search (bushy plans SQLite cannot generate), ON-conjunct pushdown
 - **Concurrency**: see below — the multipliers stack on top of the serial wins
 
+### Mega-scale: 100,000,000 rows (weekly CI job, win-enforced)
+
+The lean-shape marathon at 100M rows vs bundled SQLite on the same box, same statements, answer-equality-asserted before every timing (calibration `mega100m_g`; the weekly job re-proves it with win-enforcement gates — build >= 1.0x, aggregate <= 1.0x, group97 <= 0.6x):
+
+| Shape | rustqlite | SQLite | Ratio |
+|---|---|---|---|
+| Bulk build (rows/s) | **74,552** | 48,926 | **1.52x** |
+| Full-band aggregate | 6,671 ms | 8,707 ms | **0.77x** (1.3x faster) |
+| GROUP BY k%97, full band | 6,923 ms | 35,386 ms | **0.20x** (5.1x faster) |
+| Mass UPDATE of indexed column (capped band) | 51.3 s | 15.7 s | 3.28x (the documented residual) |
+| Top-25 by indexed column | 5.2 s | ~0 ms | the O(range) vs O(k) structural gap (see Remaining gaps) |
+| File size | 3,393.8 MB | 3,159.6 MB | 1.07x (near-par at lean; 2.35x smaller at the 10M full shape) |
+| Marathon peak RSS delta | **162.4 MB** | — | flat against the 476 MB per-row budget |
+
+The mass-DML statements in the 100M job are range-capped for the runner's disk (a full-range mass statement at 100M grows the WAL sidecar ~10x the database — cyclic-index re-dirty versioning, disk physics paid equally by SQLite's own WAL); M9 runs the same capped statement on both engines, so the ratios stay apples-to-apples.
+
 ## Resource consumption vs SQLite
 
 | Metric | rustqlite | SQLite | Verdict |
@@ -256,7 +273,7 @@ The honest ledger — verifiable absence (`module_list` / `function_list` / `com
 
 - **One serial row-shape at parity**: the unfiltered 2-table PK join (1.18x warm; 1.38x at 1M-row parallel scale).
 - **8-conn mixed R/W 80/20**: fsync-latency-dominated on SQLite's side — **7.3–8.5x** on the current CI fleet (SQLite drew ~690 ms on both macOS and ubuntu runners: 640 serial commit fsyncs), **13.7x** on a quiet 6-core box, parity-class only when a runner's fsyncs draw fast. Reads inside stay 2.8x.
-- **Mass UPDATE of an indexed column**: **2.4–3.2x** vs SQLite across 500K–10M rows (mega-scale M9 + `examples/bandupd_probe.rs`; the ratio is flat across scales — a per-op gap, not a scaling collapse). 82% of the cost is per-row index maintenance — a random delete-descent + insert-descent per updated row — where SQLite's ONEPASS update pays the same two index walks but one table walk total. The follow-up is a sorted-batch index apply (one ordered index walk for the whole statement), the index-side twin of the existing `update_table_bulk` merge path on the table side.
+- **Mass UPDATE of an indexed column**: **2.4–3.3x** vs SQLite across 500K–100M rows (mega-scale M9 + `examples/bandupd_probe.rs`; the ratio is flat across scales — a per-op gap, not a scaling collapse: **3.28x** at the 100M calibration). 82% of the cost is per-row index maintenance — a random delete-descent + insert-descent per updated row — where SQLite's ONEPASS update pays the same two index walks but one table walk total. The follow-up is a sorted-batch index apply (one ordered index walk for the whole statement), the index-side twin of the existing `update_table_bulk` merge path on the table side. The same missing piece shows up twice more at 100M: the VACUUM index rebuild (id-ordered k-cycled arrival leaves index leaves ~60% full where SQLite's vacuum SORTS its index builds) and the long-statement WAL re-spill versioning above (the 100M job's mass-DML caps exist because of it).
 - (The SQLite-format per-commit residual that used to sit here is gone with the container: the native container's page-granular WAL is the only commit path now, and it was never behind.)
 
 ### Resource
@@ -340,7 +357,7 @@ The matrix is modeled on SQLite's own testing methodology ([sqlite.org/testing.h
 | Archive CLI parity | `cli_archive.rs` | `.archive` create/list/extract/update byte-parity vs the real 3.53.4 shell over checked-in oracle fixtures (zip + sqlar + deflated members) |
 | Concurrency | `concurrent_writes.rs`, `committed_view.rs`, `concurrent_reader_visibility.rs` | multi-writer regimes, snapshot isolation, reader invariants |
 | Push-to-the-limit | `limit_stress.rs` (dedicated CI job, 3 OSes) | 1M-row file builds with throughput/RSS/file-bloat guards; 48-table × 64-column breadth; open/close cycles; 4-writer soaks; cache accounting; delete-churn reuse + VACUUM reclamation |
-| Mega-scale marathon | `mega_scale.rs` (CI: ubuntu 10M + vs-SQLite, win/mac 5M, 20K smoke in the default matrix, weekly 100M dispatch) | the M1–M9 discipline — bulk-build degradation+rate gates, exact-answer read battery, reopen cycles, churn + mixed-op storm, `BEGIN CONCURRENT` soak, mass-DELETE + VACUUM reclamation, memory flatness against a per-row RSS budget, final verification, vs-bundled-SQLite anti-collapse gates |
+| Mega-scale marathon | `mega_scale.rs` (CI: ubuntu 10M + vs-SQLite, win/mac 5M, 20K smoke in the default matrix, weekly + dispatch 100M vs-SQLite) | the M1–M9 discipline — bulk-build degradation+rate gates, exact-answer read battery, reopen cycles, churn + mixed-op storm, `BEGIN CONCURRENT` soak, mass-DELETE + VACUUM reclamation, memory flatness against a per-row RSS budget, final verification, vs-bundled-SQLite gates (anti-collapse at 10M; **win-enforcement at 100M**) |
 | Parallel equality | `parallel_scan.rs`, `parallel_join.rs` | parallel == serial, bit-identical |
 | Interop | `sqlite_interop.rs`, `utf16_interop.rs`, `cli_ops.rs` | both-direction file exchange, real SQLite as oracle |
 | Cross-database triggers | `attach_triggers.rs` | the TEMP-trigger surface (firing, guards, RAISE atomicity across engines, DETACH dormancy, validation texts) — pinned against 3.53.4 |
