@@ -143,7 +143,7 @@ impl PreimageLog {
             buf.extend_from_slice(bytes);
             cursor += 8 + bytes.len() as u64;
         }
-        let file = self.file.as_ref().unwrap();
+        let file = self.file.as_mut().unwrap();
         match positioned_write_all(file, &buf, self.next_offset) {
             Ok(()) => {
                 self.next_offset = cursor;
@@ -366,42 +366,74 @@ impl Drop for PreimageLog {
     }
 }
 
-fn positioned_write_all(file: &File, buf: &[u8], at: u64) -> io::Result<()> {
-    use std::os::unix::io::AsRawFd;
+/// Platform positioned read: reads into `buf` at `offset` WITHOUT
+/// touching the kernel file position (the tempstore position
+/// discipline — see that module's Windows lesson).
+#[cfg(unix)]
+fn positioned_read_once(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.read_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn positioned_read_once(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    file.seek_read(buf, offset)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn positioned_read_once(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = file.try_clone()?;
+    f.seek(SeekFrom::Start(offset))?;
+    f.read(buf)
+}
+
+/// Platform positioned write (see `positioned_read_once`). NOTE: the
+/// Windows `seek_write` needs `&mut File` — callers pass it.
+#[cfg(unix)]
+fn positioned_write_once(file: &mut File, buf: &[u8], offset: u64) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.write_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn positioned_write_once(file: &mut File, buf: &[u8], offset: u64) -> io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    file.seek_write(buf, offset)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn positioned_write_once(file: &mut File, buf: &[u8], offset: u64) -> io::Result<usize> {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut f = file.try_clone()?;
+    f.seek(SeekFrom::Start(offset))?;
+    f.write(buf)
+}
+
+fn positioned_write_all(file: &mut File, buf: &[u8], at: u64) -> io::Result<()> {
     let mut done = 0usize;
     while done < buf.len() {
-        let n = unsafe {
-            libc::pwrite(
-                file.as_raw_fd(),
-                buf[done..].as_ptr() as *const libc::c_void,
-                (buf.len() - done) as libc::size_t,
-                (at + done as u64) as libc::off_t,
-            )
-        };
-        if n <= 0 {
-            return Err(io::Error::last_os_error());
+        let n = positioned_write_once(file, &buf[done..], at + done as u64)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "pre-image spill: zero-byte positioned write",
+            ));
         }
-        done += n as usize;
+        done += n;
     }
     Ok(())
 }
 
 fn pread_full(file: &File, buf: &mut [u8], at: u64) -> bool {
-    use std::os::unix::io::AsRawFd;
     let mut done = 0usize;
     while done < buf.len() {
-        let n = unsafe {
-            libc::pread(
-                file.as_raw_fd(),
-                buf[done..].as_mut_ptr() as *mut libc::c_void,
-                (buf.len() - done) as libc::size_t,
-                (at + done as u64) as libc::off_t,
-            )
-        };
-        if n <= 0 {
-            return false;
+        match positioned_read_once(file, &mut buf[done..], at + done as u64) {
+            Ok(0) => return false,
+            Ok(n) => done += n,
+            Err(_) => return false,
         }
-        done += n as usize;
     }
     true
 }
