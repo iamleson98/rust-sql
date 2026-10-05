@@ -1351,7 +1351,15 @@ struct SavepointLevel {
     /// page id -> page bytes as of this savepoint's creation (captured at
     /// first fetch after creation). Pages allocated AFTER the savepoint
     /// (id >= base.n_pages) are dropped rather than restored.
-    pages: std::collections::HashMap<PageId, Vec<u8>, PageIdHashBuild>,
+    ///
+    /// Bounded-RAM discipline (storage::preimage): recent captures stay
+    /// in the hot map; past the page threshold the hot set drains to an
+    /// append-only temp file with an id->offset index in RAM. A mass
+    /// UPDATE touching every leaf of a multi-GB table journals O(touched
+    /// pages) of pre-images — the 100M marathon's M4 measured a 2.3 GB
+    /// peak here — where SQLite writes the same images to its on-disk
+    /// rollback journal. The spill keeps that flat at any scale.
+    pages: crate::storage::preimage::PreimageLog,
 }
 
 impl Pager {
@@ -1369,7 +1377,7 @@ impl Pager {
         sp.push(SavepointLevel {
             name: name.to_ascii_lowercase(),
             base: PagerSnapshot::capture(self),
-            pages: std::collections::HashMap::default(),
+            pages: Default::default(),
         });
         // A new level's base is the CURRENT n_pages (>= every existing
         // base — pages only grow), so the min cannot shrink and the max
@@ -1415,7 +1423,7 @@ impl Pager {
             sp.push(SavepointLevel {
                 name: name.to_ascii_lowercase(),
                 base: level.base.clone(),
-                pages: std::collections::HashMap::default(),
+                pages: Default::default(),
             });
             let keep_depth = sp.len();
             self.savepoint_depth.store(keep_depth, Ordering::Release);
@@ -1441,6 +1449,22 @@ impl Pager {
         // existing undo entries (any page in OUR log was fetched after the
         // lower savepoints were created, so they logged it first — the
         // capture hook's or_insert is a no-op for them).
+        //
+        // UNDO-CAPTURE SUSPENSION (the double-ROLLBACK-TO poison): the
+        // restore loop's own get_page()s must NOT capture. The stack was
+        // re-shaped above with the target RE-PUSHED and an empty log —
+        // without suspension, every restore-loop fetch captures the
+        // page's PRE-RESTORE bytes (the post-mutation state being undone)
+        // into that fresh level (capture fires on cache HITS too). A
+        // second ROLLBACK TO the same name then "restores" those poisoned
+        // images, tearing the tree into a mixed state (found by
+        // tests/preimage_spill.rs::nested_savepoints_across_drain_generations:
+        // a stale post-split parent pointer to a page the first rollback
+        // dropped — "page N out of range"). The restore is not a mutation
+        // to journal: the bytes it overwrites are the state being UNDONE,
+        // garbage for every future rollback-to-this-level; a LATER real
+        // mutation re-fetches (and captures) under an unsuspended scope.
+        let _undo_suspend = suspend_undo_capture();
         for (id, bytes) in undo {
             if id >= base.n_pages {
                 continue; // allocated after the savepoint — dropped below
@@ -1566,8 +1590,9 @@ impl Pager {
         if self.committed_view_used.load(Ordering::Acquire) {
             if let Some(begin_level) = sp.first() {
                 let mut cp = self.committed_pages.write();
-                for id in begin_level.pages.keys() {
-                    cp.remove(id);
+                let touched: Vec<PageId> = begin_level.pages.ids().copied().collect();
+                for id in touched {
+                    cp.remove(&id);
                 }
             }
         }
@@ -1635,11 +1660,7 @@ impl Pager {
         }
         // Fast exit: the newest level already has this page (the common
         // re-fetch loop on a hot page).
-        if sp
-            .last()
-            .map(|s| s.pages.contains_key(&id))
-            .unwrap_or(false)
-        {
+        if sp.last().map(|s| s.pages.contains(&id)).unwrap_or(false) {
             return;
         }
         // Pages allocated AFTER a level's base are DROPPED on rollback to
@@ -1696,7 +1717,7 @@ impl Pager {
         }
         for level in sp.iter_mut() {
             if (id as u64) < level.base.n_pages as u64 {
-                level.pages.entry(id).or_insert_with(|| bytes.clone());
+                level.pages.insert(id, bytes.clone());
             }
         }
     }
@@ -3598,7 +3619,7 @@ impl Pager {
                 // UNINIT (see the main miss path): copy_from_slice writes
                 // every byte (a size mismatch panics before visibility).
                 let mut page = Page::new_uninit(id, psz);
-                page.data.copy_from_slice(bytes);
+                page.data.copy_from_slice(&bytes);
                 let pr: PageRef = Arc::new(Mutex::new(page));
                 let entry = CommittedEntry { pr, alias: false };
                 self.cache_committed_page(id, &entry);
