@@ -1937,3 +1937,21 @@ Work Log:
 
 Stage Summary:
 - The last single-pass measurement in bench_compare is gone; the gate now measures the same steady state on both engines that the range-scan rows always measured. The macOS flip class (a one-time-cost window landing inside a single timed pass) is closed for this family.
+
+---
+Task ID: mega-6
+Agent: main (Super Z)
+Task: The 37325065383 verdict chase (the Windows mega-scale M1 rate-floor flap) + the sorted-batch index apply round's calibration probe.
+
+Work Log:
+- Run 37325065383 (d6b90b8): the macOS bench-gate is GREEN — Point lookup by indexed col measured 369.58 us vs SQLite 479.50 us = 1.30x WIN (was 697 us / 0.65x LOSS), matching probe_point_shapes' steady-state prediction almost exactly (346 us best-of-10); bench_compare 18 wins / 2 ties / 0 losses. The steady-state discipline fix worked as designed.
+- The new failure this run: mega-scale (windows-latest, 5M) — M1 bulk build 38,843 rows/s < the 60,000 default floor. NOT a code regression: my commit touched only examples/bench_compare.rs; three code-identical CI samples measured 38.8k (this run) / 52.3k (e5d16d2, run 37301225862 - failed then too but the run was cancelled) / 81.8k (5418a2a, run 37305068286 - passed) — a 2.1x Windows runner-disk spread on the fsync-bound commit path. Same run: ubuntu 380k rows/s, macOS 286k rows/s for the same work — the Windows disk family is ~10x slower and the 60k floor sat ABOVE the healthy Windows band.
+- Fix (48e41b4): MEGA_RATE_FLOOR=20000 for the windows matrix entry only (the knob the mega-4 round added for slow-disk environments): ~2x below the worst observed healthy draw, 4x+ above a real collapse shape; the degradation + commit-latency ratio gates carry the shape-collapse duty load-independently. ubuntu/macOS keep the 60k default.
+- The sorted-batch index apply round's calibration probe (5e5d0f3, examples/probe_index_maint.rs), all on the M9 shape (2M rows, 10% band, +500k shift):
+  (A) per-row maintain 5.65 us/touched-row; (B) table floor 0.74 — 87% of A is index maintenance (matches mega-2's 82% attribution);
+  (C) CREATE INDEX bulk build 1.29 us/table-row — the drop+rebuild strategy (D = B + C) only breaks even at ~27% of the table touched; the M9 band is 10% — rebuild is dead, the pinned-leaf walk is the plan;
+  (E) SQLite 2.59 us/touched-row (engine 2.18x);
+  (F) THE DECISIVE NUMBER: identical op sets through the raw per-op Btree API on a realistic 1M-entry cyclic index — rowid order (today's executor order) 3.03 us/op-pair vs key-sorted 1.91 (1.58x recovery): only 37% of the per-op cost is order-sensitive. Executor-side sorting alone cannot close the 2.2x gap; the walk must PIN THE LEAF (skip the per-op root descent). Cost model per touched row: 0.74 table rewrite + ~1.9 executor overhead (key encode/decode, partial-membership checks) + ~3.0 two tree descents — the batch walk targets the 3.0, the executor trim targets the 1.9.
+
+Stage Summary:
+- The mega-5 bench fix is verified green on macOS by the run itself; the Windows M1 floor is calibrated to its hardware family (48e41b4). The sorted-batch round now has its design data: pinned-leaf walk + executor-side key-path trim, NOT drop+rebuild, NOT sort-only. Three commits staged for the push once 37325065383 completes: 33aa3a2 (worklog), 48e41b4 (CI floor), 5e5d0f3 (probe).
