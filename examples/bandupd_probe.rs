@@ -65,7 +65,7 @@ fn main() {
 
     // ---- bundled SQLite (rusqlite) ----
     let spath = dir.path().join("sq.db");
-    let mut sc = rusqlite::Connection::open(&spath).unwrap();
+    let sc = rusqlite::Connection::open(&spath).unwrap();
     sc.pragma_update(None, "journal_mode", "WAL").unwrap();
     sc.pragma_update(None, "synchronous", "NORMAL").unwrap();
     let t = Instant::now();
