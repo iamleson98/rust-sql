@@ -2345,6 +2345,72 @@ impl Drop for ReadBurstDrain<'_> {
     }
 }
 
+/// Diagnostics helper for RSQL_VAC_TIMING: the compact source's shape.
+fn c_variant(c: &CompactSrc) -> &'static str {
+    match c {
+        CompactSrc::Image(_) => "page-image",
+        CompactSrc::File(_) => "row-file",
+    }
+}
+
+/// Batched multi-VALUES INSERT for the VACUUM row copier: one
+/// statement per batch of rows, values bound positionally (no literal
+/// escaping — TEXT/BLOB/REAL/NULL pass through `Value` verbatim).
+/// Batches shrink so the bind-parameter count stays <= 32768 (the
+/// SQLite-era bound; the engine itself has no cap, this keeps the SQL
+/// string and bind surface in the proven OLTP shape).
+fn insert_rows_batched(
+    tmp: &mut Database,
+    target: &str,
+    col_list: &str,
+    rows: &[Row],
+) -> Result<()> {
+    let n_cols = rows.first().map(|r| r.len()).unwrap_or(0);
+    if n_cols == 0 || rows.is_empty() {
+        return Ok(());
+    }
+    let tuple = format!(
+        "({})",
+        std::iter::repeat("?")
+            .take(n_cols)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    // Split the batch so tuples x cols <= 32768 binds.
+    let max_tuples_per_stmt = (32_768 / n_cols).clamp(1, rows.len());
+    let mut start = 0usize;
+    while start < rows.len() {
+        let end = (start + max_tuples_per_stmt).min(rows.len());
+        let n = end - start;
+        let mut sql = String::with_capacity(64 + n * (tuple.len() + 1));
+        sql.push_str("INSERT INTO ");
+        sql.push_str(target);
+        sql.push_str(" (");
+        sql.push_str(col_list);
+        sql.push_str(") VALUES ");
+        let mut flat: Vec<Value> = Vec::with_capacity(n * n_cols);
+        for (j, row) in rows[start..end].iter().enumerate() {
+            if j > 0 {
+                sql.push(',');
+            }
+            sql.push_str(&tuple);
+            flat.extend(row.iter().cloned());
+        }
+        tmp.execute(sql.as_str(), flat)?;
+        start = end;
+    }
+    Ok(())
+}
+
+/// VACUUM's compact source (see [`Database::build_compact_image_src`]):
+/// the page-level path hands back a ready image; the row-level path
+/// hands back the TEMP FILE it built (streamed into place, never
+/// materialized).
+enum CompactSrc {
+    Image(Vec<u8>),
+    File(std::path::PathBuf),
+}
+
 impl Database {
     /// Open or create a database at the given path.
     ///
@@ -3958,8 +4024,13 @@ impl Database {
         // cover (an object root would move — schema rootpage columns
         // would need re-encoding) keep the image path below; VACUUM INTO
         // never reaches it (the SQLite-format export returns first).
+        let vac_t0 = std::time::Instant::now();
+        let vac_dbg = std::env::var_os("RSQL_VAC_TIMING").is_some();
         if wal_install && v.into.is_none() {
             let roots = self.object_roots_from_schema()?;
+            if vac_dbg {
+                eprintln!("[vac] in-place eligibility walk: {:?}", vac_t0.elapsed());
+            }
             let plan = crate::storage::vacuum::plan_in_place_compaction(&self.pager, &roots)?;
             if let Some(plan) = plan {
                 self.pager.install_in_place_compaction(&plan)?;
@@ -3972,6 +4043,11 @@ impl Database {
                 catalog.schema_cookie = self.pager.schema_cookie();
                 load_schema(&self.pager, &mut catalog)?;
                 self.adopt_catalog_after_vacuum(catalog);
+                // Same stage-boundary discipline as the rebuild path
+                // below: the moves' churn (page copies, patch locks,
+                // eviction spills) is fully freed here — collect so the
+                // next phase's peak does not stack on it.
+                drain_mimalloc_wake();
                 return Ok(());
             }
         }
@@ -3998,71 +4074,182 @@ impl Database {
             return Ok(());
         }
 
-        let image = self.build_compact_image()?;
+        // The compact source: an in-RAM image (the page-level path —
+        // dense shapes) or a temp FILE (the row-level path — codec DBs
+        // and mass-delete shapes). The FILE source is STREAMED into
+        // place and never materialized: the mega-scale suite found the
+        // whole-image read-back alone adding transient RSS equal to the
+        // compact file (100+ MB per 2M rows vacuumed, gigabytes at 100M).
+        let compact = {
+            let t = std::time::Instant::now();
+            let c = self.build_compact_image_src()?;
+            if vac_dbg {
+                eprintln!(
+                    "[vac] compact image build ({:?}): {:?}",
+                    c_variant(&c),
+                    t.elapsed()
+                );
+            }
+            c
+        };
+        // RSS STAGE BOUNDARY: the compact-image build churned the
+        // allocator across the whole database (the temp-DB row copy,
+        // index backfills, statement machinery) and every one of those
+        // blocks is free by now — the temp handle is dropped inside the
+        // builder. mimalloc's never-purge delayed-free queues would
+        // otherwise carry the build's high-water INTO the install phase
+        // (peak = the SUM of the phases instead of the max). One ~170 µs
+        // collect returns the pages before the install stacks its own
+        // transient peak on top.
+        drain_mimalloc_wake();
 
         // In-place: re-seed self from the compact image.
         // Connection-scoped bookkeeping (last_insert_rowid) survives the
         // swap — VACUUM must not clobber it (SQLite keeps the value).
         let keep_rowid = self.last_rowid.load(Ordering::Acquire);
-        if wal_install {
-            // One commit: image pages as WAL frames (trailing commit
-            // frame), then checkpoint + truncate + WAL reset. Crash at
-            // any point leaves either the pre-VACUUM or the compact
-            // state — never a mix.
-            self.pager.install_compact_image(&image)?;
+        let reload_catalog = |me: &mut Self| -> Result<()> {
             // The roots moved (remapped). Reload the catalog and reset
             // every statement-level cache that could embed pre-VACUUM
             // state (plans, root overrides, count memo, join builds).
             let mut catalog = Catalog::new();
-            catalog.schema_cookie = self.pager.schema_cookie();
-            load_schema(&self.pager, &mut catalog)?;
-            self.adopt_catalog_after_vacuum(catalog);
-            self.last_rowid.store(keep_rowid, Ordering::Release);
-            return Ok(());
-        }
-        if self.pager.is_memory() {
-            let mut new = Self::open_in_memory_with_image(image)?;
-            new.path = self.path.clone();
-            // Codec parity is meaningless for the pure memory store's
-            // decode side (the image was encoded through the source's
-            // codec, and memory reads go through the cached decoded
-            // pages) — but keep the codec ACTIVE so the state matches.
-            if let Some(c) = self.pager.active_page_codec() {
-                let _ = new.pager.set_codec(Some(c));
-            }
-            new.last_rowid.store(keep_rowid, Ordering::Release);
-            *self = new;
-        } else {
-            let path = self.path.clone();
-            let codec = self.pager.active_page_codec();
-            // Retire the OLD pager BEFORE the image lands: its Drop would
-            // otherwise re-apply its own close-time bookkeeping (an empty
-            // checkpoint still `set_len`s the file to the pre-VACUUM page
-            // count and removes the sidecar the fresh pager just
-            // created) — clobbering the just-written compact image.
-            self.pager.retire();
-            std::fs::write(&path, &image).map_err(|e| {
-                Error::Io(std::io::Error::other(format!(
-                    "vacuum rewrite {path:?}: {e}"
-                )))
-            })?;
-            // Reopen through the normal constructors (codec-aware).
-            let mut new = match codec {
-                Some(c) => {
-                    let pager: Arc<Pager> =
-                        Arc::new(Pager::open_opts(&path, DEFAULT_CACHE_PAGES, false)?);
-                    pager.set_codec(Some(c))?;
-                    let mut catalog = Catalog::new();
-                    catalog.schema_cookie = pager.schema_cookie();
-                    load_schema(&pager, &mut catalog)?;
-                    Self::from_pager_and_catalog(pager, catalog, path.clone())
+            catalog.schema_cookie = me.pager.schema_cookie();
+            load_schema(&me.pager, &mut catalog)?;
+            me.adopt_catalog_after_vacuum(catalog);
+            Ok(())
+        };
+        let is_mem = self.pager.is_memory();
+        let result = {
+            let t_install = std::time::Instant::now();
+            let inner: Result<()> = {
+                match &compact {
+                    CompactSrc::Image(image) if wal_install => {
+                        // One commit: image pages as WAL frames (trailing
+                        // commit frame), then checkpoint + truncate + WAL
+                        // reset. Crash at any point leaves either the
+                        // pre-VACUUM or the compact state — never a mix.
+                        self.pager.install_compact_image(image)?;
+                        reload_catalog(self)?;
+                    }
+                    CompactSrc::File(src) if wal_install => {
+                        // The streaming twin: pages flow from the temp file
+                        // in bounded chunks (eviction spills under pressure),
+                        // one commit + checkpoint — identical crash-safety
+                        // epilogue, bounded RSS at any scale.
+                        self.pager.install_compact_image_from_file(src)?;
+                        reload_catalog(self)?;
+                    }
+                    src if !wal_install && is_mem => {
+                        // Memory store: seed a fresh in-memory pager from
+                        // the image (an in-RAM source reads straight; a
+                        // temp-file source reads back once — memory DBs are
+                        // chosen-sized, this is not a scale path).
+                        let image = match src {
+                            CompactSrc::Image(b) => b.clone(),
+                            CompactSrc::File(p) => std::fs::read(p).map_err(|e| {
+                                Error::Io(std::io::Error::other(format!("vacuum read back: {e}")))
+                            })?,
+                        };
+                        let mut new = Self::open_in_memory_with_image(image)?;
+                        new.path = self.path.clone();
+                        // Codec parity is meaningless for the pure memory
+                        // store's decode side — but keep the codec ACTIVE so
+                        // the state matches.
+                        if let Some(c) = self.pager.active_page_codec() {
+                            let _ = new.pager.set_codec(Some(c));
+                        }
+                        new.last_rowid.store(keep_rowid, Ordering::Release);
+                        *self = new;
+                    }
+                    src if !wal_install => {
+                        // File store, delete-journal mode: publish the
+                        // compact bytes to the path (temp + rename for the
+                        // file source — the adopt-on-write ladder's atomic
+                        // publish shape), then reopen.
+                        let path = self.path.clone();
+                        let codec = self.pager.active_page_codec();
+                        // Retire the OLD pager BEFORE the image lands: its
+                        // Drop would otherwise re-apply its own close-time
+                        // bookkeeping (an empty checkpoint still `set_len`s
+                        // the file to the pre-VACUUM page count and removes
+                        // the sidecar the fresh pager just created) —
+                        // clobbering the just-written compact image.
+                        self.pager.retire();
+                        match src {
+                            CompactSrc::Image(image) => {
+                                std::fs::write(&path, image).map_err(|e| {
+                                    Error::Io(std::io::Error::other(format!(
+                                        "vacuum rewrite {path:?}: {e}"
+                                    )))
+                                })?;
+                            }
+                            CompactSrc::File(src_path) => {
+                                let publish = std::path::PathBuf::from(format!(
+                                    "{}.vacuum-publish",
+                                    path.display()
+                                ));
+                                std::fs::copy(src_path, &publish).map_err(|e| {
+                                    Error::Io(std::io::Error::other(format!(
+                                        "vacuum copy {src_path:?}: {e}"
+                                    )))
+                                })?;
+                                // fsync the published bytes before the swap
+                                // (the temp was flushed on drop, but the
+                                // COPY is new bytes on disk).
+                                if let Ok(f) = std::fs::File::open(&publish) {
+                                    let _ = f.sync_all();
+                                }
+                                std::fs::rename(&publish, &path).map_err(|e| {
+                                    Error::Io(std::io::Error::other(format!(
+                                        "vacuum swap {path:?}: {e}"
+                                    )))
+                                })?;
+                            }
+                        }
+                        // Reopen through the normal constructors
+                        // (codec-aware).
+                        let mut new = match codec {
+                            Some(c) => {
+                                let pager: Arc<Pager> =
+                                    Arc::new(Pager::open_opts(&path, DEFAULT_CACHE_PAGES, false)?);
+                                pager.set_codec(Some(c))?;
+                                let mut catalog = Catalog::new();
+                                catalog.schema_cookie = pager.schema_cookie();
+                                load_schema(&pager, &mut catalog)?;
+                                Self::from_pager_and_catalog(pager, catalog, path.clone())
+                            }
+                            None => Self::open(&path)?,
+                        };
+                        new.path = path;
+                        new.last_rowid.store(keep_rowid, Ordering::Release);
+                        *self = new;
+                    }
+                    // wal_install is false && is_mem is true handled above;
+                    // the remaining arm (Image/File, wal_install true) is
+                    // unreachable — both are matched above.
+                    _ => unreachable!("vacuum dispatch arm"),
                 }
-                None => Self::open(&path)?,
+                Ok(())
             };
-            new.path = path;
-            new.last_rowid.store(keep_rowid, Ordering::Release);
-            *self = new;
+            if vac_dbg {
+                eprintln!("[vac] install: {:?}", t_install.elapsed());
+            }
+            inner
+        };
+        // Temp-file cleanup (both sidecars too — a WAL-mode temp leaves
+        // an empty -wal after its clean close).
+        if let CompactSrc::File(p) = &compact {
+            let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_file(format!("{}-wal", p.display()));
+            let _ = std::fs::remove_file(format!("{}-shm", p.display()));
         }
+        result?;
+        if wal_install {
+            self.last_rowid.store(keep_rowid, Ordering::Release);
+        }
+        // The install phase's churn (chunk buffers, page-cache turns,
+        // the checkpoint fold) is done: collect so the VACUUM's retained
+        // high-water does not ride into the next statement's baseline.
+        drain_mimalloc_wake();
         Ok(())
     }
 
@@ -4104,13 +4291,20 @@ impl Database {
     ///   SQL work.
     /// - **Row-level** (codec DBs): a temp FILE database + the SQL-level
     ///   copy (codec encode/decode applies). O(rows).
-    fn build_compact_image(&self) -> Result<Vec<u8>> {
+    ///
+    /// The VACUUM compact source: an in-RAM image (page-level path —
+    /// dense shapes, no codec) or a TEMP FILE (row-level path — codec
+    /// DBs and mass-delete shapes: 0-cell/hollow leaves decline both
+    /// page-level fast paths). The file source lets the install STREAM
+    /// (see [`Pager::install_compact_image_from_file`]) instead of
+    /// materializing the whole compact image in RAM.
+    fn build_compact_image_src(&self) -> Result<CompactSrc> {
         if self.pager.active_page_codec().is_none() {
             if let Some(image) = self.build_compact_image_pages()? {
-                return Ok(image);
+                return Ok(CompactSrc::Image(image));
             }
         }
-        self.build_compact_image_rows()
+        self.build_compact_image_rows_src()
     }
 
     /// Read the schema rows and extract every object's root page id
@@ -4211,16 +4405,21 @@ impl Database {
     }
 
     /// Row-level compact build in a temp FILE database (codec path /
-    /// fast-path fallback). The temp file is removed on both success and
-    /// failure.
-    fn build_compact_image_rows(&self) -> Result<Vec<u8>> {
+    /// fast-path fallback). Returns the temp file's path — the caller
+    /// streams it into place (WAL: page-by-page install; file:
+    /// copy+rename) and removes it. The historical shape read the whole
+    /// file back into a Vec<u8> here, adding transient RSS equal to the
+    /// compact image at every scale (the mega-scale suite's M6 found
+    /// it); only the in-memory-store path still reads back (chosen
+    /// size, not a scale path).
+    fn build_compact_image_rows_src(&self) -> Result<CompactSrc> {
         let tmp_path = std::env::temp_dir().join(format!(
             "rustqlite-vacuum-{}-{}.db",
             std::process::id(),
             self.pager.instance_id()
         ));
         let _ = std::fs::remove_file(&tmp_path);
-        let build = (|| -> Result<Vec<u8>> {
+        let build = (|| -> Result<CompactSrc> {
             let mut tmp = Database::open(&tmp_path)?;
             if let Some(c) = self.pager.active_page_codec() {
                 tmp.pager.set_codec(Some(c))?;
@@ -4238,12 +4437,12 @@ impl Database {
                 })?;
             tmp.pager.flush()?;
             drop(tmp);
-            std::fs::read(&tmp_path)
-                .map_err(|e| Error::Io(std::io::Error::other(format!("vacuum read back: {e}"))))
+            Ok(CompactSrc::File(tmp_path.clone()))
         })();
-        let _ = std::fs::remove_file(&tmp_path);
-        // Remove the temp WAL sidecar too, if one appeared.
-        let _ = std::fs::remove_file(format!("{}-wal", tmp_path.display()));
+        if build.is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+            let _ = std::fs::remove_file(format!("{}-wal", tmp_path.display()));
+        }
         build
     }
 
@@ -4287,7 +4486,11 @@ impl Database {
                 continue;
             }
             tmp.execute(table.create_sql.as_str(), ())?;
+            let t_t = std::time::Instant::now();
             self.vacuum_copy_table(tmp, &table)?;
+            if std::env::var_os("RSQL_VAC_TIMING").is_some() {
+                eprintln!("[vac] table {name} copy: {:?}", t_t.elapsed());
+            }
         }
         let mut indexes = self.catalog.all_indexes();
         indexes.sort_by(|a, b| a.0.cmp(&b.0));
@@ -4297,7 +4500,11 @@ impl Database {
             if name.starts_with("sqlite_autoindex_") || ix.create_sql.is_empty() {
                 continue;
             }
+            let t_ix = std::time::Instant::now();
             tmp.execute(ix.create_sql.as_str(), ())?;
+            if std::env::var_os("RSQL_VAC_TIMING").is_some() {
+                eprintln!("[vac] index {name} backfill: {:?}", t_ix.elapsed());
+            }
         }
         for (_, view) in self.catalog.all_views() {
             if !view.create_sql.is_empty() {
@@ -4340,16 +4547,14 @@ impl Database {
             // PK (among them) IS the cell key, so values come across
             // exactly.
             let select_sql = format!("SELECT {col_list} FROM {target}");
-            let placeholders = insert_cols
-                .iter()
-                .map(|_| "?")
-                .collect::<Vec<_>>()
-                .join(", ");
-            let insert_sql = format!("INSERT INTO {target} ({col_list}) VALUES ({placeholders})");
             let rows = self.query(select_sql.as_str(), ())?;
-            for row in rows {
-                tmp.execute(insert_sql.as_str(), row)?;
-            }
+            // MULTI-VALUES copy: one statement per BATCH of rows (the
+            // per-row `execute`/step paid the full statement-boundary
+            // machinery — TLS guards, xread scopes, start() — ~100 us
+            // per row: minutes at million-row scale; batched VALUES
+            // amortize it to nothing. Values bind positionally — no
+            // literal escaping, no round-trip risk.
+            insert_rows_batched(tmp, &target, &col_list, &rows)?;
             return Ok(());
         }
 
@@ -4374,13 +4579,6 @@ impl Database {
                     "SELECT {col_list} FROM {target} ORDER BY {} LIMIT {BATCH}",
                     q(&alias)
                 );
-                let placeholders = insert_cols
-                    .iter()
-                    .map(|_| "?")
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let insert_sql =
-                    format!("INSERT INTO {target} ({col_list}) VALUES ({placeholders})");
                 let mut cursor: Option<i64> = None;
                 loop {
                     let rows = match cursor {
@@ -4396,9 +4594,8 @@ impl Database {
                     if let Some(Value::Integer(last)) = rows[n - 1].get(alias_pos) {
                         next_cursor = *last;
                     }
-                    for row in rows {
-                        tmp.execute(insert_sql.as_str(), row)?;
-                    }
+                    // MULTI-VALUES copy (see the WITHOUT ROWID branch).
+                    insert_rows_batched(tmp, &target, &col_list, &rows)?;
                     if n < BATCH as usize {
                         break;
                     }
@@ -4410,12 +4607,7 @@ impl Database {
                 let select_sql = format!(
                     "SELECT rowid, {col_list} FROM {target} WHERE rowid > ? ORDER BY rowid LIMIT {BATCH}"
                 );
-                let placeholders = std::iter::once("?")
-                    .chain(insert_cols.iter().map(|_| "?"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let insert_sql =
-                    format!("INSERT INTO {target} (rowid, {col_list}) VALUES ({placeholders})");
+                let rowid_col_list = format!("rowid, {col_list}");
                 let mut cursor = i64::MIN;
                 loop {
                     let rows = self.query(select_sql.as_str(), vec![Value::Integer(cursor)])?;
@@ -4424,13 +4616,12 @@ impl Database {
                         break;
                     }
                     let mut last_rowid = cursor;
-                    for row in rows {
-                        // row[0] = rowid (pseudo-column), row[1..] = cols.
-                        if let Some(Value::Integer(r)) = row.first() {
-                            last_rowid = *r;
-                        }
-                        tmp.execute(insert_sql.as_str(), row)?;
+                    if let Some(Value::Integer(r)) = rows[n - 1].first() {
+                        last_rowid = *r;
                     }
+                    // MULTI-VALUES copy (see the WITHOUT ROWID branch);
+                    // row[0] = rowid (pseudo-column), row[1..] = cols.
+                    insert_rows_batched(tmp, &target, &rowid_col_list, &rows)?;
                     if n < BATCH as usize {
                         break;
                     }
@@ -5754,6 +5945,11 @@ impl Database {
     /// [`Self::execute`]'s body (the wrapper handles delta-journal
     /// poisoning on statement failure).
     fn execute_stmt<P: Params>(&mut self, sql: &str, params: P) -> Result<()> {
+        // Statement entry: re-arm savepoint undo capture. A plugin
+        // re-entrant call from inside a suspended scan's callback must
+        // not carry the suspension into its own mutating statement.
+        // No-op unless a pure-read scan is live on this thread.
+        let _resume_undo = crate::storage::pager::resume_undo_capture();
         profile::COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Per-connection snapshot for the SQL function
         // `last_insert_rowid()` (SQLite: the value is per-connection; the

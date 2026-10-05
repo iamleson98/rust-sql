@@ -33,6 +33,33 @@
 
 use rustqlite::{Database, Value};
 
+/// True when the test process runs with EUID 0 (root, sudo, or a
+/// Docker default). POSIX permission bits are advisory for root
+/// (CAP_DAC_OVERRIDE): chmod 444 files stay writable and chmod 555
+/// directories stay creatable, so the two permission-lever tests
+/// below CANNOT observe their failures as root — skip with a loud
+/// note instead of a false red (CI runs unprivileged; this guard
+/// keeps `cargo test` meaningful in root containers).
+fn running_as_root() -> bool {
+    // /proc (Linux): the Uid line is "real effective saved fs".
+    if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("Uid:") {
+                let mut it = rest.split_whitespace();
+                let real = it.next().unwrap_or("x");
+                let eff = it.next().unwrap_or(real);
+                return eff == "0" || real == "0";
+            }
+        }
+    }
+    // macOS / other unixes: ask id(1).
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
+        .unwrap_or(false)
+}
+
 fn build_baseline(path: &std::path::Path) {
     let mut db = Database::open(path).unwrap();
     db.execute(
@@ -101,6 +128,11 @@ fn examine_database(path: &std::path::Path) {
 
 #[test]
 fn readonly_file_rejects_writes_gracefully() {
+    if running_as_root() {
+        println!("skipped: running as root (CAP_DAC_OVERRIDE bypasses the read-only levers)");
+        return;
+    }
+
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("ro.db");
     build_baseline(&db_path);
@@ -253,6 +285,11 @@ fn deleted_file_fails_flush_gracefully() {
 
 #[test]
 fn readonly_directory_rejects_new_databases_gracefully() {
+    if running_as_root() {
+        println!("skipped: running as root (CAP_DAC_OVERRIDE bypasses the read-only levers)");
+        return;
+    }
+
     let tmp = tempfile::tempdir().unwrap();
     let ro_dir = tmp.path().join("ro-dir");
     std::fs::create_dir(&ro_dir).unwrap();

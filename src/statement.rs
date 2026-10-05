@@ -51,9 +51,10 @@
 
 use crate::api::{Database, FastPath};
 use crate::error::{Error, Result};
+use crate::executor::evaluate;
 use crate::executor::{
-    bare_column_projection, execute, scan_groupby_grouper, trivial_group_projection, ExecContext,
-    GroupProjection,
+    bare_column_projection, execute, rowid_range_bounds, scan_groupby_grouper,
+    trivial_group_projection, EvalContext, ExecContext, GroupProjection,
 };
 use crate::planner::plan::Plan;
 use crate::sql::ast::{Expr, Statement as AstStatement};
@@ -1071,6 +1072,9 @@ impl<'a> Statement<'a> {
     /// Run a closure with a fresh reader ExecContext (guards installed),
     /// capturing map deltas for merge-back.
     fn exec_with_ctx<R>(&mut self, f: impl FnOnce(&mut ExecContext<'_>) -> Result<R>) -> Result<R> {
+        // Statement entry (the stepped-statement surface): re-arm
+        // savepoint undo capture — see Database::execute_stmt's note.
+        let _resume_undo = crate::storage::pager::resume_undo_capture();
         let db = self.db;
         // BEGIN CONCURRENT owner: arm the page-shadow scope for this
         // whole step — get_page serves the transaction's shadows,
@@ -1700,6 +1704,18 @@ struct GroupByDriver {
     finished: bool,
 }
 
+/// The scan-groupby input shape extracted by
+/// [`GroupByDriver::scan_input`]: (table, alias, filter, residual-free
+/// rowid-range bounds (start, end)). The bounds pair carries the
+/// `WHERE id <op> ?` shape that streams through the same grouper with a
+/// range-bounded walk instead of materializing every row.
+type ScanGroupbyInput = (
+    std::sync::Arc<crate::schema::Table>,
+    Option<String>,
+    Option<Expr>,
+    (Option<Expr>, Option<Expr>),
+);
+
 impl GroupByDriver {
     fn new(
         input: Box<Plan>,
@@ -1720,21 +1736,29 @@ impl GroupByDriver {
     }
 
     /// Extract (table, alias, filter) from the Aggregate's input when it
-    /// is the scan-groupby shape `scan_groupby_grouper` handles.
-    fn scan_input(
-        plan: &Plan,
-    ) -> Option<(
-        std::sync::Arc<crate::schema::Table>,
-        Option<String>,
-        Option<Expr>,
-    )> {
+    /// is the scan-groupby shape `scan_groupby_grouper` handles (see
+    /// [`ScanGroupbyInput`] for the shape and the range-bounds contract).
+    fn scan_input(plan: &Plan) -> Option<ScanGroupbyInput> {
         match plan {
             Plan::Scan {
                 table,
                 alias,
                 index: None,
                 predicate: None,
-            } if table.vtab.is_none() => Some((table.clone(), alias.clone(), None)),
+            } if table.vtab.is_none() => Some((table.clone(), alias.clone(), None, (None, None))),
+            Plan::RowidRange {
+                table,
+                alias,
+                start,
+                end,
+                residual: None,
+                ..
+            } if table.vtab.is_none() && !table.without_rowid => Some((
+                table.clone(),
+                alias.clone(),
+                None,
+                (start.clone(), end.clone()),
+            )),
             Plan::Filter { input, predicate } => {
                 if let Plan::Scan {
                     table,
@@ -1744,7 +1768,12 @@ impl GroupByDriver {
                 } = input.as_ref()
                 {
                     if table.vtab.is_none() {
-                        return Some((table.clone(), alias.clone(), Some(predicate.clone())));
+                        return Some((
+                            table.clone(),
+                            alias.clone(),
+                            Some(predicate.clone()),
+                            (None, None),
+                        ));
                     }
                 }
                 None
@@ -1771,7 +1800,7 @@ impl Driver for GroupByDriver {
             return Ok(Vec::new());
         }
         if self.iter.is_none() {
-            let (table, alias, filter) = match Self::scan_input(&self.input) {
+            let (table, alias, filter, rowid_range) = match Self::scan_input(&self.input) {
                 Some(t) => t,
                 None => {
                     return Err(Error::runtime(
@@ -1788,6 +1817,26 @@ impl Driver for GroupByDriver {
             ctx.named_params = named.clone();
             let _g = db.plugin_scope();
             let _c = crate::executor::CorrGuard::install(&mut ctx as *mut _);
+            // Rowid-range bounds: evaluate under the driver's params and
+            // fold through the same cross-type semantics as
+            // exec_rowid_range; a never-matching range walks nothing.
+            let range = if rowid_range.0.is_some() || rowid_range.1.is_some() {
+                let empty_row: Vec<crate::types::Value> = Vec::new();
+                let empty_cols: Vec<String> = Vec::new();
+                let eval_ctx =
+                    EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+                let sv = match &rowid_range.0 {
+                    Some(e) => Some(evaluate(e, &eval_ctx)?),
+                    None => None,
+                };
+                let ev = match &rowid_range.1 {
+                    Some(e) => Some(evaluate(e, &eval_ctx)?),
+                    None => None,
+                };
+                Some(rowid_range_bounds(sv.as_ref(), ev.as_ref()).unwrap_or((0, -1)))
+            } else {
+                None
+            };
             let grouper = scan_groupby_grouper(
                 &mut ctx,
                 table,
@@ -1795,6 +1844,7 @@ impl Driver for GroupByDriver {
                 filter.as_ref(),
                 &self.group_by,
                 &self.aggregates,
+                range,
             )?;
             self.iter = Some(grouper.into_group_iter());
         }
@@ -2243,7 +2293,7 @@ impl Driver for ProjectedRangeDriver {
         let _c = crate::executor::CorrGuard::install(&mut ctx as *mut _);
         let empty_row: Vec<Value> = Vec::new();
         let empty_cols: Vec<String> = Vec::new();
-        let eval_ctx = crate::executor::EvalContext::new(&empty_row, &empty_cols, params, named);
+        let eval_ctx = EvalContext::new(&empty_row, &empty_cols, params, named);
         // Bounds: re-evaluated per batch (parameters may change); the
         // resume clamp keeps mid-range batches from re-reading rows.
         let lo = match &self.start {
@@ -2335,7 +2385,7 @@ impl Driver for ProjectedRangeDriver {
         // clamp keeps mid-range pulls from re-reading rows).
         let empty_row: Vec<Value> = Vec::new();
         let empty_cols: Vec<String> = Vec::new();
-        let eval_ctx = crate::executor::EvalContext::new(&empty_row, &empty_cols, params, named);
+        let eval_ctx = EvalContext::new(&empty_row, &empty_cols, params, named);
         let lo = match &self.start {
             Some(e) => {
                 let v = crate::executor::expr::evaluate(e, &eval_ctx)?.as_integer();
@@ -2965,7 +3015,7 @@ impl Driver for RangeDriver {
         let _c = crate::executor::CorrGuard::install(&mut ctx as *mut _);
         let empty_row: Vec<Value> = Vec::new();
         let empty_cols: Vec<String> = Vec::new();
-        let eval_ctx = crate::executor::EvalContext::new(&empty_row, &empty_cols, params, named);
+        let eval_ctx = EvalContext::new(&empty_row, &empty_cols, params, named);
         let lo = match &self.start {
             Some(e) => {
                 let v = crate::executor::expr::evaluate(e, &eval_ctx)?.as_integer();
@@ -3351,7 +3401,7 @@ impl Driver for LimitDriver {
         if !self.initialized {
             let empty_row: Vec<Value> = Vec::new();
             let empty_cols: Vec<String> = Vec::new();
-            let ec = crate::executor::EvalContext::new(&empty_row, &empty_cols, params, named);
+            let ec = EvalContext::new(&empty_row, &empty_cols, params, named);
             let count = crate::executor::expr::evaluate(&self.count, &ec)?.as_integer();
             let offset = crate::executor::expr::evaluate(&self.offset, &ec)?.as_integer();
             self.remaining = if count < 0 { None } else { Some(count) };

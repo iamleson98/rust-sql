@@ -256,6 +256,7 @@ The honest ledger — verifiable absence (`module_list` / `function_list` / `com
 
 - **One serial row-shape at parity**: the unfiltered 2-table PK join (1.18x warm; 1.38x at 1M-row parallel scale).
 - **8-conn mixed R/W 80/20**: fsync-latency-dominated on SQLite's side — **7.3–8.5x** on the current CI fleet (SQLite drew ~690 ms on both macOS and ubuntu runners: 640 serial commit fsyncs), **13.7x** on a quiet 6-core box, parity-class only when a runner's fsyncs draw fast. Reads inside stay 2.8x.
+- **Mass UPDATE of an indexed column**: **2.4–3.2x** vs SQLite across 500K–10M rows (mega-scale M9 + `examples/bandupd_probe.rs`; the ratio is flat across scales — a per-op gap, not a scaling collapse). 82% of the cost is per-row index maintenance — a random delete-descent + insert-descent per updated row — where SQLite's ONEPASS update pays the same two index walks but one table walk total. The follow-up is a sorted-batch index apply (one ordered index walk for the whole statement), the index-side twin of the existing `update_table_bulk` merge path on the table side.
 - (The SQLite-format per-commit residual that used to sit here is gone with the container: the native container's page-granular WAL is the only commit path now, and it was never behind.)
 
 ### Resource
@@ -339,6 +340,7 @@ The matrix is modeled on SQLite's own testing methodology ([sqlite.org/testing.h
 | Archive CLI parity | `cli_archive.rs` | `.archive` create/list/extract/update byte-parity vs the real 3.53.4 shell over checked-in oracle fixtures (zip + sqlar + deflated members) |
 | Concurrency | `concurrent_writes.rs`, `committed_view.rs`, `concurrent_reader_visibility.rs` | multi-writer regimes, snapshot isolation, reader invariants |
 | Push-to-the-limit | `limit_stress.rs` (dedicated CI job, 3 OSes) | 1M-row file builds with throughput/RSS/file-bloat guards; 48-table × 64-column breadth; open/close cycles; 4-writer soaks; cache accounting; delete-churn reuse + VACUUM reclamation |
+| Mega-scale marathon | `mega_scale.rs` (CI: ubuntu 10M + vs-SQLite, win/mac 5M, 20K smoke in the default matrix, weekly 100M dispatch) | the M1–M9 discipline — bulk-build degradation+rate gates, exact-answer read battery, reopen cycles, churn + mixed-op storm, `BEGIN CONCURRENT` soak, mass-DELETE + VACUUM reclamation, memory flatness against a per-row RSS budget, final verification, vs-bundled-SQLite anti-collapse gates |
 | Parallel equality | `parallel_scan.rs`, `parallel_join.rs` | parallel == serial, bit-identical |
 | Interop | `sqlite_interop.rs`, `utf16_interop.rs`, `cli_ops.rs` | both-direction file exchange, real SQLite as oracle |
 | Cross-database triggers | `attach_triggers.rs` | the TEMP-trigger surface (firing, guards, RAISE atomicity across engines, DETACH dormancy, validation texts) — pinned against 3.53.4 |

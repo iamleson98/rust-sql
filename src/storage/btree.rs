@@ -3670,6 +3670,47 @@ impl<'a> Btree<'a> {
         }
     }
 
+    /// The EXACT maximum rowid in the table btree — the last cell of
+    /// the right-most leaf, one O(log N) descent, no payload decode.
+    /// This is `max_rowid_hint` with the empty/degenerate cases made
+    /// explicit so rowid ALLOCATION can use it as the truthful basis
+    /// (SQLite's OP_NewRowid: OP_Last + last-cell rowid). `None` means
+    /// the right edge cannot answer — empty tree, a degenerate
+    /// delete-churned right leaf (earlier leaves may still hold rows),
+    /// or a non-table (index-shaped) root — and the caller must fall
+    /// back to the full scan for the truthful answer.
+    ///
+    /// Why this matters: the max-rowid scan that used to run here
+    /// walked EVERY page of the table, and inside an open transaction
+    /// every page the walk touched was COPIED (the BEGIN CONCURRENT
+    /// regime's page shadows; a plain transaction's savepoint undo
+    /// capture) — a one-row INSERT into a 10M-row table transiently
+    /// materialized ~500 MB of page images per connection (the
+    /// mega-scale marathon's M5 soak RSS spike).
+    pub fn max_rowid_exact(&self) -> Result<Option<i64>> {
+        let leaf = self.right_most_leaf()?;
+        let page = self.pager.get_page(leaf)?;
+        let guard = page.lock();
+        if !matches!(guard.page_type()?, PageType::LeafTable) {
+            // Degenerate right edge (delete churn) or an index-shaped
+            // root: the scan fallback owns the truthful answer.
+            return Ok(None);
+        }
+        let n = guard.n_cells();
+        if n == 0 {
+            // Empty root leaf = empty table; empty NON-root right leaf =
+            // degenerate (earlier leaves may hold rows). Either way the
+            // scan decides (O(1) on the empty root, O(n) only in the
+            // degenerate delete-churn case).
+            return Ok(None);
+        }
+        let ptr = guard.cell_pointer(n - 1) as usize;
+        match decode_rowid_only(guard.cell_slice_checked(ptr)?) {
+            Some((rowid, _)) => Ok(Some(rowid)),
+            None => Err(Error::corruption("truncated leaf rowid in max_rowid_exact")),
+        }
+    }
+
     /// Descend the right-most-child chain to the right-most leaf and
     /// PIN it: `(page, serial, epoch)` read under the leaf's lock — the
     /// fresh pin an append hint needs after a structural change (split,
@@ -7504,6 +7545,9 @@ impl<'a> Btree<'a> {
     /// Scan all rows in a table B+tree, calling `f(rowid, payload)` for each.
     /// Stops early if `f` returns false.
     pub fn scan_table<F: FnMut(i64, &[u8]) -> bool>(&mut self, mut f: F) -> Result<()> {
+        // Pure-read walk: suspend savepoint undo pre-image capture
+        // for this scan's own fetches (see storage::pager's TLS docs).
+        let _undo_scan = crate::storage::pager::suspend_undo_capture();
         self.scan_subtree(self.root, &mut f).map(|_| ())
     }
     /// Zero-allocation table scan: callback receives `(rowid, payload_bytes)`
@@ -7532,6 +7576,9 @@ impl<'a> Btree<'a> {
         mut f: F,
         may_reenter: bool,
     ) -> Result<()> {
+        // Pure-read walk: suspend savepoint undo pre-image capture
+        // for this scan's own fetches (see storage::pager's TLS docs).
+        let _undo_scan = crate::storage::pager::suspend_undo_capture();
         if may_reenter {
             // ONE batch for the whole scan: the buffers grow on the
             // first leaf and are reused by every subsequent leaf.
@@ -7558,6 +7605,9 @@ impl<'a> Btree<'a> {
     /// pager on this very leaf when the subquery scans the same table)
     /// must use `scan_table_borrowed_opts(_, true)` instead.
     pub fn scan_table_borrowed<F: FnMut(i64, &[u8]) -> bool>(&mut self, f: F) -> Result<()> {
+        // Pure-read walk: suspend savepoint undo pre-image capture
+        // for this scan's own fetches (see storage::pager's TLS docs).
+        let _undo_scan = crate::storage::pager::suspend_undo_capture();
         self.scan_table_borrowed_opts(f, false)
     }
 
@@ -7926,6 +7976,9 @@ impl<'a> Btree<'a> {
     where
         F: FnMut(i64, Vec<Value>) -> bool,
     {
+        // Pure-read walk: suspend savepoint undo pre-image capture
+        // for this scan's own fetches (see storage::pager's TLS docs).
+        let _undo_scan = crate::storage::pager::suspend_undo_capture();
         self.scan_table_range_selective(i64::MIN, i64::MAX, n_cols, wanted, rowid_alias, f)
     }
 
@@ -7945,6 +7998,9 @@ impl<'a> Btree<'a> {
     where
         F: FnMut(i64, Vec<Value>) -> bool,
     {
+        // Pure-read walk: suspend savepoint undo pre-image capture
+        // for this scan's own fetches (see storage::pager's TLS docs).
+        let _undo_scan = crate::storage::pager::suspend_undo_capture();
         // Pool-free entry (executor fused walks + parallel workers):
         // an empty scratch vec behaves exactly like the fresh-allocation
         // contract always did.
@@ -7982,6 +8038,9 @@ impl<'a> Btree<'a> {
     where
         F: FnMut(i64, Vec<Value>) -> bool,
     {
+        // Pure-read walk: suspend savepoint undo pre-image capture
+        // for this scan's own fetches (see storage::pager's TLS docs).
+        let _undo_scan = crate::storage::pager::suspend_undo_capture();
         // Trusted TEXT decode for in-memory pagers (payloads are this
         // process's own encoder output — see types::value). Saved +
         // restored so nested scans on other pagers behave correctly.
@@ -8033,6 +8092,9 @@ impl<'a> Btree<'a> {
         arena: &mut Vec<u8>,
         entries: &mut Vec<CellEntry>,
     ) -> Result<CellScanOutcome> {
+        // Pure-read walk: suspend savepoint undo pre-image capture
+        // for this scan's own fetches (see storage::pager's TLS docs).
+        let _undo_scan = crate::storage::pager::suspend_undo_capture();
         // Caller clears per pull; keep the invariant local so a stale
         // caller cannot corrupt offsets.
         arena.clear();
@@ -8821,6 +8883,9 @@ impl<'a> Btree<'a> {
         end: i64,
         mut f: F,
     ) -> Result<()> {
+        // Pure-read walk: suspend savepoint undo pre-image capture
+        // for this scan's own fetches (see storage::pager's TLS docs).
+        let _undo_scan = crate::storage::pager::suspend_undo_capture();
         self.scan_range_subtree(self.root, start, end, &mut f)
     }
 
@@ -8834,6 +8899,9 @@ impl<'a> Btree<'a> {
         end: i64,
         f: F,
     ) -> Result<()> {
+        // Pure-read walk: suspend savepoint undo pre-image capture
+        // for this scan's own fetches (see storage::pager's TLS docs).
+        let _undo_scan = crate::storage::pager::suspend_undo_capture();
         self.scan_table_range_borrowed_opts(start, end, f, false)
     }
 
@@ -8848,6 +8916,9 @@ impl<'a> Btree<'a> {
         mut f: F,
         may_reenter: bool,
     ) -> Result<()> {
+        // Pure-read walk: suspend savepoint undo pre-image capture
+        // for this scan's own fetches (see storage::pager's TLS docs).
+        let _undo_scan = crate::storage::pager::suspend_undo_capture();
         if may_reenter {
             let mut batch = ScanBatch::default();
             self.scan_range_subtree_borrowed_deferred(self.root, start, end, &mut f, &mut batch)?;
@@ -9917,6 +9988,9 @@ impl<'a> Btree<'a> {
         start_key: &[u8],
         f: F,
     ) -> Result<()> {
+        // Pure-read walk: suspend savepoint undo pre-image capture
+        // for this scan's own fetches (see storage::pager's TLS docs).
+        let _undo_scan = crate::storage::pager::suspend_undo_capture();
         let mut f = f;
         self.scan_index_range_subtree(self.root, start_key, &mut f, &mut false)?;
         Ok(())
@@ -10143,6 +10217,9 @@ impl<'a> Btree<'a> {
 
     /// Scan all entries in an index B+tree, calling `f(rowid, key)` for each.
     pub fn scan_index<F: FnMut(i64, &[u8]) -> bool>(&mut self, mut f: F) -> Result<()> {
+        // Pure-read walk: suspend savepoint undo pre-image capture
+        // for this scan's own fetches (see storage::pager's TLS docs).
+        let _undo_scan = crate::storage::pager::suspend_undo_capture();
         self.scan_index_subtree(self.root, &mut f)
     }
 

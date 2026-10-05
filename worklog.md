@@ -1852,3 +1852,42 @@ Work Log:
 
 Stage Summary:
 - The content-aware probe's false-positive class is closed (fresh logs no longer storm); the diagnostics now parse truthfully; CI runs permanently trace-armed for the xlock protocol.
+---
+Task ID: mega-1
+Agent: main
+Task: Mega-scale stress round (10M-100M rows): new tests/mega_scale.rs marathon, CI jobs, and the engine scalability fixes the suite exposed
+
+Work Log:
+- Wrote tests/mega_scale.rs: the M1-M9 marathon (bulk build w/ degradation+rate gates, exact-answer read battery, close/open cycles, churn + mixed-op storm, concurrent BEGIN-CONCURRENT soak, mass-delete + VACUUM, memory flatness, final verification, and an optional vs-bundled-SQLite comparison with anti-collapse gates).
+- Shape decision: the marathon's secondary index column k is SEQUENTIAL-CYCLIC (i % 1M), not hash-random — random-k inserts cost ~2 page-writes + 1 read PER ROW on any page-structured engine (~1.2 TB of IO at 100M rows): disk physics, not engine stress; that shape stays with the bench-gate's insert rows.
+- CI: mega-scale job (ubuntu 10M events + vs-SQLite, win/mac 5M, release, purge-delay=25, 90-min timeout), mega-scale-100m (weekly + dispatch, lean shape, 180-min), MEGA_ROWS=20000 smoke wired into the default matrix, ci-ok needs updated.
+- ENGINE FIX 1 (executor): streaming aggregates/top-N over residual-free RowidRange — fast path #1c + scan_table_maybe_range through exec_aggregate_no_group_by / scan_groupby_grouper / exec_topn_scan[_expr]; the GroupByDriver (statement.rs) too. Was: every row in the range materialized (260 MB transient RSS at 2M rows, ~13 GB at 100M). Measured at 2M: agg-4 504ms/270MB -> 178ms/14MB; group97 407->150ms; top25 543->145ms.
+- ENGINE FIX 2 (executor): LIMIT pushdown into RowidRange (bare + bare-column-Project) — `WHERE id > ? ORDER BY id LIMIT k` materialized the ENTIRE remaining range per statement (O(n^2) across batched cursors: the VACUUM row copier measured 90s at 2M rows where the walk is ~1s).
+- ENGINE FIX 3 (vacuum): the row-level VACUUM path — (a) batched multi-VALUES copy (was per-row execute at ~100 us/row of statement machinery), (b) CompactSrc::File: the compact image streams from the temp file (install_compact_image_from_file, 64-page chunks with the eviction pass) instead of fs::read of the whole image + unconditional cache-insert of every page, (c) DELETE-mode publish via copy+fsync+rename. VACUUM at 2M: 90s/198MB peak -> seconds/flat RSS (probe re-run pending the fix-2 landing).
+- io_fault.rs: skip-if-root guards on the two permission-lever tests (root bypasses DAC — CAP_DAC_OVERRIDE; CI runs unprivileged, root containers are the production reality that used to false-red).
+- RSQL_VAC_TIMING env diagnostics for vacuum phase attribution.
+
+Stage Summary:
+- tests/mega_scale.rs + CI wiring land the 10M-100M stress discipline; three real engine scalability bugs found and fixed by it (RowidRange materialization, LIMIT pushdown, VACUUM RSS+time), one allocator insight (RUSTSQL_MIMALLOC_PURGE_DELAY_MS=25 is the RSS-hygienic deployment mode for read-storm services).
+- Full default matrix re-run in flight after the LIMIT pushdown; 2M/10M/100M release validations next; README + worklog + push to follow.
+
+---
+Task ID: mega-2
+Agent: main (Super Z)
+Task: The M8 RSS budget round — close the mega marathon's last failure (peak 338.4 MB vs the 251 MB budget at 10M rows), land the marathon green end-to-end, and calibrate M9's never-before-reached gates with first measurements.
+
+Work Log:
+- Reproduced and attributed: the soak-blame probe isolated the M6 VACUUM (+59 MB at 2M rows); a perf page-fault profile on a --no-default-features (System-alloc) build pinned TWO independent owners, and an mimalloc-vs-System A/B split the third:
+  (a) 40% of VACUUM faults sat in `flush_inner_delete` — the temp VACUUM database opens in default DELETE journal mode, its 512-page cache spills every dirty page of the ~image to the sidecar during the copy, and the COMMIT-time drain MATERIALIZED every spilled body up front (HashMap<PageId, Vec<u8>> — one page-sized Vec per record, all live at once: ~the whole compact image in RAM, linear in database size).
+  (b) 38% sat under `execute_vacuum` itself — all three compact-image installers did `cache.insert` WITHOUT `lru.push_back` (the get_page contract), so the eviction pass never saw installed pages and the install accumulated the WHOLE image in the page cache.
+  (c) The build phase grew +40 MB under mimalloc but stayed flat under System — retention: the temp-DB copy's churn sat in the never-purge delayed-free queues THROUGH the install phase (peak = sum of the phases instead of the max).
+- Fix 1 (pager.rs, 3 sites): LRU registration on every install-path cache insert (install_compact_image, install_compact_image_from_file, install_in_place_compaction) — installed pages are now evictable like any get_page'd page.
+- Fix 2 (pager.rs flush_inner_delete): the STREAMING spill drain — only the index (id -> sidecar offset) is drained; each body is read into ONE reused page-sized scratch at its write turn (per-page sidecar lock re-acquisition with no cache lock held — the eviction path's cache->spill order preserved, no ABBA). The failure contract is STRONGER than the old per-page restore: `spilled_map` sheds each id as its body is written, so on any error the restore re-inserts exactly the unwritten set (the old up-front materialization dropped already-drained entries on a retry).
+- Fix 3 (api.rs execute_vacuum): mimalloc stage-boundary collects — one drain_mimalloc_wake after the compact-image build (the temp handle is dropped; everything the copy churned is free), after the in-place epilogue, and at the single install-exit point (post `result?`). Peak RSS is now max(phase), not sum.
+- Verification: examples/vac_rss_probe.rs (mimalloc process-info + forced-collect discriminator + 50 ms timeline sampler): VACUUM at 2M rows went +59 MB -> +4 MB (peak 102 -> 27 MB), flat timeline, `mi_collect(true)` returns everything, integrity ok, survivors exact. Critical suites: delete_spill 6/6, crash_recovery all crash points (delete + WAL), oom_fault 525 fault points (baseline intact at every point — the drain rewrite's error contract holds under allocation-failure injection), io_fault, foreign_journal_durability, vacuum_probe. Full default matrix: 1640 passed / 0 failed (119 binaries). fmt clean; clippy --lib --tests --examples -D warnings clean (also fixed the mega round's accumulated lints: IIFE closures -> blocks, complex tuple types -> aliases incl. the module-level ScanGroupbyInput, mangled doc list, probe dead-code/cast/no-op-drops).
+- The 10M marathon after the fixes: M8 peak RSS delta 338.4 -> 144.6 MB (budget 251) — M6's VACUUM now moves RSS by ~5 MB. The marathon then reached M9 for the FIRST time (M8 used to panic first) and found the band-update anti-collapse gate at 3.00x vs its unmeasured 2.5x bound.
+- M9 calibration (first measurements ever): examples/bandupd_probe.rs (engine vs bundled SQLite, same statement/disk) measured 3.21x @ 500K, 2.44x @ 2M, 2.68x @ 5M; the marathon's own M9 measured 3.00x @ 10M — a FLAT band across scales (a per-op gap, not a scaling collapse). Attribution: with the index the 2M update costs 1.30s, without it 0.23s — 82% of the cost is per-row index maintenance (a random delete-descent + insert-descent per updated row) where SQLite's ONEPASS update pays the same index walks over one table walk. Gate recalibrated to 4.0x (measured band's worst + ~25% runner margin) with the full measurement note in the gate; README's Performance-gaps section documents the residual and the follow-up (a sorted-batch index apply — one ordered index walk for the whole statement, the index-side twin of update_table_bulk); README's testing table gains the mega-scale marathon row.
+- Final 10M verdict run (mega10m_f): GREEN - 6/6. ega/ALL total=255.8s, peak RSS delta 144.9 MB (budget 251), M9 table: build 0.69x (gate >=0.4x), aggregate 1.12x, group97 0.26x, top25 592 ms (absolute gate), band-upd 2.90x (gate <=4.0x), final file 295.1 MB vs SQLite 693.8 MB.
+
+Stage Summary:
+- The mega marathon's blocking RSS failure is closed at the ENGINE level (three bounded-memory fixes, all O(cache), verified at 2M/10M scale); VACUUM at any scale now costs ~one cache of transient RSS instead of ~one image. M9's gates carry first-measured bands. The remaining known performance residual is the per-row index-maintenance gap on mass UPDATE-of-indexed-column (2.4-3.2x, documented) — the sorted-batch index apply is the scoped next round.

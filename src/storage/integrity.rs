@@ -40,6 +40,69 @@ use std::collections::HashSet;
 /// evaluation during index cross-verification.
 type RowidRows = Vec<(i64, Vec<Value>)>;
 
+/// Bounded rowid membership for integrity cross-verification: a bitset
+/// over `[0, ROWID_BITSET_LIMIT)` plus a hash-set tail for outlier ids.
+/// Dense rowid spaces (the OLTP reality) cost max_rowid/8 bytes —
+/// 250 KB per 2M rows, 12.5 MB per 100M — where the previous
+/// `HashSet<i64>` cost ~40 B/row (90 MB at 2M rows, ~4 GB at 100M —
+/// the mega-scale suite's M2 caught the RSS scaling; SQLite's own
+/// integrity_check keeps its cross-check sets in transient b-trees for
+/// exactly this reason). Arc-shared per owning table: the index loop
+/// previously DEEP-CLONED the table's set per index.
+#[derive(Default)]
+struct RowidSet {
+    bits: Vec<u64>,
+    tail: std::collections::HashSet<i64>,
+}
+
+/// Bitset coverage: rowids below this bound live in the bitset (the
+/// vector grows lazily to max_inserted/64 words, capped at 32 MB);
+/// larger ids spill to the hash tail (sparse outliers — rowid space
+/// beyond ~268M is pathological and stays hash-bounded).
+const ROWID_BITSET_LIMIT: i64 = 1 << 28;
+
+impl RowidSet {
+    #[inline]
+    fn insert(&mut self, id: i64) {
+        if (0..ROWID_BITSET_LIMIT).contains(&id) {
+            let idx = id as usize;
+            let w = idx / 64;
+            if w >= self.bits.len() {
+                self.bits.resize(w + 1, 0);
+            }
+            self.bits[w] |= 1u64 << (idx % 64);
+        } else {
+            self.tail.insert(id);
+        }
+    }
+
+    #[inline]
+    fn contains(&self, id: i64) -> bool {
+        if (0..ROWID_BITSET_LIMIT).contains(&id) {
+            let idx = id as usize;
+            self.bits
+                .get(idx / 64)
+                .is_some_and(|w| (w >> (idx % 64)) & 1 == 1)
+        } else {
+            self.tail.contains(&id)
+        }
+    }
+
+    /// Iterate every member (bitset words then tail — order is
+    /// irrelevant to the difference/containment uses here).
+    fn iter(&self) -> impl Iterator<Item = i64> + '_ {
+        self.bits
+            .iter()
+            .enumerate()
+            .flat_map(|(w, bits)| {
+                (0..64u32).filter_map(move |b| {
+                    ((bits >> b) & 1 == 1).then_some((w * 64 + b as usize) as i64)
+                })
+            })
+            .chain(self.tail.iter().copied())
+    }
+}
+
 /// Default maximum number of reported problems (SQLite uses 100).
 const MAX_REPORTED_PROBLEMS: usize = 100;
 
@@ -135,7 +198,8 @@ pub fn integrity_check(
         .map(|(_, idx)| idx.table.to_ascii_lowercase())
         .collect();
     let tables = catalog.all_tables();
-    let mut table_rowids: Vec<(String, HashSet<i64>)> = Vec::with_capacity(tables.len());
+    let mut table_rowids: Vec<(String, std::sync::Arc<RowidSet>)> =
+        Vec::with_capacity(tables.len());
     let mut table_rows: Vec<(String, RowidRows)> = Vec::new();
     for (name, table) in &tables {
         let root = roots
@@ -158,7 +222,7 @@ pub fn integrity_check(
         };
         let capture = partial_owners.contains(&name.to_ascii_lowercase());
         let (rowids, rows) = check_table_tree(pager, table, root, &mut p, capture);
-        table_rowids.push((name.clone(), rowids));
+        table_rowids.push((name.clone(), std::sync::Arc::new(rowids)));
         if let Some(rows) = rows {
             table_rows.push((name.clone(), rows));
         }
@@ -181,7 +245,7 @@ pub fn integrity_check(
             let owner_entry = table_rowids
                 .iter()
                 .find(|(t, _)| t.eq_ignore_ascii_case(&idx.table));
-            let owner = owner_entry.map(|(_, set)| set.clone());
+            let owner = owner_entry.map(|(_, set)| std::sync::Arc::clone(set));
             // Decoded rows + Table descriptor for partial-predicate eval.
             let rows_entry = table_rows
                 .iter()
@@ -199,7 +263,7 @@ pub fn integrity_check(
                 pager,
                 idx,
                 root,
-                owner.as_ref(),
+                owner.as_deref(),
                 partial_rows,
                 table_desc,
                 &mut p,
@@ -335,8 +399,8 @@ fn check_table_tree(
     root: u32,
     p: &mut Problems,
     capture_rows: bool,
-) -> (HashSet<i64>, Option<RowidRows>) {
-    let mut rowids = HashSet::new();
+) -> (RowidSet, Option<RowidRows>) {
+    let mut rowids = RowidSet::default();
     let mut rows: Option<RowidRows> = capture_rows.then(Vec::new);
     let mut prev: Option<i64> = None;
     let n_cols = table.n_columns();
@@ -385,13 +449,13 @@ fn check_index_tree(
     pager: &Pager,
     idx: &Index,
     root: u32,
-    owner_rowids: Option<&HashSet<i64>>,
+    owner_rowids: Option<&RowidSet>,
     partial_rows: Option<&[(i64, Vec<Value>)]>,
     table: Option<&Table>,
     p: &mut Problems,
 ) {
     let mut prev: Option<(Vec<u8>, i64)> = None;
-    let mut index_rowids: HashSet<i64> = HashSet::new();
+    let mut index_rowids = RowidSet::default();
     let mut bt = Btree::new(pager, root, true);
     let scan = bt.scan_index(|rowid, key| {
         if let Some((pk, pr)) = &prev {
@@ -418,7 +482,7 @@ fn check_index_tree(
         return;
     };
     // Index -> table: every index entry must reference a live row.
-    for r in &index_rowids {
+    for r in index_rowids.iter() {
         if !owner.contains(r) {
             p.push(format!(
                 "entry in index {} references row {} that is missing from table {}",
@@ -429,44 +493,62 @@ fn check_index_tree(
     // Table -> index: every live row must have an index entry — except
     // rows a partial index's WHERE predicate excludes (those are
     // legitimately absent; SQLite reports the same data as ok).
-    let required: HashSet<i64> = match (&idx.partial_expr, partial_rows, table) {
-        (Some(_), Some(rows), Some(t)) => rows
-            .iter()
-            .filter(|(_, vals)| {
-                crate::executor::index_row_matches_partial(
+    // The required set is the OWNER set for non-partial indexes (the
+    // Arc'd bitset — no copy) or a fresh filtered set for partial ones.
+    // Missing-row reporting is BOUNDED (count + first 5): a corrupt
+    // index over 100M rows previously materialized every missing rowid
+    // into a Vec before printing 5.
+    let partial_required: Option<RowidSet> = match (&idx.partial_expr, partial_rows, table) {
+        (Some(_), Some(rows), Some(t)) => {
+            let mut set = RowidSet::default();
+            for (rid, vals) in rows {
+                if crate::executor::index_row_matches_partial(
                     idx,
                     t,
                     vals,
                     &[],
                     &std::collections::HashMap::new(),
-                )
-            })
-            .map(|(rid, _)| *rid)
-            .collect(),
-        _ => owner.iter().cloned().collect(),
+                ) {
+                    set.insert(*rid);
+                }
+            }
+            Some(set)
+        }
+        _ => None,
     };
-    let missing: Vec<&i64> = required.difference(&index_rowids).collect();
-    if !missing.is_empty() && crate::executor::dbg_index_trace() {
-        let all: Vec<i64> = missing.iter().copied().copied().collect();
+    // The required set streams from the OWNER's bitset for non-partial
+    // indexes (zero copy) or the freshly filtered partial set.
+    let required_iter: Box<dyn Iterator<Item = i64> + '_> = match partial_required {
+        Some(ref set) => Box::new(set.iter()),
+        None => Box::new(owner.iter()),
+    };
+    let mut missing_count = 0usize;
+    let mut missing_first: Vec<i64> = Vec::new();
+    for r in required_iter {
+        if !index_rowids.contains(r) {
+            missing_count += 1;
+            if missing_first.len() < 5 {
+                missing_first.push(r);
+            }
+        }
+    }
+    if missing_count > 0 && crate::executor::dbg_index_trace() {
         eprintln!(
             "[integrity] index {} missing {} rows: {:?}",
-            idx.name,
-            all.len(),
-            all
+            idx.name, missing_count, missing_first
         );
         bt.debug_dump_tree(&format!("index {}", idx.name));
     }
-    if !missing.is_empty() {
+    if missing_count > 0 {
         // Report count-style (SQLite reports each missing row; we cap
         // through the collector, so report a bounded list).
-        for r in missing.iter().take(5) {
+        for r in &missing_first {
             p.push(format!("row {} missing from index {}", r, idx.name));
         }
-        if missing.len() > 5 {
+        if missing_count > 5 {
             p.push(format!(
                 "{} rows missing from index {} (showing first 5)",
-                missing.len(),
-                idx.name
+                missing_count, idx.name
             ));
         }
     }

@@ -1193,6 +1193,82 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+// ---- savepoint undo-capture suspension (pure-read scans) -------------
+// True while the current thread walks a PURE-READ btree scan (see
+// `suspend_undo_capture`): savepoint undo pre-image capture is
+// suspended for the walk's own page fetches. Innermost scope wins —
+// the two RAII guards below save and restore the previous value.
+//
+// Why this is safe (the full argument, in one place):
+// 1. `capture_savepoint_undo` exists because "every mutation
+//    get_page()s before it modifies" — capture-at-FETCH is the only
+//    moment the pre-mutation bytes are still in hand. That invariant
+//    is what makes suspension safe too: a page fetched by a suspended
+//    read and mutated LATER is re-fetched by the mutating operation
+//    itself, with capture re-enabled (the mutating op is never inside
+//    a pure scan primitive), and `capture_savepoint_undo` fills the
+//    page into every savepoint level that predates the mutation and
+//    still lacks it — so read-then-write sequences inside one
+//    transaction roll back exactly as before.
+// 2. The ONLY in-walk mutator is `scan_table_range_patch` (the fused
+//    UPDATE path), which does NOT suspend.
+// 3. The only way a WRITE can run while a suspension is live is a
+//    plugin re-entrant call from inside a scan callback (C-ABI
+//    `pApp`-style). Both re-entrance entries —
+//    `Database::execute_stmt` and `Statement::exec_with_ctx` — re-arm
+//    capture for their own duration, so even that exotic shape
+//    captures.
+//
+// The win: without suspension, every page a READ fetched inside a
+// transaction (a plain BEGIN arms a savepoint as the rollback base)
+// took a 4 KB pre-image copy in RAM — `BEGIN; SELECT count(*) FROM
+// <10M-row table>; COMMIT` transiently allocated ~500 MB where SQLite
+// journals only the pages it actually modifies (and to disk).
+thread_local! {
+    static UNDO_CAPTURE_SUSPENDED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// RAII: suspend savepoint undo capture for a pure-read walk.
+pub struct UndoCaptureSuspend {
+    prev: bool,
+}
+impl Drop for UndoCaptureSuspend {
+    fn drop(&mut self) {
+        UNDO_CAPTURE_SUSPENDED.with(|c| c.set(self.prev));
+    }
+}
+
+/// RAII: re-arm savepoint undo capture for a statement entry (see the
+/// re-entrance argument above).
+pub struct UndoCaptureResume {
+    prev: bool,
+}
+impl Drop for UndoCaptureResume {
+    fn drop(&mut self) {
+        UNDO_CAPTURE_SUSPENDED.with(|c| c.set(self.prev));
+    }
+}
+
+#[inline]
+pub fn suspend_undo_capture() -> UndoCaptureSuspend {
+    UndoCaptureSuspend {
+        prev: UNDO_CAPTURE_SUSPENDED.with(|c| c.replace(true)),
+    }
+}
+
+#[inline]
+pub fn resume_undo_capture() -> UndoCaptureResume {
+    UndoCaptureResume {
+        prev: UNDO_CAPTURE_SUSPENDED.with(|c| c.replace(false)),
+    }
+}
+
+#[inline]
+fn undo_capture_suspended() -> bool {
+    UNDO_CAPTURE_SUSPENDED.with(|c| c.get())
+}
+
 /// Hard cap on the per-thread committed-view memo: 256 pages x 4 KiB
 /// = 1 MiB per reader thread — the interior-node working set of even
 /// large tables is tens of pages; hot leaf ranges fit under a few
@@ -3059,7 +3135,7 @@ impl Pager {
                 // SAVEPOINT undo capture: the bytes at fetch time are the
                 // pre-mutation state (every mutation get_page()s before it
                 // modifies). One atomic load when no savepoint is active.
-                if self.savepoint_depth.load(Ordering::Relaxed) > 0 {
+                if self.savepoint_depth.load(Ordering::Relaxed) > 0 && !undo_capture_suspended() {
                     self.capture_savepoint_undo(id, &page_ref);
                 }
                 return Ok(page_ref);
@@ -3287,7 +3363,7 @@ impl Pager {
             }
         }
         self.note_seq_access(id, true);
-        if self.savepoint_depth.load(Ordering::Relaxed) > 0 {
+        if self.savepoint_depth.load(Ordering::Relaxed) > 0 && !undo_capture_suspended() {
             self.capture_savepoint_undo(id, &page_ref);
         }
         Ok(page_ref)
@@ -5723,8 +5799,16 @@ impl Pager {
                 None => {
                     let pr: PageRef =
                         Arc::new(Mutex::new(crate::storage::page::Page::new(id, psz as u32)));
-                    let mut cache = self.cache.write();
-                    cache.insert(id, pr.clone());
+                    {
+                        let mut cache = self.cache.write();
+                        cache.insert(id, pr.clone());
+                        // LRU registration — the get_page contract: an
+                        // insert without it is INVISIBLE to the eviction
+                        // pass, and a whole-image install accumulates in
+                        // the cache unbounded (the mega-scale marathon's
+                        // install spike: the whole compact image resident).
+                        self.lru.lock().push_back(id);
+                    }
                     pr
                 }
             };
@@ -5765,6 +5849,121 @@ impl Pager {
         // 6. Stale BEGIN-time pre-images from earlier committed-view
         //    scopes must not serve old-tree bytes over the compact
         //    state.
+        self.clear_committed_view();
+        Ok(())
+    }
+
+    /// STREAMING twin of [`install_compact_image`] — the compact image
+    /// is a TEMP FILE (the row-level VACUUM path: codec DBs and
+    /// mass-delete shapes) and is installed in bounded 64-page chunks
+    /// instead of one whole-file read-back. The mega-scale suite found
+    /// the whole-image materialization alone adding transient RSS equal
+    /// to the compact file (100+ MB per 2M rows vacuumed; gigabytes at
+    /// 100M-row scale) — the read-back plus the unconditional
+    /// cache-insert of every page.
+    ///
+    /// Chunk discipline: after every 64-page chunk the cache-pressure
+    /// eviction pass runs (under the cache write lock), spilling the
+    /// installed-but-uncommitted pages to the WAL as uncommitted frames
+    /// — `get_page` misses read them back through the spill index, and
+    /// the final `flush()` commits them all with one trailing commit
+    /// frame. Crash safety and the epilogue are identical to the image
+    /// variant: single commit, checkpoint, physical tail truncation,
+    /// committed-view reset.
+    pub fn install_compact_image_from_file(&self, src: &std::path::Path) -> Result<()> {
+        if self.wal.read().is_none() {
+            return Err(Error::InvalidArgument(
+                "install_compact_image_from_file requires WAL mode".into(),
+            ));
+        }
+        let psz = self.page_size() as usize;
+        let file_len = std::fs::metadata(src)
+            .map_err(|e| Error::Io(std::io::Error::other(format!("vacuum source stat: {e}"))))?
+            .len() as usize;
+        if file_len == 0 || file_len % psz != 0 {
+            return Err(Error::corruption(format!(
+                "vacuum image not page-aligned (len={}, page_size={})",
+                file_len, psz
+            )));
+        }
+        let new_n = (file_len / psz) as u32;
+        let old_n = self.n_pages.load(Ordering::Acquire);
+
+        // 1. Retire every page >= new_n FIRST (the freelist-trunk walk
+        //    in truncate_tail reads the OLD state; same ordering as the
+        //    image variant).
+        if new_n < old_n {
+            let freed: Vec<PageId> = (new_n..old_n).collect();
+            self.truncate_tail(&freed)?;
+        }
+
+        // 2. Stream the image in 64-page chunks. Each page: cached ->
+        //    overwrite in place; not cached -> created directly (no disk
+        //    read — the bytes come from the image file). The eviction
+        //    pass after each chunk bounds the cache to its capacity:
+        //    dirty pages spill to the WAL as uncommitted frames.
+        let mut f = std::fs::File::open(src)
+            .map_err(|e| Error::Io(std::io::Error::other(format!("vacuum source open: {e}"))))?;
+        const CHUNK_PAGES: usize = 64;
+        let mut buf = vec![0u8; CHUNK_PAGES * psz];
+        let mut next: PageId = 0;
+        while next < new_n {
+            let pages_this = ((new_n - next) as usize).min(CHUNK_PAGES);
+            let bytes = &mut buf[..pages_this * psz];
+            std::io::Read::read_exact(&mut f, bytes).map_err(|e| {
+                Error::Io(std::io::Error::other(format!("vacuum source read: {e}")))
+            })?;
+            for (j, chunk) in bytes.chunks_exact(psz).enumerate() {
+                let id = next + j as PageId;
+                let page_ref = {
+                    let cache = self.cache.read();
+                    cache.get(id).cloned()
+                };
+                let page_ref = match page_ref {
+                    Some(pr) => pr,
+                    None => {
+                        let pr: PageRef =
+                            Arc::new(Mutex::new(crate::storage::page::Page::new(id, psz as u32)));
+                        {
+                            let mut cache = self.cache.write();
+                            cache.insert(id, pr.clone());
+                            // Same LRU contract as get_page (see the
+                            // image variant's note): without registration
+                            // the eviction pass cannot drain the install.
+                            self.lru.lock().push_back(id);
+                        }
+                        pr
+                    }
+                };
+                {
+                    let mut p = page_ref.lock();
+                    p.data.copy_from_slice(chunk);
+                    p.touch();
+                }
+                self.note_dirty(id);
+                self.dirty_count_approx.fetch_add(1, Ordering::Relaxed);
+            }
+            next += pages_this as PageId;
+            // Pressure valve (the whole point of streaming): evict under
+            // the cache write lock so uncommitted pages spill instead of
+            // accumulating. No-ops on in-memory stores.
+            {
+                let mut cache = self.cache.write();
+                self.maybe_evict_locked(&mut cache);
+            }
+        }
+
+        // 3-6. Identical epilogue to the image variant: the compact
+        //      image has no freelist, the schema moved so the cookie must
+        //      change, ONE commit frame carries everything (spilled
+        //      frames included), the checkpoint folds it into the main
+        //      file and applies the armed tail truncation, and stale
+        //      BEGIN-time pre-images must not serve old-tree bytes.
+        self.freelist_head.store(0, Ordering::Release);
+        self.freelist_count.store(0, Ordering::Release);
+        self.schema_cookie.fetch_add(1, Ordering::AcqRel);
+        self.flush()?;
+        self.checkpoint_wal_now()?;
         self.clear_committed_view();
         Ok(())
     }
@@ -5830,8 +6029,13 @@ impl Pager {
                 None => {
                     let pr: PageRef =
                         Arc::new(Mutex::new(crate::storage::page::Page::new(k, psz as u32)));
-                    let mut cache = self.cache.write();
-                    cache.insert(k, pr.clone());
+                    {
+                        let mut cache = self.cache.write();
+                        cache.insert(k, pr.clone());
+                        // LRU registration (see the image variant's
+                        // note) — the moves must stay evictable.
+                        self.lru.lock().push_back(k);
+                    }
                     pr
                 }
             };
@@ -6236,34 +6440,26 @@ impl Pager {
         // eviction path takes the spill lock while holding the cache write
         // lock — holding it across the loop's cache reads would be an ABBA
         // deadlock).
-        let spilled_bodies: std::collections::HashMap<PageId, Vec<u8>, PageIdHashBuild> = {
+        // STREAMING DRAIN — the mega-scale fix: the drain used to
+        // materialize EVERY spilled body up front (HashMap<PageId,
+        // Vec<u8>>, one page-sized Vec per record, all live at once). A
+        // 512-page cache under a bulk DELETE-mode transaction (the VACUUM
+        // temp DB's row copy — the temp opens in default DELETE journal
+        // mode) spills essentially every page it dirties, so the COMMIT
+        // materialized the whole database image in RAM: ~60 MB at 2M
+        // rows, scaling linearly with size (the marathon's M8 budget
+        // breach). Now only the INDEX (id -> sidecar offset) is drained;
+        // each body is read into ONE reused page-sized scratch at its
+        // write turn.
+        let spilled_index: Vec<(PageId, u64)> = {
             let mut spill_guard = self.delete_spill.lock();
             match spill_guard.as_mut() {
-                Some(spill) if !spill.pages.is_empty() => {
-                    let psz = self.page_size() as usize;
-                    let mut out = std::collections::HashMap::default();
-                    let drained: Vec<(PageId, u64)> = spill.pages.drain().collect();
-                    for (id, off) in drained {
-                        let mut buf = vec![0u8; psz];
-                        match spill.read_page_at(off, &mut buf) {
-                            Ok(()) => {
-                                out.insert(id, buf);
-                            }
-                            Err(e) => {
-                                // Restore the entry so the page is not
-                                // silently lost — the error propagates below
-                                // via the same "failed drain" contract as a
-                                // failed dirty-page write.
-                                spill.pages.insert(id, off);
-                                return Err(e);
-                            }
-                        }
-                    }
-                    out
-                }
-                _ => std::collections::HashMap::default(),
+                Some(spill) if !spill.pages.is_empty() => spill.pages.drain().collect(),
+                _ => Vec::new(),
             }
         };
+        let mut spilled_map: std::collections::HashMap<PageId, u64, PageIdHashBuild> =
+            spilled_index.iter().copied().collect();
 
         // WRITE ORDER (crash safety, part 2 of the ordering contract):
         // DESCENDING page id — newly allocated page bodies (the HIGHEST
@@ -6282,7 +6478,7 @@ impl Pager {
         // remains LAST, as before.
         let mut write_order: Vec<PageId> = dirty_ids
             .into_iter()
-            .chain(spilled_bodies.keys().copied())
+            .chain(spilled_map.keys().copied())
             .collect();
         write_order.sort_unstable_by(|a, b| b.cmp(a));
         write_order.dedup();
@@ -6302,9 +6498,51 @@ impl Pager {
         // child pointer to a page the not-yet-written header did not
         // count — "page N out of range" for every later open.)
         let committed_bound = self.committed_n_pages.load(Ordering::Acquire);
-        let write_page = |id: PageId| -> Result<()> {
-            if let Some(bytes) = spilled_bodies.get(&id) {
-                return self.codec_write_page(id, bytes);
+        // The spill read re-acquires the sidecar lock per page with NO
+        // cache lock held (the eviction path's order is cache -> spill; a
+        // spill -> cache nesting here would be the ABBA cycle), and
+        // releases it before the main-file write. `spilled_map` sheds
+        // each id as its body is successfully written, so on failure the
+        // restore re-inserts exactly the UNWRITTEN set (the failed page
+        // and every page after it) into the sidecar index — strictly
+        // stronger than the old per-page restore, which dropped the
+        // already-drained entries on a retry.
+        let psz_bytes = self.page_size() as usize;
+        let mut spill_scratch = vec![0u8; psz_bytes];
+        let restore_unwritten =
+            |spilled_map: &std::collections::HashMap<PageId, u64, PageIdHashBuild>| {
+                let mut spill_guard = self.delete_spill.lock();
+                if let Some(spill) = spill_guard.as_mut() {
+                    for (sid, soff) in spilled_map.iter() {
+                        spill.pages.insert(*sid, *soff);
+                    }
+                }
+            };
+        let mut write_page = |id: PageId| -> Result<()> {
+            if let Some(&off) = spilled_map.get(&id) {
+                let written = {
+                    let read = {
+                        let mut spill_guard = self.delete_spill.lock();
+                        match spill_guard.as_mut() {
+                            Some(spill) => spill.read_page_at(off, &mut spill_scratch),
+                            // The sidecar cannot legitimately vanish
+                            // mid-drain (only rollback removes it, and
+                            // rollback cannot run while COMMIT holds the
+                            // write path): corruption class.
+                            None => Err(Error::corruption("delete sidecar vanished mid-drain")),
+                        }
+                    };
+                    match read {
+                        Ok(()) => self.codec_write_page(id, &spill_scratch),
+                        Err(e) => Err(e),
+                    }
+                };
+                if let Err(e) = written {
+                    restore_unwritten(&spilled_map);
+                    return Err(e);
+                }
+                spilled_map.remove(&id);
+                return Ok(());
             }
             // Use a single cache read lock to look up the page; clone the
             // Arc and release the lock before doing I/O.
@@ -6312,7 +6550,12 @@ impl Pager {
             if let Some(page_ref) = page_ref {
                 let mut borrowed = page_ref.lock();
                 if borrowed.dirty {
-                    self.codec_write_page(id, &borrowed.data)?;
+                    if let Err(e) = self.codec_write_page(id, &borrowed.data) {
+                        // The flush aborts here: the unwritten spilled
+                        // pages' sidecar records must survive for a retry.
+                        restore_unwritten(&spilled_map);
+                        return Err(e);
+                    }
                     borrowed.dirty = false;
                 }
             }
@@ -6339,7 +6582,7 @@ impl Pager {
         }
         // Reset the sidecar for the next transaction (truncate in place —
         // cheaper than delete + recreate).
-        if !spilled_bodies.is_empty() {
+        if !spilled_index.is_empty() {
             let mut spill_guard = self.delete_spill.lock();
             if let Some(spill) = spill_guard.as_mut() {
                 use std::io::Write;

@@ -150,6 +150,9 @@ jobs:
       # limit-stress job (release, LIMIT_ROWS=1000000); here it is a
       # quick smoke of every section's code paths.
       LIMIT_ROWS: "20000"
+      # Mega-scale marathon smoke: every section's code paths at tiny
+      # scale in the default matrix (the real scale lives in mega-scale).
+      MEGA_ROWS: "20000"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -199,6 +202,9 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
       RSQL_XPROC_TRACE: "1"
       LIMIT_ROWS: "20000"
+      # Mega-scale marathon smoke: every section's code paths at tiny
+      # scale in the default matrix (the real scale lives in mega-scale).
+      MEGA_ROWS: "20000"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -224,6 +230,9 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
       RSQL_XPROC_TRACE: "1"
       LIMIT_ROWS: "20000"
+      # Mega-scale marathon smoke: every section's code paths at tiny
+      # scale in the default matrix (the real scale lives in mega-scale).
+      MEGA_ROWS: "20000"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -453,6 +462,76 @@ jobs:
         env:
           MILLION_ROWS: ${{ matrix.rows }}
 
+  # MEGA-SCALE: the production-stress marathon (tests/mega_scale.rs) —
+  # one ordered M1-M9 pass over ONE file-backed database at the scale
+  # where engines break: bulk build with degradation/rate/RSS gates,
+  # exact-answer read battery, close/open cycles, churn + mixed-op
+  # storm, 4-writer BEGIN CONCURRENT soak with exact-reader scans,
+  # mass-delete + VACUUM reclamation, sustained-scan RSS flatness, final
+  # verification, and (ubuntu) the same dataset on bundled real SQLite
+  # with answer equality + wide anti-collapse timing gates.
+  mega-scale:
+    name: mega-scale (${{ matrix.os }}, ${{ matrix.rows }} rows)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      RUSTSQL_MIMALLOC_PURGE_DELAY_MS: "25"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            rows: "10000000"
+            vs: "1"
+          - os: windows-latest
+            rows: "5000000"
+            vs: "0"
+          - os: macos-latest
+            rows: "5000000"
+            vs: "0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: mega-${{ matrix.os }}
+          cache-on-failure: true
+      - name: "Mega-scale marathon (build/read/reopen/churn/concurrent/mass-delete+VACUUM/flatness/verify)"
+        run: cargo test --release --test mega_scale -- --nocapture --test-threads=1
+        env:
+          MEGA_ROWS: ${{ matrix.rows }}
+          MEGA_VS_SQLITE: ${{ matrix.vs }}
+          MEGA_PROBES: "2000"
+
+  # The 100M-row discipline: weekly (schedule) + manual dispatch only —
+  # a 100M build takes hours on shared runners and burns the runner-disk
+  # budget; the lean shape (id, k) keeps the file inside the runner's
+  # free space while every storage discipline still runs at full scale.
+  mega-scale-100m:
+    name: mega-scale-100m (ubuntu, lean, weekly)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      RUSTSQL_MIMALLOC_PURGE_DELAY_MS: "25"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: mega-100m
+          cache-on-failure: true
+      - name: "Mega-scale marathon at 100,000,000 rows (lean shape)"
+        run: cargo test --release --test mega_scale -- --nocapture --test-threads=1
+        env:
+          MEGA_ROWS: "100000000"
+          MEGA_LEAN: "1"
+          MEGA_BATCH: "20000"
+          MEGA_OPS: "500000"
+          MEGA_SOAK_TXNS: "10"
+
   # OOM fault injection: 532 allocation-failure points, each verified to
   # leave the baseline intact (SQLite's memsys fault-injection equivalent).
   # Uses its own allocator, so it must build without mimalloc.
@@ -464,6 +543,9 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       LIMIT_ROWS: "20000"
+      # Mega-scale marathon smoke: every section's code paths at tiny
+      # scale in the default matrix (the real scale lives in mega-scale).
+      MEGA_ROWS: "20000"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -675,7 +757,7 @@ jobs:
   # ------------------------------------------------------------ aggregate OK
   ci-ok:
     name: ci-ok (all gates green)
-    needs: [fmt, clippy, test, test-windows, test-macos, stress-intensive, limit-stress, million-record, test-oom, test-compat, torture, bench-gate, interop, sqlx-interop]
+    needs: [fmt, clippy, test, test-windows, test-macos, stress-intensive, limit-stress, million-record, mega-scale, test-oom, test-compat, torture, bench-gate, interop, sqlx-interop]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5

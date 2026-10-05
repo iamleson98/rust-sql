@@ -1805,6 +1805,7 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
                         project.as_deref(),
                         out_cols,
                         residual.as_ref(),
+                        None,
                     );
                 }
             }
@@ -2019,6 +2020,7 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             start.as_ref(),
             end.as_ref(),
             residual.as_ref(),
+            None,
         ),
         Plan::IndexLookup {
             table,
@@ -4778,6 +4780,33 @@ fn scan_table_rows<F: FnMut(i64, &[u8]) -> bool>(
     Btree::new(ctx.pager, root, false).scan_table_borrowed_opts(f, may_reenter)
 }
 
+/// Walk a rowid table's rows — the FULL table, or just a rowid RANGE —
+/// under the same `(rowid, payload) -> bool` visitor contract as
+/// [`scan_table_rows`]. The streaming aggregate / GROUP BY / top-N
+/// machines accept an optional range extracted from a residual-free
+/// `Plan::RowidRange` (the `WHERE id <op> ?` analytics battery shape):
+/// before this, their fallback materialized every row in the range (a
+/// full payload decode + a Vec of Values per row — hundreds of MB of
+/// transient RSS at multi-million-row scale) just to fold one output
+/// row. The caller guards WITHOUT ROWID tables away (no rowid space —
+/// the planner never produces a RowidRange over them).
+fn scan_table_maybe_range<F: FnMut(i64, &[u8]) -> bool>(
+    ctx: &ExecContext<'_>,
+    table: &Table,
+    range: Option<(i64, i64)>,
+    may_reenter: bool,
+    f: F,
+) -> Result<()> {
+    match range {
+        None => scan_table_rows(ctx, table, may_reenter, f),
+        Some((start, end)) => {
+            let root = ctx.table_root(table);
+            let mut bt = Btree::new(ctx.pager, root, false);
+            bt.scan_table_range_borrowed_opts(start, end, f, may_reenter)
+        }
+    }
+}
+
 /// Re-order a WITHOUT ROWID table's rowids under its PK's DECLARED
 /// direction (per-column ASC/DESC with the column collations) — the
 /// engine-internal PK index stores every column ascending, so a PK
@@ -6800,6 +6829,7 @@ fn exec_topn_scan(
     project: Option<&[usize]>,
     out_cols: Arc<[String]>,
     coll: Option<&dyn crate::plugin::Collation>,
+    range: Option<(i64, i64)>,
 ) -> Result<ExecResult> {
     let n_cols = table.n_columns();
     let rowid_alias = table.rowid_alias;
@@ -6877,6 +6907,14 @@ fn exec_topn_scan(
             offer(rowid, row);
             true
         })?;
+    } else if let Some((start, end)) = range {
+        // Rowid-range walk (the `WHERE id <op> ?` shape): same selective
+        // decode + keep-heap, bounded to the range — the materializing
+        // path decoded EVERY row in the range just to keep `keep`.
+        bt.scan_table_range_selective(start, end, n_cols, &wanted, rowid_alias, |rowid, row| {
+            offer(rowid, row);
+            true
+        })?;
     } else {
         bt.scan_table_selective(n_cols, &wanted, rowid_alias, |rowid, row| {
             offer(rowid, row);
@@ -6918,6 +6956,7 @@ fn exec_topn_scan_expr(
     offset: usize,
     project: Option<&[usize]>,
     out_cols: Arc<[String]>,
+    range: Option<(i64, i64)>,
 ) -> Result<ExecResult> {
     let n_cols = table.n_columns();
     let rowid_alias = table.rowid_alias;
@@ -6941,7 +6980,7 @@ fn exec_topn_scan_expr(
     // per comparison).
     let mut sel: Vec<TopnSel> = Vec::with_capacity(keep.min(4096));
     let mut wide: Vec<Value> = Vec::with_capacity(n_cols + 1);
-    scan_table_rows(ctx, table, false, |rowid, payload| {
+    scan_table_maybe_range(ctx, table, range, false, |rowid, payload| {
         if crate::storage::row_codec::decode_row_selective_wide(
             payload,
             n_cols,
@@ -7014,6 +7053,24 @@ fn exec_topn_scan_expr(
 /// bounded top-N selection.
 type TopnTarget<'a> = Option<(&'a Plan, &'a Vec<OrderTerm>, Option<&'a Vec<ProjectExpr>>)>;
 
+/// Post-window a pushdown result: drain `offset` rows, truncate to
+/// `count` (count < 0 = unbounded). The pushdown materializes at most
+/// offset+count rows, so both operations are bounded by the request.
+fn limit_window(mut res: ExecResult, offset: usize, count: i64) -> ExecResult {
+    if offset >= res.rows.len() {
+        res.rows.clear();
+    } else {
+        res.rows.drain(0..offset);
+        if count >= 0 {
+            let c = count as usize;
+            if res.rows.len() > c {
+                res.rows.truncate(c);
+            }
+        }
+    }
+    res
+}
+
 fn exec_limit(
     ctx: &mut ExecContext<'_>,
     input: &Plan,
@@ -7071,13 +7128,49 @@ fn exec_limit(
                 // (evaluated once per row); non-compilable shapes keep the
                 // materializing path.
                 if total <= 4096 {
-                    if let Plan::Scan {
-                        table,
-                        alias,
-                        index: None,
-                        predicate: None,
-                    } = sort_input
-                    {
+                    // Bare scan OR residual-free RowidRange (the `WHERE id
+                    // <op> ?` shape): the keep-heap walks the RANGE —
+                    // before this, a RowidRange input fell to the
+                    // materializing path (every row in the range decoded
+                    // into a Vec of Values, hundreds of MB at mega scale,
+                    // only for the heap to keep 25). The (0, -1) range is
+                    // the never-match bound — walks nothing.
+                    // (table, alias, residual-free rowid-range bounds)
+                    type TopnScanInput<'a> = (
+                        &'a std::sync::Arc<Table>,
+                        &'a Option<String>,
+                        Option<(i64, i64)>,
+                    );
+                    let topn_input: Option<TopnScanInput> = match sort_input {
+                        Plan::Scan {
+                            table,
+                            alias,
+                            index: None,
+                            predicate: None,
+                        } => Some((table, alias, None)),
+                        Plan::RowidRange {
+                            table,
+                            alias,
+                            start,
+                            end,
+                            residual: None,
+                            ..
+                        } if !table.without_rowid => {
+                            let sv = match start {
+                                Some(e) => Some(evaluate(e, &eval_ctx)?),
+                                None => None,
+                            };
+                            let ev = match end {
+                                Some(e) => Some(evaluate(e, &eval_ctx)?),
+                                None => None,
+                            };
+                            let bounds =
+                                rowid_range_bounds(sv.as_ref(), ev.as_ref()).unwrap_or((0, -1));
+                            Some((table, alias, Some(bounds)))
+                        }
+                        _ => None,
+                    };
+                    if let Some((table, alias, range)) = topn_input {
                         if table.vtab.is_none() {
                             // COLLATE terms unwrap: the key is the wrapped
                             // expression, the collation resolves ONCE here
@@ -7118,18 +7211,25 @@ fn exec_limit(
                                     // streaming path (see parallel.rs for
                                     // the proof). Declines below
                                     // threshold / config off / txn open.
-                                    if let Some(res) = crate::executor::parallel::try_parallel_topn(
-                                        ctx,
-                                        table,
-                                        key_col,
-                                        desc,
-                                        total,
-                                        offset_i as usize,
-                                        project.as_deref(),
-                                        out_cols.clone(),
-                                        coll.clone(),
-                                    )? {
-                                        return Ok(res);
+                                    // A rowid RANGE keeps the serial walk
+                                    // (the workers split the full rowid
+                                    // space — no range plumbing).
+                                    if range.is_none() {
+                                        if let Some(res) =
+                                            crate::executor::parallel::try_parallel_topn(
+                                                ctx,
+                                                table,
+                                                key_col,
+                                                desc,
+                                                total,
+                                                offset_i as usize,
+                                                project.as_deref(),
+                                                out_cols.clone(),
+                                                coll.clone(),
+                                            )?
+                                        {
+                                            return Ok(res);
+                                        }
                                     }
                                     return exec_topn_scan(
                                         ctx,
@@ -7141,6 +7241,7 @@ fn exec_limit(
                                         project.as_deref(),
                                         out_cols,
                                         coll.as_deref(),
+                                        range,
                                     );
                                 }
                             } else if let Some(compiled_terms) = expr_sort_terms(
@@ -7183,20 +7284,23 @@ fn exec_limit(
                                     // order — bit-identical to the serial
                                     // streaming path. Declines below
                                     // threshold / config off / txn open.
-                                    if let Some(res) =
-                                        crate::executor::parallel::try_parallel_topn_expr(
-                                            ctx,
-                                            table,
-                                            &compiled,
-                                            coll.clone(),
-                                            desc,
-                                            total,
-                                            offset_i as usize,
-                                            project.as_deref(),
-                                            out_cols.clone(),
-                                        )?
-                                    {
-                                        return Ok(res);
+                                    // A rowid RANGE keeps the serial walk.
+                                    if range.is_none() {
+                                        if let Some(res) =
+                                            crate::executor::parallel::try_parallel_topn_expr(
+                                                ctx,
+                                                table,
+                                                &compiled,
+                                                coll.clone(),
+                                                desc,
+                                                total,
+                                                offset_i as usize,
+                                                project.as_deref(),
+                                                out_cols.clone(),
+                                            )?
+                                        {
+                                            return Ok(res);
+                                        }
                                     }
                                     return exec_topn_scan_expr(
                                         ctx,
@@ -7208,6 +7312,7 @@ fn exec_limit(
                                         offset_i as usize,
                                         project.as_deref(),
                                         out_cols,
+                                        range,
                                     );
                                 }
                             }
@@ -7286,6 +7391,123 @@ fn exec_limit(
                                 }
                             }
                             return Ok(res);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // ---- LIMIT PUSHDOWN into a RowidRange ----
+    // `SELECT ... WHERE id > ? ORDER BY id LIMIT k` (the batched-cursor
+    // shape: VACUUM's row copier, keyset pagination) previously
+    // materialized the ENTIRE remaining range per statement and truncated
+    // — O(remaining) per batch, O(n^2) across a 600-batch 2M-row copy
+    // (measured 90s where the walk itself is ~1s). The range walk's
+    // visitor supports early-stop; push offset+count down as the stop.
+    // Covers the bare range and a bare-column Project over it (the
+    // fused projected executor).
+    {
+        // (table, alias, start, end, residual filter, bare-column
+        // projection) — the LIMIT-pushdown rowid-range shape.
+        type RowidRangeShape<'a> = (
+            &'a Arc<Table>,
+            Option<&'a String>,
+            Option<&'a Expr>,
+            Option<&'a Expr>,
+            Option<&'a Expr>,
+            Option<&'a [ProjectExpr]>,
+        );
+        let rr: Option<RowidRangeShape> = match input {
+            Plan::RowidRange {
+                table,
+                alias,
+                start,
+                end,
+                residual,
+                ..
+            } if table.vtab.is_none() && !table.without_rowid => Some((
+                table,
+                alias.as_ref(),
+                start.as_ref(),
+                end.as_ref(),
+                residual.as_ref(),
+                None,
+            )),
+            Plan::Project {
+                input: inner,
+                columns,
+            } if matches!(
+                inner.as_ref(),
+                Plan::RowidRange {
+                    table: t,
+                    ..
+                } if t.vtab.is_none() && !t.without_rowid
+            ) =>
+            {
+                if let Plan::RowidRange {
+                    table,
+                    alias,
+                    start,
+                    end,
+                    residual,
+                    ..
+                } = inner.as_ref()
+                {
+                    Some((
+                        table,
+                        alias.as_ref(),
+                        start.as_ref(),
+                        end.as_ref(),
+                        residual.as_ref(),
+                        Some(columns),
+                    ))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some((table, _alias, start, end, residual, projection)) = rr {
+            let empty_row: Vec<Value> = Vec::new();
+            let empty_cols: Vec<String> = Vec::new();
+            let eval_ctx =
+                EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+            if let (Ok(count_val), Ok(offset_val)) =
+                (evaluate(count, &eval_ctx), evaluate(offset, &eval_ctx))
+            {
+                let count_i = count_val.as_integer();
+                let offset_i = offset_val.as_integer().max(0);
+                if count_i >= 0 && offset_i <= (i64::MAX / 4) {
+                    let total = count_i.saturating_add(offset_i) as usize;
+                    match projection {
+                        None => {
+                            let res = exec_rowid_range(
+                                ctx,
+                                table.clone(),
+                                _alias.cloned(),
+                                start,
+                                end,
+                                residual,
+                                Some(total),
+                            )?;
+                            return Ok(limit_window(res, offset_i as usize, count_i));
+                        }
+                        Some(columns) => {
+                            if let Some((project, out_cols)) =
+                                bare_column_projection(columns, table)
+                            {
+                                let res = exec_rowid_range_projected_impl(
+                                    ctx,
+                                    table.clone(),
+                                    start,
+                                    end,
+                                    project.as_deref(),
+                                    out_cols,
+                                    residual,
+                                    Some(total),
+                                )?;
+                                return Ok(limit_window(res, offset_i as usize, count_i));
+                            }
                         }
                     }
                 }
@@ -9069,9 +9291,17 @@ fn exec_aggregate_streaming_scan(
     // Fast path: no GROUP BY — accumulate a single group directly (no
     // per-row key computation, no hash table).
     if group_by.is_empty() {
-        return exec_aggregate_no_group_by(ctx, table, alias, filter_predicate, aggregates);
+        return exec_aggregate_no_group_by(ctx, table, alias, filter_predicate, aggregates, None);
     }
-    let grouper = scan_groupby_grouper(ctx, table, alias, filter_predicate, group_by, aggregates)?;
+    let grouper = scan_groupby_grouper(
+        ctx,
+        table,
+        alias,
+        filter_predicate,
+        group_by,
+        aggregates,
+        None,
+    )?;
     finish_group_result(grouper, group_by, aggregates, projection)
 }
 
@@ -9181,6 +9411,7 @@ pub(crate) fn scan_groupby_grouper(
     filter_predicate: Option<&Expr>,
     group_by: &[Expr],
     aggregates: &[AggExpr],
+    range: Option<(i64, i64)>,
 ) -> Result<HashGrouper> {
     // No-GROUP-BY callers must go through `exec_aggregate`'s dispatch
     // (`exec_aggregate_no_group_by`) — a grouper only exists WITH grouping.
@@ -9305,9 +9536,6 @@ pub(crate) fn scan_groupby_grouper(
     let mut row_buf: Vec<Value> = Vec::with_capacity(n_cols);
     let mut sel_buf: Vec<Value> = Vec::with_capacity(wanted.len().max(1));
 
-    let root = ctx.table_root(&table);
-    let mut bt = Btree::new(ctx.pager, root, false);
-
     if selective_eligible {
         // ==== Intra-statement parallel split (the concurrency frontier
         // SQLite's single-threaded executor cannot follow): big tables
@@ -9315,18 +9543,21 @@ pub(crate) fn scan_groupby_grouper(
         // exact semantics over its range; partials merge in range order
         // (first-seen group order identical to the serial scan). Any
         // decline below threshold / config / shape falls through to the
-        // serial loop unchanged.
-        if let Some(g) = crate::executor::parallel::try_parallel_groupby_selective(
-            ctx,
-            &table,
-            &key_col_indices,
-            &agg_col_indices,
-            aggregates,
-            n_cols,
-            &key_collations,
-        )? {
-            drop(bt);
-            return Ok(g);
+        // serial loop unchanged. A rowid RANGE opts out (the workers
+        // split the full rowid space; no range plumbing) — the serial
+        // loop below carries the range.
+        if range.is_none() {
+            if let Some(g) = crate::executor::parallel::try_parallel_groupby_selective(
+                ctx,
+                &table,
+                &key_col_indices,
+                &agg_col_indices,
+                aggregates,
+                n_cols,
+                &key_collations,
+            )? {
+                return Ok(g);
+            }
         }
         // ==== Fully vectorized path: selective decode + direct indexing ====
         // Per-agg decode positions + COUNT(*) flags resolved ONCE (was a
@@ -9344,7 +9575,7 @@ pub(crate) fn scan_groupby_grouper(
             })
             .collect();
         let rowid_alias = table.rowid_alias;
-        bt.scan_table_borrowed(|rowid, payload| {
+        scan_table_maybe_range(ctx, &table, range, false, |rowid, payload| {
             if decode_row_selective(payload, n_cols, &wanted, rowid, rowid_alias, &mut sel_buf)
                 .is_err()
             {
@@ -9468,7 +9699,7 @@ pub(crate) fn scan_groupby_grouper(
             // merged in range order — identical groups, identical order.
             // Declines unless the filter also compiled (workers have no
             // eval_row context).
-            if filter_predicate.map_or(true, |_| compiled_filter.is_some()) {
+            if range.is_none() && filter_predicate.map_or(true, |_| compiled_filter.is_some()) {
                 if let Some(g) = crate::executor::parallel::try_parallel_groupby_compiled(
                     ctx,
                     &table,
@@ -9483,7 +9714,6 @@ pub(crate) fn scan_groupby_grouper(
                     n_cols,
                     &key_collations,
                 )? {
-                    drop(bt);
                     return Ok(g);
                 }
             }
@@ -9491,147 +9721,67 @@ pub(crate) fn scan_groupby_grouper(
             let mut wide: Vec<Value> = vec![Value::Null; n_cols];
             let mut owned_key: Value = Value::Null;
             let pred_may_reenter = filter_predicate.is_some_and(expr_has_subquery);
-            bt.scan_table_borrowed_opts(
-                |rowid, payload| {
-                    if decode_row_selective_wide(
-                        payload,
-                        n_cols,
-                        &wanted,
-                        rowid,
-                        rowid_alias,
-                        &mut wide,
-                    )
-                    .is_err()
-                    {
-                        return true; // skip corrupt rows
-                    }
-                    if let Some(pred) = filter_predicate {
-                        let keep = if let Some(cp) = &compiled_filter {
-                            cp.eval(&wide, &identity, params)
-                        } else {
-                            match eval_row(pred, &wide, &columns, params, named_params) {
-                                Ok(v) => v.is_truthy(),
-                                Err(_) => false,
-                            }
-                        };
-                        if !keep {
-                            return true;
-                        }
-                    }
-                    // Group key: single-value fast path or full key Vec.
-                    let gi = if single_key {
-                        let kv = match &compiled_keys[0] {
-                            Some(c) => c.eval(&wide, params),
-                            None => wide[key_col_indices[0].unwrap()].clone(),
-                        };
-                        owned_key = kv;
-                        grouper.intern_one(&owned_key)
-                    } else {
-                        key_buf.clear();
-                        for (i, _g) in group_by.iter().enumerate() {
-                            let kv = match &compiled_keys[i] {
-                                Some(c) => c.eval(&wide, params),
-                                None => wide[key_col_indices[i].unwrap()].clone(),
-                            };
-                            key_buf.push(kv);
-                        }
-                        grouper.intern(&key_buf)
-                    };
-                    for (i, agg) in aggregates.iter().enumerate() {
-                        if agg.arg.is_none() {
-                            // COUNT(*): constant placeholder, no evaluation.
-                            update_agg_state(
-                                grouper.state(gi, i),
-                                agg_funcs[i],
-                                &COUNT_STAR_ARG,
-                                false,
-                                agg_sep_at(aggregates, i),
-                            );
-                            continue;
-                        }
-                        let arg_val = match (agg_col_indices[i], &compiled_args[i]) {
-                            (Some(idx), _) => wide[idx].clone(),
-                            (None, Some(c)) => c.eval(&wide, params),
-                            (None, None) => Value::Null,
-                        };
-                        update_agg_state(
-                            grouper.state(gi, i),
-                            agg_funcs[i],
-                            &arg_val,
-                            agg.distinct,
-                            agg_sep_at(aggregates, i),
-                        );
-                    }
-                    true
-                },
-                pred_may_reenter,
-            )?;
-            return Ok(grouper);
-        }
-
-        let identity_ref: &[usize] = &identity;
-        let pred_may_reenter = filter_predicate.is_some_and(expr_has_subquery);
-        bt.scan_table_borrowed_opts(
-            |rowid, payload| {
-                row_buf.clear();
-                if decode_row_into(payload, n_cols, rowid, rowid_alias, &mut row_buf).is_err() {
+            scan_table_maybe_range(ctx, &table, range, pred_may_reenter, |rowid, payload| {
+                if decode_row_selective_wide(
+                    payload,
+                    n_cols,
+                    &wanted,
+                    rowid,
+                    rowid_alias,
+                    &mut wide,
+                )
+                .is_err()
+                {
                     return true; // skip corrupt rows
                 }
-                // Apply the filter predicate inline (if any).
                 if let Some(pred) = filter_predicate {
                     let keep = if let Some(cp) = &compiled_filter {
-                        cp.eval(&row_buf, identity_ref, params)
+                        cp.eval(&wide, &identity, params)
                     } else {
-                        match eval_row(pred, &row_buf, &columns, params, named_params) {
+                        match eval_row(pred, &wide, &columns, params, named_params) {
                             Ok(v) => v.is_truthy(),
                             Err(_) => false,
                         }
                     };
                     if !keep {
-                        return true; // skip — predicate false
+                        return true;
                     }
                 }
-                // Compute the group-by key: direct index when resolved, eval_row
-                // otherwise (e.g. GROUP BY x+y, GROUP BY upper(name)).
-                key_buf.clear();
-                let mut key_ok = true;
-                for (gi_expr, kidx) in group_by.iter().zip(key_col_indices.iter()) {
-                    match kidx {
-                        Some(idx) => key_buf.push(row_buf[*idx].clone()),
-                        None => match eval_row(gi_expr, &row_buf, &columns, params, named_params) {
-                            Ok(v) => key_buf.push(v),
-                            Err(_) => {
-                                key_ok = false;
-                                break;
-                            }
-                        },
-                    }
-                }
-                if !key_ok {
-                    return true;
-                }
-                let gi = grouper.intern_key(&key_buf);
-                for (i, agg) in aggregates.iter().enumerate() {
-                    // Per-aggregate FILTER (WHERE ...): only rows passing
-                    // the predicate contribute to THIS aggregate.
-                    if let Some(f) = &agg.filter {
-                        let pass = match eval_row(f, &row_buf, &columns, params, named_params) {
-                            Ok(v) => v.is_truthy(),
-                            Err(_) => false,
+                // Group key: single-value fast path or full key Vec.
+                let gi = if single_key {
+                    let kv = match &compiled_keys[0] {
+                        Some(c) => c.eval(&wide, params),
+                        None => wide[key_col_indices[0].unwrap()].clone(),
+                    };
+                    owned_key = kv;
+                    grouper.intern_one(&owned_key)
+                } else {
+                    key_buf.clear();
+                    for (i, _g) in group_by.iter().enumerate() {
+                        let kv = match &compiled_keys[i] {
+                            Some(c) => c.eval(&wide, params),
+                            None => wide[key_col_indices[i].unwrap()].clone(),
                         };
-                        if !pass {
-                            continue;
-                        }
+                        key_buf.push(kv);
                     }
-                    let arg_val = match (&agg.arg, agg_col_indices[i]) {
-                        (Some(_), Some(idx)) => row_buf[idx].clone(),
-                        (Some(arg), None) => {
-                            match eval_row(arg, &row_buf, &columns, params, named_params) {
-                                Ok(v) => v,
-                                Err(_) => Value::Null,
-                            }
-                        }
-                        (None, _) => Value::Integer(1), // COUNT(*)
+                    grouper.intern(&key_buf)
+                };
+                for (i, agg) in aggregates.iter().enumerate() {
+                    if agg.arg.is_none() {
+                        // COUNT(*): constant placeholder, no evaluation.
+                        update_agg_state(
+                            grouper.state(gi, i),
+                            agg_funcs[i],
+                            &COUNT_STAR_ARG,
+                            false,
+                            agg_sep_at(aggregates, i),
+                        );
+                        continue;
+                    }
+                    let arg_val = match (agg_col_indices[i], &compiled_args[i]) {
+                        (Some(idx), _) => wide[idx].clone(),
+                        (None, Some(c)) => c.eval(&wide, params),
+                        (None, None) => Value::Null,
                     };
                     update_agg_state(
                         grouper.state(gi, i),
@@ -9642,9 +9792,83 @@ pub(crate) fn scan_groupby_grouper(
                     );
                 }
                 true
-            },
-            pred_may_reenter,
-        )?;
+            })?;
+            return Ok(grouper);
+        }
+
+        let identity_ref: &[usize] = &identity;
+        let pred_may_reenter = filter_predicate.is_some_and(expr_has_subquery);
+        scan_table_maybe_range(ctx, &table, range, pred_may_reenter, |rowid, payload| {
+            row_buf.clear();
+            if decode_row_into(payload, n_cols, rowid, rowid_alias, &mut row_buf).is_err() {
+                return true; // skip corrupt rows
+            }
+            // Apply the filter predicate inline (if any).
+            if let Some(pred) = filter_predicate {
+                let keep = if let Some(cp) = &compiled_filter {
+                    cp.eval(&row_buf, identity_ref, params)
+                } else {
+                    match eval_row(pred, &row_buf, &columns, params, named_params) {
+                        Ok(v) => v.is_truthy(),
+                        Err(_) => false,
+                    }
+                };
+                if !keep {
+                    return true; // skip — predicate false
+                }
+            }
+            // Compute the group-by key: direct index when resolved, eval_row
+            // otherwise (e.g. GROUP BY x+y, GROUP BY upper(name)).
+            key_buf.clear();
+            let mut key_ok = true;
+            for (gi_expr, kidx) in group_by.iter().zip(key_col_indices.iter()) {
+                match kidx {
+                    Some(idx) => key_buf.push(row_buf[*idx].clone()),
+                    None => match eval_row(gi_expr, &row_buf, &columns, params, named_params) {
+                        Ok(v) => key_buf.push(v),
+                        Err(_) => {
+                            key_ok = false;
+                            break;
+                        }
+                    },
+                }
+            }
+            if !key_ok {
+                return true;
+            }
+            let gi = grouper.intern_key(&key_buf);
+            for (i, agg) in aggregates.iter().enumerate() {
+                // Per-aggregate FILTER (WHERE ...): only rows passing
+                // the predicate contribute to THIS aggregate.
+                if let Some(f) = &agg.filter {
+                    let pass = match eval_row(f, &row_buf, &columns, params, named_params) {
+                        Ok(v) => v.is_truthy(),
+                        Err(_) => false,
+                    };
+                    if !pass {
+                        continue;
+                    }
+                }
+                let arg_val = match (&agg.arg, agg_col_indices[i]) {
+                    (Some(_), Some(idx)) => row_buf[idx].clone(),
+                    (Some(arg), None) => {
+                        match eval_row(arg, &row_buf, &columns, params, named_params) {
+                            Ok(v) => v,
+                            Err(_) => Value::Null,
+                        }
+                    }
+                    (None, _) => Value::Integer(1), // COUNT(*)
+                };
+                update_agg_state(
+                    grouper.state(gi, i),
+                    agg_funcs[i],
+                    &arg_val,
+                    agg.distinct,
+                    agg_sep_at(aggregates, i),
+                );
+            }
+            true
+        })?;
     }
 
     Ok(grouper)
@@ -11013,6 +11237,7 @@ fn exec_aggregate_no_group_by(
     alias: Option<String>,
     filter_predicate: Option<&Expr>,
     aggregates: &[AggExpr],
+    range: Option<(i64, i64)>,
 ) -> Result<ExecResult> {
     let n_cols = table.n_columns();
     let prefix = alias.as_deref().unwrap_or(&table.name);
@@ -11025,8 +11250,12 @@ fn exec_aggregate_no_group_by(
     // never produce a divergent answer.
     // Per-aggregate FILTER opts out (same reason as the serial fused
     // machine below — no per-aggregate gating there either).
+    // A rowid RANGE opts out too: the parallel/fused machines split and
+    // walk the FULL rowid space and have no range plumbing — the
+    // streaming loops below already carry the range (found by the mega
+    // suite: the fallback materialized every row in the range).
     let has_agg_filter = aggregates.iter().any(|a| a.filter.is_some());
-    if !has_agg_filter {
+    if !has_agg_filter && range.is_none() {
         if let Some(res) = crate::executor::parallel::try_parallel_fused_aggregate(
             ctx,
             &table,
@@ -11045,7 +11274,7 @@ fn exec_aggregate_no_group_by(
     // serial paths below.
     // Per-aggregate FILTER opts out here too (the DISTINCT worker has
     // no per-aggregate gating).
-    if !has_agg_filter && aggregates.iter().any(|a| a.distinct) {
+    if !has_agg_filter && range.is_none() && aggregates.iter().any(|a| a.distinct) {
         if let Some(res) = crate::executor::parallel::try_parallel_distinct_aggregate(
             ctx,
             &table,
@@ -11063,8 +11292,10 @@ fn exec_aggregate_no_group_by(
     // take over (identical results, slower decode/dispatch).
     // Per-aggregate FILTER (WHERE ...) opts out: the fused machine has
     // no per-aggregate row gating (its filter is statement-wide).
+    // A rowid RANGE opts out (full-table machine — see the parallel
+    // note above).
     let has_agg_filter = aggregates.iter().any(|a| a.filter.is_some());
-    if !has_agg_filter {
+    if !has_agg_filter && range.is_none() {
         if let Some(res) =
             try_fused_aggregate(ctx, &table, alias.as_deref(), filter_predicate, aggregates)?
         {
@@ -11194,7 +11425,7 @@ fn exec_aggregate_no_group_by(
             let params = &ctx.params;
             let mut sel_buf: Vec<Value> = Vec::with_capacity(wanted.len());
             let rowid_alias = table.rowid_alias;
-            scan_table_rows(ctx, &table, false, |rowid, payload| {
+            scan_table_maybe_range(ctx, &table, range, false, |rowid, payload| {
                 if decode_row_selective(payload, n_cols, &wanted, rowid, rowid_alias, &mut sel_buf)
                     .is_err()
                 {
@@ -11288,7 +11519,7 @@ fn exec_aggregate_no_group_by(
         // page buffer. For 10k rows, this saves 10k malloc+free pairs.
         let rowid_alias = table.rowid_alias;
         let pred_may_reenter = filter_predicate.is_some_and(expr_has_subquery);
-        scan_table_rows(ctx, &table, pred_may_reenter, |rowid, payload| {
+        scan_table_maybe_range(ctx, &table, range, pred_may_reenter, |rowid, payload| {
             // Decode only the wanted columns.
             if decode_row_selective(payload, n_cols, &wanted, rowid, rowid_alias, &mut sel_buf)
                 .is_err()
@@ -11367,7 +11598,7 @@ fn exec_aggregate_no_group_by(
         let mut row_buf: Vec<Value> = Vec::with_capacity(n_cols);
         let rowid_alias = table.rowid_alias;
         let pred_may_reenter = filter_predicate.is_some_and(expr_has_subquery);
-        scan_table_rows(ctx, &table, pred_may_reenter, |rowid, payload| {
+        scan_table_maybe_range(ctx, &table, range, pred_may_reenter, |rowid, payload| {
             row_buf.clear();
             if decode_row_into(payload, n_cols, rowid, rowid_alias, &mut row_buf).is_err() {
                 return true; // skip corrupt rows
@@ -11773,6 +12004,98 @@ fn exec_aggregate(
                 columns: Arc::from(vec!["__agg_0".to_string()]),
                 rows: vec![row],
             });
+        }
+    }
+    // Fast path #1c: ANY aggregate list (with or without GROUP BY) over a
+    // residual-free RowidRange — the `WHERE id <op> ?` analytics battery
+    // shape (`SELECT count(*), sum(k), min(k), max(k) FROM t WHERE
+    // id <= ?`, `SELECT k % 97, count(*) ... GROUP BY k % 97`). The
+    // general path materialized every row in the range (a full payload
+    // decode + a Vec of Values per row — ~260 MB of transient RSS at
+    // 2M rows, gigabytes at mega scale) just to fold a single output
+    // row or 97 group rows. This streams the range walk through the
+    // same accumulation machines as the bare-scan shapes
+    // (scan_table_maybe_range). Guards: DISTINCT and per-aggregate
+    // FILTER keep the general path (their row gating lives there);
+    // bare-column pseudo-aggregates need the representative-row
+    // semantics of the general loop; plugin aggregates keep their own
+    // path; virtual tables and WITHOUT ROWID tables never take
+    // RowidRange plans.
+    if !aggregates
+        .iter()
+        .any(|a| a.distinct || a.filter.is_some() || a.func == "bare")
+        && !aggregates
+            .iter()
+            .any(|a| crate::plugin::lookup_aggregate(&a.func).is_some())
+    {
+        if let Plan::RowidRange {
+            table,
+            alias,
+            start,
+            end,
+            residual: None,
+            ..
+        } = input
+        {
+            if table.vtab.is_none() && !table.without_rowid {
+                let empty_row: Vec<Value> = Vec::new();
+                let empty_cols: Vec<String> = Vec::new();
+                let eval_ctx =
+                    EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+                let start_val = match start {
+                    Some(e) => Some(evaluate(e, &eval_ctx)?),
+                    None => None,
+                };
+                let end_val = match end {
+                    Some(e) => Some(evaluate(e, &eval_ctx)?),
+                    None => None,
+                };
+                match rowid_range_bounds(start_val.as_ref(), end_val.as_ref()) {
+                    Some((s, e)) => {
+                        if group_by.is_empty() {
+                            return exec_aggregate_no_group_by(
+                                ctx,
+                                table.clone(),
+                                alias.clone(),
+                                None,
+                                aggregates,
+                                Some((s, e)),
+                            );
+                        }
+                        let grouper = scan_groupby_grouper(
+                            ctx,
+                            table.clone(),
+                            alias.clone(),
+                            None,
+                            group_by,
+                            aggregates,
+                            Some((s, e)),
+                        )?;
+                        return finish_group_result(grouper, group_by, aggregates, projection);
+                    }
+                    None => {
+                        // Never-matching range: the no-GROUP-BY aggregate
+                        // still emits ONE row (COUNT=0, SUM=NULL — SQL
+                        // semantics); GROUP BY over zero rows emits zero
+                        // groups. The (0, -1) range walks nothing.
+                        if group_by.is_empty() {
+                            let states: Vec<AggState> =
+                                (0..aggregates.len()).map(|_| AggState::default()).collect();
+                            return finish_no_group_by(aggregates, states, false);
+                        }
+                        let grouper = scan_groupby_grouper(
+                            ctx,
+                            table.clone(),
+                            alias.clone(),
+                            None,
+                            group_by,
+                            aggregates,
+                            Some((0, -1)),
+                        )?;
+                        return finish_group_result(grouper, group_by, aggregates, projection);
+                    }
+                }
+            }
         }
     }
     // Fast path #2: input is Filter(Scan, predicate).
@@ -17324,6 +17647,7 @@ fn exec_rowid_range(
     start_expr: Option<&Expr>,
     end_expr: Option<&Expr>,
     residual: Option<&Expr>,
+    stop_after: Option<usize>,
 ) -> Result<ExecResult> {
     // Alias-qualified output columns — see exec_index_lookup's comment
     // (the leak fix).
@@ -17451,6 +17775,13 @@ fn exec_rowid_range(
                     row.push(Value::Integer(rowid));
                 }
                 rows.push(row);
+                // LIMIT pushdown: stop the walk once the requested row
+                // count is materialized (the visitor's `false` ends the
+                // range descent). Counts OUTPUT rows — the residual above
+                // already rejected non-matching ones.
+                if stop_after.is_some_and(|n| rows.len() >= n) {
+                    return false;
+                }
             }
             true
         },
@@ -17548,6 +17879,7 @@ fn exec_rowid_range_projected_impl(
     project: Option<&[usize]>,
     out_cols: Arc<[String]>,
     residual: Option<&Expr>,
+    stop_after: Option<usize>,
 ) -> Result<ExecResult> {
     let empty_row: Vec<Value> = Vec::new();
     let empty_cols: Vec<String> = Vec::new();
@@ -17677,6 +18009,12 @@ fn exec_rowid_range_projected_impl(
                         rows.push(row);
                     }
                 }
+            }
+            // LIMIT pushdown: stop the walk once the requested OUTPUT
+            // row count is materialized (all three arms above count
+            // their pushes into `rows`).
+            if stop_after.is_some_and(|n| rows.len() >= n) {
+                return false;
             }
             true
         },
@@ -22013,6 +22351,23 @@ pub fn next_auto_rowid(pager: &Pager, root: u32, max_rowid: i64, autoinc: bool) 
 /// all-negative table to the empty-table behavior; SQLite reads the
 /// tree's true max for every OP_NewRowid and so must we.
 fn find_max_rowid_opt(pager: &Pager, root: u32) -> Result<Option<i64>> {
+    // Fast path: the table btree's keys are rowids in ascending order —
+    // the maximum is the LAST cell of the RIGHT-MOST leaf, one O(log N)
+    // descent (SQLite's OP_NewRowid basis: OP_Last). The scan that used
+    // to run here walked every row of the table, and inside an open
+    // transaction every page the walk touched was COPIED (page shadows
+    // under BEGIN CONCURRENT; the savepoint undo capture under a plain
+    // BEGIN) — a one-row INSERT into a 10M-row table transiently
+    // materialized ~500 MB of page images per connection. The descent
+    // touches O(depth) pages; the scan below remains the truthful
+    // fallback for the cases the right edge cannot answer (empty tree,
+    // degenerate delete-churned right leaf, index-shaped root).
+    {
+        let bt = Btree::new(pager, root, false);
+        if let Some(max) = bt.max_rowid_exact()? {
+            return Ok(Some(max));
+        }
+    }
     let mut bt = Btree::new(pager, root, false);
     let mut max: Option<i64> = None;
     bt.scan_table(|rowid, _| {
@@ -24999,6 +25354,17 @@ fn try_streaming_delete(
         &crate::sql::ast::TriggerEvent::Delete,
     );
     let need_row = !indexes.is_empty() || returning.is_some() || has_delete_triggers;
+    // SQLite's statement-journal rule, mirrored: journal the deleted
+    // payloads ONLY when a failure surface that can abort the statement
+    // AFTER rows have landed exists (triggers, FK enforcement, RETURNING
+    // projection). A bare DELETE's post-delete failures are
+    // I/O/corruption-class, where the RAM journal's replay is
+    // best-effort by construction — and SQLite does not open a
+    // statement journal for the shape either. Eliding keeps a
+    // multi-million-row mass-DELETE at O(rowids) memory instead of
+    // O(rows x payload).
+    let journal_bare_delete =
+        has_delete_triggers || ctx.pager.foreign_keys_enabled() || returning.is_some();
     let root = ctx.table_root(table);
 
     // ---- Phase 1: collect rowids to delete ----
@@ -25410,11 +25776,13 @@ fn try_streaming_delete(
         // unique partial index ix0; row b=39 was deleted but never
         // journaled, and the rollback restored the other 8 rows only —
         // SQLite's statement atomicity restores all 9).
-        ctx.stmt_undo.push(StmtUndoEntry::Deleted {
-            table: std::sync::Arc::clone(table),
-            rowid: rid,
-            payload: payload.clone(),
-        });
+        if journal_bare_delete {
+            ctx.stmt_undo.push(StmtUndoEntry::Deleted {
+                table: std::sync::Arc::clone(table),
+                rowid: rid,
+                payload: payload.clone(),
+            });
+        }
         if need_row {
             let row = decode_row(&payload, n_cols, rid, table.rowid_alias)?;
             if let Some(ret) = returning {
@@ -25654,6 +26022,16 @@ fn exec_delete(
     let mut deleted = 0i64;
     let mut returning_rows: Vec<Vec<Value>> = Vec::new();
     let mut max_deleted: i64 = i64::MIN;
+    // The streaming loop's bare-delete journal elision, mirrored here:
+    // payload journaling only when a post-landing failure surface exists
+    // (triggers / FK enforcement / RETURNING). See try_streaming_delete.
+    let has_delete_triggers = crate::executor::triggers::has_triggers_for(
+        ctx,
+        &table,
+        &crate::sql::ast::TriggerEvent::Delete,
+    );
+    let journal_bare_delete =
+        has_delete_triggers || ctx.pager.foreign_keys_enabled() || returning.is_some();
     // Alias-less rowid tables: the source scan carries the rowid in
     // its HIDDEN rowid slot (`prefix.\0rowid` — the wants_rowid_slot
     // discipline; RowidLookup/RowidIn/scan sources all append it).
@@ -25700,11 +26078,7 @@ fn exec_delete(
         }
         // BEFORE DELETE triggers (OLD = pre-change row). Fired
         // before FK enforcement and the write (SQLite order).
-        if crate::executor::triggers::has_triggers_for(
-            ctx,
-            &table,
-            &crate::sql::ast::TriggerEvent::Delete,
-        ) {
+        if has_delete_triggers {
             crate::executor::triggers::fire_triggers(
                 ctx,
                 &table,
@@ -25734,11 +26108,13 @@ fn exec_delete(
         // the cell is already gone; a `?` failure after this point must
         // still see the undo entry (same contract as the streaming loop).
         if let Some(payload) = deleted_payload {
-            ctx.stmt_undo.push(StmtUndoEntry::Deleted {
-                table: std::sync::Arc::clone(&table),
-                rowid,
-                payload,
-            });
+            if journal_bare_delete {
+                ctx.stmt_undo.push(StmtUndoEntry::Deleted {
+                    table: std::sync::Arc::clone(&table),
+                    rowid,
+                    payload,
+                });
+            }
         }
         // Maintain indexes: delete the entry for this row.
         for idx in &indexes {
@@ -25747,11 +26123,7 @@ fn exec_delete(
         ctx.changes += 1;
         deleted += 1;
         // AFTER DELETE triggers.
-        if crate::executor::triggers::has_triggers_for(
-            ctx,
-            &table,
-            &crate::sql::ast::TriggerEvent::Delete,
-        ) {
+        if has_delete_triggers {
             crate::executor::triggers::fire_triggers(
                 ctx,
                 &table,
