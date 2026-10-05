@@ -599,6 +599,9 @@ impl Wal {
         let mut last_valid_frame: u32 = 0;
         let mut last_commit_frame: u32 = 0;
         let mut running_checksum = self.checksum;
+        // Chain state AT the last commit frame — the seed `append` and
+        // `absorb_foreign_growth` expect for the frame at index n_frames.
+        let mut last_commit_chain = self.checksum;
 
         for i in 0..n_frames_in_file {
             let offset = WAL_HEADER_SIZE as u64 + i * frame_size;
@@ -628,6 +631,7 @@ impl Wal {
             running_checksum = (c1, c2);
             if fh.commit != 0 {
                 last_commit_frame = (i + 1) as u32;
+                last_commit_chain = running_checksum;
             }
             last_valid_frame = (i + 1) as u32;
         }
@@ -635,7 +639,19 @@ impl Wal {
         // transaction (frames appended but never commit-marked) is
         // discarded. This is the WAL's atomic-commit guarantee.
         self.n_frames = last_commit_frame;
-        self.checksum = running_checksum;
+        // The checksum must seed the frame AT index n_frames — the chain
+        // state after the last COMMIT frame, NOT after the last VALID
+        // frame. With an uncommitted (or torn) tail past the last commit,
+        // `running_checksum` sits AHEAD of n_frames:
+        //  - `absorb_foreign_growth` would verify its first new frame
+        //    against the ahead-chain, always mismatch, and silently report
+        //    "no visible growth" forever — a cross-process reader frozen
+        //    at its open-time view (the macOS hammer freeze);
+        //  - the writer's first post-recovery `append` (torn-tail truncate
+        //    path) would chain from the ahead state, producing frames no
+        //    fresh scan can verify past the recovery point — every later
+        //    commit invisible to a fresh open (silent data loss).
+        self.checksum = last_commit_chain;
         // Truncate torn trailing frames so future appends overwrite
         // them (WRITER-OWNED recovery only — see `open_shared` for why
         // shared readers must not).
@@ -956,5 +972,72 @@ mod tests {
         wal.append(1, &vec![42u8; 4096], true).unwrap();
         wal.reset().unwrap();
         assert_eq!(wal.n_frames(), 0);
+    }
+
+    #[test]
+    fn shared_open_with_uncommitted_tail_still_absorbs() {
+        // CI 37259944009 (macos, no-default): a reader whose open_shared
+        // caught the writer mid-transaction (valid frames past the last
+        // commit) froze at its open-time view forever — recover() left
+        // `checksum` at the chain state of the LAST VALID frame (ahead of
+        // n_frames), so every later absorb_foreign_growth mismatched on
+        // its first new frame and silently reported "no visible growth".
+        let tmp = NamedTempFile::new().unwrap();
+        let page = || vec![7u8; 4096];
+        // Writer: txn1 committed (2 frames), txn2 mid-flight (1 frame,
+        // no commit mark) — the exact hammer-mid-transaction state.
+        let mut w = Wal::open(tmp.path(), 4096).unwrap();
+        w.append(1, &page(), false).unwrap();
+        w.append(2, &page(), true).unwrap();
+        w.append(3, &page(), false).unwrap();
+        // Reader opens NOW (non-truncating shared recovery).
+        let mut r = Wal::open_shared(tmp.path(), 4096).unwrap();
+        assert_eq!(r.n_frames(), 2, "uncommitted tail is invisible at open");
+        // Writer finishes txn2 and lands txn3.
+        w.append(4, &page(), true).unwrap();
+        w.append(5, &page(), false).unwrap();
+        w.append(6, &page(), true).unwrap();
+        // THE BUG: with the ahead-chain, absorb mismatched at frame 2 and
+        // returned empty forever. Fixed: the tail's commit + txn3 absorb.
+        let vis = r
+            .absorb_foreign_growth()
+            .unwrap()
+            .expect("absorb must not hit a salt mismatch");
+        assert!(!vis.is_empty(), "reader must see the tail txn's commit");
+        assert_eq!(r.n_frames(), 6);
+        let map = r.committed_page_map().unwrap();
+        assert!(map.contains_key(&6), "txn3's frame is committed-visible");
+    }
+
+    #[test]
+    fn torn_tail_recovery_rewrites_visible_to_fresh_open() {
+        // The writer-side twin: torn-tail recovery (truncate_torn) left
+        // `checksum` AHEAD of the truncate point (it included the torn
+        // frames), so the first post-recovery append chained from the
+        // wrong seed — and every fresh scan (true chain from the header)
+        // stopped at that frame: ALL commits after the recovery point
+        // were invisible to any fresh open. Silent data loss.
+        let tmp = NamedTempFile::new().unwrap();
+        let page = || vec![9u8; 4096];
+        let mut w = Wal::open(tmp.path(), 4096).unwrap();
+        w.append(1, &page(), false).unwrap();
+        w.append(2, &page(), true).unwrap();
+        w.append(3, &page(), false).unwrap(); // torn tail (crashed mid-txn)
+        drop(w);
+        // Writer-side recovery truncates the torn tail, then commits new
+        // data at the same offsets.
+        let mut w2 = Wal::open(tmp.path(), 4096).unwrap();
+        assert_eq!(w2.n_frames(), 2, "torn tail truncated");
+        w2.append(7, &page(), true).unwrap();
+        drop(w2);
+        // A FRESH open must see the post-recovery commit.
+        let mut fresh = Wal::open_shared(tmp.path(), 4096).unwrap();
+        assert_eq!(
+            fresh.n_frames(),
+            3,
+            "post-recovery commit must be visible to a fresh scan (true chain)"
+        );
+        let map = fresh.committed_page_map().unwrap();
+        assert!(map.contains_key(&7), "the rewritten page is committed");
     }
 }

@@ -847,6 +847,12 @@ pub struct Pager {
     /// gating + freshness probes entirely (they are the only possible
     /// writer, and their own commits maintain their committed map).
     xlock_write_held: std::sync::atomic::AtomicBool,
+    /// Freeze-watch: consecutive freshness probes that found the sidecar
+    /// grown past our horizon yet absorbed ZERO visible frames (an
+    /// uncommitted tail is normal between a writer's commit marks; a
+    /// never-ending streak is a frozen reader — see the probe's
+    /// power-of-ten trace). Reset on every absorbing or no-growth probe.
+    xlock_empty_absorb_streak: std::sync::atomic::AtomicU64,
     /// DELETE-mode mid-transaction page spill (see `DeleteSpill`):
     /// `None` until the first cache-pressure eviction of a dirty page
     /// during a write transaction; dropped (file deleted) at COMMIT
@@ -2257,6 +2263,7 @@ impl Pager {
             wal: RwLock::new(None),
             xlock: std::sync::OnceLock::new(),
             xlock_write_held: AtomicBool::new(false),
+            xlock_empty_absorb_streak: AtomicU64::new(0),
             delete_spill: Mutex::new(None),
             ckpt_scratch: Mutex::new(Vec::new()),
             synchronous: std::sync::atomic::AtomicU8::new(2),
@@ -4710,6 +4717,7 @@ impl Pager {
         if meta.len() <= expected {
             // Fresh (or a torn tail a foreign writer is appending right
             // now — uncommitted, invisible; the next growth re-probes).
+            self.xlock_empty_absorb_streak.store(0, Ordering::Relaxed);
             return Ok(false);
         }
         let _gate = self.install_gate_write();
@@ -4748,9 +4756,35 @@ impl Pager {
             }
         };
         if visible.is_empty() {
-            // Growth was an uncommitted in-flight tail only.
+            // Growth was an uncommitted in-flight tail only. A SHORT streak
+            // is the healthy between-commits window; a never-ending one is
+            // a frozen reader (the macOS hammer freeze class — its silent
+            // paths produced zero trace lines, which is why this counter
+            // exists). Power-of-ten milestones self-describe the freeze
+            // with the full state vector; healthy operation never reaches
+            // the first milestone (100 consecutive empty absorbs with the
+            // file grown past the horizon).
+            let streak = self
+                .xlock_empty_absorb_streak
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            if matches!(streak, 100 | 1_000 | 10_000 | 100_000 | 1_000_000) {
+                xlock_trace!(|| {
+                    format!(
+                        "resync: FREEZE-WATCH streak={streak} empty absorbs (file grown past \
+                         horizon, zero visible frames) expected={expected} len={} n_frames={} \
+                         mine={mine:?} now={now:?}",
+                        meta.len(),
+                        {
+                            let g = self.wal.read();
+                            g.as_ref().map(|s| s.wal.n_frames()).unwrap_or(0)
+                        }
+                    )
+                });
+            }
             return Ok(false);
         }
+        self.xlock_empty_absorb_streak.store(0, Ordering::Relaxed);
         xlock_trace!(|| {
             format!(
                 "resync: absorbed {} new visible frames, {} distinct pages",

@@ -551,20 +551,36 @@ impl MegaPlatform {
 
     /// (multiplier, additive ms) of the per-batch INSERT gate.
     fn insert_gate(&self) -> (f64, f64) {
-        match self {
+        let base = match self {
             MegaPlatform::Windows => (12.0, 120.0),
             MegaPlatform::Macos => (10.0, 80.0),
             MegaPlatform::Linux => (3.0, 25.0),
-        }
+        };
+        (base.0 * m1_relax(), base.1)
     }
 
     /// (multiplier, additive ms) of the loose COMMIT-side guard.
     fn commit_gate(&self) -> (f64, f64) {
-        match self {
+        let base = match self {
             MegaPlatform::Windows => (30.0, 2000.0),
             _ => (20.0, 250.0),
-        }
+        };
+        (base.0 * m1_relax(), base.1)
     }
+}
+
+/// Measurement-only scaling of the M1 degradation gates (default 1.0 =
+/// the shipped gates). Calibration runs at unprecedented scales (the
+/// first 100M lean marathon measured a 4.9x cyclic-index wrap cost the
+/// 10M-calibrated 3x gate could not admit) use this to reach M9 and
+/// collect the full table BEFORE any gate/shape decision; CI never sets
+/// it.
+fn m1_relax() -> f64 {
+    std::env::var("MEGA_M1_RELAX")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v >= 1.0)
+        .unwrap_or(1.0)
 }
 
 #[cfg(test)]
