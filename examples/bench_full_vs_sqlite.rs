@@ -11,8 +11,24 @@
 //!   rust-sql: <ops/sec>
 //!   SQLite:   <ops/sec>
 //!   ratio:    <x.xx>x (winner)
+//!
+//! FAIRNESS CONTRACT (audited 2026-10, enforced row by row):
+//!   1. IDENTICAL WORK — same schema, same data, same statement text,
+//!      same indexes on both engines.
+//!   2. PREPARE PARITY — rustqlite's `execute`/`query` consult the
+//!      engine-internal statement cache; the SQLite side uses rusqlite's
+//!      `prepare_cached` (SQLite's own statement cache) so BOTH engines
+//!      pay parse-once semantics. No engine is forced to re-parse.
+//!   3. READ PARITY — the SQLite side decodes the same projected columns
+//!      that rustqlite's materializing `query()` decodes (no bare stepping).
+//!   4. CONCURRENCY PARITY — every concurrency row gives BOTH engines
+//!      their best in-process shape: rustqlite one shared `Arc<Database>`
+//!      (MRMW, `&self` prepare/step statements), SQLite N real connections
+//!      on one file-backed WAL database with busy_timeout. No engine is
+//!      locked behind a wrapper mutex it does not require.
+//!   5. ANSWER EQUALITY — every row asserts both engines return identical
+//!      results (or reach identical post-DML state) before any timing runs.
 
-use parking_lot::RwLock;
 use rusqlite::params;
 use rustqlite::{Database, Value};
 use std::sync::Arc;
@@ -25,6 +41,99 @@ const N_ROWS: i64 = 10_000;
 // Test setup helpers
 // ============================================================
 
+/// Convert a rusqlite value into the engine's Value for answer comparison.
+fn to_rq_value(v: rusqlite::types::Value) -> Value {
+    use rusqlite::types::Value as V;
+    match v {
+        V::Null => Value::Null,
+        V::Integer(i) => Value::Integer(i),
+        V::Real(f) => Value::Real(f),
+        V::Text(s) => Value::Text(s.into()),
+        V::Blob(b) => Value::Blob(b),
+    }
+}
+
+/// Run a parameterless statement on SQLite and collect all rows as engine
+/// Values (full materialization parity with `Database::query`).
+fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<Value>> {
+    let mut stmt = conn.prepare(sql).unwrap();
+    let ncols = stmt.column_count();
+    let mut rows = stmt.query([]).unwrap();
+    let mut out = Vec::new();
+    while let Some(r) = rows.next().unwrap() {
+        let mut row = Vec::with_capacity(ncols);
+        for c in 0..ncols {
+            row.push(to_rq_value(r.get::<_, rusqlite::types::Value>(c).unwrap()));
+        }
+        out.push(row);
+    }
+    out
+}
+
+/// ANSWER-EQUALITY GATE: both engines must return identical row sets for
+/// `sql` before any timing is allowed to happen. Floats compare with a
+/// 1e-9 tolerance (identical aggregate arithmetic on identical inputs).
+fn assert_answers(db: &Database, conn: &rusqlite::Connection, sql: &str) {
+    let rq = db
+        .query(sql, [])
+        .unwrap_or_else(|e| panic!("rustqlite failed [{sql}]: {e}"));
+    let sq = sqlite_rows(conn, sql);
+    assert_eq!(
+        rq.len(),
+        sq.len(),
+        "ANSWER MISMATCH [{sql}]: row count {} vs {}",
+        rq.len(),
+        sq.len()
+    );
+    for (a, b) in rq.iter().zip(sq.iter()) {
+        assert_eq!(a.len(), b.len(), "ANSWER MISMATCH [{sql}]: column count");
+        for (x, y) in a.iter().zip(b.iter()) {
+            match (x, y) {
+                (Value::Real(f1), Value::Real(f2)) => assert!(
+                    (f1 - f2).abs() <= 1e-9 * f1.abs().max(1.0),
+                    "ANSWER MISMATCH [{sql}]: {f1} vs {f2}"
+                ),
+                _ => assert_eq!(x, y, "ANSWER MISMATCH [{sql}]: {x:?} vs {y:?}"),
+            }
+        }
+    }
+}
+
+/// Unique temp path for a file-backed (WAL) benchmark database.
+fn wal_path(tag: &str) -> String {
+    std::env::temp_dir()
+        .join(format!(
+            "bench-fvs-{tag}-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Remove a benchmark database plus every sidecar (-wal, -shm, lock files)
+/// it may have grown — the engine and SQLite use different suffixes.
+fn cleanup_db_files(path: &str) {
+    let _ = std::fs::remove_file(path);
+    let p = std::path::Path::new(path);
+    let stem = match p.file_name() {
+        Some(s) => s.to_string_lossy().into_owned(),
+        None => return,
+    };
+    if let Some(dir) = p.parent() {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with(&stem) {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+    }
+}
+
 fn setup_rusqlite(n: i64, with_index: bool) -> rusqlite::Connection {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute(
@@ -35,6 +144,56 @@ fn setup_rusqlite(n: i64, with_index: bool) -> rusqlite::Connection {
     if with_index {
         conn.execute("CREATE INDEX idx_val ON t(val)", []).unwrap();
     }
+    conn.execute("BEGIN", []).unwrap();
+    for i in 1..=n {
+        conn.execute(
+            "INSERT INTO t (name, val, score) VALUES (?1, ?2, ?3)",
+            params![format!("name{}", i), i, i as f64 * 1.5],
+        )
+        .unwrap();
+    }
+    conn.execute("COMMIT", []).unwrap();
+    conn
+}
+
+/// File-backed WAL setup — the concurrency rows run BOTH engines on real
+/// WAL databases (SQLite's best multi-connection shape; the engine's native
+/// container). Same data, same pragmas.
+fn setup_rustqlite_wal(path: &str, n: i64) -> Database {
+    let mut db = Database::open(path).unwrap();
+    db.execute("PRAGMA journal_mode = WAL", []).unwrap();
+    db.execute("PRAGMA synchronous = NORMAL", []).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER, score REAL)",
+        [],
+    )
+    .unwrap();
+    db.execute("BEGIN", []).unwrap();
+    for i in 1..=n {
+        db.execute(
+            "INSERT INTO t (name, val, score) VALUES (?, ?, ?)",
+            [
+                Value::Text(format!("name{}", i).into()),
+                Value::Integer(i),
+                Value::Real(i as f64 * 1.5),
+            ],
+        )
+        .unwrap();
+    }
+    db.execute("COMMIT", []).unwrap();
+    db
+}
+
+/// The SQLite twin of `setup_rustqlite_wal` — identical data and pragmas.
+fn setup_rusqlite_wal(path: &str, n: i64) -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER, score REAL)",
+        [],
+    )
+    .unwrap();
     conn.execute("BEGIN", []).unwrap();
     for i in 1..=n {
         conn.execute(
@@ -109,7 +268,7 @@ impl BenchResult {
     }
 }
 
-fn measure<F: Fn()>(name: &str, f: F, total_ops: usize) -> (f64, String) {
+fn measure<F: FnMut()>(name: &str, mut f: F, total_ops: usize) -> (f64, String) {
     // warm up
     for _ in 0..2 {
         f();
@@ -131,6 +290,38 @@ fn measure<F: Fn()>(name: &str, f: F, total_ops: usize) -> (f64, String) {
 
 fn bench_insert_autocommit() -> BenchResult {
     let n = 1000;
+    // ANSWER EQUALITY: identical post-insert state on both engines.
+    {
+        let mut db = Database::open_in_memory().unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+            [],
+        )
+        .unwrap();
+        for i in 1..=n {
+            db.execute(
+                "INSERT INTO t (name, val) VALUES (?, ?)",
+                [Value::Text(format!("name{}", i).into()), Value::Integer(i)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO t (name, val) VALUES (?1, ?2)",
+                params![format!("name{}", i), i],
+            )
+            .unwrap();
+        }
+        assert_answers(
+            &db,
+            &conn,
+            "SELECT COUNT(*), SUM(val), MIN(name), MAX(name) FROM t",
+        );
+    }
     let (rq_ops, _) = measure(
         "rust-sql autocommit insert",
         || {
@@ -160,11 +351,12 @@ fn bench_insert_autocommit() -> BenchResult {
             )
             .unwrap();
             for i in 1..=n {
-                conn.execute(
-                    "INSERT INTO t (name, val) VALUES (?1, ?2)",
-                    params![format!("name{}", i), i],
-                )
-                .unwrap();
+                // PREPARE PARITY: rusqlite's `prepare_cached` is SQLite's
+                // statement cache — the twin of the engine's internal cache.
+                conn.prepare_cached("INSERT INTO t (name, val) VALUES (?1, ?2)")
+                    .unwrap()
+                    .execute(params![format!("name{}", i), i])
+                    .unwrap();
             }
         },
         n as usize,
@@ -173,12 +365,48 @@ fn bench_insert_autocommit() -> BenchResult {
         name: "INSERT (auto-commit, 1k rows)".into(),
         rustqlite_ops_per_sec: rq_ops,
         rusqlite_ops_per_sec: rs_ops,
-        note: Some("fsync per stmt"),
+        note: Some("in-memory, per-statement commit machinery on both"),
     }
 }
 
 fn bench_insert_transaction() -> BenchResult {
     let n = 1000;
+    // ANSWER EQUALITY: identical post-insert state on both engines.
+    {
+        let mut db = Database::open_in_memory().unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+            [],
+        )
+        .unwrap();
+        db.execute("BEGIN", []).unwrap();
+        conn.execute("BEGIN", []).unwrap();
+        for i in 1..=n {
+            db.execute(
+                "INSERT INTO t (name, val) VALUES (?, ?)",
+                [Value::Text(format!("name{}", i).into()), Value::Integer(i)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO t (name, val) VALUES (?1, ?2)",
+                params![format!("name{}", i), i],
+            )
+            .unwrap();
+        }
+        db.execute("COMMIT", []).unwrap();
+        conn.execute("COMMIT", []).unwrap();
+        assert_answers(
+            &db,
+            &conn,
+            "SELECT COUNT(*), SUM(val), MIN(name), MAX(name) FROM t",
+        );
+    }
     let (rq_ops, _) = measure(
         "rust-sql txn insert",
         || {
@@ -211,11 +439,10 @@ fn bench_insert_transaction() -> BenchResult {
             .unwrap();
             conn.execute("BEGIN", []).unwrap();
             for i in 1..=n {
-                conn.execute(
-                    "INSERT INTO t (name, val) VALUES (?1, ?2)",
-                    params![format!("name{}", i), i],
-                )
-                .unwrap();
+                conn.prepare_cached("INSERT INTO t (name, val) VALUES (?1, ?2)")
+                    .unwrap()
+                    .execute(params![format!("name{}", i), i])
+                    .unwrap();
             }
             conn.execute("COMMIT", []).unwrap();
         },
@@ -231,7 +458,40 @@ fn bench_insert_transaction() -> BenchResult {
 
 fn bench_insert_multi_values() -> BenchResult {
     // Single INSERT with 1000 VALUES tuples — best case for bulk insert.
+    // ANSWER EQUALITY: both engines reach the identical post-insert state.
     let n = 1000;
+    {
+        let mut db = Database::open_in_memory().unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+            [],
+        )
+        .unwrap();
+        let chunk_size = 100;
+        let mut i = 1;
+        while i <= n {
+            let end = (i + chunk_size - 1).min(n);
+            let values: String = (i..=end)
+                .map(|j| format!("('name{}', {})", j, j))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!("INSERT INTO t (name, val) VALUES {}", values);
+            db.execute(&sql, []).unwrap();
+            conn.execute(&sql, []).unwrap();
+            i = end + 1;
+        }
+        assert_answers(
+            &db,
+            &conn,
+            "SELECT COUNT(*), SUM(val), MIN(name), MAX(name) FROM t",
+        );
+    }
     let (rq_ops, _) = measure(
         "rust-sql multi-VALUES",
         || {
@@ -275,7 +535,7 @@ fn bench_insert_multi_values() -> BenchResult {
                     .collect::<Vec<_>>()
                     .join(",");
                 let sql = format!("INSERT INTO t (name, val) VALUES {}", values);
-                conn.execute(&sql, []).unwrap();
+                conn.prepare_cached(&sql).unwrap().execute([]).unwrap();
                 i = end + 1;
             }
         },
@@ -285,13 +545,38 @@ fn bench_insert_multi_values() -> BenchResult {
         name: "INSERT (multi-VALUES 100/batch)".into(),
         rustqlite_ops_per_sec: rq_ops,
         rusqlite_ops_per_sec: rs_ops,
-        note: Some("bulk path"),
+        note: Some("bulk path, statement-cached on both"),
     }
 }
 
 fn bench_point_lookup() -> BenchResult {
     let db = setup_rustqlite(N_ROWS, false);
     let conn = setup_rusqlite(N_ROWS, false);
+    // ANSWER EQUALITY: identical rows for representative ids.
+    for probe in [1, 37, 5000, N_ROWS] {
+        let rq = db
+            .query(
+                "SELECT name, val FROM t WHERE id = ?",
+                [Value::Integer(probe)],
+            )
+            .unwrap();
+        let sq = conn
+            .prepare("SELECT name, val FROM t WHERE id = ?1")
+            .unwrap()
+            .query_row(params![probe], |r| {
+                Ok(vec![
+                    to_rq_value(r.get::<_, rusqlite::types::Value>(0)?),
+                    to_rq_value(r.get::<_, rusqlite::types::Value>(1)?),
+                ])
+            })
+            .unwrap();
+        assert_eq!(
+            rq.len(),
+            1,
+            "point lookup must return one row at id {probe}"
+        );
+        assert_eq!(&rq[0], &sq, "point lookup mismatch at id {probe}");
+    }
     let n = 1000;
     let (rq_ops, _) = measure(
         "rust-sql point lookup",
@@ -309,10 +594,15 @@ fn bench_point_lookup() -> BenchResult {
         || {
             for i in 1..=n {
                 let mut stmt = conn
-                    .prepare("SELECT name, val FROM t WHERE id = ?1")
+                    .prepare_cached("SELECT name, val FROM t WHERE id = ?1")
                     .unwrap();
                 let mut rows = stmt.query(params![i]).unwrap();
-                while rows.next().unwrap().is_some() {}
+                // READ PARITY: decode the projected columns like the
+                // engine's materializing query() does.
+                while let Some(row) = rows.next().unwrap() {
+                    let _ = row.get::<_, String>(0).unwrap();
+                    let _ = row.get::<_, i64>(1).unwrap();
+                }
             }
         },
         n as usize,
@@ -328,6 +618,29 @@ fn bench_point_lookup() -> BenchResult {
 fn bench_index_lookup() -> BenchResult {
     let db = setup_rustqlite(N_ROWS, true);
     let conn = setup_rusqlite(N_ROWS, true);
+    // ANSWER EQUALITY: identical rows for representative indexed values.
+    for probe in [1, 2500, 9999] {
+        let rq = db
+            .query("SELECT name FROM t WHERE val = ?", [Value::Integer(probe)])
+            .unwrap();
+        let sq: Vec<Value> = conn
+            .prepare("SELECT name FROM t WHERE val = ?1")
+            .unwrap()
+            .query_map(params![probe], |r| {
+                Ok(to_rq_value(r.get::<_, rusqlite::types::Value>(0)?))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rq.len(),
+            sq.len(),
+            "index lookup row count mismatch at val {probe}"
+        );
+        for (a, b) in rq.iter().zip(sq.iter()) {
+            assert_eq!(&a[0], b, "index lookup mismatch at val {probe}");
+        }
+    }
     let n = 1000;
     let (rq_ops, _) = measure(
         "rust-sql index lookup",
@@ -344,9 +657,13 @@ fn bench_index_lookup() -> BenchResult {
         "rusqlite index lookup",
         || {
             for i in 1..=n {
-                let mut stmt = conn.prepare("SELECT name FROM t WHERE val = ?1").unwrap();
+                let mut stmt = conn
+                    .prepare_cached("SELECT name FROM t WHERE val = ?1")
+                    .unwrap();
                 let mut rows = stmt.query(params![i]).unwrap();
-                while rows.next().unwrap().is_some() {}
+                while let Some(row) = rows.next().unwrap() {
+                    let _ = row.get::<_, String>(0).unwrap();
+                }
             }
         },
         n as usize,
@@ -362,6 +679,12 @@ fn bench_index_lookup() -> BenchResult {
 fn bench_range_scan() -> BenchResult {
     let db = setup_rustqlite(N_ROWS, false);
     let conn = setup_rusqlite(N_ROWS, false);
+    // ANSWER EQUALITY: identical range results.
+    assert_answers(
+        &db,
+        &conn,
+        "SELECT name, val FROM t WHERE id BETWEEN 1 AND 100",
+    );
     let n = 500;
     let (rq_ops, _) = measure(
         "rust-sql range scan",
@@ -379,7 +702,7 @@ fn bench_range_scan() -> BenchResult {
         || {
             for _ in 0..n {
                 let mut stmt = conn
-                    .prepare("SELECT name, val FROM t WHERE id BETWEEN 1 AND 100")
+                    .prepare_cached("SELECT name, val FROM t WHERE id BETWEEN 1 AND 100")
                     .unwrap();
                 let mut rows = stmt.query([]).unwrap();
                 // Fair-work parity: read the projected columns —
@@ -403,6 +726,12 @@ fn bench_range_scan() -> BenchResult {
 fn bench_full_scan() -> BenchResult {
     let db = setup_rustqlite(N_ROWS, false);
     let conn = setup_rusqlite(N_ROWS, false);
+    // ANSWER EQUALITY: identical scan answers (checksum aggregate).
+    assert_answers(
+        &db,
+        &conn,
+        "SELECT COUNT(*), SUM(id), SUM(val), SUM(score) FROM t",
+    );
     let n = 50;
     let (rq_ops, _) = measure(
         "rust-sql full scan",
@@ -417,7 +746,7 @@ fn bench_full_scan() -> BenchResult {
         "rusqlite full scan",
         || {
             for _ in 0..n {
-                let mut stmt = conn.prepare("SELECT * FROM t").unwrap();
+                let mut stmt = conn.prepare_cached("SELECT * FROM t").unwrap();
                 let mut rows = stmt.query([]).unwrap();
                 // Fair-work parity: rustqlite's `db.query()` materializes
                 // EVERY column of EVERY row into owned Values — the SQLite
@@ -446,6 +775,12 @@ fn bench_full_scan() -> BenchResult {
 fn bench_aggregate_multi() -> BenchResult {
     let db = setup_rustqlite(N_ROWS, false);
     let conn = setup_rusqlite(N_ROWS, false);
+    // ANSWER EQUALITY: identical aggregate answers.
+    assert_answers(
+        &db,
+        &conn,
+        "SELECT COUNT(*), SUM(val), MIN(val), MAX(val), AVG(val) FROM t",
+    );
     let n = 500;
     let (rq_ops, _) = measure(
         "rust-sql aggregate multi",
@@ -466,10 +801,17 @@ fn bench_aggregate_multi() -> BenchResult {
         || {
             for _ in 0..n {
                 let mut stmt = conn
-                    .prepare("SELECT COUNT(*), SUM(val), MIN(val), MAX(val), AVG(val) FROM t")
+                    .prepare_cached(
+                        "SELECT COUNT(*), SUM(val), MIN(val), MAX(val), AVG(val) FROM t",
+                    )
                     .unwrap();
                 let mut rows = stmt.query([]).unwrap();
-                while rows.next().unwrap().is_some() {}
+                // READ PARITY: decode the 5 aggregate results.
+                while let Some(row) = rows.next().unwrap() {
+                    for c in 0..5 {
+                        let _ = row.get::<_, rusqlite::types::Value>(c).unwrap();
+                    }
+                }
             }
         },
         n as usize,
@@ -485,6 +827,8 @@ fn bench_aggregate_multi() -> BenchResult {
 fn bench_count_star() -> BenchResult {
     let db = setup_rustqlite(N_ROWS, false);
     let conn = setup_rusqlite(N_ROWS, false);
+    // ANSWER EQUALITY: identical count.
+    assert_answers(&db, &conn, "SELECT COUNT(*) FROM t");
     let n = 500;
     let (rq_ops, _) = measure(
         "rust-sql COUNT(*)",
@@ -499,9 +843,12 @@ fn bench_count_star() -> BenchResult {
         "rusqlite COUNT(*)",
         || {
             for _ in 0..n {
-                let mut stmt = conn.prepare("SELECT COUNT(*) FROM t").unwrap();
+                let mut stmt = conn.prepare_cached("SELECT COUNT(*) FROM t").unwrap();
                 let mut rows = stmt.query([]).unwrap();
-                while rows.next().unwrap().is_some() {}
+                // READ PARITY: decode the result.
+                while let Some(row) = rows.next().unwrap() {
+                    let _ = row.get::<_, i64>(0).unwrap();
+                }
             }
         },
         n as usize,
@@ -517,6 +864,12 @@ fn bench_count_star() -> BenchResult {
 fn bench_aggregate_with_where() -> BenchResult {
     let db = setup_rustqlite(N_ROWS, false);
     let conn = setup_rusqlite(N_ROWS, false);
+    // ANSWER EQUALITY: identical filtered aggregates.
+    assert_answers(
+        &db,
+        &conn,
+        "SELECT SUM(val), COUNT(*), AVG(score) FROM t WHERE val > 5000",
+    );
     let n = 500;
     let (rq_ops, _) = measure(
         "rust-sql agg + WHERE",
@@ -537,10 +890,15 @@ fn bench_aggregate_with_where() -> BenchResult {
         || {
             for _ in 0..n {
                 let mut stmt = conn
-                    .prepare("SELECT SUM(val), COUNT(*), AVG(score) FROM t WHERE val > 5000")
+                    .prepare_cached("SELECT SUM(val), COUNT(*), AVG(score) FROM t WHERE val > 5000")
                     .unwrap();
                 let mut rows = stmt.query([]).unwrap();
-                while rows.next().unwrap().is_some() {}
+                // READ PARITY: decode the 3 aggregate results.
+                while let Some(row) = rows.next().unwrap() {
+                    for c in 0..3 {
+                        let _ = row.get::<_, rusqlite::types::Value>(c).unwrap();
+                    }
+                }
             }
         },
         n as usize,
@@ -556,6 +914,12 @@ fn bench_aggregate_with_where() -> BenchResult {
 fn bench_group_by() -> BenchResult {
     let db = setup_rustqlite(N_ROWS, false);
     let conn = setup_rusqlite(N_ROWS, false);
+    // ANSWER EQUALITY: identical GROUP BY answers.
+    assert_answers(
+        &db,
+        &conn,
+        "SELECT val / 100 AS bucket, COUNT(*) FROM t GROUP BY bucket",
+    );
     let n = 50;
     let (rq_ops, _) = measure(
         "rust-sql GROUP BY",
@@ -576,10 +940,14 @@ fn bench_group_by() -> BenchResult {
         || {
             for _ in 0..n {
                 let mut stmt = conn
-                    .prepare("SELECT val / 100 AS bucket, COUNT(*) FROM t GROUP BY bucket")
+                    .prepare_cached("SELECT val / 100 AS bucket, COUNT(*) FROM t GROUP BY bucket")
                     .unwrap();
                 let mut rows = stmt.query([]).unwrap();
-                while rows.next().unwrap().is_some() {}
+                // READ PARITY: decode the grouped rows.
+                while let Some(row) = rows.next().unwrap() {
+                    let _ = row.get::<_, i64>(0).unwrap();
+                    let _ = row.get::<_, i64>(1).unwrap();
+                }
             }
         },
         N_ROWS as usize * n,
@@ -593,14 +961,17 @@ fn bench_group_by() -> BenchResult {
 }
 
 fn bench_update_by_id() -> BenchResult {
-    let db = Arc::new(RwLock::new(setup_rustqlite(N_ROWS, false)));
-    let conn = Arc::new(std::sync::Mutex::new(setup_rusqlite(N_ROWS, false)));
+    // ANSWER EQUALITY: both engines start identical, run the identical
+    // idempotent update stream (val = i*2 is deterministic), and end
+    // identical — verified before AND after the timed sections.
+    let mut db = setup_rustqlite(N_ROWS, false);
+    let conn = setup_rusqlite(N_ROWS, false);
+    assert_answers(&db, &conn, "SELECT COUNT(*), SUM(val) FROM t");
     let n = 1000;
     let (rq_ops, _) = measure(
         "rust-sql update by id",
         || {
             for i in 1..=n {
-                let mut db = db.write();
                 db.execute(
                     "UPDATE t SET val = ? WHERE id = ?",
                     [Value::Integer(i * 2), Value::Integer(i)],
@@ -614,13 +985,16 @@ fn bench_update_by_id() -> BenchResult {
         "rusqlite update by id",
         || {
             for i in 1..=n {
-                let conn = conn.lock().unwrap();
-                conn.execute("UPDATE t SET val = ?1 WHERE id = ?2", params![i * 2, i])
+                conn.prepare_cached("UPDATE t SET val = ?1 WHERE id = ?2")
+                    .unwrap()
+                    .execute(params![i * 2, i])
                     .unwrap();
             }
         },
         n as usize,
     );
+    // Post-timing state equality (the update stream is idempotent).
+    assert_answers(&db, &conn, "SELECT COUNT(*), SUM(val) FROM t");
     BenchResult {
         name: "UPDATE by id (1k updates)".into(),
         rustqlite_ops_per_sec: rq_ops,
@@ -630,11 +1004,17 @@ fn bench_update_by_id() -> BenchResult {
 }
 
 fn bench_delete_insert_cycle() -> BenchResult {
+    // ANSWER EQUALITY + TIMER PARITY: the 10k-row setup happens OUTSIDE the
+    // timed closure on BOTH engines (it used to run inside, diluting the
+    // signal); the cycle itself is idempotent (delete id i, reinsert the
+    // identical row), so state matches before and after timing.
+    let mut db = setup_rustqlite(N_ROWS, false);
+    let conn = setup_rusqlite(N_ROWS, false);
+    assert_answers(&db, &conn, "SELECT COUNT(*), SUM(val), SUM(score) FROM t");
     let n = 500;
     let (rq_ops, _) = measure(
         "rust-sql delete+insert cycle",
         || {
-            let mut db = setup_rustqlite(N_ROWS, false);
             for i in 1..=n {
                 db.execute("DELETE FROM t WHERE id = ?", [Value::Integer(i)])
                     .unwrap();
@@ -655,19 +1035,20 @@ fn bench_delete_insert_cycle() -> BenchResult {
     let (rs_ops, _) = measure(
         "rusqlite delete+insert cycle",
         || {
-            let conn = setup_rusqlite(N_ROWS, false);
             for i in 1..=n {
-                conn.execute("DELETE FROM t WHERE id = ?1", params![i])
+                conn.prepare_cached("DELETE FROM t WHERE id = ?1")
+                    .unwrap()
+                    .execute(params![i])
                     .unwrap();
-                conn.execute(
-                    "INSERT INTO t (id, name, val, score) VALUES (?1, ?2, ?3, ?4)",
-                    params![i, format!("name{}", i), i, i as f64],
-                )
-                .unwrap();
+                conn.prepare_cached("INSERT INTO t (id, name, val, score) VALUES (?1, ?2, ?3, ?4)")
+                    .unwrap()
+                    .execute(params![i, format!("name{}", i), i, i as f64])
+                    .unwrap();
             }
         },
         n as usize * 2,
     );
+    assert_answers(&db, &conn, "SELECT COUNT(*), SUM(val), SUM(score) FROM t");
     BenchResult {
         name: "DELETE + INSERT cycle (500 iters)".into(),
         rustqlite_ops_per_sec: rq_ops,
@@ -677,8 +1058,32 @@ fn bench_delete_insert_cycle() -> BenchResult {
 }
 
 fn bench_concurrent_8_readers() -> BenchResult {
-    let db = Arc::new(RwLock::new(setup_rustqlite(N_ROWS, false)));
-    let conn = Arc::new(std::sync::Mutex::new(setup_rusqlite(N_ROWS, false)));
+    // CONCURRENCY PARITY: both engines get their best in-process MRMW shape
+    // on file-backed WAL databases with identical data:
+    //   rustqlite — ONE shared `Arc<Database>`; every thread prepares its own
+    //     statement (`&self` prepare/step) and reads in PARALLEL (the
+    //     engine's multi-reader-multi-writer core).
+    //   SQLite — 8 REAL connections on one WAL database (busy_timeout,
+    //     per-connection prepared statements): SQLite's best multi-reader
+    //     shape (its WAL readers run concurrently).
+    // No wrapper mutex on either side.
+    let rq_path = wal_path("r8");
+    let sq_path = wal_path("s8");
+    let db = Arc::new(setup_rustqlite_wal(&rq_path, N_ROWS));
+    let _sq_setup = setup_rusqlite_wal(&sq_path, N_ROWS);
+    drop(_sq_setup);
+    // ANSWER EQUALITY (identical WAL images before the threads run).
+    {
+        let check = rusqlite::Connection::open(&sq_path).unwrap();
+        let rq = db.query("SELECT COUNT(*), SUM(val) FROM t", []).unwrap();
+        let sq: (i64, i64) = check
+            .query_row("SELECT COUNT(*), SUM(val) FROM t", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(rq[0][0].as_integer(), sq.0, "reader row count mismatch");
+        assert_eq!(rq[0][1].as_integer(), sq.1, "reader SUM mismatch");
+    }
     let n_per_thread = 500;
     let total_ops = 8 * n_per_thread;
     let (rq_ops, _) = measure(
@@ -688,11 +1093,16 @@ fn bench_concurrent_8_readers() -> BenchResult {
             for _ in 0..8 {
                 let db = Arc::clone(&db);
                 handles.push(thread::spawn(move || {
+                    let mut stmt = db.prepare("SELECT name, val FROM t WHERE id = ?").unwrap();
                     for i in 0..n_per_thread {
                         let id = (i % N_ROWS as usize) as i64 + 1;
-                        let guard = db.read();
-                        let _ = guard
-                            .query("SELECT name, val FROM t WHERE id = ?", [Value::Integer(id)]);
+                        stmt.bind(1, Value::Integer(id)).unwrap();
+                        while let rustqlite::StepResult::Row = stmt.step().unwrap() {
+                            // READ PARITY: decode the projected columns.
+                            let _ = stmt.column_text(0);
+                            let _ = stmt.column_int(1);
+                        }
+                        stmt.reset();
                     }
                 }));
             }
@@ -702,21 +1112,27 @@ fn bench_concurrent_8_readers() -> BenchResult {
         },
         total_ops,
     );
+    drop(db);
     let (rs_ops, _) = measure(
-        "rusqlite 8 readers mutex",
+        "rusqlite 8 readers (8 conns, WAL)",
         || {
             let mut handles = Vec::new();
             for _ in 0..8 {
-                let conn = Arc::clone(&conn);
+                let path = sq_path.clone();
                 handles.push(thread::spawn(move || {
+                    let conn = rusqlite::Connection::open(&path).unwrap();
+                    conn.busy_timeout(std::time::Duration::from_secs(30))
+                        .unwrap();
+                    let mut stmt = conn
+                        .prepare("SELECT name, val FROM t WHERE id = ?1")
+                        .unwrap();
                     for i in 0..n_per_thread {
                         let id = (i % N_ROWS as usize) as i64 + 1;
-                        let guard = conn.lock().unwrap();
-                        let mut stmt = guard
-                            .prepare("SELECT name, val FROM t WHERE id = ?1")
-                            .unwrap();
                         let mut rows = stmt.query(params![id]).unwrap();
-                        while rows.next().unwrap().is_some() {}
+                        while let Some(row) = rows.next().unwrap() {
+                            let _ = row.get::<_, String>(0).unwrap();
+                            let _ = row.get::<_, i64>(1).unwrap();
+                        }
                     }
                 }));
             }
@@ -726,17 +1142,33 @@ fn bench_concurrent_8_readers() -> BenchResult {
         },
         total_ops,
     );
+    cleanup_db_files(&rq_path);
+    cleanup_db_files(&sq_path);
     BenchResult {
         name: "Concurrent reads (8 threads × 500 queries)".into(),
         rustqlite_ops_per_sec: rq_ops,
         rusqlite_ops_per_sec: rs_ops,
-        note: Some("Rust: RwLock | SQLite: Mutex"),
+        note: Some("shared engine MRMW vs 8-conn WAL (both best shapes)"),
     }
 }
 
 fn bench_concurrent_16_readers() -> BenchResult {
-    let db = Arc::new(RwLock::new(setup_rustqlite(N_ROWS, false)));
-    let conn = Arc::new(std::sync::Mutex::new(setup_rusqlite(N_ROWS, false)));
+    // Same fair shape as the 8-reader row, at 16 threads.
+    let rq_path = wal_path("r16");
+    let sq_path = wal_path("s16");
+    let db = Arc::new(setup_rustqlite_wal(&rq_path, N_ROWS));
+    drop(setup_rusqlite_wal(&sq_path, N_ROWS));
+    {
+        let check = rusqlite::Connection::open(&sq_path).unwrap();
+        let rq = db.query("SELECT COUNT(*), SUM(val) FROM t", []).unwrap();
+        let sq: (i64, i64) = check
+            .query_row("SELECT COUNT(*), SUM(val) FROM t", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(rq[0][0].as_integer(), sq.0, "reader row count mismatch");
+        assert_eq!(rq[0][1].as_integer(), sq.1, "reader SUM mismatch");
+    }
     let n_per_thread = 250;
     let total_ops = 16 * n_per_thread;
     let (rq_ops, _) = measure(
@@ -746,11 +1178,15 @@ fn bench_concurrent_16_readers() -> BenchResult {
             for _ in 0..16 {
                 let db = Arc::clone(&db);
                 handles.push(thread::spawn(move || {
+                    let mut stmt = db.prepare("SELECT name, val FROM t WHERE id = ?").unwrap();
                     for i in 0..n_per_thread {
                         let id = (i % N_ROWS as usize) as i64 + 1;
-                        let guard = db.read();
-                        let _ = guard
-                            .query("SELECT name, val FROM t WHERE id = ?", [Value::Integer(id)]);
+                        stmt.bind(1, Value::Integer(id)).unwrap();
+                        while let rustqlite::StepResult::Row = stmt.step().unwrap() {
+                            let _ = stmt.column_text(0);
+                            let _ = stmt.column_int(1);
+                        }
+                        stmt.reset();
                     }
                 }));
             }
@@ -760,21 +1196,27 @@ fn bench_concurrent_16_readers() -> BenchResult {
         },
         total_ops,
     );
+    drop(db);
     let (rs_ops, _) = measure(
-        "rusqlite 16 readers mutex",
+        "rusqlite 16 readers (16 conns, WAL)",
         || {
             let mut handles = Vec::new();
             for _ in 0..16 {
-                let conn = Arc::clone(&conn);
+                let path = sq_path.clone();
                 handles.push(thread::spawn(move || {
+                    let conn = rusqlite::Connection::open(&path).unwrap();
+                    conn.busy_timeout(std::time::Duration::from_secs(30))
+                        .unwrap();
+                    let mut stmt = conn
+                        .prepare("SELECT name, val FROM t WHERE id = ?1")
+                        .unwrap();
                     for i in 0..n_per_thread {
                         let id = (i % N_ROWS as usize) as i64 + 1;
-                        let guard = conn.lock().unwrap();
-                        let mut stmt = guard
-                            .prepare("SELECT name, val FROM t WHERE id = ?1")
-                            .unwrap();
                         let mut rows = stmt.query(params![id]).unwrap();
-                        while rows.next().unwrap().is_some() {}
+                        while let Some(row) = rows.next().unwrap() {
+                            let _ = row.get::<_, String>(0).unwrap();
+                            let _ = row.get::<_, i64>(1).unwrap();
+                        }
                     }
                 }));
             }
@@ -784,48 +1226,76 @@ fn bench_concurrent_16_readers() -> BenchResult {
         },
         total_ops,
     );
+    cleanup_db_files(&rq_path);
+    cleanup_db_files(&sq_path);
     BenchResult {
         name: "Concurrent reads (16 threads × 250 queries)".into(),
         rustqlite_ops_per_sec: rq_ops,
         rusqlite_ops_per_sec: rs_ops,
-        note: None,
+        note: Some("shared engine MRMW vs 16-conn WAL (both best shapes)"),
     }
 }
 
 fn bench_mixed_rw() -> BenchResult {
-    let db = Arc::new(RwLock::new(setup_rustqlite(N_ROWS, false)));
-    let conn = Arc::new(std::sync::Mutex::new(setup_rusqlite(N_ROWS, false)));
+    // CONCURRENCY PARITY (the honest 4-readers + 1-writer fight):
+    //   rustqlite — one shared `Arc<Database>` on a file-backed WAL
+    //     database: the writer runs autocommit UPDATEs through a prepared
+    //     `&self` statement (implicitly joining the concurrent regime),
+    //     readers run prepared SELECTs in PARALLEL — readers never block
+    //     on the writer and vice versa.
+    //   SQLite — its best shape for this workload: one WAL database, FIVE
+    //     real connections (1 writer + 4 readers, busy_timeout, WAL+
+    //     synchronous=NORMAL on every connection). Readers run in parallel;
+    //     the writer holds SQLite's single write lock.
+    let rq_path = wal_path("rm");
+    let sq_path = wal_path("sm");
+    let db = Arc::new(setup_rustqlite_wal(&rq_path, N_ROWS));
+    drop(setup_rusqlite_wal(&sq_path, N_ROWS));
+    {
+        let check = rusqlite::Connection::open(&sq_path).unwrap();
+        let rq = db.query("SELECT COUNT(*), SUM(val) FROM t", []).unwrap();
+        let sq: (i64, i64) = check
+            .query_row("SELECT COUNT(*), SUM(val) FROM t", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(rq[0][0].as_integer(), sq.0, "mixed row count mismatch");
+        assert_eq!(rq[0][1].as_integer(), sq.1, "mixed SUM mismatch");
+    }
     let n_per_thread = 500;
     let total_ops = 5 * n_per_thread;
     let (rq_ops, _) = measure(
         "rust-sql mixed R/W",
         || {
             let mut handles = Vec::new();
-            // 1 writer
+            // 1 writer (prepared &self statement, autocommit DML)
             {
                 let db = Arc::clone(&db);
                 handles.push(thread::spawn(move || {
+                    let mut stmt = db
+                        .prepare("UPDATE t SET val = val + 1 WHERE id = ?")
+                        .unwrap();
                     for i in 0..n_per_thread {
                         let id = (i % N_ROWS as usize) as i64 + 1;
-                        let mut guard = db.write();
-                        guard
-                            .execute(
-                                "UPDATE t SET val = val + 1 WHERE id = ?",
-                                [Value::Integer(id)],
-                            )
-                            .unwrap();
+                        stmt.bind(1, Value::Integer(id)).unwrap();
+                        stmt.step().unwrap();
+                        stmt.reset();
                     }
                 }));
             }
-            // 4 readers
+            // 4 readers (parallel prepared statements)
             for _ in 0..4 {
                 let db = Arc::clone(&db);
                 handles.push(thread::spawn(move || {
+                    let mut stmt = db.prepare("SELECT name, val FROM t WHERE id = ?").unwrap();
                     for i in 0..n_per_thread {
                         let id = (i % N_ROWS as usize) as i64 + 1;
-                        let guard = db.read();
-                        let _ = guard
-                            .query("SELECT name, val FROM t WHERE id = ?", [Value::Integer(id)]);
+                        stmt.bind(1, Value::Integer(id)).unwrap();
+                        while let rustqlite::StepResult::Row = stmt.step().unwrap() {
+                            let _ = stmt.column_text(0);
+                            let _ = stmt.column_int(1);
+                        }
+                        stmt.reset();
                     }
                 }));
             }
@@ -835,35 +1305,46 @@ fn bench_mixed_rw() -> BenchResult {
         },
         total_ops,
     );
+    drop(db);
     let (rs_ops, _) = measure(
-        "rusqlite mixed R/W",
+        "rusqlite mixed R/W (5 conns, WAL)",
         || {
             let mut handles = Vec::new();
-            // 1 writer
+            // 1 writer connection
             {
-                let conn = Arc::clone(&conn);
+                let path = sq_path.clone();
                 handles.push(thread::spawn(move || {
+                    let conn = rusqlite::Connection::open(&path).unwrap();
+                    conn.busy_timeout(std::time::Duration::from_secs(30))
+                        .unwrap();
+                    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
+                        .unwrap();
+                    let mut stmt = conn
+                        .prepare("UPDATE t SET val = val + 1 WHERE id = ?1")
+                        .unwrap();
                     for i in 0..n_per_thread {
                         let id = (i % N_ROWS as usize) as i64 + 1;
-                        let guard = conn.lock().unwrap();
-                        guard
-                            .execute("UPDATE t SET val = val + 1 WHERE id = ?1", params![id])
-                            .unwrap();
+                        stmt.execute(params![id]).unwrap();
                     }
                 }));
             }
-            // 4 readers
+            // 4 reader connections
             for _ in 0..4 {
-                let conn = Arc::clone(&conn);
+                let path = sq_path.clone();
                 handles.push(thread::spawn(move || {
+                    let conn = rusqlite::Connection::open(&path).unwrap();
+                    conn.busy_timeout(std::time::Duration::from_secs(30))
+                        .unwrap();
+                    let mut stmt = conn
+                        .prepare("SELECT name, val FROM t WHERE id = ?1")
+                        .unwrap();
                     for i in 0..n_per_thread {
                         let id = (i % N_ROWS as usize) as i64 + 1;
-                        let guard = conn.lock().unwrap();
-                        let mut stmt = guard
-                            .prepare("SELECT name, val FROM t WHERE id = ?1")
-                            .unwrap();
                         let mut rows = stmt.query(params![id]).unwrap();
-                        while rows.next().unwrap().is_some() {}
+                        while let Some(row) = rows.next().unwrap() {
+                            let _ = row.get::<_, String>(0).unwrap();
+                            let _ = row.get::<_, i64>(1).unwrap();
+                        }
                     }
                 }));
             }
@@ -873,11 +1354,27 @@ fn bench_mixed_rw() -> BenchResult {
         },
         total_ops,
     );
+    // Post-state: the writer streams are identical (+1 per id per pass) on
+    // both engines, so the final SUMs must match exactly.
+    {
+        let check = rusqlite::Connection::open(&sq_path).unwrap();
+        let sq: (i64, i64) = check
+            .query_row("SELECT COUNT(*), SUM(val) FROM t", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        let rq_db = Database::open(&rq_path).unwrap();
+        let rq = rq_db.query("SELECT COUNT(*), SUM(val) FROM t", []).unwrap();
+        assert_eq!(rq[0][0].as_integer(), sq.0, "mixed post row count mismatch");
+        assert_eq!(rq[0][1].as_integer(), sq.1, "mixed post SUM mismatch");
+    }
+    cleanup_db_files(&rq_path);
+    cleanup_db_files(&sq_path);
     BenchResult {
         name: "Mixed R/W (4 readers + 1 writer)".into(),
         rustqlite_ops_per_sec: rq_ops,
         rusqlite_ops_per_sec: rs_ops,
-        note: None,
+        note: Some("shared engine vs 5-conn WAL (both best shapes)"),
     }
 }
 
@@ -935,11 +1432,15 @@ fn bench_concurrent_writes() -> BenchResult {
             for h in handles {
                 h.join().unwrap();
             }
-            let n = db.query("SELECT count(*) FROM t", []).unwrap()[0][0].as_integer();
-            assert_eq!(n, 1000, "every parallel writer's rows must land");
+            let check = db.query("SELECT count(*), sum(val) FROM t", []).unwrap();
+            assert_eq!(
+                check[0][0].as_integer(),
+                1000,
+                "every parallel writer's rows must land"
+            );
+            assert_eq!(check[0][1].as_integer(), 1500, "parallel writer checksum");
             drop(db);
-            let _ = std::fs::remove_file(&rq_path);
-            let _ = std::fs::remove_file(format!("{}-wal", rq_path));
+            cleanup_db_files(&rq_path);
         },
         total_ops,
     );
@@ -973,13 +1474,15 @@ fn bench_concurrent_writes() -> BenchResult {
                     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
                         .unwrap();
                     conn.execute("BEGIN", []).unwrap();
-                    for i in 0..250i64 {
-                        conn.execute(
-                            "INSERT INTO t (id, val) VALUES (?1, ?2)",
-                            params![tid * 1_000_000 + i, tid],
-                        )
+                    // PREPARE PARITY: the statement is prepared once per
+                    // thread — the same discipline the engine side uses.
+                    let mut stmt = conn
+                        .prepare("INSERT INTO t (id, val) VALUES (?1, ?2)")
                         .unwrap();
+                    for i in 0..250i64 {
+                        stmt.execute(params![tid * 1_000_000 + i, tid]).unwrap();
                     }
+                    drop(stmt);
                     conn.execute("COMMIT", []).unwrap();
                 }));
             }
@@ -988,14 +1491,15 @@ fn bench_concurrent_writes() -> BenchResult {
             }
             {
                 let conn = rusqlite::Connection::open(&rs_path).unwrap();
-                let n: i64 = conn
-                    .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+                let (n, s): (i64, i64) = conn
+                    .query_row("SELECT count(*), sum(val) FROM t", [], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })
                     .unwrap();
                 assert_eq!(n, 1000);
+                assert_eq!(s, 1500, "SQLite writer checksum");
             }
-            let _ = std::fs::remove_file(&rs_path);
-            let _ = std::fs::remove_file(format!("{}-wal", rs_path));
-            let _ = std::fs::remove_file(format!("{}-shm", rs_path));
+            cleanup_db_files(&rs_path);
         },
         total_ops,
     );
@@ -1011,6 +1515,12 @@ fn bench_hash_join() -> BenchResult {
     // Self-join — should hit hash join path.
     let db = setup_rustqlite(N_ROWS / 10, false);
     let conn = setup_rusqlite(N_ROWS / 10, false);
+    // ANSWER EQUALITY: identical join answers (checksum aggregate).
+    assert_answers(
+        &db,
+        &conn,
+        "SELECT COUNT(*), SUM(a.id), SUM(b.val) FROM t a JOIN t b ON a.val = b.val",
+    );
     let n = 50;
     let (rq_ops, _) = measure(
         "rust-sql self-join",
@@ -1028,10 +1538,14 @@ fn bench_hash_join() -> BenchResult {
         || {
             for _ in 0..n {
                 let mut stmt = conn
-                    .prepare("SELECT a.id, b.val FROM t a JOIN t b ON a.val = b.val")
+                    .prepare_cached("SELECT a.id, b.val FROM t a JOIN t b ON a.val = b.val")
                     .unwrap();
                 let mut rows = stmt.query([]).unwrap();
-                while rows.next().unwrap().is_some() {}
+                // READ PARITY: decode the projected columns.
+                while let Some(row) = rows.next().unwrap() {
+                    let _ = row.get::<_, i64>(0).unwrap();
+                    let _ = row.get::<_, i64>(1).unwrap();
+                }
             }
         },
         (N_ROWS / 10) as usize * n * 2,

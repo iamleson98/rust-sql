@@ -589,6 +589,15 @@ pub struct Database {
     /// mutable (`Mutex`) because the read paths (`query`) must be able to
     /// break (flush) a hot chain from `&self`.
     insert_chain: Mutex<Option<InsertChain>>,
+    /// Memoized bound PK-UPDATE plan (see [`BoundUpdatePlan`]) — a
+    /// single-entry memo keyed by the exact statement text. The hottest
+    /// OLTP update shape (`UPDATE t SET c = ? WHERE id = ?`) skips the
+    /// general dispatch for the lean lookup->decode->SET->encode->replace
+    /// apply. Invalidated by ANY DDL (`invalidate_stmt_cache`).
+    bound_update_memo: Mutex<Option<BoundUpdatePlan>>,
+    /// Memoized bound PK-DELETE plan (`DELETE FROM t WHERE id = ?`) —
+    /// same discipline as the bound-UPDATE memo.
+    bound_delete_memo: Mutex<Option<BoundDeletePlan>>,
     /// Advisory fast-path flag for [`Database::break_insert_chain`]: true
     /// while a chain might be hot. Cold (the overwhelmingly common state
     /// for read-heavy workloads) the break costs ONE relaxed atomic load
@@ -2575,6 +2584,8 @@ impl Database {
             deferred_flush_threshold: 1000,
             last_rowid: AtomicI64::new(0),
             insert_chain: Mutex::new(None),
+            bound_update_memo: Mutex::new(None),
+            bound_delete_memo: Mutex::new(None),
             insert_chain_hot: AtomicBool::new(false),
             plugins: RwLock::new(std::sync::Arc::new(
                 crate::plugin::PluginRegistry::with_builtins(),
@@ -2972,6 +2983,8 @@ impl Database {
             deferred_flush_threshold: 1000,
             last_rowid: AtomicI64::new(0),
             insert_chain: Mutex::new(None),
+            bound_update_memo: Mutex::new(None),
+            bound_delete_memo: Mutex::new(None),
             insert_chain_hot: AtomicBool::new(false),
             plugins: RwLock::new(std::sync::Arc::new(
                 crate::plugin::PluginRegistry::with_builtins(),
@@ -4808,14 +4821,14 @@ impl Database {
     /// match it (the caller falls back to the cold fast-insert path).
     /// On any error the chain is dropped (after flushing its state), so a
     /// failed chained statement can never leave stale bookkeeping behind.
-    fn exec_chained_insert(&mut self, sql: &str) -> Result<bool> {
+    fn exec_chained_insert(&mut self, sql: &str, params: Option<&[Value]>) -> Result<bool> {
         let epoch = self.write_epoch.load(Ordering::Acquire);
         let mut guard = self.insert_chain.lock();
         let Some(ch) = guard.as_mut() else {
             return Ok(false);
         };
         let chain_epoch_ok = ch.epoch == epoch.wrapping_sub(1);
-        if !chain_epoch_ok || matches!(parse_chain_row(sql, ch), ChainParse::Mismatch) {
+        if !chain_epoch_ok || matches!(parse_chain_row(sql, ch, params), ChainParse::Mismatch) {
             // Epoch gap (another statement ran since the chain's last use)
             // or shape mismatch: flush the chain's root / max-rowid into
             // the bookkeeping maps, then drop it. The cold path below (or
@@ -4930,10 +4943,14 @@ impl Database {
             let mut synced = self.schema_root_pages.lock();
             synced.insert(format!("table:{}", ch.name_lc), ch.root);
         }
-        // Counters (mirrors the general path's epilogue).
+        // Counters (mirrors the general path's epilogue). The burst
+        // accounting keeps the RSS-guard honest for chained insert
+        // storms (the chain is allocation-light, but its pages still
+        // wake the deferred-free queue).
         self.set_last_insert_rowid(rowid);
         crate::executor::change_counters::record(1);
         self.pager.note_rows_modified(1);
+        self.note_alloc_burst(1, 0);
         // Auto-commit flush, exactly like `exec_fast_insert`'s tail.
         let in_txn = self.in_transaction.load(Ordering::Acquire);
         if !in_txn {
@@ -5896,7 +5913,7 @@ impl Database {
     /// Rewrite one schema row's rootpage: read the existing row (preserving
     /// its name/table/sql columns), delete it, and insert the updated row.
     fn rewrite_schema_row_root(&self, kind: &str, name: &str, new_root: u32) -> Result<()> {
-        if std::env::var_os("RSQL_DBG_FLUSH").is_some() {
+        if dbg_flush() {
             eprintln!("[SCHEMA-REWRITE] {kind}:{name} -> root {new_root}");
         }
         let mut bt = Btree::new(&self.pager, 0, false);
@@ -5940,6 +5957,10 @@ impl Database {
         self.stmt_cache.write().clear();
         self.stmt_cache_order.lock().clear();
         *self.last_stmt.write() = None;
+        // The bound PK-UPDATE / PK-DELETE memos hold schema facts
+        // (table, column indices, gates) — any DDL can invalidate them.
+        *self.bound_update_memo.lock() = None;
+        *self.bound_delete_memo.lock() = None;
     }
 
     /// Execute a statement that does not return rows (INSERT/UPDATE/DELETE/CREATE/...).
@@ -6061,7 +6082,110 @@ impl Database {
                 .as_bytes()
                 .iter()
                 .find(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'));
-            if first == Some(&b'I') || first == Some(&b'i') {
+            if first == Some(&b'D') || first == Some(&b'd') {
+                // Bound PK-DELETE fast path — same regime gates.
+                let conc_owner = self.concurrent_txn_for_caller().is_some();
+                let plain_during_regime =
+                    self.concurrent_active.load(Ordering::Acquire) && !conc_owner;
+                if !conc_owner && !plain_during_regime {
+                    self.break_insert_chain();
+                    let view = {
+                        let memo = self.bound_delete_memo.lock();
+                        match memo.as_ref() {
+                            Some(p) if p.sql.as_ref() == sql => {
+                                Some((p.table.clone(), p.rowid_pos, p.n_params))
+                            }
+                            _ => None,
+                        }
+                    };
+                    let view = match view {
+                        Some(v) => Some(v),
+                        None => match try_bound_delete_parse(sql) {
+                            Some((tname, wcol, _n)) => {
+                                match self.build_bound_delete_plan(sql, tname, wcol) {
+                                    Some(plan) => {
+                                        let v = (plan.table.clone(), plan.rowid_pos, plan.n_params);
+                                        *self.bound_delete_memo.lock() = Some(plan);
+                                        Some(v)
+                                    }
+                                    None => None,
+                                }
+                            }
+                            None => None,
+                        },
+                    };
+                    if let Some((table, rowid_pos, n_params)) = view {
+                        let handled =
+                            self.exec_bound_delete(&table, rowid_pos, n_params, params.as_slice());
+                        if handled.is_err() {
+                            self.recover_failed_autocommit_fastpath(dirty_at_start);
+                        }
+                        if handled? {
+                            self.note_pending_write()?;
+                            return Ok(());
+                        }
+                    }
+                }
+            } else if first == Some(&b'U') || first == Some(&b'u') {
+                // Bound PK-UPDATE fast path — the same concurrent-regime
+                // gates as the insert fast paths (a CONCURRENT OWNER's
+                // overlays and a plain writer during an active regime
+                // need the general path's machinery).
+                let conc_owner = self.concurrent_txn_for_caller().is_some();
+                let plain_during_regime =
+                    self.concurrent_active.load(Ordering::Acquire) && !conc_owner;
+                if !conc_owner && !plain_during_regime {
+                    // A non-INSERT statement ends any hot INSERT chain
+                    // (its root / max-rowid must reach the maps first).
+                    self.break_insert_chain();
+                    // Memo: hit on the exact statement text, else first
+                    // sight (scan + build + store).
+                    let view = {
+                        let memo = self.bound_update_memo.lock();
+                        match memo.as_ref() {
+                            Some(p) if p.sql.as_ref() == sql => {
+                                Some((p.table.clone(), p.sets.clone(), p.rowid_pos, p.n_params))
+                            }
+                            _ => None,
+                        }
+                    };
+                    let view = match view {
+                        Some(v) => Some(v),
+                        None => match try_bound_update_parse(sql) {
+                            Some(sc) => match self.build_bound_update_plan(sql, &sc) {
+                                Some(plan) => {
+                                    let v = (
+                                        plan.table.clone(),
+                                        plan.sets.clone(),
+                                        plan.rowid_pos,
+                                        plan.n_params,
+                                    );
+                                    *self.bound_update_memo.lock() = Some(plan);
+                                    Some(v)
+                                }
+                                None => None,
+                            },
+                            None => None,
+                        },
+                    };
+                    if let Some((table, sets, rowid_pos, n_params)) = view {
+                        let handled = self.exec_bound_update(
+                            &table,
+                            &sets,
+                            rowid_pos,
+                            n_params,
+                            params.as_slice(),
+                        );
+                        if handled.is_err() {
+                            self.recover_failed_autocommit_fastpath(dirty_at_start);
+                        }
+                        if handled? {
+                            self.note_pending_write()?;
+                            return Ok(());
+                        }
+                    }
+                }
+            } else if first == Some(&b'I') || first == Some(&b'i') {
                 // Concurrent regime, two gates:
                 // - a CONCURRENT OWNER never takes the fast insert paths
                 //   (their chained roots / max-rowids / leaf hints are
@@ -6075,7 +6199,7 @@ impl Database {
                 let plain_during_regime =
                     self.concurrent_active.load(Ordering::Acquire) && !conc_owner;
                 if !conc_owner && !plain_during_regime {
-                    let chained = self.exec_chained_insert(sql);
+                    let chained = self.exec_chained_insert(sql, params.as_slice());
                     if chained.is_err() {
                         self.recover_failed_autocommit_fastpath(dirty_at_start);
                     }
@@ -6083,7 +6207,7 @@ impl Database {
                         self.note_pending_write()?;
                         return Ok(());
                     }
-                    if let Some(fi) = try_fast_insert_parse(sql) {
+                    if let Some(fi) = try_fast_insert_parse(sql, params.as_slice()) {
                         let fast = self.exec_fast_insert(fi);
                         if fast.is_err() {
                             self.recover_failed_autocommit_fastpath(dirty_at_start);
@@ -13379,7 +13503,7 @@ impl Database {
                 // seed the leaf-hint cache through the read path, so the
                 // first user query after the build doesn't pay the
                 // read-path wake-up (see Btree::warm_read_path).
-                if std::env::var_os("RUSTQLITE_NO_WARM_TAP").is_none() {
+                if !no_warm_tap() {
                     let mut warm_bt =
                         crate::storage::btree::Btree::new(ctx.pager, final_root, true);
                     let _ = warm_bt.warm_read_path();
@@ -17035,6 +17159,512 @@ fn rebuild_implicit_indexes(
 
 /// Pieces of a fast-path INSERT statement, sliced directly out of the SQL
 /// text (no tokenizer, no AST, no Plan).
+/// A memoized bound PK-DELETE plan: `DELETE FROM t WHERE
+/// <rowid-alias> = ?`. Gates mirror the bound-UPDATE plan's (plus a
+/// per-op `foreign_keys_enabled` check — an incoming reference's ON
+/// DELETE action needs the general path when FKs are enforced).
+struct BoundDeletePlan {
+    /// Exact statement text — the memo key (byte compare, no hashing).
+    sql: Box<str>,
+    table: Arc<Table>,
+    /// Param position (0-based) of the rowid-alias equality value.
+    rowid_pos: usize,
+    n_params: usize,
+}
+
+/// Scanner for `DELETE FROM <table> WHERE <col> = ?` — nothing else.
+fn try_bound_delete_parse(sql: &str) -> Option<(&str, &str, usize)> {
+    let b = sql.as_bytes();
+    let mut i = skip_ws(b, 0);
+    i = match_word_ci(b, i, "DELETE")?;
+    i = skip_ws(b, i);
+    i = match_word_ci(b, i, "FROM")?;
+    i = skip_ws(b, i);
+    let (ts, te) = read_ident(b, i)?;
+    let table = &sql[ts..te];
+    i = skip_ws(b, te);
+    i = match_word_ci(b, i, "WHERE")?;
+    i = skip_ws(b, i);
+    let (cs, ce) = read_ident(b, i)?;
+    let col = &sql[cs..ce];
+    i = skip_ws(b, ce);
+    if i >= b.len() || b[i] != b'=' {
+        return None;
+    }
+    i = skip_ws(b, i + 1);
+    if i >= b.len() || b[i] != b'?' {
+        return None;
+    }
+    i = skip_ws(b, i + 1);
+    if i < b.len() && b[i] == b';' {
+        i = skip_ws(b, i + 1);
+    }
+    if i != b.len() {
+        return None;
+    }
+    Some((table, col, 1))
+}
+
+/// A memoized bound PK-UPDATE plan: `UPDATE t SET c1 = ?, c2 = ? ...
+/// WHERE <rowid-alias> = ?` — the canonical OLTP point update. All SET
+/// values and the WHERE key are positional `?` parameters. Built once per
+/// statement text after the table-shape gates pass; invalidated by ANY
+/// DDL. The lean apply: rowid lookup -> decode -> SET -> encode -> in-place
+/// replace (delete+insert fallback when the payload class changes).
+struct BoundUpdatePlan {
+    /// Exact statement text — the memo key (byte compare, no hashing).
+    sql: Box<str>,
+    table: Arc<Table>,
+    /// (column index, param position) per SET assignment.
+    sets: Vec<(usize, usize)>,
+    /// Param position of the rowid-alias equality value.
+    rowid_pos: usize,
+    /// Total bind count the statement expects.
+    n_params: usize,
+}
+
+/// The scanned shape of a candidate bound UPDATE (pre-resolution).
+struct ScannedBoundUpdate<'a> {
+    table: &'a str,
+    /// (column name as written, param ordinal) per SET assignment.
+    sets: Vec<(&'a str, usize)>,
+    /// WHERE column name as written + its param ordinal.
+    where_col: &'a str,
+    where_pos: usize,
+    n_params: usize,
+}
+
+/// Ultra-lightweight scanner for `UPDATE <table> SET <col> = ?[, <col> = ?]*
+/// WHERE <col> = ?` — every value a plain positional `?`, nothing else in
+/// the statement. Returns None for ANY deviation (SET expressions,
+/// literals, OR UPDATE, RETURNING, FROM, trailing clauses, `?N` explicit
+/// indices): the general path owns those shapes.
+fn try_bound_update_parse(sql: &str) -> Option<ScannedBoundUpdate<'_>> {
+    let b = sql.as_bytes();
+    let mut i = skip_ws(b, 0);
+    i = match_word_ci(b, i, "UPDATE")?;
+    i = skip_ws(b, i);
+    let (ts, te) = read_ident(b, i)?;
+    let table = &sql[ts..te];
+    i = skip_ws(b, te);
+    i = match_word_ci(b, i, "SET")?;
+    i = skip_ws(b, i);
+    let mut sets: Vec<(&str, usize)> = Vec::new();
+    let mut n_params = 0usize;
+    loop {
+        let (cs, ce) = read_ident(b, i)?;
+        let col = &sql[cs..ce];
+        i = skip_ws(b, ce);
+        if i >= b.len() || b[i] != b'=' {
+            return None;
+        }
+        i = skip_ws(b, i + 1);
+        if i >= b.len() || b[i] != b'?' {
+            return None; // non-param SET value: general path
+        }
+        i = skip_ws(b, i + 1);
+        n_params += 1;
+        let pos = n_params;
+        sets.push((col, pos));
+        if i < b.len() && b[i] == b',' {
+            i = skip_ws(b, i + 1);
+            continue;
+        }
+        break;
+    }
+    i = match_word_ci(b, i, "WHERE")?;
+    i = skip_ws(b, i);
+    let (ws_, we_) = read_ident(b, i)?;
+    let where_col = &sql[ws_..we_];
+    i = skip_ws(b, we_);
+    if i >= b.len() || b[i] != b'=' {
+        return None;
+    }
+    i = skip_ws(b, i + 1);
+    if i >= b.len() || b[i] != b'?' {
+        return None;
+    }
+    i = skip_ws(b, i + 1);
+    n_params += 1;
+    let where_pos = n_params;
+    // Optional single trailing semicolon, then end-of-statement.
+    if i < b.len() && b[i] == b';' {
+        i = skip_ws(b, i + 1);
+    }
+    if i != b.len() {
+        return None;
+    }
+    Some(ScannedBoundUpdate {
+        table,
+        sets,
+        where_col,
+        where_pos,
+        n_params,
+    })
+}
+
+impl Database {
+    /// Build (and store) the bound-UPDATE plan for a scanned shape, or
+    /// None when any gate rejects the table/shape (the general path then
+    /// owns the statement). Gates mirror `try_build_insert_chain`'s.
+    fn build_bound_update_plan(
+        &self,
+        sql: &str,
+        sc: &ScannedBoundUpdate<'_>,
+    ) -> Option<BoundUpdatePlan> {
+        let table = self.catalog.get_table_fast(sc.table)?;
+        // Plain tables only: no vtab, not WITHOUT ROWID, not STRICT, no
+        // generated columns (their values are computed, not SET-able).
+        if table.vtab.is_some()
+            || table.without_rowid
+            || table.strict
+            || table.columns.iter().any(|c| c.generated.is_some())
+        {
+            return None;
+        }
+        // The WHERE must target the rowid-alias column (INTEGER PRIMARY
+        // KEY) — the only key this path resolves.
+        let alias_idx = table.rowid_alias?;
+        let alias_name = table.columns.get(alias_idx)?.name.as_bytes();
+        if !alias_name.eq_ignore_ascii_case(sc.where_col.as_bytes()) {
+            return None;
+        }
+        // No CHECKs (the lean apply skips enforce_row_constraints), no FKs
+        // (parent-side cascades need the general path), no UPDATE
+        // triggers.
+        if !table.check_exprs.is_empty()
+            || !table.foreign_keys.is_empty()
+            || self.catalog.triggers_on_table(&table.name).iter().any(|t| {
+                t.events
+                    .iter()
+                    .any(|ev| matches!(ev, TriggerEvent::Update { .. }))
+            })
+        {
+            return None;
+        }
+        // Resolve SET columns: ordinary columns, not the alias itself
+        // (a rowid rewrite needs the general path's collision checks).
+        let mut sets = Vec::with_capacity(sc.sets.len());
+        for (name, pos) in sc.sets.iter() {
+            let mut found = None;
+            for (ci, c) in table.columns.iter().enumerate() {
+                if c.name.as_bytes().eq_ignore_ascii_case(name.as_bytes()) {
+                    found = Some(ci);
+                    break;
+                }
+            }
+            let ci = found?;
+            if ci == alias_idx {
+                return None;
+            }
+            // Param ordinals are 1-based (bind order); store 0-based
+            // slice positions.
+            sets.push((ci, *pos - 1));
+        }
+        // Index gate (column-aware): a SET column that participates in an
+        // index key — or ANY partial index on the table (its WHERE
+        // predicate can flip membership when any column changes) — needs
+        // the general path's index maintenance. Indexes that reference
+        // only untouched columns keep their (key, rowid) entries exactly
+        // as they were: the table cell's payload changes, the index cells
+        // do not.
+        for idx in self.catalog.indexes_on_table(&table.name).iter() {
+            if idx.partial_expr.is_some() {
+                return None;
+            }
+            for icol in idx.columns.iter() {
+                if sets.iter().any(|(ci, _)| {
+                    table.columns[*ci]
+                        .name
+                        .as_bytes()
+                        .eq_ignore_ascii_case(icol.name.as_bytes())
+                }) {
+                    return None;
+                }
+            }
+        }
+        Some(BoundUpdatePlan {
+            sql: sql.into(),
+            table,
+            sets,
+            rowid_pos: sc.where_pos - 1,
+            n_params: sc.n_params,
+        })
+    }
+
+    /// Build the bound PK-DELETE plan (gates mirror the UPDATE plan's).
+    fn build_bound_delete_plan(
+        &self,
+        sql: &str,
+        table_name: &str,
+        where_col: &str,
+    ) -> Option<BoundDeletePlan> {
+        let table = self.catalog.get_table_fast(table_name)?;
+        if table.vtab.is_some()
+            || table.without_rowid
+            || table.strict
+            || table.columns.iter().any(|c| c.generated.is_some())
+        {
+            return None;
+        }
+        let alias_idx = table.rowid_alias?;
+        let alias_name = table.columns.get(alias_idx)?.name.as_bytes();
+        if !alias_name.eq_ignore_ascii_case(where_col.as_bytes()) {
+            return None;
+        }
+        if !table.foreign_keys.is_empty()
+            || self
+                .catalog
+                .triggers_on_table(&table.name)
+                .iter()
+                .any(|t| t.events.iter().any(|ev| matches!(ev, TriggerEvent::Delete)))
+            || !self.catalog.indexes_on_table(&table.name).is_empty()
+        {
+            return None;
+        }
+        Some(BoundDeletePlan {
+            sql: sql.into(),
+            table,
+            rowid_pos: 0,
+            n_params: 1,
+        })
+    }
+
+    /// The lean apply for a memoized bound PK-DELETE.
+    fn exec_bound_delete(
+        &mut self,
+        table: &Arc<Table>,
+        rowid_pos: usize,
+        n_params: usize,
+        params: Option<&[Value]>,
+    ) -> Result<bool> {
+        let params = match params {
+            Some(p) if p.len() == n_params => p,
+            _ => return Ok(false),
+        };
+        let rowid = match params.get(rowid_pos) {
+            Some(Value::Integer(r)) => *r,
+            _ => return Ok(false),
+        };
+        // Incoming FK references (ON DELETE actions) need the general
+        // path whenever FK enforcement is on (per-op check: the PRAGMA
+        // toggles at runtime).
+        if self.pager.foreign_keys_enabled() {
+            return Ok(false);
+        }
+        let in_txn = self.in_transaction.load(Ordering::Acquire);
+        let txn_snap = self.txn_snapshot.get_mut().take();
+        let deferred_flush = self.deferred_flush.load(Ordering::Acquire);
+        let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
+        let mut ctx = ExecContext::new(&self.pager, catalog_ptr);
+        ctx.in_transaction = in_txn;
+        ctx.deferred_flush = deferred_flush;
+        ctx.txn_snapshot = txn_snap;
+        ctx.shared = std::mem::replace(self.maps.get_mut(), empty_maps());
+        ctx.shared_detached = true;
+        let mut changed: i64 = 0;
+        let result = (|| -> Result<()> {
+            let root = ctx.table_root(table);
+            let mut bt = Btree::new(ctx.pager, root, false);
+            let old_payload = match bt.lookup_table(rowid)? {
+                crate::storage::btree::LookupResult::Found(p) => p,
+                crate::storage::btree::LookupResult::NotFound => {
+                    // WHERE matched nothing: a no-op DELETE.
+                    return Ok(());
+                }
+            };
+            // Decode the old row for the preupdate/session hook scope.
+            let n_cols = table.n_columns();
+            let mut old_crow: Vec<Value> = Vec::with_capacity(n_cols);
+            crate::storage::row_codec::decode_row_into(
+                &old_payload,
+                n_cols,
+                rowid,
+                table.rowid_alias,
+                &mut old_crow,
+            )?;
+            crate::preupdate::fire(
+                crate::preupdate::PreupdateOp::Delete,
+                table,
+                rowid,
+                Some(&old_crow),
+                None,
+            );
+            bt.delete_table(rowid)?;
+            if bt.root != root {
+                ctx.set_table_root_lc(&table.name.to_ascii_lowercase(), bt.root);
+            }
+            changed = 1;
+            Ok(())
+        })();
+        // Epilogue: mirrors exec_bound_update's write-backs.
+        self.in_transaction
+            .store(ctx.in_transaction, Ordering::Release);
+        *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
+        if result.is_ok() && !ctx.in_transaction {
+            self.clear_vtab_shadow_flight();
+        }
+        if result.is_ok() {
+            crate::executor::change_counters::record(changed);
+            self.pager.note_rows_modified(changed);
+            self.note_alloc_burst(changed.unsigned_abs(), 0);
+            if changed > 0 && !ctx.in_transaction {
+                self.pager.note_tx_autocommit();
+            }
+        }
+        if ctx.roots_changed {
+            let shared = Arc::make_mut(&mut ctx.shared);
+            shared.roots.extend(ctx.root_overrides.drain());
+            for k in ctx.roots_invalidated.drain(..) {
+                shared.roots.remove(&k);
+            }
+        }
+        *self.maps.get_mut() = ctx.shared;
+        self.refresh_maps_flag();
+        if result.is_ok() && ctx.roots_changed {
+            self.sync_schema_roots_inner()?;
+        }
+        result?;
+        if !in_txn && !deferred_flush {
+            self.pager.flush()?;
+        } else if deferred_flush && !in_txn {
+            let dirty = self.pager.dirty_page_count();
+            if dirty >= self.deferred_flush_threshold {
+                let _ = self.pager.flush();
+            }
+        }
+        Ok(true)
+    }
+
+    /// The lean apply for a memoized bound PK-UPDATE, taking OWNED views
+    /// cloned out of the memo (Arc + small vecs). `Ok(true)` = handled
+    /// (including the matched-nothing no-op); `Ok(false)` = fall through
+    /// to the general path (arity mismatch / non-integer key).
+    fn exec_bound_update(
+        &mut self,
+        table: &Arc<Table>,
+        sets: &[(usize, usize)],
+        rowid_pos: usize,
+        n_params: usize,
+        params: Option<&[Value]>,
+    ) -> Result<bool> {
+        let params = match params {
+            Some(p) if p.len() == n_params => p,
+            // Iterator-backed or wrong arity: the general path errors
+            // exactly like SQLite.
+            _ => return Ok(false),
+        };
+        let rowid = match params.get(rowid_pos) {
+            Some(Value::Integer(r)) => *r,
+            // NULL / REAL / TEXT key: the general path owns the semantics.
+            _ => return Ok(false),
+        };
+        let in_txn = self.in_transaction.load(Ordering::Acquire);
+        let txn_snap = self.txn_snapshot.get_mut().take();
+        let deferred_flush = self.deferred_flush.load(Ordering::Acquire);
+        let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
+        let mut ctx = ExecContext::new(&self.pager, catalog_ptr);
+        ctx.in_transaction = in_txn;
+        ctx.deferred_flush = deferred_flush;
+        ctx.txn_snapshot = txn_snap;
+        ctx.shared = std::mem::replace(self.maps.get_mut(), empty_maps());
+        ctx.shared_detached = true;
+        let mut changed: i64 = 0;
+        let result = (|| -> Result<()> {
+            let root = ctx.table_root(table);
+            let mut bt = Btree::new(ctx.pager, root, false);
+            let old_payload = match bt.lookup_table(rowid)? {
+                crate::storage::btree::LookupResult::Found(p) => p,
+                crate::storage::btree::LookupResult::NotFound => {
+                    // WHERE matched nothing: a no-op UPDATE (SQLite
+                    // reports 0 changes, no error).
+                    return Ok(());
+                }
+            };
+            // Decode the old row, clone it as the new row, apply the SETs
+            // with column affinity + NOT NULL on the modified columns.
+            let n_cols = table.n_columns();
+            let mut old_crow: Vec<Value> = Vec::with_capacity(n_cols);
+            crate::storage::row_codec::decode_row_into(
+                &old_payload,
+                n_cols,
+                rowid,
+                table.rowid_alias,
+                &mut old_crow,
+            )?;
+            let mut new_crow = old_crow.clone();
+            for &(col_idx, pos) in sets.iter() {
+                new_crow[col_idx] = table.columns[col_idx].coerce(params[pos].clone());
+                if !table.columns[col_idx].nullable && new_crow[col_idx].is_null() {
+                    return Err(Error::constraint(format!(
+                        "NOT NULL constraint failed: {}.{}",
+                        table.name, table.columns[col_idx].name
+                    )));
+                }
+            }
+            let payload =
+                crate::storage::row_codec::encode_row_aliased(&new_crow, table.rowid_alias);
+            // Preupdate/session hook scope (installed by `execute`).
+            crate::preupdate::fire(
+                crate::preupdate::PreupdateOp::Update,
+                table,
+                rowid,
+                Some(&old_crow),
+                Some(&new_crow),
+            );
+            // In-place replace; delete+insert fallback when the payload
+            // size class changed (mirrors try_streaming_update).
+            let updated = bt.update_table(rowid, &payload)?;
+            if !updated {
+                bt.delete_table(rowid)?;
+                bt.insert_table(rowid, &payload)?;
+            }
+            if bt.root != root {
+                ctx.set_table_root_lc(&table.name.to_ascii_lowercase(), bt.root);
+            }
+            changed = 1;
+            Ok(())
+        })();
+        // Epilogue: mirrors exec_fast_insert's write-backs.
+        self.in_transaction
+            .store(ctx.in_transaction, Ordering::Release);
+        *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
+        if result.is_ok() && !ctx.in_transaction {
+            self.clear_vtab_shadow_flight();
+        }
+        if result.is_ok() {
+            crate::executor::change_counters::record(changed);
+            self.pager.note_rows_modified(changed);
+            self.note_alloc_burst(changed.unsigned_abs(), 0);
+            if changed > 0 && !ctx.in_transaction {
+                self.pager.note_tx_autocommit();
+            }
+        }
+        if ctx.roots_changed {
+            let shared = Arc::make_mut(&mut ctx.shared);
+            shared.roots.extend(ctx.root_overrides.drain());
+            for k in ctx.roots_invalidated.drain(..) {
+                shared.roots.remove(&k);
+            }
+        }
+        *self.maps.get_mut() = ctx.shared;
+        self.refresh_maps_flag();
+        if result.is_ok() && ctx.roots_changed {
+            self.sync_schema_roots_inner()?;
+        }
+        result?;
+        if !in_txn && !deferred_flush {
+            self.pager.flush()?;
+        } else if deferred_flush && !in_txn {
+            let dirty = self.pager.dirty_page_count();
+            if dirty >= self.deferred_flush_threshold {
+                let _ = self.pager.flush();
+            }
+        }
+        Ok(true)
+    }
+}
+
 struct FastInsert<'a> {
     /// Table name as written (matched case-insensitively).
     table: &'a str,
@@ -17264,7 +17894,7 @@ fn parse_fast_literal(b: &[u8], i: usize) -> Option<(Value, usize)> {
     }
 }
 
-fn try_fast_insert_parse(sql: &str) -> Option<FastInsert<'_>> {
+fn try_fast_insert_parse<'a>(sql: &'a str, params: Option<&'a [Value]>) -> Option<FastInsert<'a>> {
     let b = sql.as_bytes();
     let mut i = skip_ws(b, 0);
     i = match_word_ci(b, i, "INSERT")?;
@@ -17307,6 +17937,49 @@ fn try_fast_insert_parse(sql: &str) -> Option<FastInsert<'_>> {
             return None;
         }
         i += 1;
+        // BOUND arm: a row of positional `?` placeholders takes its values
+        // from the bound parameters (the sqlite3_bind model — the hottest
+        // OLTP shape through every driver). Single-row statements only;
+        // this first-sight execution arms the INSERT chain, and
+        // subsequent same-shape statements run through the chain's lean
+        // apply (parse_chain_row's bound arm).
+        {
+            let j = skip_ws(b, i);
+            if j < b.len() && b[j] == b'?' {
+                if !values.is_empty() {
+                    return None; // multi-row with a bound row: cold path
+                }
+                let mut q = j;
+                let mut count = 0usize;
+                loop {
+                    q = skip_ws(b, q);
+                    if q >= b.len() || b[q] != b'?' {
+                        return None; // mixed literal/param row: cold path
+                    }
+                    q = skip_ws(b, q + 1);
+                    count += 1;
+                    if q < b.len() && b[q] == b',' {
+                        q += 1;
+                        continue;
+                    }
+                    break;
+                }
+                if q >= b.len() || b[q] != b')' {
+                    return None;
+                }
+                let params = params?;
+                if params.len() != count {
+                    return None; // wrong bind count: the general path errors
+                }
+                let row: Vec<Value> = params.to_vec();
+                i = skip_ws(b, q + 1);
+                if i < b.len() && b[i] == b',' {
+                    return None; // bound row followed by more rows: cold path
+                }
+                values.push(row);
+                break;
+            }
+        }
         let mut row: Vec<Value> = Vec::new();
         loop {
             i = skip_ws(b, i);
@@ -17461,7 +18134,7 @@ enum ChainParse {
 /// the affinity-coerced values directly into `ch.full_row` at their
 /// resolved column positions. Zero heap allocations on the matched path
 /// for short strings (Text small-string optimization).
-fn parse_chain_row(sql: &str, ch: &mut InsertChain) -> ChainParse {
+fn parse_chain_row(sql: &str, ch: &mut InsertChain, params: Option<&[Value]>) -> ChainParse {
     let b = sql.as_bytes();
     let mut i = skip_ws(b, 0);
     // INSERT INTO
@@ -17530,6 +18203,75 @@ fn parse_chain_row(sql: &str, ch: &mut InsertChain) -> ChainParse {
         return ChainParse::Mismatch;
     }
     i += 1;
+    // BOUND-VALUES arm: `VALUES (?, ?, ...)` — the row's values come from
+    // the bound parameters, placed at the chained positions with the same
+    // affinity coercion the literal arm applies. The row must be ALL
+    // placeholders (no literal/param mixes), the count must match the
+    // chained shape AND the parameter count, and nothing may follow the
+    // row — any deviation falls to the general path.
+    {
+        let j = skip_ws(b, i);
+        if j < b.len() && b[j] == b'?' {
+            let params = match params {
+                Some(p) => p,
+                None => return ChainParse::Mismatch,
+            };
+            // NULL-reset the reusable row buffer.
+            for v in ch.full_row.iter_mut() {
+                *v = Value::Null;
+            }
+            let mut q = j;
+            let mut k = 0usize;
+            loop {
+                q = skip_ws(b, q);
+                if k >= n_fields || q >= b.len() || b[q] != b'?' {
+                    return ChainParse::Mismatch;
+                }
+                q = skip_ws(b, q + 1);
+                k += 1;
+                if q < b.len() && b[q] == b',' {
+                    q += 1;
+                    continue;
+                }
+                break;
+            }
+            if k != n_fields || params.len() != n_fields {
+                return ChainParse::Mismatch;
+            }
+            if q >= b.len() || b[q] != b')' {
+                return ChainParse::Mismatch;
+            }
+            for (pos, v) in params.iter().enumerate() {
+                let target = ch.col_indices[pos];
+                if target == crate::executor::ROWID_COLUMN_SENTINEL {
+                    // Explicit `rowid` binding: the general path's
+                    // conflict-checking path.
+                    return ChainParse::Mismatch;
+                }
+                ch.full_row[target] =
+                    crate::schema::coerce_with(ch.affinities[pos], ch.decimals[pos], v.clone());
+            }
+            let mut i2 = skip_ws(b, q + 1);
+            // Trailing clause (other than one optional semicolon) → cold.
+            if i2 < b.len() && b[i2] != b';' {
+                return ChainParse::Mismatch;
+            }
+            if i2 < b.len() && b[i2] == b';' {
+                i2 = skip_ws(b, i2 + 1);
+            }
+            if i2 != b.len() {
+                return ChainParse::Mismatch;
+            }
+            // An explicit value bound for the rowid-alias column needs the
+            // general path's collision check (same rule as the literal arm).
+            if let Some(alias) = ch.rowid_alias {
+                if !ch.full_row[alias].is_null() {
+                    return ChainParse::Mismatch;
+                }
+            }
+            return ChainParse::Matched;
+        }
+    }
     // NULL-reset the reusable row buffer (releases nothing: Text values
     // up to 23 bytes are stored inline inside the Value).
     for v in ch.full_row.iter_mut() {
@@ -17838,9 +18580,12 @@ mod tests {
         .unwrap();
         let sql = "INSERT INTO t (name, val, score) VALUES (?, ?, ?)";
         db.execute("BEGIN", []).unwrap();
-        // 5000 single-row statements ≈ 1.02M accounted blocks — past the
+        // 12000 single-row statements. The bound-INSERT chain made each
+        // statement ~4x lighter to allocate (was: 5000 general-path
+        // statements ≈ 1.02M accounted blocks ≈ 204/statement; the chain
+        // accounts ≈ 54/statement) — 12000 × 54 ≈ 648k still crosses the
         // 400k ALLOC_WAKE_THRESHOLD, so the COMMIT-path drain must fire.
-        for i in 1..=5000i64 {
+        for i in 1..=12000i64 {
             db.execute(
                 sql,
                 [
@@ -17860,7 +18605,7 @@ mod tests {
         }
         // Data intact either way.
         let n = db.query("SELECT COUNT(*) FROM t", []).unwrap()[0][0].as_integer();
-        assert_eq!(n, 5000);
+        assert_eq!(n, 12000);
     }
 
     #[test]
@@ -19081,4 +19826,19 @@ fn delete_stat_rows(
     // correct rule here is the name match; indexes share the table's
     // fate through the catalog's own drop).
     catalog.set_stat1(kept);
+}
+
+/// RSQL_DBG_FLUSH=1 prints schema-rewrite root changes (cached — the raw
+/// env read costs ~40ns under the environ lock, paid per statement).
+#[inline]
+pub(crate) fn dbg_flush() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RSQL_DBG_FLUSH").is_some())
+}
+
+/// RUSTQLITE_NO_WARM_TAP=1 skips the post-CREATE-INDEX warm tap (A/B knob).
+#[inline]
+pub(crate) fn no_warm_tap() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RUSTQLITE_NO_WARM_TAP").is_some())
 }

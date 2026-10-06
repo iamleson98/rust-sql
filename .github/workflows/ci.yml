@@ -525,30 +525,81 @@ jobs:
           # to its default floor (60k non-lean / 100k lean).
           MEGA_RATE_FLOOR: ${{ matrix.rate_floor }}
 
-  # The 100M-row discipline: weekly (schedule) + manual dispatch only —
-  # a 100M build takes hours on shared runners and burns the runner-disk
-  # budget; the lean shape (id, k) keeps the file inside the runner's
-  # free space while every storage discipline still runs at full scale.
-  # The 100M contract (weekly + dispatch): the FULL marathon discipline
-  # at 100M rows, LEAN shape, with the vs-bundled-SQLite comparison and
-  # WIN-ENFORCEMENT gates (M9 at 100M: build rate >= 1.0x, aggregate
-  # <= 1.0x, group97 <= 0.6x — measured 1.52x / 0.77x / 0.20x on the
-  # calibration box; the 10M job keeps the anti-collapse board).
+  # The 100M-row discipline: EVERY push (user directive 2026-10) on all
+  # three platforms + manual dispatch. A 100M marathon takes 1-3+ hours
+  # per OS on shared runners; the lean shape (id, k) keeps the file
+  # inside each runner's free space while every storage discipline still
+  # runs at full scale. The 100M contract: the FULL marathon at 100M
+  # rows, LEAN shape, vs-bundled-SQLite with WIN-ENFORCEMENT gates (M9 at
+  # 100M: build rate >= 1.0x, aggregate <= 1.0x, group97 <= 0.6x —
+  # measured 1.52x / 0.77x / 0.20x on the calibration box; the 10M job
+  # keeps the anti-collapse board).
+  #
+  # The WIN gates are RATIOS vs SQLite on the same runner, so a slow
+  # runner family penalizes both engines equally; the ABSOLUTE bounds
+  # (rate floor, top-N ms) are the anti-collapse side and carry per-OS
+  # margins in the matrix (first runs calibrate — the same discipline
+  # that produced the 5M per-OS floors).
   #
   # DISK-FIT SHAPE: a GitHub runner carries ~14GB free on / and ~19GB on
-  # /mnt. The marathon's working set at 100M (engine file 3.4GB + WAL
-  # sidecar + pre-image spill + the M9 SQLite copy 3.2GB + its -wal)
-  # runs on the bigger volume via TMPDIR, and the two mass-DML
-  # statements are RANGE-CAPPED: a full-range 100M band-update measured
-  # a 40GB WAL sidecar (cyclic-index RMW disk physics — the same k-cycle
+  # /mnt (linux). The marathon's working set at 100M (engine file 3.4GB +
+  # WAL sidecar + pre-image spill + the M9 SQLite copy 3.2GB + its -wal)
+  # runs on the bigger volume via TMPDIR on linux, and the two mass-DML
+  # statements are RANGE-CAPPED (windows halves the caps so the working
+  # set fits its system drive): a full-range 100M band-update measured a
+  # 40GB WAL sidecar (cyclic-index RMW disk physics — the same k-cycle
   # re-dirty versioning that costs SQLite equally; no checkpoint can
   # reset mid-statement). M9 runs the SAME capped statement on BOTH
-  # engines, so the ratio table stays an apples-to-apples comparison.
+  # engines, so the ratio table stays apples-to-apples.
+  #
+  # ci-ok deliberately does NOT wait on this job (a 1-3h marathon must
+  # not delay the fast verdict); the per-push verdict for the 100M
+  # contract is this job's own status.
   mega-scale-100m:
-    name: mega-scale-100m (ubuntu, lean, weekly, vs-sqlite)
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 180
+    name: mega-scale-100m (${{ matrix.os }}, lean, push, vs-sqlite)
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ubuntu: the calibration platform (mega100m_g measured these
+          # bounds directly: build 74552 rs/s, top25 5208ms).
+          - os: ubuntu-latest
+            rate_floor: "50000"
+            topn_ms: "15000"
+            band_rows: "10000000"
+            m6_rows: "10000000"
+            timeout: 240
+          # windows: the slow-disk runner family (the 5M job measured the
+          # same code at 38.8k-81.8k rows/s where ubuntu drew 380k). A
+          # 100M healthy band is unmeasured — 10k is the anti-collapse
+          # floor (~2.5x below the family's 5M worst, still far above a
+          # real collapse), the O(range) top-25 walk gets a 45s bound,
+          # and the disk caps halve so the working set fits C:.
+          - os: windows-latest
+            rate_floor: "10000"
+            topn_ms: "45000"
+            band_rows: "5000000"
+            m6_rows: "5000000"
+            timeout: 360
+          # macos: the ARM runner family — faster disks than windows but
+          # the highest timing variance of the three; 30k floor + 25s
+          # top-N margin until first draws calibrate.
+          - os: macos-latest
+            rate_floor: "30000"
+            topn_ms: "25000"
+            band_rows: "10000000"
+            m6_rows: "10000000"
+            timeout: 360
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.timeout }}
+    # Job-level concurrency (supersedes the workflow-level group for this
+    # job): a new push cancels the in-flight 100M marathon — the verdict
+    # always belongs to the newest commit, and a burst of pushes must not
+    # queue hours of stale marathons.
+    concurrency:
+      group: mega-100m-${{ github.ref }}
+      cancel-in-progress: true
     env:
       CARGO_PROFILE_RELEASE_DEBUG: "0"
       RUSTSQL_MIMALLOC_PURGE_DELAY_MS: "25"
@@ -557,13 +608,33 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: mega-100m
+          shared-key: mega-100m-${{ matrix.os }}
           cache-on-failure: true
-      - name: "Tempdir on the runner's bigger volume"
+      - name: "Tempdir on the runner's bigger volume (linux)"
+        if: runner.os == 'Linux'
         run: |
           sudo mkdir -p /mnt/mega-tmp
           sudo chmod 1777 /mnt/mega-tmp
+          echo "TMPDIR=/mnt/mega-tmp" >> "$GITHUB_ENV"
           df -h / /mnt || true
+      - name: "Tempdir on the bigger volume (windows)"
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $d = Get-PSDrive -Name D -ErrorAction SilentlyContinue
+          if ($d -and $d.Free -gt 20GB) {
+            New-Item -ItemType Directory -Force D:\mega-tmp | Out-Null
+            "TMP=D:\mega-tmp" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "TEMP=D:\mega-tmp" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "TMPDIR=D:\mega-tmp" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            Write-Host "using D:\mega-tmp ($([math]::Round($d.Free/1GB,1))GB free)"
+          } else {
+            Write-Host "keeping default TEMP (D: missing or <20GB free)"
+          }
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name,Free
+      - name: "Disk report (macos)"
+        if: runner.os == 'macOS'
+        run: df -h . || true
       - name: "Mega-scale marathon at 100,000,000 rows (lean shape, vs bundled SQLite)"
         run: cargo test --release --test mega_scale -- --nocapture --test-threads=1
         env:
@@ -573,22 +644,16 @@ jobs:
           # Disk-fit caps (see the job comment): mass-DML statements
           # range-capped; the storm trimmed.
           MEGA_OPS: "200000"
-          MEGA_BAND_ROWS: "10000000"
-          MEGA_M6_ROWS: "10000000"
+          MEGA_BAND_ROWS: ${{ matrix.band_rows }}
+          MEGA_M6_ROWS: ${{ matrix.m6_rows }}
           MEGA_SOAK_TXNS: "10"
           # The outperformance contract: answer equality + the 100M
           # win-enforcement gates vs bundled SQLite (M9).
           MEGA_VS_SQLITE: "1"
-          # 100M-calibrated bounds (calibration mega100m_g on the dev
-          # box; the runner is slower — margins noted):
-          #   M1 build rate measured 74552 rs/s (floor 50000 = 0.67x);
-          #   M1 head->tail degradation measured 6.2x under the cyclic
-          #     wrap (gate x2.5 -> 7.5x+25ms vs measured 310ms tail);
-          #   top25 measured 5208ms (O(range) path — bound 15000 = 2.9x).
-          MEGA_RATE_FLOOR: "50000"
+          # Per-OS anti-collapse bounds (see the matrix comments).
+          MEGA_RATE_FLOOR: ${{ matrix.rate_floor }}
           MEGA_M1_RELAX: "2.5"
-          MEGA_M9_TOPN_MS: "15000"
-          TMPDIR: "/mnt/mega-tmp"
+          MEGA_M9_TOPN_MS: ${{ matrix.topn_ms }}
 
   # OOM fault injection: 532 allocation-failure points, each verified to
   # leave the baseline intact (SQLite's memsys fault-injection equivalent).

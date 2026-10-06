@@ -6328,7 +6328,7 @@ fn condition_has_equi_leaf(cond: &Expr) -> bool {
 /// tree) whenever a safety gate trips or the greedy outcome is the
 /// syntactic order itself with nothing new pooled from the filter.
 fn try_reorder_spine(catalog: &Catalog, spine: &Plan, top_filter: Option<&Expr>) -> Option<Plan> {
-    let dbg = std::env::var_os("RSQL_DBG_REORDER").is_some();
+    let dbg = dbg_reorder();
     // ---- Flatten (atoms + conditions with their original windows) ------
     let mut atom_plans: Vec<Plan> = Vec::new();
     let mut spine_conds: Vec<SpineCond> = Vec::new();
@@ -6441,7 +6441,7 @@ fn try_reorder_spine(catalog: &Catalog, spine: &Plan, top_filter: Option<&Expr>)
     // tree. The greedy only serves spines beyond the DP cap.
     // RSQL_NO_DP=1 disables the DP (A/B debugging knob — the greedy takes
     // over at every spine size).
-    if n <= DP_LEFTDEEP_MAX_ATOMS && std::env::var_os("RSQL_NO_DP").is_none() {
+    if n <= DP_LEFTDEEP_MAX_ATOMS && !no_dp() {
         return try_cost_search_spine(
             catalog,
             &atom_plans,
@@ -6999,7 +6999,7 @@ fn try_cost_search_spine(
     mut top_conjuncts: Vec<Expr>,
 ) -> Option<Plan> {
     let n = atom_plans.len();
-    let dbg = std::env::var_os("RSQL_DBG_REORDER").is_some();
+    let dbg = dbg_reorder();
 
     // ---- Fold single-atom conjuncts into their atoms ---------------------
     // A conjunct referencing one relation evaluates identically as a Filter
@@ -8950,6 +8950,21 @@ pub(crate) fn rewrite_column_collations(
         }
         _ => e.clone(),
     }
+}
+
+/// RSQL_DBG_REORDER=1 prints the join-reorder trace (cached: the planner
+/// runs per statement; a raw env read costs ~40ns under the environ lock).
+#[inline]
+pub(crate) fn dbg_reorder() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RSQL_DBG_REORDER").is_some())
+}
+
+/// RSQL_NO_DP=1 disables the subset-DP cost search (A/B knob).
+#[inline]
+pub(crate) fn no_dp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RSQL_NO_DP").is_some())
 }
 
 #[cfg(test)]

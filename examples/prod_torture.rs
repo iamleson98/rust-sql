@@ -371,11 +371,12 @@ fn s01_bulk_load(engine: Engine) {
             .unwrap();
             conn.execute("BEGIN", []).unwrap();
             for i in 1..=rows {
-                conn.execute(
-                    "INSERT INTO t (name, val, score) VALUES (?1, ?2, ?3)",
-                    params![format!("name{i}"), i, i as f64 * 1.5],
-                )
-                .unwrap();
+                // PREPARE PARITY: rusqlite's statement cache — the twin of
+                // the engine's internal cache (parse once, not per row).
+                conn.prepare_cached("INSERT INTO t (name, val, score) VALUES (?1, ?2, ?3)")
+                    .unwrap()
+                    .execute(params![format!("name{i}"), i, i as f64 * 1.5])
+                    .unwrap();
             }
             conn.execute("COMMIT", []).unwrap();
         }
@@ -583,7 +584,9 @@ fn s05_point_lookups(engine: Engine) {
             let conn = build_big_sq(rows as i64);
             let t = Instant::now();
             for id in &ids {
-                let mut stmt = conn.prepare("SELECT val FROM t WHERE id = ?1").unwrap();
+                let mut stmt = conn
+                    .prepare_cached("SELECT val FROM t WHERE id = ?1")
+                    .unwrap();
                 let mut rows_it = stmt.query(params![id]).unwrap();
                 if let Some(r) = rows_it.next().unwrap() {
                     acc = acc.wrapping_add(r.get::<_, i64>(0).unwrap());
@@ -716,18 +719,17 @@ fn s07_random_inserts(engine: Engine) {
             let t = Instant::now();
             conn.execute("BEGIN", []).unwrap();
             for (i, k) in keys.iter().enumerate() {
-                conn.execute(
-                    "INSERT INTO r (k, v, s) VALUES (?1, ?2, ?3)",
-                    params![k, i as i64, *k as f64 * 0.25],
-                )
-                .unwrap();
+                conn.prepare_cached("INSERT INTO r (k, v, s) VALUES (?1, ?2, ?3)")
+                    .unwrap()
+                    .execute(params![k, i as i64, *k as f64 * 0.25])
+                    .unwrap();
             }
             conn.execute("COMMIT", []).unwrap();
             let insert_ms = t.elapsed().as_secs_f64() * 1000.0;
             let t = Instant::now();
             for _ in 0..lookups {
                 let k = keys[(lcg(&mut seed) as usize) % keys.len()];
-                let mut stmt = conn.prepare("SELECT v FROM r WHERE k = ?1").unwrap();
+                let mut stmt = conn.prepare_cached("SELECT v FROM r WHERE k = ?1").unwrap();
                 let mut rows_it = stmt.query(params![k]).unwrap();
                 if let Some(r) = rows_it.next().unwrap() {
                     acc = acc.wrapping_add(r.get::<_, i64>(0).unwrap());
@@ -796,11 +798,10 @@ fn s08_wide_rows(engine: Engine) {
             let t = Instant::now();
             conn.execute("BEGIN", []).unwrap();
             for i in 1..=rows as i64 {
-                conn.execute(
-                    "INSERT INTO w (id, b) VALUES (?1, ?2)",
-                    params![i, variants[(i % 8) as usize].as_str()],
-                )
-                .unwrap();
+                conn.prepare_cached("INSERT INTO w (id, b) VALUES (?1, ?2)")
+                    .unwrap()
+                    .execute(params![i, variants[(i % 8) as usize].as_str()])
+                    .unwrap();
             }
             conn.execute("COMMIT", []).unwrap();
             let insert_ms = t.elapsed().as_secs_f64() * 1000.0;
@@ -889,11 +890,10 @@ fn s09_blobs(engine: Engine) {
             let t = Instant::now();
             conn.execute("BEGIN", []).unwrap();
             for i in 1..=rows as i64 {
-                conn.execute(
-                    "INSERT INTO z (id, data) VALUES (?1, ?2)",
-                    params![i, variants[(i % 4) as usize]],
-                )
-                .unwrap();
+                conn.prepare_cached("INSERT INTO z (id, data) VALUES (?1, ?2)")
+                    .unwrap()
+                    .execute(params![i, variants[(i % 4) as usize]])
+                    .unwrap();
             }
             conn.execute("COMMIT", []).unwrap();
             let insert_ms = t.elapsed().as_secs_f64() * 1000.0;
@@ -1145,17 +1145,16 @@ fn s12_multi_index(engine: Engine) {
             let t = Instant::now();
             conn.execute("BEGIN", []).unwrap();
             for i in 1..=rows as i64 {
-                conn.execute(
-                    "INSERT INTO m (id, a, b, c, d) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
+                conn.prepare_cached("INSERT INTO m (id, a, b, c, d) VALUES (?1, ?2, ?3, ?4, ?5)")
+                    .unwrap()
+                    .execute(params![
                         i,
                         (i * 7919) % 100_003,
                         i as f64 * 0.5,
                         format!("c{i}"),
                         i % 1000
-                    ],
-                )
-                .unwrap();
+                    ])
+                    .unwrap();
             }
             conn.execute("COMMIT", []).unwrap();
             let insert_ms = t.elapsed().as_secs_f64() * 1000.0;
@@ -1307,34 +1306,37 @@ fn s13_sustained_load(engine: Engine) {
             for r in 0..rounds {
                 for _ in 0..1000 {
                     let id = (lcg(&mut seed) % rows as u64) as i64 + 1;
-                    conn.execute("UPDATE s SET val = val + 1 WHERE id = ?1", params![id])
+                    conn.prepare_cached("UPDATE s SET val = val + 1 WHERE id = ?1")
+                        .unwrap()
+                        .execute(params![id])
                         .unwrap();
                 }
                 for _ in 0..1000 {
                     let id = (lcg(&mut seed) % rows as u64) as i64 + 1;
                     let v: i64 = conn
-                        .query_row("SELECT val FROM s WHERE id = ?1", params![id], |x| x.get(0))
+                        .prepare_cached("SELECT val FROM s WHERE id = ?1")
+                        .unwrap()
+                        .query_row(params![id], |x| x.get(0))
                         .unwrap_or(0);
                     acc = acc.wrapping_add(v);
                 }
                 for _ in 0..100 {
                     let id = (lcg(&mut seed) % rows as u64) as i64 + 1;
-                    conn.execute("DELETE FROM s WHERE id = ?1", params![id])
+                    conn.prepare_cached("DELETE FROM s WHERE id = ?1")
+                        .unwrap()
+                        .execute(params![id])
                         .unwrap();
-                    conn.execute(
-                        "INSERT INTO s (id, val, score) VALUES (?1, ?2, ?3)",
-                        params![id, r, r as f64 * 0.1],
-                    )
-                    .unwrap();
+                    conn.prepare_cached("INSERT INTO s (id, val, score) VALUES (?1, ?2, ?3)")
+                        .unwrap()
+                        .execute(params![id, r, r as f64 * 0.1])
+                        .unwrap();
                 }
                 for _ in 0..100 {
                     let lo = (lcg(&mut seed) % 5_000) as i64 + 1;
                     let v: i64 = conn
-                        .query_row(
-                            "SELECT SUM(val) FROM s WHERE id BETWEEN ?1 AND ?2",
-                            params![lo, lo + 500],
-                            |x| x.get(0),
-                        )
+                        .prepare_cached("SELECT SUM(val) FROM s WHERE id BETWEEN ?1 AND ?2")
+                        .unwrap()
+                        .query_row(params![lo, lo + 500], |x| x.get(0))
                         .unwrap_or(0);
                     acc = acc.wrapping_add(v % 7);
                 }
@@ -1436,11 +1438,12 @@ fn s14_churn_reclaim(engine: Engine) {
             .unwrap();
             conn.execute("BEGIN", []).unwrap();
             for i in 1..=rows {
-                conn.execute(
-                    "INSERT INTO t (name, val, score) VALUES (?1, ?2, ?3)",
-                    params![format!("name{i}"), i, i as f64 * 1.5],
-                )
-                .unwrap();
+                // PREPARE PARITY: rusqlite's statement cache — the twin of
+                // the engine's internal cache (parse once, not per row).
+                conn.prepare_cached("INSERT INTO t (name, val, score) VALUES (?1, ?2, ?3)")
+                    .unwrap()
+                    .execute(params![format!("name{i}"), i, i as f64 * 1.5])
+                    .unwrap();
             }
             conn.execute("COMMIT", []).unwrap();
             let full_mb =
@@ -1561,21 +1564,19 @@ fn s15_rollback(engine: Engine) {
             .unwrap();
             conn.execute("BEGIN", []).unwrap();
             for i in 1..=10_000 {
-                conn.execute(
-                    "INSERT INTO t (name, val, score) VALUES (?1, ?2, ?3)",
-                    params![format!("name{i}"), i, i as f64 * 1.5],
-                )
-                .unwrap();
+                conn.prepare_cached("INSERT INTO t (name, val, score) VALUES (?1, ?2, ?3)")
+                    .unwrap()
+                    .execute(params![format!("name{i}"), i, i as f64 * 1.5])
+                    .unwrap();
             }
             conn.execute("COMMIT", []).unwrap();
             let t = Instant::now();
             conn.execute("BEGIN", []).unwrap();
             for i in 10_001..=10_000 + rows {
-                conn.execute(
-                    "INSERT INTO t (name, val, score) VALUES (?1, ?2, ?3)",
-                    params![format!("name{i}"), i, i as f64 * 1.5],
-                )
-                .unwrap();
+                conn.prepare_cached("INSERT INTO t (name, val, score) VALUES (?1, ?2, ?3)")
+                    .unwrap()
+                    .execute(params![format!("name{i}"), i, i as f64 * 1.5])
+                    .unwrap();
             }
             conn.execute("ROLLBACK", []).unwrap();
             let rollback_ms = t.elapsed().as_secs_f64() * 1000.0;
@@ -1593,37 +1594,68 @@ fn s15_rollback(engine: Engine) {
 // ============================================================
 
 fn s16_concurrent(engine: Engine) {
-    use parking_lot::{Mutex, RwLock};
+    // FAIRNESS (2026-10 audit): both engines get their best in-process
+    // concurrent shape on FILE-BACKED WAL databases with identical data:
+    //   rustqlite — one shared `Arc<Database>`: 8 parallel prepared-statement
+    //     readers (`&self` prepare/step — the MRMW engine core) + 2 writers
+    //     running autocommit INSERTs through prepared statements (the
+    //     implicit concurrent regime, the shape SQLite cannot offer).
+    //   SQLite — 10 REAL connections on one WAL database (busy_timeout,
+    //     per-connection prepared statements): its best 8R+2W shape (its WAL
+    //     readers run concurrently; its writers serialize on the
+    //     database-wide write lock).
+    // The retired shape handed SQLite ONE Arc<Mutex<Connection>>: every
+    // thread serialized on a wrapper lock — it measured the harness, not
+    // the engine.
     use std::thread;
     let base_rows = n(100_000) as i64;
     let reads_per = n(10_000);
     let writes_per = n(5_000);
-    let t = Instant::now();
     let readers: usize = 8;
     let writers: usize = 2;
+    let t = Instant::now();
     match engine {
         Engine::Rq => {
-            let db = Arc::new(RwLock::new(build_big_rq(base_rows)));
-            db.write()
-                .execute("CREATE TABLE cw (id INTEGER PRIMARY KEY, v INTEGER)", [])
+            // Setup on the mutable handle, THEN share (execute is &mut;
+            // the concurrent phase below only uses &self statements).
+            let mut db = rq_file("s16");
+            db.execute(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER, score REAL)",
+                [],
+            )
+            .unwrap();
+            db.execute("BEGIN", []).unwrap();
+            for i in 1..=base_rows {
+                db.execute(
+                    "INSERT INTO t (name, val, score) VALUES (?, ?, ?)",
+                    [
+                        Value::Text(format!("name{i}").into()),
+                        Value::Integer(i),
+                        Value::Real(i as f64 * 1.5),
+                    ],
+                )
                 .unwrap();
+            }
+            db.execute("COMMIT", []).unwrap();
+            db.execute("CREATE TABLE cw (id INTEGER PRIMARY KEY, v INTEGER)", [])
+                .unwrap();
+            let db = Arc::new(db);
             let mut handles = Vec::new();
             for _ in 0..readers {
                 let db = Arc::clone(&db);
                 handles.push(thread::spawn(move || {
                     let mut seed = 0xC0FFEE_u64;
                     let mut hits = 0i64;
+                    let mut stmt = db.prepare("SELECT COUNT(*) FROM t WHERE id <= ?").unwrap();
                     for _ in 0..reads_per {
                         let hi = (lcg(&mut seed) % base_rows as u64) as i64 + 1;
-                        let out = db
-                            .read()
-                            .query("SELECT COUNT(*) FROM t WHERE id <= ?", [Value::Integer(hi)])
-                            .unwrap();
-                        if let Some(row) = out.first() {
-                            if let rustqlite::Value::Integer(c) = &row[0] {
-                                hits = hits.wrapping_add(*c);
-                            }
+                        stmt.bind(1, Value::Integer(hi)).unwrap();
+                        while let Ok(rustqlite::StepResult::Row) = stmt.step() {
+                            // READ PARITY: consume the count like the SQLite
+                            // side's query_row callback.
+                            hits = hits.wrapping_add(stmt.column_int(0));
                         }
+                        stmt.reset();
                     }
                     hits
                 }));
@@ -1631,14 +1663,13 @@ fn s16_concurrent(engine: Engine) {
             for w in 0..writers {
                 let db = Arc::clone(&db);
                 handles.push(thread::spawn(move || {
+                    let mut stmt = db.prepare("INSERT INTO cw (id, v) VALUES (?, ?)").unwrap();
                     for i in 0..writes_per {
                         let id = (w * 100_000_000 + i) as i64;
-                        db.write()
-                            .execute(
-                                "INSERT INTO cw (id, v) VALUES (?, ?)",
-                                [Value::Integer(id), Value::Integer(i as i64)],
-                            )
-                            .unwrap();
+                        stmt.bind(1, Value::Integer(id)).unwrap();
+                        stmt.bind(2, Value::Integer(i as i64)).unwrap();
+                        stmt.step().unwrap();
+                        stmt.reset();
                     }
                     0i64
                 }));
@@ -1650,13 +1681,10 @@ fn s16_concurrent(engine: Engine) {
                 }
             }
             let ms = t.elapsed().as_secs_f64() * 1000.0;
-            let cnt = {
-                let db = db.read();
-                let out = db.query("SELECT COUNT(*) FROM cw", []).unwrap();
-                match out.first().and_then(|r| r.first()) {
-                    Some(rustqlite::Value::Integer(c)) => *c,
-                    _ => -1,
-                }
+            let out = db.query("SELECT COUNT(*) FROM cw", []).unwrap();
+            let cnt = match out.first().and_then(|r| r.first()) {
+                Some(rustqlite::Value::Integer(c)) => *c,
+                _ => -1,
             };
             check("no_lost_writes", cnt == (writers * writes_per) as i64);
             metric("sink", (sink % 1000) as f64);
@@ -1665,39 +1693,74 @@ fn s16_concurrent(engine: Engine) {
                 "total_ops",
                 (readers * reads_per + writers * writes_per) as f64,
             );
+            drop(db);
+            // Remove the database and every sidecar it grew.
+            let stem = format!("{}/s16.rq.db", scratch());
+            let _ = std::fs::remove_file(&stem);
+            if let Ok(entries) = std::fs::read_dir(scratch()) {
+                for e in entries.flatten() {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if name.starts_with("s16.rq.db") {
+                        let _ = std::fs::remove_file(e.path());
+                    }
+                }
+            }
         }
         Engine::Sq => {
-            let conn = build_big_sq(base_rows);
-            conn.execute("CREATE TABLE cw (id INTEGER PRIMARY KEY, v INTEGER)", [])
+            let setup = sq_file("s16");
+            setup
+                .execute(
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER, score REAL)",
+                    [],
+                )
                 .unwrap();
-            let db = Arc::new(Mutex::new(conn));
+            setup.execute("BEGIN", []).unwrap();
+            for i in 1..=base_rows {
+                setup
+                    .execute(
+                        "INSERT INTO t (name, val, score) VALUES (?1, ?2, ?3)",
+                        params![format!("name{i}"), i, i as f64 * 1.5],
+                    )
+                    .unwrap();
+            }
+            setup.execute("COMMIT", []).unwrap();
+            setup
+                .execute("CREATE TABLE cw (id INTEGER PRIMARY KEY, v INTEGER)", [])
+                .unwrap();
+            drop(setup);
+            let path = format!("{}/s16.sq.db", scratch());
             let mut handles = Vec::new();
             for _ in 0..readers {
-                let db = Arc::clone(&db);
+                let path = path.clone();
                 handles.push(thread::spawn(move || {
+                    let conn = rusqlite::Connection::open(&path).unwrap();
+                    conn.busy_timeout(std::time::Duration::from_secs(60))
+                        .unwrap();
+                    let mut stmt = conn
+                        .prepare("SELECT COUNT(*) FROM t WHERE id <= ?1")
+                        .unwrap();
                     let mut seed = 0xC0FFEE_u64;
                     let mut hits = 0i64;
                     for _ in 0..reads_per {
                         let hi = (lcg(&mut seed) % base_rows as u64) as i64 + 1;
-                        let c: i64 = db
-                            .lock()
-                            .query_row("SELECT COUNT(*) FROM t WHERE id <= ?1", params![hi], |r| {
-                                r.get(0)
-                            })
-                            .unwrap();
+                        let c: i64 = stmt.query_row(params![hi], |r| r.get(0)).unwrap();
                         hits = hits.wrapping_add(c);
                     }
                     hits
                 }));
             }
             for w in 0..writers {
-                let db = Arc::clone(&db);
+                let path = path.clone();
                 handles.push(thread::spawn(move || {
+                    let conn = rusqlite::Connection::open(&path).unwrap();
+                    conn.busy_timeout(std::time::Duration::from_secs(60))
+                        .unwrap();
+                    let mut stmt = conn
+                        .prepare("INSERT INTO cw (id, v) VALUES (?1, ?2)")
+                        .unwrap();
                     for i in 0..writes_per {
                         let id = (w * 100_000_000 + i) as i64;
-                        db.lock()
-                            .execute("INSERT INTO cw (id, v) VALUES (?1, ?2)", params![id, i])
-                            .unwrap();
+                        stmt.execute(params![id, i as i64]).unwrap();
                     }
                     0i64
                 }));
@@ -1709,8 +1772,8 @@ fn s16_concurrent(engine: Engine) {
                 }
             }
             let ms = t.elapsed().as_secs_f64() * 1000.0;
-            let cnt: i64 = db
-                .lock()
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let cnt: i64 = conn
                 .query_row("SELECT COUNT(*) FROM cw", [], |r| r.get(0))
                 .unwrap();
             check("no_lost_writes", cnt == (writers * writes_per) as i64);
@@ -1720,6 +1783,10 @@ fn s16_concurrent(engine: Engine) {
                 "total_ops",
                 (readers * reads_per + writers * writes_per) as f64,
             );
+            drop(conn);
+            for f in db_files(&format!("{}/s16.sq.db", scratch())) {
+                let _ = std::fs::remove_file(f);
+            }
         }
     }
 }
@@ -2075,14 +2142,13 @@ fn merge_best(best: &mut ChildOut, extra: ChildOut) {
         }
     }
     for (k, ok) in extra.checks {
-        if ok {
-            if let Some(existing) = best.checks.iter_mut().find(|(bk, _)| bk == &k) {
-                existing.1 = true;
-            } else {
-                best.checks.push((k, true));
-            }
-        } else if !best.checks.iter().any(|(bk, _)| bk == &k) {
-            best.checks.push((k, false));
+        // AND semantics: a check passes only if it passed in EVERY round
+        // (the old OR-merge let a one-round corruption hide behind a
+        // passing sibling round).
+        if let Some(existing) = best.checks.iter_mut().find(|(bk, _)| bk == &k) {
+            existing.1 = existing.1 && ok;
+        } else {
+            best.checks.push((k, ok));
         }
     }
 }

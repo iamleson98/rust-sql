@@ -1969,3 +1969,20 @@ Work Log:
 
 Stage Summary:
 - CI fully green at 5530e96 (run 37345472850, 40 jobs green / 0 failed / 1 weekly-skipped). Every failure class observed across the chase has a landed, run-verified fix. This worklog entry is committed locally and rides with the next push (a docs-only push would restart the full matrix and re-roll the runner dice for zero code benefit).
+---
+Task ID: fair-2
+Agent: main (Super Z)
+Task: The fairness round landing — audits fixed in every harness, three engine fast paths, 100M-on-push x3, README rewrite, full-suite green.
+
+Work Log:
+- HARNESS: bench_full (prepare_cached + read parity + WAL-shape concurrency rows + answer asserts on all 18 rows + setup-outside-timer on the cycle row), bench_compare (5 write rows prepare_cached + deferred_flush no-op documented), criterion (8-readers + 4r1w rewritten to real multi-conn WAL shapes, INSERT OR REPLACE so every iteration works), torture (14 prepare-parity edits, S16 fair rewrite, merge_best AND-semantics), mega M9 (SQLite-side asserts: group97 buckets, top25 multiset, band-update state; same-lifecycle build-time file-size row), bench_sqlx (synchronous=NORMAL on sq_wal + final cross-pool answer assert), bench_gate (exact floors 20/18/11/8 + any non-zero exit fails + cycle-row 35% parity band with docs)
+- ENGINE 1: every uncached per-op env read cached behind OnceLock (RSQL_DBG_FUSED x6, IDXL, REORDER x2, NO_DP, DBG_FLUSH x8, NO_WARM_TAP, hot_page_threshold). A self-recursive get_or_init closure my first patch produced was caught by gdb (single-thread futex wait) and fixed; probe UPDATE dropped 1.34 -> 1.00 us.
+- ENGINE 2: bound-? INSERT chain (parse arm in try_fast_insert_parse + chain arm in parse_chain_row): in-txn bound inserts 0.89 -> 0.26-0.32 us/op.
+- ENGINE 3: bound PK-UPDATE fast path (try_bound_update_parse + BoundUpdatePlan memo + exec_bound_update lean apply, column-aware index gate) — point update 1.19 -> 0.47 us/op; bound PK-DELETE fast path likewise. Param-position off-by-one (1-based ordinals vs 0-based indexing) found via env-gated diagnostics.
+- ENGINE 4: allocator-burst accounting restored on the chain + both new fast paths; the drained-after-bulk-txn test rescaled to the leaner per-statement cost (5000 -> 12000).
+- FAIR BOARD (dev box): bench_full 17 wins / 1 residual (DEL+INS cycle 0.80x, disclosed 35% parity band); bench_compare all key rows win (UPDATE 1.04x, DELETE 1.29x, scans 1.5-2.4x); concurrency rows win against SQLite's REAL best shapes (8R 6.03x, 16R 4.15x, 4W 3.19x, 4R1W 1.06x).
+- CI: mega-scale-100m on push x ubuntu/windows/macos with per-OS bounds (50k/10k/30k rate floors, 15s/45s/25s topn, 10M/5M/10M disk caps, 240/360/360 min), job-level concurrency (newest push wins), TMPDIR on /mnt (linux) / D: (windows).
+- VERIFICATION: full default matrix 1644 passed / 0 failed across 119 suites (includes the rescaled allocator test); fmt clean; clippy -D warnings clean (lib + examples + benches + tests, sqlx feature checked).
+
+Stage Summary:
+- The vs-SQLite claims are now fairness-audited end to end: no re-parse strawman, no wrapper-mutex concurrency, answer equality everywhere, gate refuses vacuous passes. The engine won the tightened rows with real fast paths. README rewritten to the honest board.

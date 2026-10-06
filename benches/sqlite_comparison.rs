@@ -11,7 +11,6 @@
 //! Output is printed to stdout with a final summary table.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
-use parking_lot::RwLock;
 use rusqlite::params;
 use rustqlite::{Database, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -374,12 +373,91 @@ fn bench_join(c: &mut Criterion) {
 // the rusqlite wrapper requires a Mutex for shared access).
 
 fn bench_concurrent_throughput(c: &mut Criterion) {
+    // FAIRNESS (2026-10 audit): both engines get their best in-process
+    // multi-reader shape on file-backed WAL databases with identical data:
+    //   rustqlite — one shared `Arc<Database>`; each thread prepares its own
+    //     `&self` statement and reads in PARALLEL (the MRMW engine core).
+    //   SQLite — 8 REAL connections on one WAL database (busy_timeout,
+    //     per-connection prepared statements): SQLite's best multi-reader
+    //     shape (WAL readers run concurrently). The old
+    //     `Arc<Mutex<Connection>>` shape measured a wrapper lock, not the
+    //     engine, and is retired.
     let mut group = c.benchmark_group("concurrent_throughput");
     group.throughput(Throughput::Elements(1));
     group.sample_size(10);
 
-    // rust-sql: 8 readers concurrent, 500 queries each.
-    let db = Arc::new(RwLock::new(setup_rustqlite(N_ROWS)));
+    let tmp = std::env::temp_dir();
+    let uniq = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let rq_path = tmp.join(format!("crit-rq8-{uniq}.db"));
+    let sq_path = tmp.join(format!("crit-sq8-{uniq}.db"));
+    let rq_path = rq_path.to_string_lossy().into_owned();
+    let sq_path = sq_path.to_string_lossy().into_owned();
+
+    // Build the two identical WAL databases.
+    let mut rq_db = Database::open(&rq_path).unwrap();
+    rq_db.execute("PRAGMA journal_mode = WAL", []).unwrap();
+    rq_db.execute("PRAGMA synchronous = NORMAL", []).unwrap();
+    rq_db
+        .execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER, score REAL)",
+            [],
+        )
+        .unwrap();
+    rq_db.execute("BEGIN", []).unwrap();
+    for i in 1..=N_ROWS {
+        rq_db
+            .execute(
+                "INSERT INTO t (name, val, score) VALUES (?, ?, ?)",
+                [
+                    Value::Text(format!("name{}", i).into()),
+                    Value::Integer(i),
+                    Value::Real(i as f64 * 1.5),
+                ],
+            )
+            .unwrap();
+    }
+    rq_db.execute("COMMIT", []).unwrap();
+    // ANSWER EQUALITY before timing.
+    {
+        let sq_setup = rusqlite::Connection::open(&sq_path).unwrap();
+        sq_setup
+            .execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
+            .unwrap();
+        sq_setup
+            .execute(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER, score REAL)",
+                [],
+            )
+            .unwrap();
+        sq_setup.execute("BEGIN", []).unwrap();
+        for i in 1..=N_ROWS {
+            sq_setup
+                .execute(
+                    "INSERT INTO t (name, val, score) VALUES (?1, ?2, ?3)",
+                    params![format!("name{}", i), i, i as f64 * 1.5],
+                )
+                .unwrap();
+        }
+        sq_setup.execute("COMMIT", []).unwrap();
+        let sq: (i64, i64) = sq_setup
+            .query_row("SELECT COUNT(*), SUM(val) FROM t", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        let rq = rq_db.query("SELECT COUNT(*), SUM(val) FROM t", []).unwrap();
+        assert_eq!(
+            rq[0][0].as_integer(),
+            sq.0,
+            "criterion reader row count mismatch"
+        );
+        assert_eq!(rq[0][1].as_integer(), sq.1, "criterion reader SUM mismatch");
+    }
+
+    // rust-sql: 8 readers concurrent, 500 queries each (shared Arc<Database>).
+    let db = Arc::new(rq_db);
     group.bench_function("rustqlite_8_readers", |b| {
         b.iter_custom(|iters| {
             let total_queries = Arc::new(AtomicUsize::new(0));
@@ -390,14 +468,15 @@ fn bench_concurrent_throughput(c: &mut Criterion) {
                     let db = Arc::clone(&db);
                     let total = Arc::clone(&total_queries);
                     handles.push(thread::spawn(move || {
+                        let mut stmt = db.prepare("SELECT name, val FROM t WHERE id = ?").unwrap();
                         for i in 0..500usize {
                             let id = (i % N_ROWS as usize) as i64 + 1;
-                            let guard = db.read();
-                            let _ = guard.query(
-                                "SELECT name, val FROM t WHERE id = ?",
-                                [Value::Integer(id)],
-                            );
-                            drop(guard);
+                            stmt.bind(1, Value::Integer(id)).unwrap();
+                            while let rustqlite::StepResult::Row = stmt.step().unwrap() {
+                                let _ = stmt.column_text(0);
+                                let _ = stmt.column_int(1);
+                            }
+                            stmt.reset();
                             total.fetch_add(1, Ordering::Relaxed);
                         }
                     }));
@@ -411,30 +490,31 @@ fn bench_concurrent_throughput(c: &mut Criterion) {
             elapsed
         })
     });
+    drop(db);
 
-    // rusqlite: 8 readers concurrent, 500 queries each.
-    // Uses Arc<Mutex<Connection>> because rusqlite::Connection is !Sync.
-    // This is what most production Rust apps do today for SQLite concurrency.
-    let conn = Arc::new(std::sync::Mutex::new(setup_rusqlite(N_ROWS)));
-    group.bench_function("rusqlite_8_readers_mutex", |b| {
+    // rusqlite: 8 REAL connections on one WAL database, 500 queries each.
+    group.bench_function("rusqlite_8_readers_wal", |b| {
         b.iter_custom(|iters| {
             let total_queries = Arc::new(AtomicUsize::new(0));
             let start = Instant::now();
             for _ in 0..iters {
                 let mut handles = Vec::new();
                 for _ in 0..8 {
-                    let conn = Arc::clone(&conn);
+                    let path = sq_path.clone();
                     let total = Arc::clone(&total_queries);
                     handles.push(thread::spawn(move || {
+                        let conn = rusqlite::Connection::open(&path).unwrap();
+                        conn.busy_timeout(std::time::Duration::from_secs(30))
+                            .unwrap();
+                        let mut stmt = conn
+                            .prepare("SELECT name, val FROM t WHERE id = ?1")
+                            .unwrap();
                         for i in 0..500usize {
                             let id = (i % N_ROWS as usize) as i64 + 1;
-                            {
-                                let guard = conn.lock().unwrap();
-                                let mut stmt = guard
-                                    .prepare("SELECT name, val FROM t WHERE id = ?1")
-                                    .unwrap();
-                                let mut rows = stmt.query(params![id]).unwrap();
-                                while rows.next().unwrap().is_some() {}
+                            let mut rows = stmt.query(params![id]).unwrap();
+                            while let Some(row) = rows.next().unwrap() {
+                                let _ = row.get::<_, String>(0).unwrap();
+                                let _ = row.get::<_, i64>(1).unwrap();
                             }
                             total.fetch_add(1, Ordering::Relaxed);
                         }
@@ -449,6 +529,23 @@ fn bench_concurrent_throughput(c: &mut Criterion) {
             elapsed
         })
     });
+
+    // Cleanup both WAL databases and their sidecars.
+    for path in [&rq_path, &sq_path] {
+        let _ = std::fs::remove_file(path);
+        let p = std::path::Path::new(path);
+        let stem = p.file_name().unwrap().to_string_lossy().into_owned();
+        if let Some(dir) = p.parent() {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for e in entries.flatten() {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if name.starts_with(&stem) {
+                        let _ = std::fs::remove_file(e.path());
+                    }
+                }
+            }
+        }
+    }
 
     group.finish();
 }
@@ -456,56 +553,122 @@ fn bench_concurrent_throughput(c: &mut Criterion) {
 // ============================================================
 // 7. Mixed read/write concurrency (the killer test)
 // ============================================================
-
+// FAIRNESS (2026-10 audit): both engines get their best in-process shape
+// on file-backed WAL databases with identical data — the engine's shared
+// `Arc<Database>` (parallel prepared-statement readers + a concurrent-
+// regime writer) against SQLite's 5 real connections on one WAL database
+// (busy_timeout, per-connection prepared statements). The old
+// `Arc<Mutex<Connection>>` shape serialized all five SQLite threads on a
+// wrapper lock; it measured the harness, not the engine. The writer uses
+// INSERT OR REPLACE on BOTH sides so every timed iteration performs real
+// work (the old harness's plain INSERTs all failed with PK conflicts
+// after the first iteration, on both engines equally — swallowed errors).
 fn bench_mixed_rw(c: &mut Criterion) {
     let mut group = c.benchmark_group("mixed_rw_concurrency");
     group.throughput(Throughput::Elements(1));
     group.sample_size(10);
 
-    // rust-sql: 4 readers + 1 writer, fixed work (1000 queries per reader + 200 inserts).
-    let db = Arc::new(RwLock::new(setup_rustqlite(N_ROWS)));
+    let tmp = std::env::temp_dir();
+    let uniq = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let rq_path = tmp.join(format!("crit-rmw-{uniq}.db"));
+    let sq_path = tmp.join(format!("crit-smw-{uniq}.db"));
+    let rq_path = rq_path.to_string_lossy().into_owned();
+    let sq_path = sq_path.to_string_lossy().into_owned();
+
+    // Engine side: one shared WAL database.
+    let mut rq_db = Database::open(&rq_path).unwrap();
+    rq_db.execute("PRAGMA journal_mode = WAL", []).unwrap();
+    rq_db.execute("PRAGMA synchronous = NORMAL", []).unwrap();
+    rq_db
+        .execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+            [],
+        )
+        .unwrap();
+    rq_db.execute("BEGIN", []).unwrap();
+    for i in 1..=N_ROWS {
+        rq_db
+            .execute(
+                "INSERT INTO t (name, val) VALUES (?, ?)",
+                [Value::Text(format!("name{}", i).into()), Value::Integer(i)],
+            )
+            .unwrap();
+    }
+    rq_db.execute("COMMIT", []).unwrap();
+
+    // SQLite side: the same database shape, built once.
+    {
+        let sq = rusqlite::Connection::open(&sq_path).unwrap();
+        sq.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
+            .unwrap();
+        sq.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+            [],
+        )
+        .unwrap();
+        sq.execute("BEGIN", []).unwrap();
+        for i in 1..=N_ROWS {
+            sq.execute(
+                "INSERT INTO t (name, val) VALUES (?1, ?2)",
+                params![format!("name{}", i), i],
+            )
+            .unwrap();
+        }
+        sq.execute("COMMIT", []).unwrap();
+        // ANSWER EQUALITY before timing.
+        let s: (i64, i64) = sq
+            .query_row("SELECT COUNT(*), SUM(val) FROM t", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        let r = rq_db.query("SELECT COUNT(*), SUM(val) FROM t", []).unwrap();
+        assert_eq!(r[0][0].as_integer(), s.0, "mixed_rw count mismatch");
+        assert_eq!(r[0][1].as_integer(), s.1, "mixed_rw SUM mismatch");
+    }
+
+    // rust-sql: 4 parallel readers + 1 writer on ONE shared engine.
+    let db = Arc::new(rq_db);
     group.bench_function("rustqlite_4r_1w", |b| {
         b.iter_custom(|iters| {
             let start = Instant::now();
             for _ in 0..iters {
                 let mut handles = Vec::new();
-
-                // Writer thread: 200 inserts in a distinct id range.
+                // Writer: 200 upserts through a prepared &self statement.
                 {
                     let db = Arc::clone(&db);
                     handles.push(thread::spawn(move || {
+                        let mut stmt = db
+                            .prepare("INSERT OR REPLACE INTO t (id, name, val) VALUES (?, ?, ?)")
+                            .unwrap();
                         for i in 0..200 {
                             let id = N_ROWS + 1 + i;
-                            let mut guard = db.write();
-                            let _ = guard.execute(
-                                "INSERT INTO t (id, name, val) VALUES (?, ?, ?)",
-                                [
-                                    Value::Integer(id),
-                                    Value::Text(format!("new{i}").into()),
-                                    Value::Integer(i),
-                                ],
-                            );
-                            drop(guard);
+                            stmt.bind(1, Value::Integer(id)).unwrap();
+                            stmt.bind(2, Value::Text(format!("new{i}").into())).unwrap();
+                            stmt.bind(3, Value::Integer(i)).unwrap();
+                            stmt.step().unwrap();
+                            stmt.reset();
                         }
                     }));
                 }
-
-                // 4 reader threads × 250 queries each.
+                // 4 readers: parallel prepared statements.
                 for _ in 0..4 {
                     let db = Arc::clone(&db);
                     handles.push(thread::spawn(move || {
+                        let mut stmt = db.prepare("SELECT name, val FROM t WHERE id = ?").unwrap();
                         for i in 0..250usize {
                             let id = (i % N_ROWS as usize) as i64 + 1;
-                            let guard = db.read();
-                            let _ = guard.query(
-                                "SELECT name, val FROM t WHERE id = ?",
-                                [Value::Integer(id)],
-                            );
-                            drop(guard);
+                            stmt.bind(1, Value::Integer(id)).unwrap();
+                            while let rustqlite::StepResult::Row = stmt.step().unwrap() {
+                                let _ = stmt.column_text(0);
+                                let _ = stmt.column_int(1);
+                            }
+                            stmt.reset();
                         }
                     }));
                 }
-
                 for h in handles {
                     h.join().unwrap();
                 }
@@ -513,49 +676,50 @@ fn bench_mixed_rw(c: &mut Criterion) {
             start.elapsed()
         })
     });
+    drop(db);
 
-    // rusqlite: 4 readers + 1 writer, same workload, serialized via Mutex.
-    let conn = Arc::new(std::sync::Mutex::new(setup_rusqlite(N_ROWS)));
-    group.bench_function("rusqlite_4r_1w_mutex", |b| {
+    // rusqlite: 5 real connections (1 writer + 4 readers) on one WAL file.
+    group.bench_function("rusqlite_4r_1w_wal", |b| {
         b.iter_custom(|iters| {
             let start = Instant::now();
             for _ in 0..iters {
                 let mut handles = Vec::new();
-
-                // Writer thread: 200 inserts.
+                // Writer connection.
                 {
-                    let conn = Arc::clone(&conn);
+                    let path = sq_path.clone();
                     handles.push(thread::spawn(move || {
+                        let conn = rusqlite::Connection::open(&path).unwrap();
+                        conn.busy_timeout(std::time::Duration::from_secs(30))
+                            .unwrap();
+                        let mut stmt = conn
+                            .prepare("INSERT OR REPLACE INTO t (id, name, val) VALUES (?1, ?2, ?3)")
+                            .unwrap();
                         for i in 0..200 {
                             let id = N_ROWS + 1 + i;
-                            let guard = conn.lock().unwrap();
-                            let _ = guard.execute(
-                                "INSERT INTO t (id, name, val) VALUES (?1, ?2, ?3)",
-                                params![id, format!("new{i}"), i],
-                            );
-                            drop(guard);
+                            stmt.execute(params![id, format!("new{i}"), i]).unwrap();
                         }
                     }));
                 }
-
-                // 4 reader threads × 250 queries each.
+                // 4 reader connections.
                 for _ in 0..4 {
-                    let conn = Arc::clone(&conn);
+                    let path = sq_path.clone();
                     handles.push(thread::spawn(move || {
+                        let conn = rusqlite::Connection::open(&path).unwrap();
+                        conn.busy_timeout(std::time::Duration::from_secs(30))
+                            .unwrap();
+                        let mut stmt = conn
+                            .prepare("SELECT name, val FROM t WHERE id = ?1")
+                            .unwrap();
                         for i in 0..250usize {
                             let id = (i % N_ROWS as usize) as i64 + 1;
-                            {
-                                let guard = conn.lock().unwrap();
-                                let mut stmt = guard
-                                    .prepare("SELECT name, val FROM t WHERE id = ?1")
-                                    .unwrap();
-                                let mut rows = stmt.query(params![id]).unwrap();
-                                while rows.next().unwrap().is_some() {}
+                            let mut rows = stmt.query(params![id]).unwrap();
+                            while let Some(row) = rows.next().unwrap() {
+                                let _ = row.get::<_, String>(0).unwrap();
+                                let _ = row.get::<_, i64>(1).unwrap();
                             }
                         }
                     }));
                 }
-
                 for h in handles {
                     h.join().unwrap();
                 }
@@ -563,6 +727,23 @@ fn bench_mixed_rw(c: &mut Criterion) {
             start.elapsed()
         })
     });
+
+    // Cleanup both WAL databases and their sidecars.
+    for path in [&rq_path, &sq_path] {
+        let _ = std::fs::remove_file(path);
+        let p = std::path::Path::new(path);
+        let stem = p.file_name().unwrap().to_string_lossy().into_owned();
+        if let Some(dir) = p.parent() {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for e in entries.flatten() {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if name.starts_with(&stem) {
+                        let _ = std::fs::remove_file(e.path());
+                    }
+                }
+            }
+        }
+    }
 
     group.finish();
 }

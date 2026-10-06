@@ -133,13 +133,14 @@ fn sqlite_create_index(conn: &rusqlite::Connection) {
 }
 
 fn sqlite_insert_single(conn: &rusqlite::Connection, n: usize) -> Duration {
+    // PREPARE PARITY: rusqlite's `prepare_cached` is SQLite's own statement
+    // cache — the twin of the engine's internal cache (parse once, not per row).
     let start = Instant::now();
     for i in 1..=n as i64 {
-        conn.execute(
-            "INSERT INTO t (name, val, score) VALUES (?1, ?2, ?3)",
-            params![format!("name{}", i), i * 2, i as f64 * 1.5],
-        )
-        .unwrap();
+        conn.prepare_cached("INSERT INTO t (name, val, score) VALUES (?1, ?2, ?3)")
+            .unwrap()
+            .execute(params![format!("name{}", i), i * 2, i as f64 * 1.5])
+            .unwrap();
     }
     start.elapsed()
 }
@@ -148,11 +149,10 @@ fn sqlite_insert_single_in_txn(conn: &rusqlite::Connection, n: usize) -> Duratio
     let start = Instant::now();
     conn.execute_batch("BEGIN").unwrap();
     for i in 1..=n as i64 {
-        conn.execute(
-            "INSERT INTO t (name, val, score) VALUES (?1, ?2, ?3)",
-            params![format!("name{}", i), i * 2, i as f64 * 1.5],
-        )
-        .unwrap();
+        conn.prepare_cached("INSERT INTO t (name, val, score) VALUES (?1, ?2, ?3)")
+            .unwrap()
+            .execute(params![format!("name{}", i), i * 2, i as f64 * 1.5])
+            .unwrap();
     }
     conn.execute_batch("COMMIT").unwrap();
     start.elapsed()
@@ -181,7 +181,7 @@ fn sqlite_insert_multirow(conn: &rusqlite::Connection, n: usize) -> Duration {
             "INSERT INTO t (name, val, score) VALUES {}",
             values.join(", ")
         );
-        conn.execute(&sql, []).unwrap();
+        conn.prepare_cached(&sql).unwrap().execute([]).unwrap();
     }
     start.elapsed()
 }
@@ -630,13 +630,13 @@ fn sqlite_join_full_scan(conn: &rusqlite::Connection) -> Duration {
 }
 
 fn sqlite_update_by_pk(conn: &rusqlite::Connection, n: usize) -> Duration {
+    // PREPARE PARITY: statement cached like the engine side.
     let start = Instant::now();
     for i in 1..=n as i64 {
-        conn.execute(
-            "UPDATE t SET score = ?1 WHERE id = ?2",
-            params![i as f64 * 2.5, (i % 1000) + 1],
-        )
-        .unwrap();
+        conn.prepare_cached("UPDATE t SET score = ?1 WHERE id = ?2")
+            .unwrap()
+            .execute(params![i as f64 * 2.5, (i % 1000) + 1])
+            .unwrap();
     }
     start.elapsed()
 }
@@ -668,7 +668,9 @@ fn sqlite_delete_by_pk(conn: &rusqlite::Connection, n: usize) -> Duration {
     conn.execute_batch("COMMIT").unwrap();
     let start = Instant::now();
     for i in 1..=n as i64 {
-        conn.execute("DELETE FROM t_del WHERE id = ?1", params![i])
+        conn.prepare_cached("DELETE FROM t_del WHERE id = ?1")
+            .unwrap()
+            .execute(params![i])
             .unwrap();
     }
     start.elapsed()
@@ -720,6 +722,13 @@ fn sqlite_mixed_workload(conn: &rusqlite::Connection, ops: usize) -> Duration {
 // ===========================================================================
 
 fn rustqlite_open() -> rustqlite::Database {
+    // NOTE (fairness audit 2026-10): `set_deferred_flush(true)` is a NO-OP
+    // for in-memory sessions — the pager's flush path early-returns for
+    // memory stores and there is no file to sync — and SQLite's
+    // `journal_mode = WAL` on `:memory:` fails silently (also moot: a
+    // `:memory:` database never fsyncs; both engines keep RAM rollback
+    // semantics). The call is kept purely as documentation of intent for
+    // file-backed sessions and costs nothing here.
     let mut db = rustqlite::Database::open_in_memory().unwrap();
     // Enable deferred flush to amortize fsync across N statements. Mirrors
     // SQLite's WAL + synchronous=NORMAL behaviour, which is the default in

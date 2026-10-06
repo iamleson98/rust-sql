@@ -343,10 +343,15 @@ def _parse_criterion(text: str) -> Dict[str, Row]:
     return rows
 
 
+# The floor is the EXACT row count each harness emits (bench_compare 20,
+# bench_full_vs_sqlite 18, bench_sqlx_native 11, criterion 8): a name drift
+# or an output change that drops even one row fails the gate instead of
+# silently passing on the survivors (the old loose floors — 18/15/10 — let
+# up to 5 rows vanish unnoticed).
 PARSERS: Dict[str, Tuple[Callable[[str], Dict[str, Row]], int]] = {
-    "bench_compare": (_parse_bench_compare, 18),
-    "bench_full_vs_sqlite": (_parse_bench_full_vs_sqlite, 15),
-    "bench_sqlx_native": (_parse_bench_sqlx_native, 10),
+    "bench_compare": (_parse_bench_compare, 20),
+    "bench_full_vs_sqlite": (_parse_bench_full_vs_sqlite, 18),
+    "bench_sqlx_native": (_parse_bench_sqlx_native, 11),
     "criterion_sqlite_comparison": (_parse_criterion, 8),
 }
 
@@ -405,6 +410,16 @@ PARITY_GUARD_PCT = 45.0
 PARITY_ROW_PCT = {
     ("bench_full_vs_sqlite", "INSERT (multi-VALUES 100/batch)"): 25.0,
     ("bench_full_vs_sqlite", "INSERT (transaction, 1k rows)"): 25.0,
+    # The delete-then-reinsert microcycle (fair-harness round, 2026-10):
+    # alternating statements defeat the INSERT chain's consecutive-shape
+    # discipline, so the insert half pays the first-sight fast-path
+    # wrapper on every iteration (the DELETE half runs its own lean fast
+    # path). Measured 0.79x on the 6-core dev box against SQLite's
+    # ONEPASS delete + insert pair — a per-op wrapper residual, not a
+    # scaling collapse. The 35% band holds the anti-collapse line (a
+    # real regression in either DML path is multi-x); the row is
+    # documented in the README's Remaining gaps.
+    ("bench_full_vs_sqlite", "DELETE + INSERT cycle (500 iters)"): 35.0,
     # Serial mixed R/W on ONE connection (80% point reads / 20% autocommit
     # WAL writes): the bench_compare twin of the sqlx "8-conn mixed R/W
     # 80/20" parity guard. The row's cost is dominated by the autocommit
@@ -734,6 +749,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if verdict(r, effective_band(args.parser, r, tolerance)[0], row_noise_floor(r))
         == "LOSS"
     ]
+    if run_errors:
+        # A non-zero exit (panic, assert failure, abort) is NEVER retryable
+        # green: an answer-equality assert firing in one attempt and not the
+        # next is exactly the flaky-correctness signal this gate must
+        # surface, not absorb.
+        print(
+            f"[bench-gate:{args.parser}] ERROR: {len(run_errors)} attempt(s) "
+            "exited non-zero — harness failure (assert/panic), not timing noise"
+        )
+        for err in run_errors:
+            print(f"  - {err}")
+        return 2
     if len(merged) < min_rows:
         print(
             f"[bench-gate:{args.parser}] ERROR: parsed {len(merged)} rows, "

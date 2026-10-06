@@ -1081,13 +1081,13 @@ impl Pager {
                 let recorded = txn.read_stamps.get(id).copied().unwrap_or(0);
                 let now = stamps.get(id).copied().unwrap_or(0);
                 if now != recorded && !conflicts.contains(id) {
-                    if std::env::var_os("RSQL_DBG_FLUSH").is_some() {
+                    if dbg_flush() {
                         eprintln!("[DECISION-CONFLICT] page {id}: base {recorded} now {now}");
                     }
                     conflicts.push(*id);
                 }
             }
-            if std::env::var_os("RSQL_DBG_FLUSH").is_some() && !txn.decision_reads.is_empty() {
+            if dbg_flush() && !txn.decision_reads.is_empty() {
                 eprintln!(
                     "[DECISION-SET] txn {} marked {} pages",
                     txn.id,
@@ -1137,7 +1137,7 @@ impl Pager {
             }
         }
         if !conflicts.is_empty() {
-            if std::env::var_os("RSQL_DBG_FLUSH").is_some() {
+            if dbg_flush() {
                 eprintln!(
                     "[CONFLICT] pages {:?} journal_ops={} → merge",
                     conflicts,
@@ -1296,7 +1296,7 @@ impl Pager {
         for id in &fresh {
             self.note_dirty(*id);
         }
-        if std::env::var_os("RSQL_DBG_FLUSH").is_some() && !installed.is_empty() {
+        if dbg_flush() && !installed.is_empty() {
             eprintln!("[INSTALL] pages {:?}", installed);
         }
         installed
@@ -1379,7 +1379,7 @@ impl Pager {
                 return Err(page_conflict());
             }
         };
-        if std::env::var_os("RSQL_DBG_FLUSH").is_some() {
+        if dbg_flush() {
             let dirty: Vec<PageId> = fresh
                 .shadows
                 .iter()
@@ -1802,7 +1802,7 @@ impl Pager {
         if stale.is_empty() {
             return Ok(());
         }
-        if std::env::var_os("RSQL_DBG_FLUSH").is_some() {
+        if dbg_flush() {
             eprintln!("[CATALOG-RECONCILE] {} stale row(s)", stale.len());
         }
         // Pass 2: apply through the plain path (live cache + dirty set —
@@ -1865,7 +1865,7 @@ impl Pager {
                 .current_root_of(self.concurrent.origin_of(cur))
         });
         if current != stale_root {
-            if std::env::var_os("RSQL_DBG_FLUSH").is_some() {
+            if dbg_flush() {
                 eprintln!(
                     "[PATCH] catalog row: rootpage {} -> {}",
                     stale_root + 1,
@@ -2651,6 +2651,14 @@ impl Pager {
             }
         }
     }
+}
+
+/// RSQL_DBG_FLUSH=1 prints install/decision traces (cached — this fires
+/// inside commit paths; a raw env read costs ~40ns under the environ lock).
+#[inline]
+fn dbg_flush() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RSQL_DBG_FLUSH").is_some())
 }
 
 #[cfg(test)]

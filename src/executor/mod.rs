@@ -1944,7 +1944,7 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             condition,
             algorithm,
         } => {
-            if std::env::var_os("RSQL_DBG_FUSED").is_some() {
+            if dbg_fused() {
                 eprintln!(
                     "[dbg] execute: Plan::Join algo={:?} join={:?}",
                     algorithm, join_type
@@ -15847,7 +15847,7 @@ fn exec_hash_join(
     // shape or value the fast path doesn't cover; the materialized path
     // below is then 100% in charge (same semantics, different cost
     // profile).
-    if std::env::var_os("RSQL_DBG_FUSED").is_some() {
+    if dbg_fused() {
         eprintln!(
             "[dbg] hash-join: fused gate: projection={} join={:?}",
             projection.is_some(),
@@ -18109,7 +18109,7 @@ fn exec_index_lookup_projected(
     key_exprs: &[Expr],
     projection: Option<&[crate::planner::plan::ProjectExpr]>,
 ) -> Result<ExecResult> {
-    if std::env::var_os("RSQL_DBG_IDXL").is_some() {
+    if dbg_idxl() {
         eprintln!("[dbg] fused IndexLookup path taken");
     }
     let (project, out_cols) =
@@ -21997,6 +21997,18 @@ pub(crate) fn dbg_index_trace() -> bool {
     })
 }
 
+#[inline]
+pub(crate) fn dbg_fused() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RSQL_DBG_FUSED").is_some())
+}
+
+#[inline]
+pub(crate) fn dbg_idxl() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RSQL_DBG_IDXL").is_some())
+}
+
 fn insert_index_entry(
     ctx: &mut ExecContext<'_>,
     index: &crate::schema::Index,
@@ -23413,7 +23425,7 @@ fn try_streaming_update(
         returning,
         fk_enforced,
     );
-    if std::env::var_os("RSQL_DBG_FUSED").is_some() {
+    if dbg_fused() {
         eprintln!(
             "[dbg] streaming-update eligibility: patch_ctx={} compiled_all={} compiled_residual={} residual={:?}",
             patch_ctx.is_some(),
@@ -23690,7 +23702,7 @@ fn try_streaming_update(
                 },
                 &mut overflow_fallback,
             )?;
-            if std::env::var_os("RSQL_DBG_FUSED").is_some() {
+            if dbg_fused() {
                 eprintln!(
                     "[dbg] fused RowidRange: patched={} not_fusable={} overflow={}",
                     fused_patched,
@@ -23942,7 +23954,7 @@ fn try_streaming_update(
                     },
                     &mut overflow_fallback,
                 )?;
-                if std::env::var_os("RSQL_DBG_FUSED").is_some() {
+                if dbg_fused() {
                     eprintln!(
                         "[dbg] fused merge-scan: patched={} not_fusable={} overflow={}",
                         fused_patched,
@@ -24208,7 +24220,7 @@ fn try_streaming_update(
                 },
                 &mut overflow_fallback,
             )?;
-            if std::env::var_os("RSQL_DBG_FUSED").is_some() {
+            if dbg_fused() {
                 eprintln!(
                     "[dbg] fused full-scan: patched={} not_fusable={} overflow={}",
                     fused_patched,

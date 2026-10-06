@@ -56,11 +56,14 @@ fn unique_temp_path() -> PathBuf {
 /// Hot page-count threshold override (tests force it low to exercise the
 /// spill paths deterministically; deployments may tune it).
 pub fn hot_page_threshold() -> usize {
-    std::env::var("RSQL_PREIMAGE_HOT_PAGES")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v >= 1)
-        .unwrap_or(DEFAULT_HOT_PAGES)
+    static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("RSQL_PREIMAGE_HOT_PAGES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v >= 1)
+            .unwrap_or(DEFAULT_HOT_PAGES)
+    })
 }
 
 /// One savepoint level's pre-image log: hot map + optional spill file.

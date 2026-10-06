@@ -74,6 +74,47 @@ async fn main() {
     seed!("sqlx-sqlite", sq);
     println!();
 
+    // ANSWER EQUALITY (2026-10 fairness round): both single-connection pools
+    // experienced the IDENTICAL op stream across every row above — their
+    // final states must match exactly, and the fresh concurrency pools must
+    // start identical. This assert makes a wrong-results driver fail loudly
+    // instead of silently winning on timing.
+    async fn rq_stats(pool: &RustqlitePool) -> (i64, i64, f64, String, i64) {
+        let rec = sqlx::query(
+            "SELECT COUNT(*), COALESCE(SUM(a),0), COALESCE(SUM(b),0.0), COALESCE(MIN(c),''), COALESCE(SUM(LENGTH(c)),0) FROM bench",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        (
+            rec.get::<i64, _>(0),
+            rec.get::<i64, _>(1),
+            rec.get::<f64, _>(2),
+            rec.get::<String, _>(3),
+            rec.get::<i64, _>(4),
+        )
+    }
+    async fn sq_stats(pool: &sqlx::SqlitePool) -> (i64, i64, f64, String, i64) {
+        let rec = sqlx::query(
+            "SELECT COUNT(*), COALESCE(SUM(a),0), COALESCE(SUM(b),0.0), COALESCE(MIN(c),''), COALESCE(SUM(LENGTH(c)),0) FROM bench",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        (
+            rec.get::<i64, _>(0),
+            rec.get::<i64, _>(1),
+            rec.get::<f64, _>(2),
+            rec.get::<String, _>(3),
+            rec.get::<i64, _>(4),
+        )
+    }
+    async fn verify_pools(rq: &RustqlitePool, sq: &sqlx::SqlitePool, label: &str) {
+        let r = rq_stats(rq).await;
+        let s2 = sq_stats(sq).await;
+        assert_eq!(r, s2, "ANSWER MISMATCH [{label}]: {r:?} vs {s2:?}");
+    }
+
     struct Row1 {
         rq_ms: f64,
         sq_ms: f64,
@@ -421,6 +462,11 @@ async fn main() {
                     .filename(tmp.path().join("wal.db"))
                     .create_if_missing(true)
                     .journal_mode(SqliteJournalMode::Wal)
+                    // SQLite's documented best config for WAL concurrency:
+                    // WAL + synchronous=NORMAL (its default is FULL — one
+                    // fsync per commit; NORMAL batches WAL fsyncs at
+                    // checkpoints). Fairness: give the opponent its best.
+                    .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
                     .busy_timeout(std::time::Duration::from_secs(60)),
             )
             .await
@@ -726,6 +772,10 @@ async fn main() {
         let sq_ms = t.elapsed().as_secs_f64() * 1e3;
         results.push(("1 writer + 7 readers", Row1 { rq_ms, sq_ms }));
     }
+
+    // FINAL ANSWER EQUALITY: the single-connection pools experienced the
+    // IDENTICAL op stream across every row above — their states must match.
+    verify_pools(&rq, &sq, "final state").await;
 
     // ------------------------------------------------------------------ report
     println!(
