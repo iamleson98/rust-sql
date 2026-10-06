@@ -569,6 +569,7 @@ jobs:
             topn_ms: "15000"
             band_rows: "10000000"
             m6_rows: "10000000"
+            m1_relax: "2.5"
             timeout: 240
           # windows: the slow-disk runner family (the 5M job measured the
           # same code at 38.8k-81.8k rows/s where ubuntu drew 380k). A
@@ -581,15 +582,24 @@ jobs:
             topn_ms: "45000"
             band_rows: "5000000"
             m6_rows: "5000000"
+            m1_relax: "2.5"
             timeout: 360
-          # macos: the ARM runner family — faster disks than windows but
-          # the highest timing variance of the three; 30k floor + 25s
-          # top-N margin until first draws calibrate.
+          # macos: the ARM runner family — the highest storage variance
+          # of the three. First two 100M draws: 87k rows/s (tail 228ms,
+          # 6.8x) and a 41k rows/s slow-storage draw (tail 1034ms, 33x)
+          # that PASSED the 30k floor and the commit gate (66ms tail —
+          # sequential WAL appends were fine; only the random leaf reads
+          # of the cyclic-index insert inflated). The 100M relax widens
+          # to 4.5 so the degradation gate covers exactly the band the
+          # rate floor admits (a ~30k draw's ~1.4s tail still fits
+          # head*45+80; anything slower fails BOTH gates as a
+          # collapse-suspect — the coherent verdict).
           - os: macos-latest
             rate_floor: "30000"
             topn_ms: "25000"
             band_rows: "10000000"
             m6_rows: "10000000"
+            m1_relax: "4.5"
             timeout: 360
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout }}
@@ -654,7 +664,7 @@ jobs:
           MEGA_VS_SQLITE: "1"
           # Per-OS anti-collapse bounds (see the matrix comments).
           MEGA_RATE_FLOOR: ${{ matrix.rate_floor }}
-          MEGA_M1_RELAX: "2.5"
+          MEGA_M1_RELAX: ${{ matrix.m1_relax }}
           MEGA_M9_TOPN_MS: ${{ matrix.topn_ms }}
 
   # OOM fault injection: 532 allocation-failure points, each verified to
