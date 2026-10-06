@@ -5877,12 +5877,26 @@ impl Pager {
         }
 
         // 3. The compact image has no freelist; the schema moved (roots
-        //    were remapped), so the cookie must change. flush_wal writes
-        //    page 0's header FROM these atomics — setting them here makes
-        //    the committed frame self-consistent. (NEVER the
-        //    direct-file-write `bump_schema_cookie`: a write outside the
-        //    WAL would be invisible to WAL-served readers and clobbered
-        //    by the next checkpoint.)
+        // were remapped), so the cookie must change. flush_wal writes
+        // page 0's header FROM these atomics — setting them here makes
+        // the committed frame self-consistent. (NEVER the
+        // direct-file-write `bump_schema_cookie`: a write outside the
+        // WAL would be invisible to WAL-served readers and clobbered
+        // by the next checkpoint.)
+        //
+        // THE PAGE COUNT IS THE IMAGE'S — both directions. The shrink
+        // path already rewound it (truncate_tail in step 1); the GROWTH
+        // path must extend it here: a rebuilt image can be LARGER than
+        // the pre-VACUUM file (the row-level rebuild allocates fresh
+        // pages instead of reusing post-delete leaf gaps — the fill
+        // penalty of the documented index-rebuild gap). Without this
+        // store the commit header carried the OLD count and the
+        // checkpoint's closing set_len(n_pages) TRUNCATED the freshly
+        // written tail away: exact answers survived, but the index's
+        // upper levels lived in the amputated tail and
+        // integrity_check reported pages out of range (the 100M M6
+        // marathon, CI run 37427014651, all three OS).
+        self.n_pages.store(new_n, Ordering::Release);
         self.freelist_head.store(0, Ordering::Release);
         self.freelist_count.store(0, Ordering::Release);
         self.schema_cookie.fetch_add(1, Ordering::AcqRel);
@@ -6014,6 +6028,17 @@ impl Pager {
         //      frames included), the checkpoint folds it into the main
         //      file and applies the armed tail truncation, and stale
         //      BEGIN-time pre-images must not serve old-tree bytes.
+        // Same atomics contract as the image variant's step 3 —
+        // INCLUDING the page count: the streamed image REPLACES the
+        // whole database, so n_pages is new_n in BOTH directions (the
+        // shrink path rewound it via truncate_tail above; the growth
+        // path extends it here). flush_wal refreshes the commit header
+        // from this atomic, and the checkpoint's closing set_len sizes
+        // the main file from it — a stale count amputated the freshly
+        // written tail pages at the first growth-shaped VACUUM (the
+        // 100M M6 marathon: index upper levels lost, exact answers,
+        // integrity_check "page out of range").
+        self.n_pages.store(new_n, Ordering::Release);
         self.freelist_head.store(0, Ordering::Release);
         self.freelist_count.store(0, Ordering::Release);
         self.schema_cookie.fetch_add(1, Ordering::AcqRel);
@@ -7411,6 +7436,64 @@ impl<P: AsRef<Path>> PathExt for P {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn vacuum_image_install_grows_page_count() {
+        // The growth-shaped VACUUM publish regression (100M M6 marathon,
+        // CI run 37427014651): install_compact_image with an image LARGER
+        // than the current file must publish the IMAGE's page count — the
+        // commit header (flush_wal refreshes it from the n_pages atomic)
+        // and the checkpoint's closing set_len both size the database
+        // from that counter. The pre-fix bug left the OLD count in place,
+        // so the checkpoint amputated the freshly written tail while the
+        // cached answers stayed exact — only integrity_check caught it.
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let n_before;
+        {
+            let pager = Pager::open(&path, 64).unwrap();
+            pager.enable_wal().unwrap();
+            // A few dirty pages + a commit, so the file has real content.
+            for i in 0..6u32 {
+                let id = pager.allocate_page().unwrap();
+                let page = pager.get_page(id).unwrap();
+                let mut p = page.lock();
+                p.data[0] = 0xA0 + i as u8;
+                p.mark_dirty();
+            }
+            pager.note_write();
+            pager.flush().unwrap();
+            pager.checkpoint_wal_now().unwrap();
+            n_before = pager.n_pages();
+        }
+        // The flushed file is a valid (compact) image of the current
+        // state; pad it with 5 extra pages to force the GROWTH shape.
+        let psz = DEFAULT_PAGE_SIZE as usize;
+        let mut image = std::fs::read(&path).unwrap();
+        assert_eq!(image.len() % psz, 0);
+        let n_padded = image.len() / psz + 5;
+        image.resize(n_padded * psz, 0);
+        {
+            let pager = Pager::open(&path, 64).unwrap();
+            pager.enable_wal().unwrap();
+            pager.install_compact_image(&image).unwrap();
+            assert_eq!(
+                pager.n_pages(),
+                n_padded as u32,
+                "the published page count must be the IMAGE's (growth direction)"
+            );
+        }
+        // Reopen: the header on disk carries the new count and the file
+        // physically covers every image page.
+        let pager = Pager::open(&path, 64).unwrap();
+        assert_eq!(pager.n_pages(), n_padded as u32);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len() as usize,
+            n_padded * psz,
+            "the checkpoint's closing set_len must size the file to the image"
+        );
+        assert!(n_padded as u32 > n_before);
+    }
 
     #[test]
     fn open_creates_new_db() {

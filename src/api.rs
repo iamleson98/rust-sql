@@ -4046,6 +4046,7 @@ impl Database {
             }
             let plan = crate::storage::vacuum::plan_in_place_compaction(&self.pager, &roots)?;
             if let Some(plan) = plan {
+                eprintln!("[vac] path=in-place");
                 self.pager.install_in_place_compaction(&plan)?;
                 // Roots did not move (identity layout), but the cookie
                 // changed and every statement-level cache must revalidate
@@ -4096,13 +4097,7 @@ impl Database {
         let compact = {
             let t = std::time::Instant::now();
             let c = self.build_compact_image_src()?;
-            if vac_dbg {
-                eprintln!(
-                    "[vac] compact image build ({:?}): {:?}",
-                    c_variant(&c),
-                    t.elapsed()
-                );
-            }
+            eprintln!("[vac] path={} (build {:?})", c_variant(&c), t.elapsed());
             c
         };
         // RSS STAGE BOUNDARY: the compact-image build churned the
@@ -4459,6 +4454,37 @@ impl Database {
                     Error::Io(std::io::Error::other(format!("vacuum application_id: {e}")))
                 })?;
             tmp.pager.flush()?;
+            // RSQL_VAC_DEBUG=1 — the temp publish divergence probe: the
+            // freshly-flushed temp must be internally consistent BEFORE
+            // the install reads it back. Any structural break here is a
+            // build/flush bug, not an install bug.
+            if std::env::var_os("RSQL_VAC_DEBUG").is_some() {
+                let rows = tmp.query("PRAGMA integrity_check", []).unwrap_or_default();
+                let report = rows
+                    .first()
+                    .and_then(|r| r.first())
+                    .map(|v| v.as_text())
+                    .unwrap_or_default();
+                eprintln!(
+                    "[vacdbg] temp integrity: {:?} | page_count={} freelist={}",
+                    report,
+                    tmp.query("PRAGMA page_count", [])
+                        .ok()
+                        .and_then(|r| r.first().map(|v| v[0].as_integer()))
+                        .unwrap_or(-1),
+                    tmp.query("PRAGMA freelist_count", [])
+                        .ok()
+                        .and_then(|r| r.first().map(|v| v[0].as_integer()))
+                        .unwrap_or(-1),
+                );
+                let flen = std::fs::metadata(&tmp_path).map(|m| m.len()).unwrap_or(0);
+                let psz = tmp.pager.page_size() as u64;
+                eprintln!(
+                    "[vacdbg] temp file len={flen} ({} pages) | pager.n_pages={}",
+                    flen / psz,
+                    tmp.pager.n_pages.load(std::sync::atomic::Ordering::Acquire),
+                );
+            }
             drop(tmp);
             Ok(CompactSrc::File(tmp_path.clone()))
         })();
