@@ -598,7 +598,9 @@ jobs:
     # always belongs to the newest commit, and a burst of pushes must not
     # queue hours of stale marathons.
     concurrency:
-      group: mega-100m-${{ github.ref }}
+      # Per-OS groups: the three matrix entries must not cancel each
+      # other (a shared group lets them contend — only one survives).
+      group: mega-100m-${{ matrix.os }}-${{ github.ref }}
       cancel-in-progress: true
     env:
       CARGO_PROFILE_RELEASE_DEBUG: "0"
