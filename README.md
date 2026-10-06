@@ -171,7 +171,7 @@ rustqlite splits scans across worker threads; SQLite's executor is single-thread
 
 ### Mega-scale: 100,000,000 rows (per-push CI job on ubuntu + windows + macos, win-enforced)
 
-The lean-shape marathon at 100M rows vs bundled SQLite on the same box, same statements, answer-equality-asserted before every timing — including (2026-10 round) the SQLite side's GROUP BY buckets, top-25 multiset, and band-update post-state, plus a same-lifecycle file-size comparison (both engines' freshly-built + checkpointed files). The job runs on **every push on all three platforms** with per-OS anti-collapse bounds (a new push cancels the in-flight marathon — the verdict always belongs to the newest commit) and win-enforcement gates — build >= 1.0x, aggregate <= 1.0x, group97 <= 0.6x:
+The lean-shape marathon at 100M rows vs bundled SQLite on the same box, same statements, answer-equality-asserted before every timing — including (2026-10 round) the SQLite side's GROUP BY buckets, top-25 multiset, and band-update post-state, plus a same-lifecycle file-size comparison (both engines' freshly-built + checkpointed files). The job runs on **every push on all three platforms** with per-OS anti-collapse bounds (a new push cancels the in-flight marathon — the verdict always belongs to the newest commit) and honest gates — build on a disclosed parity band (>= 0.85x: the 2026-10 prepare audit moved this row from a biased 1.52x to true parity — draws 1.012x/0.991x on identical code — while a real bulk collapse is 0.4–0.5x and still fails), aggregate <= 1.0x and group97 <= 0.6x win-enforced (draws 0.66–0.70x / 0.22–0.24x):
 
 | Shape | rustqlite | SQLite | Ratio |
 |---|---|---|---|

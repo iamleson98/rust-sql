@@ -1867,17 +1867,24 @@ fn mega_scale_marathon() {
             mb(engine_bytes),
             mb(sqlite_bytes),
         );
-        // ANTI-COLLAPSE at 10M, WIN-ENFORCEMENT at 100M. The 10M board
-        // is anti-collapse by measurement (build 0.69x, aggregate 1.12x,
-        // group97 0.26x — the 10M job's gates stay wide). The 100M board
-        // FLIPPED (calibration mega100m_g, lean, band-capped, both
-        // engines the same statements): build 1.52x (SQLite's own
-        // cyclic-index insert RMW degraded harder with scale), aggregate
-        // 0.77x, group97 0.20x — the engine OUTPERFORMS SQLite on three
-        // shapes at 100M, and the 100M gates now ENFORCE the wins with
-        // margin (1.0x/1.0x/0.6x against measured 1.52/0.77/0.20).
+        // ANTI-COLLAPSE at 10M; at 100M the rows the engine WINS stay
+        // win-enforced, and the build row is a DISCLOSED PARITY BAND.
+        // The 10M board is anti-collapse by measurement (build 0.69x,
+        // aggregate 1.12x, group97 0.26x — the 10M job's gates stay
+        // wide). The 100M board's history: calibration mega100m_g
+        // measured build 1.52x — against SQLite's UN-PREPARED insert
+        // loop. The 2026-10 fairness round gave the SQLite side
+        // prepare_cached and the honest 100M build board moved to
+        // PARITY: CI draws 1.012x (118,256 vs 116,843 rows/s, run
+        // 37478497580) and 0.991x (68,023 vs 68,683, run 37487305177)
+        // on IDENTICAL engine code — a >=1.0x floor flips on ±2%
+        // runner noise (the 0.991x draw failed by 0.9%). 0.85x absorbs
+        // the draw envelope with margin while a real bulk-path
+        // collapse is 0.4-0.5x and still fails; aggregate (draws
+        // 0.66/0.70x) and group97 (draws 0.22/0.24x) keep their
+        // win-enforcement (<=1.0x / <=0.6x) with comfortable margin.
         let (build_floor, agg_gate, group_gate) = if rows >= 100_000_000 {
-            (1.0, 1.0, 0.6)
+            (0.85, 1.0, 0.6)
         } else {
             (0.4, 2.5, 2.5)
         };
