@@ -520,7 +520,13 @@ fn count(db: &Database, table: &str) -> i64 {
 }
 
 fn integrity_ok(db: &Database) -> bool {
-    one_text(db, "PRAGMA integrity_check") == "ok"
+    let out = one_text(db, "PRAGMA integrity_check");
+    if out != "ok" {
+        // The full integrity report (multi-line) so CI failures name the
+        // broken structure instead of a bare boolean.
+        eprintln!("[mega] integrity_check reported: {out}");
+    }
+    out == "ok"
 }
 
 fn page_count(db: &Database) -> i64 {
