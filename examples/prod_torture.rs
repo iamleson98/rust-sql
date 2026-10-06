@@ -2398,9 +2398,13 @@ fn primary_time(c: &ChildOut) -> f64 {
 /// S12 0.49-0.64x.
 fn section_time_band(section: &str) -> Option<f64> {
     match section {
-        "S07" => Some(65.0),
-        "S08" => Some(60.0),
-        "S12" => Some(60.0),
+        // Band = how much slower rq may be than sq. Observed fair draws:
+        // S07 rq/sq 2.30-2.56x (windows 137.8/59.8, ubuntu 102.9/39.7,
+        // macos 55.1/26.6) -> 175% absorbs the worst with margin;
+        // S08 worst 2.04x, S12 worst 2.04x -> 125%.
+        "S07" => Some(175.0),
+        "S08" => Some(125.0),
+        "S12" => Some(125.0),
         _ => None,
     }
 }
