@@ -671,16 +671,28 @@ fn limit_schema_breadth() {
     // ---- LATENCY: last-created table must not be slower to talk to
     //      than the first (catalog lookup is O(1)-ish; a linear scan of
     //      the schema per statement would degrade with n_tables).
+    // BEST-OF-5 with a distinct value per sample: a single timed pass
+    // is a runner-noise hostage (the 2026-10-06 chase drew a 206 ms
+    // stall inside the only window — first table 0.328 ms, gate bound
+    // 8.28 ms — on a binary that was green an hour earlier). A real
+    // catalog-scan degradation is per-statement and shows in EVERY
+    // sample, so the min still catches it; the min only absorbs the
+    // one-off stalls (the same discipline the bench-gate point-lookup
+    // rows took in the mega-5 round).
     let mut probe = |t: usize, val: i64| -> f64 {
-        let sql = format!(
-            "INSERT INTO broad_{t:03} (c01, c02, c03, c10) VALUES ({v}, 'z', {v}, {v})",
-            v = val
-        );
-        let start = Instant::now();
-        db.execute(&sql, []).unwrap();
-        let sel = format!("SELECT count(*) FROM broad_{t:03} WHERE c01 = {val}");
-        db.query(&sel, []).unwrap();
-        start.elapsed().as_secs_f64() * 1000.0
+        let mut best = f64::INFINITY;
+        for i in 0..5i64 {
+            let v = val + i;
+            let sql = format!(
+                "INSERT INTO broad_{t:03} (c01, c02, c03, c10) VALUES ({v}, 'z', {v}, {v})"
+            );
+            let start = Instant::now();
+            db.execute(&sql, []).unwrap();
+            let sel = format!("SELECT count(*) FROM broad_{t:03} WHERE c01 = {v}");
+            db.query(&sel, []).unwrap();
+            best = best.min(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        best
     };
     // Warm both paths first (page allocation, catalog caches).
     probe(0, 1_000_000);
@@ -707,11 +719,13 @@ fn limit_schema_breadth() {
         "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'",
     );
     assert_eq!(objects2, objects as i64, "schema census across reopen");
+    // The best-of-5 probe adds 5 rows per call; each of the three
+    // probed tables sees 2 calls (warmup + timed) = 10 extra rows.
     for t in [0, n_tables / 2, n_tables - 1] {
         assert_eq!(
             count(&db2, &format!("broad_{t:03}")),
-            (rows_per_table + 2) as i64,
-            "broad_{t:03} row count across reopen (2 probe rows added)"
+            (rows_per_table + 10) as i64,
+            "broad_{t:03} row count across reopen (10 probe rows added: 2 best-of-5 calls)"
         );
     }
     assert!(integrity_ok(&db2), "integrity_check after reopen");
