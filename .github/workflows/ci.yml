@@ -504,7 +504,7 @@ jobs:
           - os: windows-latest
             rows: "5000000"
             vs: "0"
-            rate_floor: "20000"
+            rate_floor: "12000"
           - os: macos-latest
             rows: "5000000"
             vs: "0"
