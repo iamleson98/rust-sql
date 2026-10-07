@@ -508,6 +508,18 @@ DARWIN_WIDE_ROWS = {
     ("bench_compare", "UPDATE by PK (1000 ops)"): 60.0,
 }
 
+# Invariant: a darwin wide band must actually WIDEN the row's generic
+# parity band — an entry at or below the PARITY_ROW_PCT value is either
+# dead code (unreachable under a generic-first lookup order, as the
+# 4R1W 45% band was behind its 35% generic entry from 1d900cf through
+# run 37597765597) or a silent tightening. Fail at import time.
+for _band_key, _band_wide in DARWIN_WIDE_ROWS.items():
+    _band_generic = PARITY_ROW_PCT.get(_band_key)
+    assert _band_generic is None or _band_wide > _band_generic, (
+        f"darwin wide band {_band_wide}% for {_band_key[1]!r} does not "
+        f"widen its generic parity band {_band_generic}% — fix the tables"
+    )
+
 
 # ---------------------------------------------------------------------------
 # Platform noise floor (darwin) + micro-row noise floor (all platforms)
@@ -569,16 +581,29 @@ def row_noise_floor(row: "Row") -> Optional[float]:
 
 
 def effective_band(parser: str, row: "Row", default_pct: float) -> Tuple[float, bool]:
-    """(tolerance_pct, is_parity_guard) for one row."""
+    """(tolerance_pct, is_parity_guard) for one row.
+
+    Precedence: the global guard set, then DARWIN wide bands, then the
+    generic per-row parity table, then the default. The darwin table
+    MUST be consulted before PARITY_ROW_PCT: its purpose is to WIDEN a
+    row the generic table also covers. The 4R1W row sat in both from
+    1d900cf — its 45% darwin band was unreachable, shadowed by its own
+    35% generic entry, and run 37597765597 failed the row at a 37.8%
+    loss the darwin band existed to absorb (0.61/0.64/0.66x across the
+    job's three attempts, engine steady at 91-93k ops/s — the disclosed
+    macOS-ARM MRMW residual). The import-time invariant below keeps any
+    future shadowed-or-narrowed darwin entry from slipping through
+    silently.
+    """
     if (parser, row.name) in PARITY_GUARD_ROWS:
         return max(default_pct, PARITY_GUARD_PCT), True
-    row_pct = PARITY_ROW_PCT.get((parser, row.name))
-    if row_pct is not None:
-        return max(default_pct, row_pct), True
     if sys.platform == "darwin":
         wide = DARWIN_WIDE_ROWS.get((parser, row.name))
         if wide is not None:
             return max(default_pct, wide), True
+    row_pct = PARITY_ROW_PCT.get((parser, row.name))
+    if row_pct is not None:
+        return max(default_pct, row_pct), True
     return default_pct, False
 
 
