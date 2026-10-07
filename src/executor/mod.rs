@@ -22214,12 +22214,13 @@ type UpdateRec = (i64, std::ops::Range<usize>, Option<Vec<u8>>);
 pub(crate) type IndexOpBuf = (Vec<(Vec<u8>, i64)>, Vec<(Vec<u8>, i64)>);
 
 /// Minimum statement size (rows) before the sorted-batch path engages.
-/// The batch's fixed per-statement overhead (key clones + buffer + sort
-/// + sweep setup, ~1-2 us) is a WIN at mass scale and a regression tax
-/// on OLTP-sized statements — torture S13's fast-draw 0.85x (vs 0.98x
-/// on a slow draw, run 37592180792 vs 37582198811) pinned the class.
-/// Statements below this row count keep the immediate per-row path,
-/// which is exactly the pre-sorted-batch behavior.
+///
+/// The batch's fixed per-statement overhead (key clones + buffer +
+/// sort + sweep setup, ~1-2 us) is a WIN at mass scale and a regression
+/// tax on OLTP-sized statements — torture S13's fast-draw 0.85x versus
+/// 0.98x on a slow draw (runs 37592180792 vs 37582198811) pinned the
+/// class. Statements below this row count keep the immediate per-row
+/// path, which is exactly the pre-sorted-batch behavior.
 const INDEX_BATCH_MIN_ROWS: usize = 64;
 
 /// Buffered index ops per index before a sorted-sweep flush. 1M ops is
