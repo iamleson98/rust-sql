@@ -268,6 +268,37 @@ impl BenchResult {
     }
 }
 
+/// Run a measurement closure N times and return the BEST (minimum)
+/// duration — bench_compare's harness-wide convention (see its
+/// best_of). Point-lookup loops are microsecond-scale single windows:
+/// a one-time cost inside the only timed window (allocator
+/// deferred-free purge, page-fault settle) flips the row's verdict
+/// while SQLite sits steady — run 37582198811 (bench_full, macOS) drew
+/// 1.58x / 0.65x / 0.84x across the gate's attempts on UNTOUCHED read
+/// code, the same class run 37305068286 documented. Adaptive warmup
+/// absorbs the one-time costs on BOTH engines identically; pure reads,
+/// so repeated windows are sound.
+fn best_of<const N: usize>(mut f: impl FnMut() -> std::time::Duration) -> std::time::Duration {
+    let probe = f();
+    if probe < std::time::Duration::from_millis(2) {
+        for _ in 0..100 {
+            let _ = f();
+        }
+    } else if probe < std::time::Duration::from_millis(100) {
+        for _ in 0..5 {
+            let _ = f();
+        }
+    }
+    let mut best = std::time::Duration::MAX;
+    for _ in 0..N {
+        let d = f();
+        if d < best {
+            best = d;
+        }
+    }
+    best
+}
+
 fn measure<F: FnMut()>(name: &str, mut f: F, total_ops: usize) -> (f64, String) {
     // warm up
     for _ in 0..2 {
@@ -578,35 +609,35 @@ fn bench_point_lookup() -> BenchResult {
         assert_eq!(&rq[0], &sq, "point lookup mismatch at id {probe}");
     }
     let n = 1000;
-    let (rq_ops, _) = measure(
-        "rust-sql point lookup",
-        || {
-            for i in 1..=n {
-                let _ = db
-                    .query("SELECT name, val FROM t WHERE id = ?", [Value::Integer(i)])
-                    .unwrap();
+    // best-of-7 windows (see best_of): the single-window draw swings 2.7x
+    // on the runner's micro-state; steady state is the engine signal.
+    let rq_dur = best_of::<7>(|| {
+        let start = Instant::now();
+        for i in 1..=n {
+            let _ = db
+                .query("SELECT name, val FROM t WHERE id = ?", [Value::Integer(i)])
+                .unwrap();
+        }
+        start.elapsed()
+    });
+    let rq_ops = n as f64 / rq_dur.as_secs_f64();
+    let rs_dur = best_of::<7>(|| {
+        let start = Instant::now();
+        for i in 1..=n {
+            let mut stmt = conn
+                .prepare_cached("SELECT name, val FROM t WHERE id = ?1")
+                .unwrap();
+            let mut rows = stmt.query(params![i]).unwrap();
+            // READ PARITY: decode the projected columns like the
+            // engine's materializing query() does.
+            while let Some(row) = rows.next().unwrap() {
+                let _ = row.get::<_, String>(0).unwrap();
+                let _ = row.get::<_, i64>(1).unwrap();
             }
-        },
-        n as usize,
-    );
-    let (rs_ops, _) = measure(
-        "rusqlite point lookup",
-        || {
-            for i in 1..=n {
-                let mut stmt = conn
-                    .prepare_cached("SELECT name, val FROM t WHERE id = ?1")
-                    .unwrap();
-                let mut rows = stmt.query(params![i]).unwrap();
-                // READ PARITY: decode the projected columns like the
-                // engine's materializing query() does.
-                while let Some(row) = rows.next().unwrap() {
-                    let _ = row.get::<_, String>(0).unwrap();
-                    let _ = row.get::<_, i64>(1).unwrap();
-                }
-            }
-        },
-        n as usize,
-    );
+        }
+        start.elapsed()
+    });
+    let rs_ops = n as f64 / rs_dur.as_secs_f64();
     BenchResult {
         name: "Point lookup (SELECT by id, 1k queries)".into(),
         rustqlite_ops_per_sec: rq_ops,
@@ -642,32 +673,31 @@ fn bench_index_lookup() -> BenchResult {
         }
     }
     let n = 1000;
-    let (rq_ops, _) = measure(
-        "rust-sql index lookup",
-        || {
-            for i in 1..=n {
-                let _ = db
-                    .query("SELECT name FROM t WHERE val = ?", [Value::Integer(i)])
-                    .unwrap();
+    // best-of-7 windows — same rationale as the rowid twin above.
+    let rq_dur = best_of::<7>(|| {
+        let start = Instant::now();
+        for i in 1..=n {
+            let _ = db
+                .query("SELECT name FROM t WHERE val = ?", [Value::Integer(i)])
+                .unwrap();
+        }
+        start.elapsed()
+    });
+    let rq_ops = n as f64 / rq_dur.as_secs_f64();
+    let rs_dur = best_of::<7>(|| {
+        let start = Instant::now();
+        for i in 1..=n {
+            let mut stmt = conn
+                .prepare_cached("SELECT name FROM t WHERE val = ?1")
+                .unwrap();
+            let mut rows = stmt.query(params![i]).unwrap();
+            while let Some(row) = rows.next().unwrap() {
+                let _ = row.get::<_, String>(0).unwrap();
             }
-        },
-        n as usize,
-    );
-    let (rs_ops, _) = measure(
-        "rusqlite index lookup",
-        || {
-            for i in 1..=n {
-                let mut stmt = conn
-                    .prepare_cached("SELECT name FROM t WHERE val = ?1")
-                    .unwrap();
-                let mut rows = stmt.query(params![i]).unwrap();
-                while let Some(row) = rows.next().unwrap() {
-                    let _ = row.get::<_, String>(0).unwrap();
-                }
-            }
-        },
-        n as usize,
-    );
+        }
+        start.elapsed()
+    });
+    let rs_ops = n as f64 / rs_dur.as_secs_f64();
     BenchResult {
         name: "Index lookup (SELECT by indexed col, 1k)".into(),
         rustqlite_ops_per_sec: rq_ops,
