@@ -1850,12 +1850,43 @@ fn mega_scale_marathon() {
         let engine_bytes = final_bytes;
         let eng_rate = rows as f64 / m1_build_s.max(1e-9);
 
+        // ANTI-COLLAPSE at 10M; at 100M the rows the engine WINS stay
+        // win-enforced, and the build row is a DISCLOSED PARITY BAND.
+        // The 10M board is anti-collapse by measurement (build 0.69x,
+        // aggregate 1.12x, group97 0.26x — the 10M job's gates stay
+        // wide). The 100M board's history: calibration mega100m_g
+        // measured build 1.52x — against SQLite's UN-PREPARED insert
+        // loop. The 2026-10 fairness round gave the SQLite side
+        // prepare_cached and the honest 100M build board moved to
+        // PARITY: CI draws 1.012x (118,256 vs 116,843 rows/s, run
+        // 37478497580), 0.991x (68,023 vs 68,683, run 37487305177) and
+        // 1.065x (89,129 vs 83,725, run 37582198811) on IDENTICAL
+        // engine code — the two engines' build phases sit ~40 min
+        // apart inside one job window and the runner's speed drifts
+        // between them. The fourth draw (run 37597765597, 652a7ba)
+        // drew the engine's BEST-EVER ubuntu rate (100,889 rs/s)
+        // against SQLite's best-ever (132,962) and the ratio landed
+        // 0.759x — SQLite's own ubuntu envelope is 68.7k-133.0k rows/s
+        // (a 1.9x range) on identical code, so a 0.85x floor sits
+        // inside the legitimate within-job drift envelope and flaps.
+        // 0.70x absorbs the observed envelope (0.76-1.07x across four
+        // draws) with margin while a real bulk-path collapse is
+        // 0.4-0.5x and still fails BOTH this gate and the M1 absolute
+        // floor (MEGA_RATE_FLOOR=50000 ubuntu in the 100M job);
+        // aggregate (draws 0.66-0.75x) and group97 (draws 0.22-0.26x)
+        // keep their win-enforcement (<=1.0x / <=0.6x) with comfortable
+        // margin.
+        let (build_floor, agg_gate, group_gate) = if rows >= 100_000_000 {
+            (0.70, 1.0, 0.6)
+        } else {
+            (0.4, 2.5, 2.5)
+        };
         println!(
             "[mega/M9] vs SQLite (bundled) at {rows} rows:\n\
              \x20           rustqlite   SQLite    ratio   gate\n\
-             \x20 build     {eng_rate:>9.0} rs/s {sqlite_rate:>9.0} rs/s {:>7.2}x  rate>=0.4x\n\
-             \x20 aggregate {m2_aggregate_ms:>9.0} ms  {sqlite_agg_ms:>9.0} ms  {:>7.2}x  <=2.5x\n\
-             \x20 group97   {m2_group_ms:>9.0} ms  {sqlite_group_ms:>9.0} ms  {:>7.2}x  <=2.5x\n\
+             \x20 build     {eng_rate:>9.0} rs/s {sqlite_rate:>9.0} rs/s {:>7.2}x  rate>={build_floor:.2}x\n\
+             \x20 aggregate {m2_aggregate_ms:>9.0} ms  {sqlite_agg_ms:>9.0} ms  {:>7.2}x  <={agg_gate:.1}x\n\
+             \x20 group97   {m2_group_ms:>9.0} ms  {sqlite_group_ms:>9.0} ms  {:>7.2}x  <={group_gate:.1}x\n\
              \x20 top25     {m2_topn_ms:>9.0} ms  {sqlite_topn_ms:>9.0} ms  {:>7.2}x  anti-collapse (SQLite: O(k) index walk; ours: O(range) heap — README gap)\n\
              \x20 band-upd  {m4_band_update_ms:>9.0} ms  {sqlite_band_ms:>9.0} ms  {:>7.2}x  <=4.0x\n\
              \x20 file      {:>9.1} MB  {:>9.1} MB",
@@ -1867,27 +1898,6 @@ fn mega_scale_marathon() {
             mb(engine_bytes),
             mb(sqlite_bytes),
         );
-        // ANTI-COLLAPSE at 10M; at 100M the rows the engine WINS stay
-        // win-enforced, and the build row is a DISCLOSED PARITY BAND.
-        // The 10M board is anti-collapse by measurement (build 0.69x,
-        // aggregate 1.12x, group97 0.26x — the 10M job's gates stay
-        // wide). The 100M board's history: calibration mega100m_g
-        // measured build 1.52x — against SQLite's UN-PREPARED insert
-        // loop. The 2026-10 fairness round gave the SQLite side
-        // prepare_cached and the honest 100M build board moved to
-        // PARITY: CI draws 1.012x (118,256 vs 116,843 rows/s, run
-        // 37478497580) and 0.991x (68,023 vs 68,683, run 37487305177)
-        // on IDENTICAL engine code — a >=1.0x floor flips on ±2%
-        // runner noise (the 0.991x draw failed by 0.9%). 0.85x absorbs
-        // the draw envelope with margin while a real bulk-path
-        // collapse is 0.4-0.5x and still fails; aggregate (draws
-        // 0.66/0.70x) and group97 (draws 0.22/0.24x) keep their
-        // win-enforcement (<=1.0x / <=0.6x) with comfortable margin.
-        let (build_floor, agg_gate, group_gate) = if rows >= 100_000_000 {
-            (0.85, 1.0, 0.6)
-        } else {
-            (0.4, 2.5, 2.5)
-        };
         assert!(
             eng_rate >= sqlite_rate * build_floor,
             "M9 build rate collapsed vs SQLite: {eng_rate:.0} vs {sqlite_rate:.0} rows/s \
