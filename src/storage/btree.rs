@@ -1956,6 +1956,42 @@ enum AppendTry {
     Declined,
 }
 
+/// Pinned index leaf for a sorted sweep: the leaf, its object-state
+/// proof, its HIGH fence (the last cell — an ascending stream can
+/// never fall below the leaf's low fence, so the high fence alone
+/// decides membership), and the interior parent the establishing
+/// descent routed through (empty-leaf recycling needs it).
+struct IndexSweepPin {
+    page: PageId,
+    parent: PageId,
+    serial: u64,
+    epoch: u32,
+    max_key: Vec<u8>,
+    max_rowid: i64,
+    /// The pinned leaf holds no cells: no fence bounds the next op
+    /// (the parent separator is not knowable from the leaf alone), so
+    /// every op re-descends. The pin is kept only to carry the
+    /// recycle parent after a sweep delete empties the leaf.
+    empty: bool,
+    /// Monotone search hint: the position the previous op touched in
+    /// this leaf. Sorted streams land at non-decreasing positions, so a
+    /// gallop from here converges in 1-3 probes (a cold binary search
+    /// pays ~8 on a 250-cell leaf).
+    pos_hint: u16,
+}
+
+/// Outcome of a pinned-leaf attempt.
+enum SweepTry {
+    /// Applied (or a tolerated miss). `pin_alive` false = the leaf
+    /// was emptied and recycled — the pin is dead, the next op
+    /// re-descends.
+    Done { pin_alive: bool },
+    /// Not attempted — stale proof, wrong page type, no room, or an
+    /// oversized key. The caller applies the op through the full
+    /// per-op path (splits and overflow chains belong to it).
+    Declined,
+}
+
 impl<'a> Btree<'a> {
     pub fn new(pager: &'a Pager, root: PageId, is_index: bool) -> Self {
         Self {
@@ -9764,6 +9800,569 @@ impl<'a> Btree<'a> {
         Ok(true)
     }
 
+    // ========================================================================
+    // SORTED BATCH INDEX MAINTENANCE — the pinned-leaf sweep.
+    // ========================================================================
+    //
+    // A per-row maintenance op (delete_index / insert_index) pays a full
+    // root-to-leaf descent per op — ~3 us per touched row at 100M scale,
+    // and a band UPDATE of an indexed cyclic key is pure scatter (the
+    // probe_index_maint calibration: 86% of the statement is index
+    // maintenance, 3.36x SQLite on the same statement). A SORTED batch —
+    // the same op multiset ordered by (key, rowid) — sweeps the tree left
+    // to right instead: one descent per leaf boundary, then direct cell
+    // writes into the pinned leaf.
+    //
+    // The pin carries the page's `(serial, epoch)` object-state proof
+    // (refreshed post-touch after the pin's own writes); any structural
+    // change by another path re-establishes it by descent. The two public
+    // entry points take strict caller contracts:
+    //
+    //   * `entries` are ASCENDING by (key bytes, rowid) — byte order IS
+    //     the tree's total order (the order-preserving key encoding);
+    //   * non-unique indexes only (the executor gates unique indexes to
+    //     the per-row immediate path — violations surface mid-statement);
+    //   * delete batches tolerate absent entries (the per-op API's
+    //     Ok(false) twin — the executor's membership gating is the
+    //     contract).
+    //
+    // Journaling: one `note_row_write` per applied op, byte-identical to
+    // the records the per-op APIs emit — the concurrent-merge replay
+    // re-derives the batch op by op. Interior pages visited while
+    // (re-)establishing a pin are marked as decision reads, the same
+    // discipline as the per-op descents.
+
+    /// Descend (read-only; routing interiors marked as decision reads)
+    /// to the index leaf whose range covers `(key, rowid)` and pin it.
+    /// `Ok(None)` means "not routable this way" — the caller falls back
+    /// to the full per-op path (which surfaces real corruption itself).
+    fn find_index_leaf_pinned(&mut self, key: &[u8], rowid: i64) -> Result<Option<IndexSweepPin>> {
+        let mut parent: PageId = 0;
+        let mut page_id = self.root;
+        // Depth guard: a healthy tree is logarithmic; 64 levels is far
+        // beyond any page-count reality (a cycle is corruption, and the
+        // full path reports it better than a hang here).
+        for _ in 0..64 {
+            let page = match self.pager.get_page(page_id) {
+                Ok(p) => p,
+                Err(_) => return Ok(None),
+            };
+            let pt = match page.lock().page_type() {
+                Ok(t) => t,
+                Err(_) => return Ok(None),
+            };
+            match pt {
+                PageType::LeafIndex => {
+                    let mut pin = IndexSweepPin {
+                        page: page_id,
+                        parent,
+                        serial: 0,
+                        epoch: 0,
+                        max_key: Vec::new(),
+                        max_rowid: 0,
+                        empty: true,
+                        pos_hint: 0,
+                    };
+                    let n = {
+                        let b = page.lock();
+                        pin.serial = b.serial;
+                        pin.epoch = b.epoch;
+                        b.n_cells()
+                    };
+                    if n > 0 {
+                        let b = page.lock();
+                        let psz = b.page_size();
+                        let cell_ptr = b.cell_pointer(n - 1) as usize;
+                        let slice = match b.cell_slice_checked(cell_ptr) {
+                            Ok(s) => s,
+                            Err(_) => {
+                                drop(b);
+                                return Ok(None);
+                            }
+                        };
+                        match decode_index_cell(slice, false, psz) {
+                            Some(v) if v.overflow == 0 => {
+                                pin.max_key = v.key.to_vec();
+                                pin.max_rowid = v.rowid;
+                                pin.empty = false;
+                            }
+                            Some(v) => {
+                                // Spilled last key: reassemble the FULL
+                                // key — the local prefix is not a fence.
+                                match self.index_view_key(&v) {
+                                    Ok(full) => {
+                                        pin.max_key = full;
+                                        pin.max_rowid = v.rowid;
+                                        pin.empty = false;
+                                    }
+                                    Err(_) => {
+                                        drop(b);
+                                        return Ok(None);
+                                    }
+                                }
+                            }
+                            None => {
+                                drop(b);
+                                return Ok(None);
+                            }
+                        }
+                    }
+                    return Ok(Some(pin));
+                }
+                PageType::InteriorIndex => {
+                    self.pager.note_decision_read(page_id);
+                    let child_id = {
+                        let b = page.lock();
+                        let n = b.n_cells();
+                        let cp = |i: u16| b.cell_pointer(i);
+                        let (_, child) = self.find_index_child(
+                            &b.data,
+                            n,
+                            cp,
+                            b.right_most_pointer(),
+                            key,
+                            rowid,
+                        );
+                        child
+                    };
+                    if child_id == 0 {
+                        return Ok(None);
+                    }
+                    parent = page_id;
+                    page_id = child_id;
+                }
+                _ => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Bracketed galloping search for a sorted stream: find the first
+    /// cell >= (key, rowid) starting from `hint` (the previous op's
+    /// position). Probes forward in doubling steps to bracket the
+    /// target, then binary-searches the bracket. Any overflow cell
+    /// encountered mid-gallop falls back to the COLD binary search
+    /// (full-key comparison needs the chain walk, which the cold path
+    /// already performs). Returns the position in `0..=n`.
+    fn sweep_gallop_search(
+        &mut self,
+        b: &Page,
+        key: &[u8],
+        rowid: i64,
+        hint: u16,
+        n: u16,
+        psz: u32,
+    ) -> Result<u16> {
+        // Cell (key, rowid) at index i, as an ordering tuple; None
+        // flags an overflow cell (caller falls back).
+        let cell_order = |i: u16| -> Result<Option<(&[u8], i64)>> {
+            let cell_ptr = b.cell_pointer(i) as usize;
+            let Some(v) = decode_index_cell(b.cell_slice_checked(cell_ptr)?, false, psz) else {
+                return Err(Error::corruption("truncated index leaf cell"));
+            };
+            if v.overflow != 0 {
+                return Ok(None);
+            }
+            Ok(Some((v.key, v.rowid)))
+        };
+        // Cold binary search (overflow-aware, reassembling chains).
+        let cold = |s: &mut Self, lo0: u16, hi0: u16| -> Result<u16> {
+            let mut lo = lo0;
+            let mut hi = hi0;
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                let cell_ptr = b.cell_pointer(mid) as usize;
+                let Some(v) = decode_index_cell(b.cell_slice_checked(cell_ptr)?, false, psz) else {
+                    return Err(Error::corruption("truncated index leaf cell"));
+                };
+                let go_right = if v.overflow != 0 {
+                    let full = s.index_view_key(&v)?;
+                    (full.as_slice(), v.rowid) < (key, rowid)
+                } else {
+                    (v.key, v.rowid) < (key, rowid)
+                };
+                if go_right {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            Ok(lo)
+        };
+        let hint = hint.min(n);
+        if hint >= n {
+            return Ok(n); // the stream is past every cell
+        }
+        // Defensive hint check (one probe): the cell BEFORE the hint
+        // must be < the target. A stale or unsorted-stream hint that
+        // skips past the true position would otherwise place the op in
+        // the wrong slot — this turns any violation into a cold full
+        // search (correct results, just slower).
+        if hint > 0 {
+            match cell_order(hint - 1)? {
+                Some(cell) if cell < (key, rowid) => {}
+                _ => return cold(self, 0, n),
+            }
+        }
+        // Gallop forward from the hint.
+        let mut step: u16 = 1;
+        let mut lo = hint;
+        let mut hi = n;
+        loop {
+            let probe = lo.saturating_add(step).min(n);
+            match cell_order(probe.saturating_sub(1))? {
+                Some(cell) if cell < (key, rowid) => {
+                    // Target is at or after `probe`.
+                    if probe >= n {
+                        return Ok(n);
+                    }
+                    lo = probe;
+                    step = step.saturating_mul(2);
+                }
+                Some(_) => {
+                    // Target is in (lo - step_before ..= probe - 1]...
+                    // bracket found: [lo_prev, probe).
+                    hi = probe;
+                    break;
+                }
+                None => {
+                    // Overflow cell inside the bracket — cold search the
+                    // whole (already narrowed) range.
+                    return cold(self, lo, hi);
+                }
+            }
+        }
+        cold(self, lo, hi)
+    }
+
+    /// Direct insert of `(key, rowid)` into the pinned leaf — ONE lock
+    /// for validate + search + mutate (the try_append shape), direct
+    /// cell bytes from a stack buffer. The caller guarantees the entry
+    /// belongs in the leaf's range (carried pin: within the fence; fresh
+    /// pin: the descent just routed THIS entry here — append-past-last
+    /// is the normal band shape). In-page keys only; a full leaf
+    /// declines to the per-op path (its split machinery owns the
+    /// structural work).
+    fn sweep_insert_in_pinned(
+        &mut self,
+        pin: &mut IndexSweepPin,
+        key: &[u8],
+        rowid: i64,
+    ) -> Result<SweepTry> {
+        if key.len() > self.max_cell_payload() {
+            return Ok(SweepTry::Declined);
+        }
+        // Index leaf cell layout: varint(rowid) + varint(key_len) + key.
+        let mut cell_stack = [0u8; 256];
+        let mut cell_heap: Vec<u8>;
+        let mut rid_buf = [0u8; 9];
+        let n_rid = varint::encode_signed(rowid, &mut rid_buf);
+        let mut klen_buf = [0u8; 9];
+        let n_klen = varint::encode(key.len() as u64, &mut klen_buf);
+        let cell_len = n_rid + n_klen + key.len();
+        let cell: &[u8] = if cell_len <= cell_stack.len() {
+            cell_stack[..n_rid].copy_from_slice(&rid_buf[..n_rid]);
+            cell_stack[n_rid..n_rid + n_klen].copy_from_slice(&klen_buf[..n_klen]);
+            cell_stack[n_rid + n_klen..cell_len].copy_from_slice(key);
+            &cell_stack[..cell_len]
+        } else {
+            cell_heap = Vec::with_capacity(cell_len);
+            cell_heap.extend_from_slice(&rid_buf[..n_rid]);
+            cell_heap.extend_from_slice(&klen_buf[..n_klen]);
+            cell_heap.extend_from_slice(key);
+            &cell_heap
+        };
+        let page = match self.pager.get_page(pin.page) {
+            Ok(p) => p,
+            Err(_) => return Ok(SweepTry::Declined),
+        };
+        let page_id = pin.page;
+        let root = self.root;
+        let mut b = page.lock();
+        if !matches!(b.page_type(), Ok(PageType::LeafIndex)) {
+            return Ok(SweepTry::Declined);
+        }
+        if b.serial != pin.serial || b.epoch != pin.epoch {
+            return Ok(SweepTry::Declined);
+        }
+        let n = b.n_cells();
+        let psz = b.page_size();
+        let free = b.free_space();
+        if (free as usize) < cell_len + 2 {
+            return Ok(SweepTry::Declined); // full — the split path owns it
+        }
+        // Galloping search from the previous op's position (the stream
+        // is sorted — positions are monotone non-decreasing): probe
+        // forward in doubling steps, then binary-search the bracket.
+        // Falls back to the cold binary search when the hint is stale
+        // or a probed cell is an overflow cell (full-key compare needs
+        // the chain walk — the cold path already reassembles).
+        let pos = self.sweep_gallop_search(&b, key, rowid, pin.pos_hint, n, psz)? as usize;
+        let n_usize = n as usize;
+        // Write the cell at the content frontier and open its pointer
+        // slot (one memmove) — insert_cell_into_ref's tail, inlined.
+        let new_content_start = b.cell_content_start() - cell_len as u32;
+        let off = new_content_start as usize;
+        if off + cell_len > b.data.len() {
+            return Err(Error::corruption(format!(
+                "cell content area out of range in sweep insert (page {page_id})"
+            )));
+        }
+        b.data[off..off + cell_len].copy_from_slice(cell);
+        b.set_cell_content_start(new_content_start);
+        let header_offset = if page_id == 0 {
+            crate::storage::page::DB_HEADER_SIZE as usize
+        } else {
+            0
+        };
+        let ptr_array_start = header_offset + PAGE_HEADER_SIZE as usize;
+        b.data.copy_within(
+            ptr_array_start + pos * 2..ptr_array_start + n_usize * 2,
+            ptr_array_start + (pos + 1) * 2,
+        );
+        let dst = ptr_array_start + pos * 2;
+        b.data[dst..dst + 2].copy_from_slice(&(new_content_start as u16).to_be_bytes());
+        b.set_n_cells(n + 1);
+        b.touch();
+        // Post-touch proof refresh (the pin certifies the state it left
+        // behind, not the state it found — the append path's rule). The
+        // next op of the sorted stream lands at or after this position.
+        pin.serial = b.serial;
+        pin.epoch = b.epoch;
+        pin.pos_hint = pos as u16 + 1;
+        drop(b);
+        self.pager.note_dirty(page_id);
+        self.pager
+            .note_row_write(root, true, JournalKind::Insert, rowid, key, &[]);
+        Ok(SweepTry::Done { pin_alive: true })
+    }
+
+    /// Direct delete of `(key, rowid)` from the pinned leaf — ONE lock
+    /// for validate + search + mutate, the same tolerated-miss contract
+    /// as `delete_index`'s `Ok(false)`. When the removal empties the
+    /// leaf, the leaf is recycled from its parent right there — the
+    /// per-row path's discipline (a mass DELETE's 0-cell leaves must not
+    /// linger as file bloat).
+    #[allow(clippy::too_many_lines)]
+    fn sweep_delete_in_pinned(
+        &mut self,
+        pin: &mut IndexSweepPin,
+        key: &[u8],
+        rowid: i64,
+    ) -> Result<SweepTry> {
+        let page = match self.pager.get_page(pin.page) {
+            Ok(p) => p,
+            Err(_) => return Ok(SweepTry::Declined),
+        };
+        let page_id = pin.page;
+        let root = self.root;
+        let mut b = page.lock();
+        if !matches!(b.page_type(), Ok(PageType::LeafIndex)) {
+            return Ok(SweepTry::Declined);
+        }
+        if b.serial != pin.serial || b.epoch != pin.epoch {
+            return Ok(SweepTry::Declined);
+        }
+        let n = b.n_cells();
+        let psz = b.page_size();
+        // Galloping search from the previous op's position (sorted
+        // stream — positions monotone non-decreasing).
+        let lo = self.sweep_gallop_search(&b, key, rowid, pin.pos_hint, n, psz)?;
+        if lo >= n {
+            // Past every cell — absent (the fence said inside; the entry
+            // is not there): a tolerated miss.
+            return Ok(SweepTry::Done { pin_alive: true });
+        }
+        let cell_ptr = b.cell_pointer(lo) as usize;
+        let (matches, dead_chain) =
+            match decode_index_cell(b.cell_slice_checked(cell_ptr)?, false, psz) {
+                Some(v) => {
+                    let matches = if v.overflow != 0 {
+                        let full = self.index_view_key(&v)?;
+                        full == key && v.rowid == rowid
+                    } else {
+                        v.key == key && v.rowid == rowid
+                    };
+                    (matches, v.overflow)
+                }
+                None => (false, 0),
+            };
+        if !matches {
+            return Ok(SweepTry::Done { pin_alive: true }); // absent — tolerated
+        }
+        // Remove the cell (pointer shift only) and refresh the fence
+        // from the post-delete state — all under this one lock.
+        let header_offset = if page_id == 0 {
+            crate::storage::page::DB_HEADER_SIZE as usize
+        } else {
+            0
+        };
+        let ptr_array_start = header_offset + PAGE_HEADER_SIZE as usize;
+        let pos_usize = lo as usize;
+        let n_usize = n as usize;
+        b.data.copy_within(
+            ptr_array_start + (pos_usize + 1) * 2..ptr_array_start + n_usize * 2,
+            ptr_array_start + pos_usize * 2,
+        );
+        b.set_n_cells(n - 1);
+        b.touch();
+        pin.serial = b.serial;
+        pin.epoch = b.epoch;
+        // The stream's next op lands at or after this position (the
+        // cells shifted down by one here).
+        pin.pos_hint = lo;
+        let n_now = (n - 1) as usize;
+        let mut became_empty = false;
+        if n_now == 0 {
+            became_empty = true;
+        } else {
+            let last_ptr = b.cell_pointer(n_now as u16 - 1) as usize;
+            match b
+                .cell_slice_checked(last_ptr)
+                .ok()
+                .and_then(|s| decode_index_cell(s, false, psz))
+            {
+                Some(v) if v.overflow == 0 => {
+                    pin.max_key.clear();
+                    pin.max_key.extend_from_slice(v.key);
+                    pin.max_rowid = v.rowid;
+                }
+                Some(v) => {
+                    if let Ok(full) = self.index_view_key(&v) {
+                        pin.max_key = full;
+                        pin.max_rowid = v.rowid;
+                    } else {
+                        became_empty = true; // fence unreadable: drop the pin
+                    }
+                }
+                None => became_empty = true,
+            }
+        }
+        drop(b);
+        self.pager.note_dirty(page_id);
+        if dead_chain != 0 {
+            self.free_overflow_chain(dead_chain)?;
+        }
+        self.pager
+            .note_row_write(root, true, JournalKind::Delete, rowid, key, &[]);
+        if became_empty {
+            if pin.parent != 0 {
+                let _ = self.maybe_recycle_empty_child(pin.parent, pin.page)?;
+            }
+            return Ok(SweepTry::Done { pin_alive: false });
+        }
+        Ok(SweepTry::Done { pin_alive: true })
+    }
+
+    /// Apply a `(key, rowid)`-ascending batch of index DELETES as one
+    /// pinned-leaf sweep. Every entry that shares a leaf with its
+    /// predecessor costs one locked cell removal — no descent; boundary
+    /// crossings re-pin by descent. Absent entries are tolerated misses.
+    pub fn delete_index_sorted(&mut self, entries: &[(Vec<u8>, i64)]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        self.pager.note_write();
+        let r = self.delete_index_sorted_inner(entries);
+        if r.is_err() {
+            self.pager.note_journal_invalidated();
+        }
+        r
+    }
+
+    fn delete_index_sorted_inner(&mut self, entries: &[(Vec<u8>, i64)]) -> Result<()> {
+        let mut pin: Option<IndexSweepPin> = None;
+        for (key, rowid) in entries {
+            // Pinned fast path: the fence covers the op.
+            let mut handled = false;
+            if let Some(mut p) = pin.take() {
+                if !p.empty && (&key[..], *rowid) <= (&p.max_key[..], p.max_rowid) {
+                    match self.sweep_delete_in_pinned(&mut p, key, *rowid)? {
+                        SweepTry::Done { pin_alive: true } => {
+                            pin = Some(p);
+                            handled = true;
+                        }
+                        SweepTry::Done { pin_alive: false } => {
+                            handled = true; // leaf emptied + recycled; op applied
+                        }
+                        SweepTry::Declined => {} // stale — re-pin below
+                    }
+                }
+            }
+            if handled {
+                continue;
+            }
+            // Re-pin by descent — a FRESH pin routed THIS op, so the
+            // fence check is unnecessary (append-past-max is legal).
+            if let Some(mut p) = self.find_index_leaf_pinned(key, *rowid)? {
+                if !p.empty {
+                    match self.sweep_delete_in_pinned(&mut p, key, *rowid)? {
+                        SweepTry::Done { pin_alive: true } => {
+                            pin = Some(p);
+                            continue;
+                        }
+                        SweepTry::Done { pin_alive: false } => continue,
+                        SweepTry::Declined => {}
+                    }
+                }
+            }
+            let _ = self.delete_index(key, *rowid)?;
+        }
+        Ok(())
+    }
+
+    /// Apply a `(key, rowid)`-ascending batch of index INSERTS as one
+    /// pinned-leaf sweep. Splits (full leaves) and oversized keys fall
+    /// back to the per-op path op by op — the amortized descent cost
+    /// stays one per leaf boundary plus one per split.
+    pub fn insert_index_sorted(&mut self, entries: &[(Vec<u8>, i64)]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        self.pager.note_write();
+        let r = self.insert_index_sorted_inner(entries);
+        if r.is_err() {
+            self.pager.note_journal_invalidated();
+        }
+        r
+    }
+
+    fn insert_index_sorted_inner(&mut self, entries: &[(Vec<u8>, i64)]) -> Result<()> {
+        let mut pin: Option<IndexSweepPin> = None;
+        for (key, rowid) in entries {
+            let mut handled = false;
+            if let Some(mut p) = pin.take() {
+                if !p.empty && (&key[..], *rowid) <= (&p.max_key[..], p.max_rowid) {
+                    match self.sweep_insert_in_pinned(&mut p, key, *rowid)? {
+                        SweepTry::Done { pin_alive: true } => {
+                            pin = Some(p);
+                            handled = true;
+                        }
+                        SweepTry::Done { pin_alive: false } => handled = true,
+                        SweepTry::Declined => {}
+                    }
+                }
+            }
+            if handled {
+                continue;
+            }
+            if let Some(mut p) = self.find_index_leaf_pinned(key, *rowid)? {
+                if !p.empty {
+                    match self.sweep_insert_in_pinned(&mut p, key, *rowid)? {
+                        SweepTry::Done { pin_alive: true } => {
+                            pin = Some(p);
+                            continue;
+                        }
+                        SweepTry::Done { pin_alive: false } => continue,
+                        SweepTry::Declined => {}
+                    }
+                }
+            }
+            self.insert_index(key, *rowid)?;
+        }
+        Ok(())
+    }
+
     /// Look up all rowids matching a given key in an index B+tree.
     /// Returns a list of rowids (usually 1, but may be more for non-unique indexes).
     ///
@@ -10527,6 +11126,240 @@ mod tests {
     fn open_pager() -> Pager {
         let tmp = NamedTempFile::new().unwrap();
         Pager::open(tmp.path(), 256).unwrap()
+    }
+
+    // ── sorted batch index maintenance (the pinned-leaf sweep) ──
+
+    /// Collect the tree's full entry list in scan order (the tree's own
+    /// total order — the comparison oracle for batch-vs-per-op tests).
+    fn scan_index_entries(bt: &mut Btree<'_>) -> Vec<(Vec<u8>, i64)> {
+        let mut out = Vec::new();
+        bt.scan_index(|rowid, key| {
+            out.push((key.to_vec(), rowid));
+            true
+        })
+        .unwrap();
+        out
+    }
+
+    /// The sweep must be invisible: a batch of deletes+inserts applied
+    /// through the sorted APIs leaves the tree with EXACTLY the entry
+    /// multiset the per-op path produces, in tree order, with the same
+    /// page hygiene (emptied leaves recycled).
+    ///
+    /// Deterministic construction of a scattered-key index tree +
+    /// its entry list (a nested fn so the returned Btree can borrow the
+    /// returned Pager).
+    fn mk_scattered_tree(pager: &Pager, seed: u64) -> (Btree<'_>, Vec<(Vec<u8>, i64)>) {
+        let mut s = seed;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let mut bt = Btree::create(pager, true).unwrap();
+        let mut ops: Vec<(Vec<u8>, i64)> = Vec::new();
+        for i in 1..=4000i64 {
+            let k = (next() % 1500) as i64;
+            let key = Value::Integer(k).encode_order_key();
+            bt.insert_index(&key, i).unwrap();
+            ops.push((key, i));
+        }
+        (bt, ops)
+    }
+
+    #[test]
+    fn index_sorted_batch_matches_per_op_random() {
+        // The maintenance multiset: half the rowids get their keys
+        // shifted, a quarter are deleted outright.
+        fn maintenance(next: &mut dyn FnMut() -> u64) -> Vec<(u64, i64, bool)> {
+            let mut v = Vec::new();
+            for rid in 1..=4000i64 {
+                match next() % 4 {
+                    0 | 1 => v.push((next() % 1500, rid, true)), // shift key
+                    2 => v.push((0, rid, false)),                // delete only
+                    _ => {}
+                }
+            }
+            v
+        }
+        fn run(batch: bool) -> Vec<(Vec<u8>, i64)> {
+            let pager = Pager::open_memory(512).unwrap();
+            let (mut bt, existing) = mk_scattered_tree(&pager, 0xdead_beef);
+            let mut s2 = 0x1234_5678_9abc_def0u64;
+            let mut next2 = move || {
+                s2 ^= s2 << 13;
+                s2 ^= s2 >> 7;
+                s2 ^= s2 << 17;
+                s2
+            };
+            let ops = maintenance(&mut next2);
+            // The per-op reference applies each op immediately; the
+            // batch path sorts dels and ins and applies two sweeps.
+            let mut dels: Vec<(Vec<u8>, i64)> = Vec::new();
+            let mut ins: Vec<(Vec<u8>, i64)> = Vec::new();
+            for &(k, rid, shift) in &ops {
+                let old = existing
+                    .iter()
+                    .find(|(_, r)| *r == rid)
+                    .map(|(k, _)| k.clone())
+                    .unwrap();
+                dels.push((old, rid));
+                if shift {
+                    ins.push((Value::Integer(k as i64).encode_order_key(), rid));
+                }
+                if batch {
+                    continue;
+                }
+                for d in dels.drain(..) {
+                    bt.delete_index(&d.0, d.1).unwrap();
+                }
+                for i2 in ins.drain(..) {
+                    bt.insert_index(&i2.0, i2.1).unwrap();
+                }
+            }
+            if batch {
+                dels.sort_unstable_by(|a, b| (&a.0[..], a.1).cmp(&(&b.0[..], b.1)));
+                ins.sort_unstable_by(|a, b| (&a.0[..], a.1).cmp(&(&b.0[..], b.1)));
+                bt.delete_index_sorted(&dels).unwrap();
+                bt.insert_index_sorted(&ins).unwrap();
+            }
+            scan_index_entries(&mut bt)
+        }
+        let per_op = run(false);
+        let batched = run(true);
+        assert_eq!(per_op, batched, "batch sweep diverged from per-op");
+        assert!(!per_op.is_empty());
+    }
+
+    /// The band shape itself: contiguous key ranges moved across the
+    /// cycle (the marathon M9 UPDATE form), large enough to cross many
+    /// leaf boundaries, empty whole leaves (the recycle path), and
+    /// refill target leaves past their fence (split-heavy stretches).
+    #[test]
+    fn index_sorted_batch_band_shape() {
+        fn mk(pager: &Pager) -> Btree<'_> {
+            let cycle = 20_000i64;
+            let rows = 40_000i64;
+            let mut bt = Btree::create(pager, true).unwrap();
+            for i in 1..=rows {
+                let key = Value::Integer(i % cycle).encode_order_key();
+                bt.insert_index(&key, i).unwrap();
+            }
+            bt
+        }
+        let cycle = 20_000i64;
+        let shift = 7_000i64;
+        // Band: rowids 1..=5000 move their keys +shift; 5001..=6000 are
+        // deleted outright.
+        let mut dels: Vec<(Vec<u8>, i64)> = Vec::new();
+        let mut ins: Vec<(Vec<u8>, i64)> = Vec::new();
+        for i in 1..=6000i64 {
+            dels.push((Value::Integer(i % cycle).encode_order_key(), i));
+            if i <= 5000 {
+                ins.push((
+                    Value::Integer((i % cycle + shift) % cycle).encode_order_key(),
+                    i,
+                ));
+            }
+        }
+        dels.sort_unstable_by(|a, b| (&a.0[..], a.1).cmp(&(&b.0[..], b.1)));
+        ins.sort_unstable_by(|a, b| (&a.0[..], a.1).cmp(&(&b.0[..], b.1)));
+
+        let p1 = Pager::open_memory(512).unwrap();
+        let mut bt_per_op = mk(&p1);
+        for d in &dels {
+            bt_per_op.delete_index(&d.0, d.1).unwrap();
+        }
+        for i in &ins {
+            bt_per_op.insert_index(&i.0, i.1).unwrap();
+        }
+        let expect = scan_index_entries(&mut bt_per_op);
+
+        let p2 = Pager::open_memory(512).unwrap();
+        let mut bt_batch = mk(&p2);
+        bt_batch.delete_index_sorted(&dels).unwrap();
+        bt_batch.insert_index_sorted(&ins).unwrap();
+        let got = scan_index_entries(&mut bt_batch);
+
+        assert_eq!(expect, got, "band-shape batch sweep diverged");
+    }
+
+    /// Emptied leaves must not linger: a sorted delete pass that clears
+    /// whole leaves recycles them, keeping the page count at (or below)
+    /// the per-op path's.
+    #[test]
+    fn index_sorted_delete_recycles_emptied_leaves() {
+        fn mk(pager: &Pager) -> Btree<'_> {
+            let mut bt = Btree::create(pager, true).unwrap();
+            for i in 1..=30_000i64 {
+                let key = Value::Integer(i).encode_order_key();
+                bt.insert_index(&key, i).unwrap();
+            }
+            bt
+        }
+        // Delete a contiguous range covering many whole leaves.
+        let dels: Vec<(Vec<u8>, i64)> = (5_000..=25_000)
+            .map(|i| (Value::Integer(i).encode_order_key(), i))
+            .collect();
+        let p1 = Pager::open_memory(512).unwrap();
+        let mut bt1 = mk(&p1);
+        for d in &dels {
+            bt1.delete_index(&d.0, d.1).unwrap();
+        }
+        let per_op_pages = p1.n_pages();
+        let per_op_entries = scan_index_entries(&mut bt1);
+
+        let p2 = Pager::open_memory(512).unwrap();
+        let mut bt2 = mk(&p2);
+        bt2.delete_index_sorted(&dels).unwrap();
+        let batch_pages = p2.n_pages();
+        let batch_entries = scan_index_entries(&mut bt2);
+
+        assert_eq!(per_op_entries, batch_entries);
+        assert!(
+            batch_pages <= per_op_pages,
+            "batch left {batch_pages} pages vs per-op {per_op_pages} (empty leaves not recycled)"
+        );
+    }
+
+    /// Oversized (overflow-chain) keys in the batch decline to the full
+    /// per-op path — correctness over speed, verified end to end.
+    #[test]
+    fn index_sorted_batch_handles_oversized_keys() {
+        let pager = Pager::open_memory(512).unwrap();
+        let mut bt = Btree::create(&pager, true).unwrap();
+        let big = |i: i64| {
+            Value::Text(crate::types::Text::new(&format!("{i:06}").repeat(120))).encode_order_key()
+        };
+        for i in 1..=200i64 {
+            bt.insert_index(&big(i), i).unwrap();
+        }
+        // Move every other oversized key to a new value, batched.
+        let mut dels: Vec<(Vec<u8>, i64)> = Vec::new();
+        let mut ins: Vec<(Vec<u8>, i64)> = Vec::new();
+        for i in 1..=200i64 {
+            if i % 2 == 0 {
+                dels.push((big(i), i));
+                ins.push((big(i + 10_000), i));
+            }
+        }
+        dels.sort_unstable_by(|a, b| (&a.0[..], a.1).cmp(&(&b.0[..], b.1)));
+        ins.sort_unstable_by(|a, b| (&a.0[..], a.1).cmp(&(&b.0[..], b.1)));
+        bt.delete_index_sorted(&dels).unwrap();
+        bt.insert_index_sorted(&ins).unwrap();
+
+        let mut expect: Vec<(Vec<u8>, i64)> = Vec::new();
+        for i in 1..=200i64 {
+            if i % 2 == 0 {
+                expect.push((big(i + 10_000), i));
+            } else {
+                expect.push((big(i), i));
+            }
+        }
+        expect.sort_unstable_by(|a, b| (&a.0[..], a.1).cmp(&(&b.0[..], b.1)));
+        assert_eq!(scan_index_entries(&mut bt), expect);
     }
 
     // Temporary perf probe (not a correctness test): raw walk costs on an

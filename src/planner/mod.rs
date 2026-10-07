@@ -2402,6 +2402,25 @@ fn collect_windows_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<WindowExp
     }
 }
 
+/// May `index` serve a query whose top-level WHERE conjuncts are
+/// `conjuncts`?
+///
+/// A PARTIAL index (CREATE INDEX ... WHERE pred) only holds rows
+/// matching `pred`, so it may answer ONLY when the query itself carries
+/// that predicate as a conjunct — otherwise the index silently answers
+/// with a subset (the pre-gate bug: `WHERE a = 3` was answered from an
+/// index partial on `id % 2 = 0`, dropping every odd row). Syntactic
+/// containment is conservative but sound: predicates the query only
+/// IMPLIES (`id = 4` implies `id % 2 = 0`) are missed optimizations,
+/// never wrong answers — the same conservatism SQLite applies before
+/// its full implication analysis engages.
+fn index_serves_conjuncts_partial(index: &crate::schema::Index, conjuncts: &[Expr]) -> bool {
+    match &index.partial_expr {
+        None => true,
+        Some(pred) => conjuncts.iter().any(|c| exprs_equal_conjunct(c, pred)),
+    }
+}
+
 /// Try to find an index that can satisfy a point lookup on the given column.
 pub fn find_index_for_column(
     catalog: &Catalog,
@@ -2411,6 +2430,7 @@ pub fn find_index_for_column(
     catalog
         .indexes_on_table(&table.name)
         .into_iter()
+        .filter(|idx| idx.partial_expr.is_none())
         .find(|idx| {
             idx.columns
                 .first()
@@ -2684,6 +2704,11 @@ pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> 
                 continue;
             };
             for index in catalog.indexes_on_table(&table.name) {
+                // Partial gate: a partial index answers only queries
+                // carrying its own predicate (see the helper).
+                if !index_serves_conjuncts_partial(&index, &conjuncts) {
+                    continue;
+                }
                 let Some(first_col) = index.columns.first() else {
                     continue;
                 };
@@ -2865,6 +2890,10 @@ fn try_index_in(
             };
             if let Some(name) = unqualified_col(expr.as_ref()) {
                 for index in catalog.indexes_on_table(&table.name) {
+                    // Partial gate (same rule as equality seeks).
+                    if !index_serves_conjuncts_partial(&index, conjuncts) {
+                        continue;
+                    }
                     // Single-column index whose (only) column matches: each
                     // list member becomes one equality seek. The IN's
                     // comparison collation must match the index column's
@@ -3119,6 +3148,11 @@ fn try_index_range(
     }
     // For each index, try to collect bounds on its first column.
     for index in &indexes {
+        // Partial gate: ranges must not be bounded by a partial index
+        // unless the query carries its predicate.
+        if !index_serves_conjuncts_partial(index, conjuncts) {
+            continue;
+        }
         let first_col = index.columns.first()?;
         let first_name = first_col.name.to_ascii_lowercase();
         let mut start: Option<(Expr, bool)> = None;
@@ -3458,6 +3492,10 @@ fn try_inverted_index(
             if !matches!(index.kind, crate::schema::IndexKind::Inverted) {
                 continue;
             }
+            // Partial gate (same rule as the btree paths).
+            if !index_serves_conjuncts_partial(&index, conjuncts) {
+                continue;
+            }
             if index_serves_expr(&index, &lhs) {
                 return Some(Plan::InvertedIndexScan {
                     table: table.clone(),
@@ -3549,6 +3587,10 @@ fn try_spatial_range(
         }
         for index in catalog.indexes_on_table(&table.name) {
             if !matches!(index.kind, crate::schema::IndexKind::Spatial { .. }) {
+                continue;
+            }
+            // Partial gate (same rule as the btree paths).
+            if !index_serves_conjuncts_partial(&index, conjuncts) {
                 continue;
             }
             if index_serves_expr(&index, geom_expr) {
@@ -3704,6 +3746,12 @@ fn try_rewrite_spatial_knn(catalog: &Catalog, plan: &Plan) -> Option<Plan> {
     }
     for index in catalog.indexes_on_table(&table.name) {
         if !matches!(index.kind, crate::schema::IndexKind::Spatial { .. }) {
+            continue;
+        }
+        // Partial gate: conjuncts are not in scope at this rewrite —
+        // skip partial spatial indexes outright (sound; an implication
+        // analysis can refine this later).
+        if index.partial_expr.is_some() {
             continue;
         }
         if !index_serves_expr(&index, geom_expr) {

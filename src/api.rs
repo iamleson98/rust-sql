@@ -4550,9 +4550,37 @@ impl Database {
                 continue;
             }
             let t_ix = std::time::Instant::now();
-            tmp.execute(ix.create_sql.as_str(), ())?;
+            // Plain B-tree, non-temp: DIRECT ENTRY COPY (the source tree
+            // is already the sorted multiset — no key re-derivation, no
+            // sort, dense fill). Everything else replays the DDL.
+            let direct = matches!(ix.kind, crate::schema::IndexKind::Btree)
+                && !tmp.catalog.is_temp(&ix.table);
+            if direct {
+                let final_root = vacuum_copy_index_entries(self, &ix, tmp)?;
+                // Register the index on the temp DB exactly as the DDL
+                // replay would: the schema row (rootpage = the copied
+                // tree's root) + the catalog entry.
+                let schema_row = crate::schema::encode_schema_row(
+                    "index",
+                    &ix.name,
+                    &ix.table,
+                    final_root,
+                    &ix.create_sql,
+                );
+                insert_schema_row(&tmp.pager, &schema_row)?;
+                tmp.catalog.add_index(crate::schema::Index {
+                    root_page: final_root,
+                    ..ix.as_ref().clone()
+                });
+            } else {
+                tmp.execute(ix.create_sql.as_str(), ())?;
+            }
             if std::env::var_os("RSQL_VAC_TIMING").is_some() {
-                eprintln!("[vac] index {name} backfill: {:?}", t_ix.elapsed());
+                eprintln!(
+                    "[vac] index {name} {}: {:?}",
+                    if direct { "copy" } else { "backfill" },
+                    t_ix.elapsed()
+                );
             }
         }
         for (_, view) in self.catalog.all_views() {
@@ -13416,93 +13444,201 @@ impl Database {
                     let mut backfill_err: Option<crate::error::Error> = None;
                     let mut table_bt =
                         crate::storage::btree::Btree::new(ctx.pager, table_root, false);
-                    table_bt.scan_table_borrowed(|rowid, payload| {
-                        if crate::storage::row_codec::decode_row_into(
-                            payload,
-                            n_cols,
-                            rowid,
-                            alias,
-                            &mut row_buf,
-                        )
-                        .is_err()
-                        {
-                            return true; // skip corrupt rows
-                        }
-                        // Partial index: only rows matching the WHERE clause.
-                        if let Some(pred) = &partial {
-                            match crate::executor::eval_row_public(
-                                pred,
-                                &row_buf,
-                                &col_names,
-                                &ctx.params,
-                                &ctx.named_params,
+                    // ---- SORTED BACKFILL (the dense build) ----
+                    // Eligibility: plain B-tree access method, and the
+                    // table fits the arena budget (row count is a cheap
+                    // pages-only walk). Everything else keeps the
+                    // streaming per-row path below, unchanged.
+                    let approx_rows = table_bt.count_rows().unwrap_or(u64::MAX);
+                    let sorted_path = matches!(&index.kind, crate::schema::IndexKind::Btree)
+                        && approx_rows as usize <= BACKFILL_SORT_MAX_ENTRIES;
+                    if sorted_path {
+                        // Collect: one packed record per row (partial
+                        // predicate evaluated per row exactly as the
+                        // streaming path does; the NULL flag mirrors its
+                        // any-indexed-column-is-NULL rule).
+                        let mut arena: Vec<u8> = Vec::new();
+                        let mut recs: Vec<BackfillRec> = Vec::new();
+                        table_bt.scan_table_borrowed(|rowid, payload| {
+                            if crate::storage::row_codec::decode_row_into(
+                                payload,
+                                n_cols,
+                                rowid,
+                                alias,
+                                &mut row_buf,
+                            )
+                            .is_err()
+                            {
+                                return true; // skip corrupt rows
+                            }
+                            if let Some(pred) = &partial {
+                                match crate::executor::eval_row_public(
+                                    pred,
+                                    &row_buf,
+                                    &col_names,
+                                    &ctx.params,
+                                    &ctx.named_params,
+                                ) {
+                                    Ok(v) if v.is_truthy() => {}
+                                    _ => return true,
+                                }
+                            }
+                            let has_null_key = index.columns.iter().any(|c| {
+                                table
+                                    .find_column(&c.name)
+                                    .and_then(|p| row_buf.get(p))
+                                    .map(|v| v.is_null())
+                                    .unwrap_or(false)
+                            });
+                            let entry_keys = match crate::executor::index_am::index_entry_keys(
+                                &index, &table, &row_buf,
                             ) {
-                                Ok(v) if v.is_truthy() => {}
-                                _ => return true,
+                                Ok(k) => k,
+                                Err(e) => {
+                                    backfill_err = Some(e);
+                                    return false;
+                                }
+                            };
+                            // B-tree kind: exactly one key per row.
+                            if let Some(key) = entry_keys.first() {
+                                let off = arena.len() as u32;
+                                arena.extend_from_slice(key);
+                                recs.push(BackfillRec {
+                                    off,
+                                    len_null: ((key.len() as u32) << 1) | u32::from(has_null_key),
+                                    rowid,
+                                });
+                            }
+                            true
+                        })?;
+                        if let Some(e) = backfill_err {
+                            return Err(e);
+                        }
+                        // Sort by (key, rowid) — the tree's total order.
+                        backfill_sort_recs(&mut recs, &arena);
+                        // UNIQUE: adjacent duplicate keys (NULL-exempt
+                        // rows flagged aside). One pass replaces the
+                        // streaming path's growing-tree lookup per row.
+                        if is_unique {
+                            let mut prev: Option<(&[u8], bool)> = None;
+                            for r in &recs {
+                                let key = backfill_key(r, &arena);
+                                let null_exempt = r.len_null & 1 == 1;
+                                if let Some((pk, p_exempt)) = prev {
+                                    if !null_exempt && !p_exempt && pk == key {
+                                        let cols = index
+                                            .columns
+                                            .iter()
+                                            .map(|c| c.name.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join(", ");
+                                        return Err(Error::constraint(format!(
+                                            "UNIQUE constraint failed: {}.{}",
+                                            table_name, cols
+                                        )));
+                                    }
+                                }
+                                prev = Some((key, null_exempt));
                             }
                         }
-                        // NULLs are distinct: rows with ANY NULL among
-                        // the indexed columns are exempt from the UNIQUE
-                        // duplicate check (SQLite semantics — you can
-                        // CREATE UNIQUE INDEX over data holding many NULLs).
-                        let has_null_key = index.columns.iter().any(|c| {
-                            table
-                                .find_column(&c.name)
-                                .and_then(|p| row_buf.get(p))
-                                .map(|v| v.is_null())
-                                .unwrap_or(false)
-                        });
-                        // Multi-entry keys: specialized access methods
-                        // contribute one entry PER tsvector lexeme /
-                        // covered grid cell (validated tsvector / geometry
-                        // errors abort the CREATE INDEX, matching
-                        // PostgreSQL's GIN input strictness).
-                        let entry_keys = match crate::executor::index_am::index_entry_keys(
-                            &index, &table, &row_buf,
-                        ) {
-                            Ok(k) => k,
-                            Err(e) => {
-                                backfill_err = Some(e);
-                                return false;
+                        // Append-build: the sorted stream is a pure
+                        // right-edge walk — one descent per leaf
+                        // boundary, ~100% leaf fill (the dense build).
+                        let mut hint = None;
+                        for r in &recs {
+                            let key = backfill_key(r, &arena);
+                            hint = index_bt.insert_index_append_hinted(key, r.rowid, hint)?;
+                        }
+                        final_root = index_bt.root;
+                    } else {
+                        table_bt.scan_table_borrowed(|rowid, payload| {
+                            if crate::storage::row_codec::decode_row_into(
+                                payload,
+                                n_cols,
+                                rowid,
+                                alias,
+                                &mut row_buf,
+                            )
+                            .is_err()
+                            {
+                                return true; // skip corrupt rows
                             }
-                        };
-                        if is_unique && !has_null_key {
-                            if let Some(key) = entry_keys.first() {
-                                match index_bt.lookup_index(key) {
-                                    Ok(existing) if !existing.is_empty() => {
-                                        backfill_err = Some(Error::constraint(format!(
-                                            "UNIQUE constraint failed: {}.{}",
-                                            table_name,
-                                            index
-                                                .columns
-                                                .iter()
-                                                .map(|c| c.name.as_str())
-                                                .collect::<Vec<_>>()
-                                                .join(", ")
-                                        )));
-                                        return false; // stop the scan
-                                    }
-                                    Ok(_) => {}
-                                    Err(e) => {
-                                        backfill_err = Some(e);
-                                        return false;
+                            // Partial index: only rows matching the WHERE clause.
+                            if let Some(pred) = &partial {
+                                match crate::executor::eval_row_public(
+                                    pred,
+                                    &row_buf,
+                                    &col_names,
+                                    &ctx.params,
+                                    &ctx.named_params,
+                                ) {
+                                    Ok(v) if v.is_truthy() => {}
+                                    _ => return true,
+                                }
+                            }
+                            // NULLs are distinct: rows with ANY NULL among
+                            // the indexed columns are exempt from the UNIQUE
+                            // duplicate check (SQLite semantics — you can
+                            // CREATE UNIQUE INDEX over data holding many NULLs).
+                            let has_null_key = index.columns.iter().any(|c| {
+                                table
+                                    .find_column(&c.name)
+                                    .and_then(|p| row_buf.get(p))
+                                    .map(|v| v.is_null())
+                                    .unwrap_or(false)
+                            });
+                            // Multi-entry keys: specialized access methods
+                            // contribute one entry PER tsvector lexeme /
+                            // covered grid cell (validated tsvector / geometry
+                            // errors abort the CREATE INDEX, matching
+                            // PostgreSQL's GIN input strictness).
+                            let entry_keys = match crate::executor::index_am::index_entry_keys(
+                                &index, &table, &row_buf,
+                            ) {
+                                Ok(k) => k,
+                                Err(e) => {
+                                    backfill_err = Some(e);
+                                    return false;
+                                }
+                            };
+                            if is_unique && !has_null_key {
+                                if let Some(key) = entry_keys.first() {
+                                    match index_bt.lookup_index(key) {
+                                        Ok(existing) if !existing.is_empty() => {
+                                            backfill_err = Some(Error::constraint(format!(
+                                                "UNIQUE constraint failed: {}.{}",
+                                                table_name,
+                                                index
+                                                    .columns
+                                                    .iter()
+                                                    .map(|c| c.name.as_str())
+                                                    .collect::<Vec<_>>()
+                                                    .join(", ")
+                                            )));
+                                            return false; // stop the scan
+                                        }
+                                        Ok(_) => {}
+                                        Err(e) => {
+                                            backfill_err = Some(e);
+                                            return false;
+                                        }
                                     }
                                 }
                             }
-                        }
-                        for entry_key in &entry_keys {
-                            if let Err(e) = index_bt.insert_index(entry_key, rowid) {
-                                backfill_err = Some(e);
-                                return false;
+                            for entry_key in &entry_keys {
+                                if let Err(e) = index_bt.insert_index(entry_key, rowid) {
+                                    backfill_err = Some(e);
+                                    return false;
+                                }
                             }
+                            true
+                        })?;
+                        if let Some(e) = backfill_err {
+                            return Err(e);
                         }
-                        true
-                    })?;
-                    if let Some(e) = backfill_err {
-                        return Err(e);
+                        // Splits during the backfill may have moved the root.
+                        final_root = index_bt.root;
                     }
-                    // Splits during the backfill may have moved the root.
-                    final_root = index_bt.root;
                 }
                 let index = crate::schema::Index {
                     root_page: final_root,
@@ -16643,6 +16779,123 @@ fn schema_tree_mutate<T>(pager: &Pager, f: impl FnOnce(&mut Btree<'_>) -> Result
         crate::storage::vacuum::repin_schema_root(pager, root)?;
     }
     Ok(out)
+}
+
+/// Packed backfill record: key bytes live in one shared arena; `len`
+/// carries the NULL-exemption flag in its low bit (SQLite's
+/// NULLs-are-distinct rule for UNIQUE indexes).
+#[derive(Clone, Copy)]
+struct BackfillRec {
+    off: u32,
+    /// High 31 bits: key length. Low bit: any indexed column is NULL
+    /// (exempt from the UNIQUE adjacent-duplicate check).
+    len_null: u32,
+    rowid: i64,
+}
+
+/// Arena budget for the sorted backfill: 8M entries at ~16B of record +
+/// key bytes is ~250 MB worst case — inside the marathons' RSS budget
+/// when it engages, and above every CREATE INDEX shape the CI board
+/// exercises on the sorted path. Bigger tables (and non-B-tree access
+/// methods) keep the streaming per-row path unchanged.
+const BACKFILL_SORT_MAX_ENTRIES: usize = 8 << 20;
+
+/// Sort the collected (key, rowid) records by the index's total order
+/// (key bytes, then rowid) — an arena-pointer sort, no key copies.
+fn backfill_sort_recs(recs: &mut [BackfillRec], arena: &[u8]) {
+    recs.sort_unstable_by(|a, b| {
+        let (ka, kb) = (backfill_key(a, arena), backfill_key(b, arena));
+        (ka, a.rowid).cmp(&(kb, b.rowid))
+    });
+}
+
+#[inline]
+fn backfill_key<'a>(r: &BackfillRec, arena: &'a [u8]) -> &'a [u8] {
+    &arena[r.off as usize..r.off as usize + (r.len_null >> 1) as usize]
+}
+
+/// Resolve an object's CURRENT root from the schema tree — the
+/// authoritative view (root syncs keep the rootpage column current;
+/// the catalog's `Arc<Index>` carries the CREATE-time root and is
+/// never replaced — the live root rides the override maps). The vacuum
+/// machinery reads roots this way throughout (see
+/// `object_roots_from_schema`).
+fn object_root_from_schema(db: &Database, name: &str) -> Result<Option<u32>> {
+    let mut root: Option<u32> = None;
+    let mut bt = Btree::new(&db.pager, 0, false);
+    bt.scan_table(|_, payload| {
+        if let Ok(row) = decode_row(payload, 5, 0, None) {
+            if let Some((_, iname, _, r, _)) = crate::schema::decode_schema_row(&row) {
+                if iname.eq_ignore_ascii_case(name) {
+                    root = Some(crate::schema::rootpage_to_internal(r));
+                    return false; // found — stop the walk
+                }
+            }
+        }
+        true
+    })?;
+    Ok(root)
+}
+
+/// Copy one index's entries from the SOURCE tree to a FRESH target tree:
+/// scan_index walks the source in (key, rowid) order (the tree's own
+/// total order — overflow keys reassembled), and the append-hinted
+/// insert builds the target left to right — one descent per leaf
+/// boundary, ~100% leaf fill. The result is the same multiset the DDL
+/// replay's backfill would produce, at a fraction of the cost and with
+/// dense fill instead of random-split sparsity.
+///
+/// Returns the target tree's final root (splits may have moved it).
+fn vacuum_copy_index_entries(
+    src_db: &Database,
+    ix: &crate::schema::Index,
+    tmp: &mut Database,
+) -> Result<u32> {
+    use crate::storage::btree::Btree;
+    let root_page = tmp.pager.allocate_page()?;
+    {
+        let page = tmp.pager.get_page(root_page)?;
+        page.lock().init_leaf_index();
+    }
+    // The SOURCE root comes from the schema tree — the catalog's
+    // root_page field is the CREATE-time value (stale after splits).
+    let Some(src_root) = object_root_from_schema(src_db, &ix.name)? else {
+        return Err(Error::corruption(format!(
+            "vacuum: no schema row for index {}",
+            ix.name
+        )));
+    };
+    let mut target = Btree::new(&tmp.pager, root_page, true);
+    let mut hint: Option<crate::storage::btree::AppendHint> = None;
+    let mut copy_err: Option<crate::error::Error> = None;
+    {
+        let mut source = Btree::new(&src_db.pager, src_root, true);
+        let mut n_copied: usize = 0;
+        let r = source.scan_index(|rowid, key| {
+            match target.insert_index_append_hinted(key, rowid, hint.take()) {
+                Ok(h) => {
+                    hint = h;
+                    n_copied += 1;
+                    true
+                }
+                Err(e) => {
+                    if std::env::var_os("RSQL_VAC_DEBUG").is_some() {
+                        eprintln!("[vacdbg] copy insert failed at entry {n_copied} (rowid {rowid}, key {:02X?}): {e}", &key[..key.len().min(16)]);
+                    }
+                    copy_err = Some(e);
+                    false
+                }
+            }
+        });
+        if std::env::var_os("RSQL_VAC_DEBUG").is_some() {
+            eprintln!("[vacdbg] index {} scan result={:?} copied={n_copied} src_root={src_root} tgt_root={root_page}", ix.name, r.is_ok());
+        }
+        r?;
+    }
+    if let Some(e) = copy_err {
+        return Err(e);
+    }
+    Ok(target.root)
 }
 
 fn insert_schema_row(pager: &Pager, row: &[Value]) -> Result<()> {

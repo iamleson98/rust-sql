@@ -902,7 +902,9 @@ pub(crate) fn replay_stmt_undo(
                         decode_row(&payload, table.n_columns(), rowid, table.rowid_alias)
                     {
                         for idx in &indexes {
-                            let _ = insert_index_entry(ctx, idx, &table, &row, rowid);
+                            // Idempotent: an un-applied sorted-batch
+                            // buffer left this row's entries live.
+                            let _ = insert_index_entry_if_absent(ctx, idx, &table, &row, rowid);
                         }
                     }
                 }
@@ -955,7 +957,10 @@ pub(crate) fn replay_stmt_undo(
                             decode_row(&old_payload, table.n_columns(), rowid, table.rowid_alias)
                         {
                             for idx in &indexes {
-                                let _ = insert_index_entry(ctx, idx, &table, &old_row, rowid);
+                                // Idempotent: an un-applied sorted-batch
+                                // buffer left this row's OLD entries live.
+                                let _ =
+                                    insert_index_entry_if_absent(ctx, idx, &table, &old_row, rowid);
                             }
                         }
                     }
@@ -997,6 +1002,24 @@ pub(crate) fn journal_row_rewrite(
 /// Same as [`journal_row_rewrite`] but from an already-encoded pre-update
 /// payload (the streaming path stashes it during the scan phase — no
 /// re-encode). Byte-for-byte the same contract.
+/// [`journal_row_rewrite_payload`] but the entry OWNS the payload —
+/// the bulk-branch journal loop moves each row's stash in (no per-row
+/// alloc + copy). Callers must not need the stash afterwards.
+pub(crate) fn journal_row_rewrite_payload_owned(
+    ctx: &mut ExecContext<'_>,
+    table: &Table,
+    rowid: i64,
+    old_payload: Vec<u8>,
+) {
+    if let Some(t) = ctx.catalog().get_table(&table.name.to_ascii_lowercase()) {
+        ctx.stmt_undo.push(StmtUndoEntry::Updated {
+            table: t,
+            rowid,
+            old_payload,
+        });
+    }
+}
+
 pub(crate) fn journal_row_rewrite_payload(
     ctx: &mut ExecContext<'_>,
     table: &Table,
@@ -22004,9 +22027,226 @@ pub(crate) fn dbg_fused() -> bool {
 }
 
 #[inline]
+pub(crate) fn updtime() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RSQL_UPDTIME").is_some())
+}
+
+#[inline]
 pub(crate) fn dbg_idxl() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("RSQL_DBG_IDXL").is_some())
+}
+
+/// Extract a plain-column B-tree index key DIRECTLY from an encoded row
+/// payload: walk the value spans once, decode ONLY the indexed columns
+/// (the rowid-alias column encodes from the rowid itself — the stored
+/// byte is the marker), fold each value through its collation, and
+/// concatenate the order-key bytes. The result is byte-identical to
+/// decode_row + encode_index_key with ZERO row materialization and zero
+/// per-op key evaluation. Returns false on any structural surprise (the
+/// caller falls back to the decode path for that row).
+fn extract_index_key_from_payload(
+    payload: &[u8],
+    n_cols: usize,
+    rowid: i64,
+    alias: Option<usize>,
+    idx_columns: &[crate::schema::IndexColumn],
+    positions: &[usize],
+    out: &mut Vec<u8>,
+    regions: &mut Vec<(u32, u32)>,
+) -> bool {
+    out.clear();
+    if !crate::storage::row_codec::row_column_regions_into(payload, n_cols, alias, regions) {
+        return false;
+    }
+    for (col, &pos) in idx_columns.iter().zip(positions) {
+        if Some(pos) == alias {
+            Value::Integer(rowid).encode_order_key_into(out);
+            continue;
+        }
+        let Some(&(off, len)) = regions.get(pos) else {
+            return false;
+        };
+        let span = &payload[off as usize..off as usize + len as usize];
+        match Value::decode(span) {
+            Ok((v, n)) if n == len as usize => {
+                let folded = crate::plugin::collation_fold_key_ref(&col.collation, &v);
+                folded.encode_order_key_into(out);
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// The fully-batched shape's op pre-pass: walk the collected update set
+/// once and buffer every row's index ops. Plain-column indexes extract
+/// keys payload-directly; expression / partial indexes (and any row the
+/// extractor declines) take the decode path — the same code the per-row
+/// loop used, correctness identical, only the cost differs. Deferred
+/// (size-changed) rows still get their table rewrite in the per-row
+/// loop, but their ops are ALREADY buffered here — the loop skips its
+/// own journal + maintenance sections for them.
+#[allow(clippy::too_many_arguments)]
+fn buffer_index_ops_pre_pass(
+    ctx: &mut ExecContext<'_>,
+    table: &Table,
+    indexes: &[&std::sync::Arc<crate::schema::Index>],
+    roots: &mut [u32],
+    bufs: &mut [IndexOpBuf],
+    order: &[usize],
+    updates: &[UpdateRec],
+    arena: &[u8],
+    params: &[Value],
+    named_params: &std::collections::HashMap<String, Value>,
+) -> Result<()> {
+    let n_cols = table.n_columns();
+    let alias = table.rowid_alias;
+    // Per index: fast-extract eligibility + resolved column positions.
+    let mut fast: Vec<bool> = Vec::with_capacity(indexes.len());
+    let mut positions: Vec<Vec<usize>> = Vec::with_capacity(indexes.len());
+    for idx in indexes {
+        let mut ok = idx.partial_expr.is_none();
+        let mut pos_v = Vec::with_capacity(idx.columns.len());
+        for col in &idx.columns {
+            match (col.expr.is_none(), table.find_column(&col.name)) {
+                (true, Some(p)) => pos_v.push(p),
+                _ => {
+                    ok = false;
+                    pos_v.push(0); // placeholder — never read when !ok
+                }
+            }
+        }
+        fast.push(ok);
+        positions.push(pos_v);
+    }
+    let mut regions: Vec<(u32, u32)> = Vec::new();
+    let mut old_key: Vec<u8> = Vec::new();
+    let mut new_key: Vec<u8> = Vec::new();
+    let mut old_row_buf: Vec<Value> = Vec::with_capacity(n_cols);
+    let mut new_row_buf: Vec<Value> = Vec::with_capacity(n_cols);
+    for &i in order {
+        let (rowid, rng, old_stash) = &updates[i];
+        let Some(old_payload) = old_stash.as_deref() else {
+            continue; // today's per-row loop skips these too
+        };
+        let new_payload: &[u8] = &arena[rng.clone()];
+        for (ti, idx) in indexes.iter().enumerate() {
+            let mut handled = false;
+            if fast[ti] {
+                let ok_old = extract_index_key_from_payload(
+                    old_payload,
+                    n_cols,
+                    *rowid,
+                    alias,
+                    &idx.columns,
+                    &positions[ti],
+                    &mut old_key,
+                    &mut regions,
+                );
+                let ok_new = extract_index_key_from_payload(
+                    new_payload,
+                    n_cols,
+                    *rowid,
+                    alias,
+                    &idx.columns,
+                    &positions[ti],
+                    &mut new_key,
+                    &mut regions,
+                );
+                if ok_old && ok_new {
+                    if old_key != new_key {
+                        bufs[ti].0.push((old_key.clone(), *rowid));
+                        bufs[ti].1.push((new_key.clone(), *rowid));
+                    }
+                    handled = true;
+                }
+            }
+            if !handled {
+                // Expression / partial index, or a structural fallback:
+                // the decode path (identical to the per-row loop's).
+                if decode_row_into(old_payload, n_cols, *rowid, alias, &mut old_row_buf).is_err()
+                    || decode_row_into(new_payload, n_cols, *rowid, alias, &mut new_row_buf)
+                        .is_err()
+                {
+                    continue;
+                }
+                let old_keys =
+                    crate::executor::index_am::index_entry_keys(idx, table, &old_row_buf)?;
+                let new_keys =
+                    crate::executor::index_am::index_entry_keys(idx, table, &new_row_buf)?;
+                let (old_in, new_in) = partial_membership_pair(
+                    idx,
+                    table,
+                    &old_row_buf,
+                    &new_row_buf,
+                    params,
+                    named_params,
+                );
+                if old_keys == new_keys && old_in == new_in {
+                    continue;
+                }
+                if old_in {
+                    for k in &old_keys {
+                        bufs[ti].0.push((k.clone(), *rowid));
+                    }
+                }
+                if new_in {
+                    for k in &new_keys {
+                        bufs[ti].1.push((k.clone(), *rowid));
+                    }
+                }
+            }
+            if bufs[ti].0.len() + bufs[ti].1.len() >= INDEX_BATCH_CHUNK_OPS {
+                flush_index_op_buf(ctx, idx, &mut roots[ti], &mut bufs[ti])?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The streaming UPDATE's collected write set: (rowid, arena range, stashed old payload).
+type UpdateRec = (i64, std::ops::Range<usize>, Option<Vec<u8>>);
+
+/// One index's buffered maintenance ops: (key, rowid) pairs, deletes
+/// and inserts in separate lists (each sorted independently at flush).
+pub(crate) type IndexOpBuf = (Vec<(Vec<u8>, i64)>, Vec<(Vec<u8>, i64)>);
+
+/// Buffered index ops per index before a sorted-sweep flush. 1M ops is
+/// ~40-60 MB of (key, rowid) pairs — the 100M marathon's RSS budget
+/// holds ten such chunks comfortably.
+const INDEX_BATCH_CHUNK_OPS: usize = 1 << 20;
+
+/// Sort + sweep-apply one index's buffered maintenance ops through the
+/// pinned-leaf sweep (see Btree::delete_index_sorted /
+/// insert_index_sorted). The delete and insert multisets are sorted
+/// independently and applied as two passes — the resulting (key, rowid)
+/// multiset is identical to per-row maintenance for a non-unique index
+/// (an op pair from row R can never alias a pair from row R': rowids
+/// are unique per row).
+pub(crate) fn flush_index_op_buf(
+    ctx: &mut ExecContext<'_>,
+    idx: &crate::schema::Index,
+    root: &mut u32,
+    bufs: &mut IndexOpBuf,
+) -> Result<()> {
+    let (dels, ins) = bufs;
+    if dels.is_empty() && ins.is_empty() {
+        return Ok(());
+    }
+    dels.sort_unstable_by(|a, b| (&a.0[..], a.1).cmp(&(&b.0[..], b.1)));
+    ins.sort_unstable_by(|a, b| (&a.0[..], a.1).cmp(&(&b.0[..], b.1)));
+    let mut ibt = Btree::new(ctx.pager, *root, true);
+    ibt.delete_index_sorted(dels)?;
+    ibt.insert_index_sorted(ins)?;
+    if ibt.root != *root {
+        *root = ibt.root;
+        ctx.set_index_root(&idx.name, ibt.root);
+    }
+    dels.clear();
+    ins.clear();
+    Ok(())
 }
 
 fn insert_index_entry(
@@ -22030,6 +22270,42 @@ fn insert_index_entry(
                 "[idx+] {} rowid={} key={:02X?} root={}",
                 index.name, rowid, key_bytes, root
             );
+        }
+        bt.insert_index(key_bytes, rowid)?;
+    }
+    if bt.root != root {
+        ctx.set_index_root(&index.name, bt.root);
+    }
+    Ok(())
+}
+
+/// [`insert_index_entry`] but IDEMPOTENT — an already-present entry
+/// (same (key, rowid) pair) is left untouched. The statement-undo
+/// replay re-inserts OLD index entries on rollback, and with
+/// sorted-batch maintenance a failed statement may carry UN-APPLIED op
+/// buffers: those rows' pre-statement entries were never removed, so a
+/// blind insert would DUPLICATE them. Presence of the exact pair makes
+/// the re-insert a no-op (non-unique and unique indexes alike — the
+/// pair identifies the entry), which makes the replay heal ANY mix of
+/// flushed and un-flushed batches, per row, on its own.
+fn insert_index_entry_if_absent(
+    ctx: &mut ExecContext<'_>,
+    index: &crate::schema::Index,
+    table: &Table,
+    row: &[Value],
+    rowid: i64,
+) -> Result<()> {
+    let keys = crate::executor::index_am::index_entry_keys(index, table, row)?;
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let root = ctx.index_root(index);
+    let mut bt = Btree::new(ctx.pager, root, true);
+    let mut hits: Vec<i64> = Vec::new();
+    for key_bytes in &keys {
+        bt.lookup_index_into(key_bytes, &mut hits)?;
+        if hits.contains(&rowid) {
+            continue;
         }
         bt.insert_index(key_bytes, rowid)?;
     }
@@ -23496,7 +23772,7 @@ fn try_streaming_update(
     // (rowid, payload range in the arena, old-payload stash). The arena
     // replaces one Vec<u8> allocation PER ROW — a 5000-row UPDATE paid
     // 5000 alloc+copy pairs just to hand payloads to phase 2.
-    let mut updates: Vec<(i64, std::ops::Range<usize>, Option<Vec<u8>>)> = Vec::new();
+    let mut updates: Vec<UpdateRec> = Vec::new();
     let mut update_arena: Vec<u8> = Vec::new();
     // RETURNING: stash decoded new rows too (only when needed).
     let mut returning_rows: Vec<Vec<Value>> = Vec::new();
@@ -23505,6 +23781,7 @@ fn try_streaming_update(
     // Rows patched IN PLACE by the fused single-pass scan (see the
     // RowidRange / Scan / merge-scan branches): these never enter
     // `updates`, so the final count adds them explicitly.
+    let t_scan_start = std::time::Instant::now();
     let mut fused_patched: usize = 0;
 
     let mut bt = Btree::new(ctx.pager, root, false);
@@ -24367,6 +24644,9 @@ fn try_streaming_update(
             .collect();
     }
 
+    if updtime() {
+        eprintln!("[updtime] scan+collect: {:?}", t_scan_start.elapsed());
+    }
     // Phase 2: apply the updates. For each (rowid, new_payload, old_payload):
     //   1. The old payload was pre-stashed during the scan when an indexed
     //      column is being SET — no per-row re-fetch descent needed.
@@ -24385,6 +24665,34 @@ fn try_streaming_update(
         index_roots.push(r);
         index_bts.push(Btree::new(ctx.pager, r, true));
     }
+    // Sorted-batch eligibility per index (the pinned-leaf sweep): no
+    // update triggers (a trigger body may read the index mid-statement
+    // and must see per-row maintenance), non-unique (violations must
+    // surface per row with the offending row), plain B-tree access
+    // method. Eligible indexes buffer their op multiset and flush it
+    // as sorted sweeps (chunked — RSS bounded at any scale; the op
+    // multiset is order-independent for non-unique indexes, so chunk
+    // interleaving is sound).
+    let index_batch_ok: Vec<bool> = touched_indexes
+        .iter()
+        .map(|idx| {
+            !has_update_triggers
+                && !idx.unique
+                && matches!(idx.kind, crate::schema::IndexKind::Btree)
+        })
+        .collect();
+    let mut index_op_bufs: Vec<IndexOpBuf> = touched_indexes
+        .iter()
+        .map(|_| (Vec::new(), Vec::new()))
+        .collect();
+    // The fully-batched shape: every touched index buffers its ops, so
+    // the TABLE updates can run through update_table_bulk (the same-size
+    // merge-scan patch pass — previously disabled the moment ANY index
+    // was touched, which forced a per-row descent per row), and the
+    // index ops are extracted DIRECTLY from the stashed old payloads +
+    // the arena's new payloads (no row materialization at all for
+    // plain-column indexes).
+    let all_batchable = !touched_indexes.is_empty() && index_batch_ok.iter().all(|&b| b);
     // Sort by rowid (merge-scan sources already are; IndexRange sources
     // are in index order). Phase 2's per-row work is order-independent.
     let mut order: Vec<usize> = (0..updates.len()).collect();
@@ -24401,16 +24709,47 @@ fn try_streaming_update(
     // Bulk in-place pass ONLY when no indexed column is being SET —
     // bulk-applied rows skip the per-row index maintenance, so any
     // touched index forces the per-row path (defer everything).
-    if touched_indexes.is_empty() && !has_update_triggers {
+    if (touched_indexes.is_empty() || all_batchable) && !has_update_triggers {
         // Statement journal FIRST: every row this bulk pass may apply gets
         // its pre-update payload captured (over-journaling is a no-op on
         // replay — see journal_row_rewrite_payload). A failure after some
         // rows landed (an error in the per-row phase that follows, an
         // io fault mid-bulk) replays them all back.
-        for &i in order.iter() {
-            let (rowid, _, old_stash) = &updates[i];
-            if let Some(old) = old_stash.as_deref() {
-                journal_row_rewrite_payload(ctx, table, *rowid, old);
+        // Order matters: the op pre-pass BORROWS each row's stashed old
+        // payload (key extraction), and only then does the journal loop
+        // MOVE the stash into its undo entry — a take-first order would
+        // leave the pre-pass nothing to extract (an empty buffer set
+        // silently skipped ALL index maintenance).
+        // The batched shape's op pre-pass: buffer every row's index ops
+        // BEFORE the table bulk pass (order is irrelevant — the op
+        // multiset is what the sweeps apply, and the per-row loop only
+        // rewrites DEFERRED rows' table cells).
+        if all_batchable {
+            let t0 = std::time::Instant::now();
+            buffer_index_ops_pre_pass(
+                ctx,
+                table,
+                &touched_indexes,
+                &mut index_roots,
+                &mut index_op_bufs,
+                &order,
+                &updates,
+                &update_arena,
+                &params,
+                &named_params,
+            )?;
+            if updtime() {
+                eprintln!(
+                    "[updtime] pre-pass: {:?} ({} updates)",
+                    t0.elapsed(),
+                    order.len()
+                );
+            }
+        }
+        for i in order.iter().copied() {
+            let (rowid, _, old_stash) = &mut updates[i];
+            if let Some(old) = old_stash.take() {
+                journal_row_rewrite_payload_owned(ctx, table, *rowid, old);
             }
         }
         let sorted_updates: Vec<(i64, &[u8])> = order
@@ -24421,7 +24760,16 @@ fn try_streaming_update(
             })
             .collect();
         let mut bt = Btree::new(ctx.pager, root, false);
+        let t_bulk = std::time::Instant::now();
         bt.update_table_bulk(&sorted_updates, &mut deferred)?;
+        if updtime() {
+            eprintln!(
+                "[updtime] bulk table: {:?} ({} updates, {} deferred)",
+                t_bulk.elapsed(),
+                sorted_updates.len(),
+                deferred.len()
+            );
+        }
         if bt.root != root {
             root = bt.root;
             ctx.set_table_root(&table.name, root);
@@ -24444,10 +24792,13 @@ fn try_streaming_update(
     for &di in &deferred {
         done_mask[order[di]] = false; // not applied yet
     }
+    let t_defer_loop = std::time::Instant::now();
+    let mut defer_count = 0usize;
     for &i in order.iter() {
         if done_mask[i] {
             continue;
         }
+        defer_count += 1;
         let (rowid, new_payload_range, old_payload_stash) = &updates[i];
         let new_payload: &[u8] = &update_arena[new_payload_range.clone()];
         let old_payload_opt: Option<&[u8]> = old_payload_stash.as_deref();
@@ -24481,8 +24832,12 @@ fn try_streaming_update(
             // Statement journal: this row's pre-update payload, captured
             // before the rewrite (rows from the bulk branch were already
             // journaled pre-bulk — the entry replay is a no-op then).
-            if let Some(old) = old_payload_opt {
-                journal_row_rewrite_payload(ctx, table, *rowid, old);
+            // The batched shape journaled EVERY row pre-bulk; the copy
+            // here would only be replayed as a no-op.
+            if !all_batchable {
+                if let Some(old) = old_payload_opt {
+                    journal_row_rewrite_payload(ctx, table, *rowid, old);
+                }
             }
             let mut bt = Btree::new(ctx.pager, root, false);
             let did_in_place = bt.update_table(*rowid, new_payload).unwrap_or(false);
@@ -24522,7 +24877,12 @@ fn try_streaming_update(
         // decoded rows a second time and created a fresh Btree per call).
         // Index B+trees are reused across the loop: their roots track
         // splits, and the pager keeps pages hot.
-        if needs_old_payload {
+        // The batched shape buffered this row's ops in the pre-pass —
+        // the maintenance section (and its row decodes) is per-row-loop
+        // work only for the partially-batched shapes. Triggers are off
+        // in the batched shape, so the AFTER-trigger section below needs
+        // nothing from these decodes either.
+        if needs_old_payload && !all_batchable {
             if let Some(old_payload) = old_payload_opt {
                 old_row_buf.clear();
                 if decode_row_into(
@@ -24557,6 +24917,27 @@ fn try_streaming_update(
                         &named_params,
                     );
                     if old_keys == new_keys && old_in == new_in {
+                        continue;
+                    }
+                    // Sorted-batch path: buffer the op multiset, flush
+                    // per chunk as sorted sweeps. Partial-index membership
+                    // gates the ops exactly as the immediate path does
+                    // (old_in / new_in).
+                    if index_batch_ok[ti] {
+                        let buf = &mut index_op_bufs[ti];
+                        if old_in {
+                            for old_key in &old_keys {
+                                buf.0.push((old_key.clone(), *rowid));
+                            }
+                        }
+                        if new_in {
+                            for new_key in &new_keys {
+                                buf.1.push((new_key.clone(), *rowid));
+                            }
+                        }
+                        if buf.0.len() + buf.1.len() >= INDEX_BATCH_CHUNK_OPS {
+                            flush_index_op_buf(ctx, idx, &mut index_roots[ti], buf)?;
+                        }
                         continue;
                     }
                     let ibt = &mut index_bts[ti];
@@ -24621,6 +25002,26 @@ fn try_streaming_update(
         }
         ctx.changes += 1;
         updated += 1;
+    }
+    // Success path: flush every buffered index batch. (The error paths
+    // DON'T flush — the un-applied buffers are simply dropped and
+    // replay_stmt_undo's IDEMPOTENT index re-inserts restore the
+    // pre-statement state per row; see insert_index_entry_if_absent.)
+    if updtime() {
+        eprintln!(
+            "[updtime] deferred loop: {:?} ({} rows)",
+            t_defer_loop.elapsed(),
+            defer_count
+        );
+    }
+    {
+        let t0 = std::time::Instant::now();
+        for (ti, idx) in touched_indexes.iter().enumerate() {
+            flush_index_op_buf(ctx, idx, &mut index_roots[ti], &mut index_op_bufs[ti])?;
+        }
+        if updtime() {
+            eprintln!("[updtime] sweep flush: {:?}", t0.elapsed());
+        }
     }
     // Count the bulk-applied rows (they skipped the per-row loop).
     {
