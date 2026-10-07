@@ -2063,3 +2063,19 @@ Work Log:
 
 Stage Summary:
 - The sorted-batch family landed end to end: the pinned-leaf sweep primitive, the UPDATE executor's buffered/batched shape with the idempotent-replay error contract, the sorted CREATE INDEX backfill, and the vacuum's direct index copy. Band-UPDATE on the dev box went 3.36x loss to ~1.4x (with the sweep 2.8-4x faster than per-op in isolation — the remaining gap is scan+I/O context, scoped for the next round), CREATE INDEX 2x, the 50M vacuum from +6.7% growth to -16.9% reclaim. A pre-existing partial-index wrong-answer planner bug was found by the new suite and fixed at all selection sites. CI verdict (the 100M band-upd + build rows, all three platforms) is the authoritative board check.
+---
+Task ID: sb-2 (the round's CI verdict + the bench_full chase)
+Agent: main (Super Z)
+Task: Land the sorted-batch round's CI verdict (run 37582198811 on 69d3b39), chase the one red row (bench-gate macOS), and refresh the README's honest board.
+
+Work Log:
+- Run 37582198811 (69d3b39): 42/43 jobs green — the ONLY failure was bench-gate (macos) on "Point lookup (SELECT by id, 1k queries)": 1.58x WIN / 0.65x LOSS / 0.84x LOSS across the gate's three attempts — a 2.7x swing on the ENGINE side while SQLite sat steady at 1.80-2.63M ops/s. The read path is untouched by the round's diff; the exact class d6b90b8 documented in bench_compare (run 37305068286): a one-time cost inside a single-window point-lookup loop's only timed window. Fix (9752383): bench_full's two point-lookup rows (by-id PK + by-val secondary, BOTH engines) take best_of::<7> windows with adaptive warmup — the harness's own established convention. Dev box: 1.56x / 1.87x steady-state wins.
+- THE 100M MARATHONS — ALL THREE PLATFORMS GREEN at 69d3b39, and the round flipped both documented residuals:
+  - ubuntu: build 89,129 vs 83,725 rs/s (1.06x WIN), aggregate 6,685 vs 9,109 ms (0.73x), group97 6,835 vs 28,788 ms (0.24x), top25 4.8s absolute, band-upd 9,267 vs 10,141 ms (0.91x WIN — was 1.67x), file 2,865.2 vs 3,014.5 MB (0.95x — SMALLER than SQLite, was 1.16x larger), RSS 144.8/476 MB, M6 VACUUM reclaimed 15.7%.
+  - windows: build 70,074 vs 55,848 (1.25x WIN), aggregate 0.88x, group97 0.24x, band-upd 11,082 vs 12,306 ms (0.90x WIN — was 1.34x), file 2,925.0 vs 2,940.8 MB (SMALLER, was 1.23x larger), RSS 129.6/476 MB, VACUUM 13.9% reclaimed.
+  - macOS: build 100,743 vs 50,122 (2.01x WIN), aggregate 0.43x, group97 0.15x, band-upd 43,747 vs 33,473 ms (1.31x — was 2.57x; the ARM fleet's slow-storage I/O draw owns the window), file 2,865.2 vs 3,014.5 MB (SMALLER), RSS 230.1/508 MB, VACUUM 15.7%.
+- README (732187d): the 100M table now carries the sweep (band-upd 0.91x WIN, file 0.95x SMALLER, build 1.06-2.01x, per-OS notes), and the Remaining-gaps mass-UPDATE bullet is rewritten to the landed state (the sorted-batch round: sweep + bulk table pass + payload-direct extraction; macOS-only 1.31x residual; the CREATE INDEX 2x + vacuum direct-copy file-size story).
+- Chasing run 37591876166 (732187d) for the fully-green close.
+
+Stage Summary:
+- The user's contract advanced materially at the flagship scale: at 100M rows the engine now beats bundled SQLite on EVERY M9 performance row on ubuntu and windows (band-upd included) and on all but band-upd on macOS (1.31x, halved), with the final file SMALLER than SQLite's on all three platforms (was +15-23% larger) and RSS flat at 129-230 MB against the 476-508 MB budgets. The one red CI row was the documented macOS single-window measurement class, fixed with the harness's established best-of convention.
