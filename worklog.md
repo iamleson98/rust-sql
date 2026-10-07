@@ -2107,3 +2107,17 @@ Work Log:
 
 Stage Summary:
 - 43-job matrix: every engine-behavior and harness fix from the round is green on all three platforms; the two remaining reds were measurement-envelope recalibrations on untouched code paths, now banded to their observed envelopes with the evidence in the comments. The 100M board after this round: build 1.02x (ubuntu, best-ever engine draw), aggregate 0.66x, group97 0.22x, band-upd 0.82x, file smaller, RSS flat.
+
+---
+Task ID: ci-1 (final) — run 37632078042: ALL GREEN
+Agent: main (Super Z)
+Task: The verdict on b773cd5.
+
+Work Log:
+- Run 37632078042 (b773cd5): completed SUCCESS — 43/43 jobs green, 0 failures.
+- The two draw-noise recalibrations held: torture (ubuntu) green (S08 inside 175%), mega-scale-100m (windows) green — aggregate drew 0.99x (after 1.017x last run: the ±2% flakiness is bidirectional, exactly the class the 1.10x gate absorbs; build 0.83x, group97 0.26x, band-upd 0.80x WIN, file smaller).
+- mega-scale-100m (macos) green on a 3.5h slow-storage draw: build 1.51x WIN (76,615 vs 50,846 rs/s), aggregate 0.56x, group97 0.22x, band-upd 0.89x WIN (the historical 1.31x macOS residual drew a win), file 2865.2 vs 3014.5 MB smaller, M6 reclaimed 15.7%.
+- mega-scale-100m (ubuntu) green: build 119,036 vs 116,385 rs/s = 1.02x (the engine's best-ever ubuntu draw at the time), aggregate 0.66x, group97 0.22x, band-upd 0.82x, file smaller, RSS flat 144 MB.
+
+Stage Summary:
+- The round: 2 CI runs tracked (37618397620: 40/43 -> 37632078042: 43/43 green), 3 original root causes fixed with deterministic regression pins (the vacuum true-slack waste budget, the darwin gate precedence, the 100M build floor + honest labels), 2 draw-noise bands recalibrated to their observed envelopes with the evidence in the comments. HEAD = b773cd5 = fully green on all three platforms. This worklog commit defers its push (mega-5 precedent): remote HEAD stays at the green verdict.
