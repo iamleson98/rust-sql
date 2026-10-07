@@ -22213,6 +22213,15 @@ type UpdateRec = (i64, std::ops::Range<usize>, Option<Vec<u8>>);
 /// and inserts in separate lists (each sorted independently at flush).
 pub(crate) type IndexOpBuf = (Vec<(Vec<u8>, i64)>, Vec<(Vec<u8>, i64)>);
 
+/// Minimum statement size (rows) before the sorted-batch path engages.
+/// The batch's fixed per-statement overhead (key clones + buffer + sort
+/// + sweep setup, ~1-2 us) is a WIN at mass scale and a regression tax
+/// on OLTP-sized statements — torture S13's fast-draw 0.85x (vs 0.98x
+/// on a slow draw, run 37592180792 vs 37582198811) pinned the class.
+/// Statements below this row count keep the immediate per-row path,
+/// which is exactly the pre-sorted-batch behavior.
+const INDEX_BATCH_MIN_ROWS: usize = 64;
+
 /// Buffered index ops per index before a sorted-sweep flush. 1M ops is
 /// ~40-60 MB of (key, rowid) pairs — the 100M marathon's RSS budget
 /// holds ten such chunks comfortably.
@@ -24673,10 +24682,12 @@ fn try_streaming_update(
     // as sorted sweeps (chunked — RSS bounded at any scale; the op
     // multiset is order-independent for non-unique indexes, so chunk
     // interleaving is sound).
+    let batch_worthy = updates.len() >= INDEX_BATCH_MIN_ROWS;
     let index_batch_ok: Vec<bool> = touched_indexes
         .iter()
         .map(|idx| {
-            !has_update_triggers
+            batch_worthy
+                && !has_update_triggers
                 && !idx.unique
                 && matches!(idx.kind, crate::schema::IndexKind::Btree)
         })
