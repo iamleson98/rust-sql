@@ -14,6 +14,7 @@
 //! page. After the swap the tree is rooted at 0 again.
 
 use crate::error::{Error, Result};
+use crate::storage::btree::{index_leaf_cell_size, table_leaf_cell_size_paged};
 use crate::storage::page::{PageType, DB_HEADER_SIZE, PAGE_HEADER_SIZE};
 use crate::storage::pager::{PageIdHashBuild, PageIdSet, Pager};
 
@@ -208,9 +209,12 @@ pub(crate) struct InPlaceCompaction {
 /// VACUUM fast-path eligibility walk: every leaf of every tree must be
 /// dense enough that a page-level path (the in-place WAL install or the
 /// verbatim image copy) reclaims all the waste there is. Policy per
-/// leaf, O(1) (no cell parsing — the CONTENT AREA, pointer-array end to
-/// page tail, bounds live bytes from above, and for the packed leaves
-/// the delete path's rebuild produces it IS the live bytes):
+/// leaf, O(cells) — the LIVE bytes are the pointer-array cell sum with
+/// the overflow-aware size helpers (the same accounting
+/// `compact_leaf_if_fragmented` uses); the content area alone is NOT a
+/// live-bytes bound, because `remove_cell_at` drops the pointer but
+/// leaves the dead cell bytes inside the content area (inserts reclaim
+/// them lazily):
 ///   - a 0-cell leaf (this engine's mass-delete signature — DELETE
 ///     never detaches pages, emptied leaves stay wired in) is PRUNABLE
 ///     by the image copier; `allow_empty = false` (the in-place plan,
@@ -219,12 +223,44 @@ pub(crate) struct InPlaceCompaction {
 ///     survivor leaves rebuilt at a low fill fraction by mass deletes.
 ///     Only the row-level rebuild re-flows those densely; both fast
 ///     paths decline.
+///   - WASTE BUDGET (file-wide, the third line): a leaf's TRUE slack is
+///     (page bytes minus header/pointer array minus live cells) —
+///     exactly what a row-level re-flow of that page would free, gap
+///     AND dead content bytes both. A file can sit ABOVE the hollow
+///     line on every leaf and still waste a large slice of its
+///     footprint: a dense bulk load minus an INTERLEAVED mass delete
+///     (id % 10 < 4) leaves every page ~60% live with a zero freelist
+///     and no 0-cell leaf — the macOS M6 draw of run 37597765597
+///     ("freelist=0 pages (of 217) | VACUUM 2ms -> 888864 bytes
+///     (reclaimed 0.0%)"). Both fast paths decline when the collected
+///     slack exceeds two frontier pages per tree plus 10% of the leaf
+///     footprint; the row-level rebuild runs and re-flows densely.
 pub(crate) fn trees_eligible_for_page_copy(
     src: &Pager,
     roots: &[u32],
     allow_empty: bool,
 ) -> Result<bool> {
     let psz = src.page_size() as usize;
+    // Waste-budget accumulators: the leaf footprint (page count) and
+    // the total TRUE free slack a row-level re-flow would reclaim (see
+    // the policy note above).
+    let mut leaf_pages: usize = 0;
+    let mut leaf_slack_bytes: usize = 0;
+    // Decline-reason instrumentation (the vacuum's own timing env):
+    // which guard fired, with the walk's running totals. A macro (not
+    // a closure) so the accumulators stay unborrowed and mutable.
+    let vac_dbg = std::env::var_os("RSQL_VAC_TIMING").is_some();
+    macro_rules! decline {
+        ($why:expr, $n:expr) => {
+            if vac_dbg {
+                eprintln!(
+                    "[vac] page-copy eligibility decline: {} \
+                     (n_cells={}, leaf_pages={}, leaf_slack_bytes={})",
+                    $why, $n, leaf_pages, leaf_slack_bytes
+                );
+            }
+        };
+    }
     let mut visited: PageIdSet = std::collections::HashSet::default();
     let mut stack: Vec<u32> = roots.iter().copied().filter(|&r| r != 0).collect();
     while let Some(page_id) = stack.pop() {
@@ -243,27 +279,68 @@ pub(crate) fn trees_eligible_for_page_copy(
         };
         match pt {
             PageType::LeafTable | PageType::LeafIndex => {
-                let ok = {
+                // (decline_reason, true_slack, n_cells): the slack is
+                // what a row-level re-flow of THIS page would free —
+                // the gap under the content start PLUS the dead cell
+                // bytes inside the content area (the live-byte sum is
+                // the compaction path's own accounting).
+                let (reason, slack, n) = {
                     let b = pr.lock();
                     let n = b.n_cells() as usize;
                     if n == 0 {
-                        allow_empty
+                        (
+                            if allow_empty {
+                                None
+                            } else {
+                                Some("empty leaf")
+                            },
+                            0,
+                            n,
+                        )
                     } else {
                         let content_start = b.cell_content_start() as usize;
                         let ptr_end = hdr + PAGE_HEADER_SIZE as usize + n * 2;
                         if content_start < ptr_end || content_start > psz {
-                            false // malformed: not a shape we fast-path
+                            (Some("malformed leaf"), 0, n)
+                            // not a shape we fast-path
                         } else {
-                            let content_area = psz - content_start;
-                            let usable = psz - ptr_end;
-                            content_area * 2 >= usable
+                            let mut live = 0usize;
+                            let mut live_ok = true;
+                            for i in 0..n as u16 {
+                                let p = b.cell_pointer(i) as usize;
+                                let size = match pt {
+                                    PageType::LeafIndex => {
+                                        index_leaf_cell_size(&b.data[p..], psz as u32)
+                                    }
+                                    _ => table_leaf_cell_size_paged(&b.data[p..], psz as u32),
+                                };
+                                match size {
+                                    Some(s) if s > 0 && p + s <= psz => live += s,
+                                    _ => {
+                                        live_ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if !live_ok {
+                                (Some("unreadable cells"), 0, n)
+                            } else {
+                                let content_area = psz - content_start;
+                                let usable = psz - ptr_end;
+                                let slack = (psz - ptr_end).saturating_sub(live);
+                                let hollow = content_area * 2 < usable;
+                                (if hollow { Some("hollow leaf") } else { None }, slack, n)
+                            }
                         }
                     }
                 };
                 drop(pr);
-                if !ok {
+                if let Some(why) = reason {
+                    decline!(why, n);
                     return Ok(false);
                 }
+                leaf_pages += 1;
+                leaf_slack_bytes += slack;
             }
             PageType::InteriorTable | PageType::InteriorIndex => {
                 let mut children = Vec::new();
@@ -288,6 +365,32 @@ pub(crate) fn trees_eligible_for_page_copy(
             }
             PageType::Overflow => {}
         }
+    }
+    // WASTE BUDGET: the page-level result keeps every non-empty leaf
+    // whole, so the collected TRUE slack (gap + dead content bytes)
+    // stays wasted in it. VACUUM's contract is a fully compact image —
+    // decline when the slack is a significant slice of the leaf
+    // footprint and let the row-level rebuild re-flow. Allowance: two
+    // pages per tree (a dense rebuild's own frontier pages are
+    // partially filled by construction) plus a 10% relative margin for
+    // steady-state fill variance.
+    let slack_allowance =
+        (roots.len().saturating_mul(2) + 2).saturating_mul(psz) + leaf_pages * psz / 10;
+    if leaf_slack_bytes > slack_allowance {
+        if vac_dbg {
+            eprintln!(
+                "[vac] page-copy eligibility decline: waste budget \
+                 (leaf_pages={leaf_pages}, leaf_slack_bytes={leaf_slack_bytes}, \
+                 allowance={slack_allowance})"
+            );
+        }
+        return Ok(false);
+    }
+    if vac_dbg {
+        eprintln!(
+            "[vac] page-copy eligibility ok: leaf_pages={leaf_pages}, \
+             leaf_slack_bytes={leaf_slack_bytes}, allowance={slack_allowance}"
+        );
     }
     Ok(true)
 }
