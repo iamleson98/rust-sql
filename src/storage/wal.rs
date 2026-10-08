@@ -789,6 +789,11 @@ impl Wal {
         Ok(())
     }
 
+    /// Current high-water length of the sidecar file (diagnostics).
+    pub fn file_len(&self) -> u64 {
+        self.file.metadata().map(|m| m.len()).unwrap_or(0)
+    }
+
     /// Current salts (diagnostics).
     pub fn salts(&self) -> (u32, u32) {
         (self.header.salt1, self.header.salt2)

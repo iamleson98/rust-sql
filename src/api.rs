@@ -8530,6 +8530,17 @@ impl Database {
         (self.pager.cache_size(), self.pager.cache_capacity())
     }
 
+    /// Pages written by the most recent COMMIT (dirty pages + drained
+    /// spill records in DELETE mode; WAL frames appended in WAL mode).
+    /// The DETERMINISTIC commit-work measure: commit LATENCY is hostage
+    /// to the runner's per-op I/O price (13 us/page healthy Windows
+    /// draws, ~650 us/page on IOPS-throttled ones — the 37773610851
+    /// episode), but the page COUNT is draw-free, so the stress suites
+    /// gate degradation on it.
+    pub fn last_commit_page_writes(&self) -> u64 {
+        self.pager.last_commit_page_writes()
+    }
+
     /// Page-cache hit accounting since open: `(hits, misses)` — the
     /// counters behind the live hit rate `hits / (hits + misses)`.
     /// A miss is one file-read (or WAL-frame read) page fetch; a hit is

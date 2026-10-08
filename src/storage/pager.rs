@@ -436,6 +436,23 @@ pub struct WalState {
 /// count).
 const WAL_AUTOCHECKPOINT_FRAMES: u32 = 1000;
 
+/// SPILL-ARENA CAP (the 37773610851 commit-tail round): when a DELETE-mode
+/// transaction's spill sidecar is at most this many bytes, the COMMIT reads
+/// the WHOLE sidecar once (a few sequential positioned reads) instead of one
+/// positioned read per spilled page — a 3000-page bulk load's commit paid
+/// ~3000 4-KiB preads on the sidecar (the scattered-index tail of
+/// `limit_million_row_file`), which healthy disks serve in tens of ms but
+/// IOPS-throttled draws (AV-filtered shared Windows runners) pay at
+/// ~0.1-1 ms PER READ. Above the cap (mega transactions) the per-page drain
+/// keeps the streaming-RSS contract (nothing materializes the whole
+/// database image).
+const SPILL_ARENA_CAP: usize = 16 << 20;
+
+/// COMMIT-RUN CAP: contiguous page-id runs in the DELETE commit's write
+/// walk are issued as ONE positioned write per run, capped at this many
+/// bytes (256 pages at the default page size — the WAL fold's run cap).
+const COMMIT_RUN_CAP_BYTES: usize = 1 << 20;
+
 /// Adaptive cache growth's ceiling (pages). 16k pages = 64 MiB at the
 /// default 4 KiB page — an interior-ring + sweep working set that keeps
 /// even a 1B-row index's upper levels resident, still far inside the
@@ -679,6 +696,23 @@ impl DeleteSpill {
     fn read_page_at(&self, off: u64, buf: &mut [u8]) -> Result<()> {
         read_exact_at(&self.file, off + 4, buf)
     }
+
+    /// High-water length of the sidecar (the commit's arena sizing probe).
+    fn file_len(&self) -> u64 {
+        self.file.metadata().map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Bulk-read the WHOLE sidecar into `buf` (`buf.len()` == `file_len`):
+    /// the commit's arena path — every spilled page's body is then a slice
+    /// of the arena, replacing one positioned read per page. The caller
+    /// holds the spill lock for the whole read (the non-Unix path moves
+    /// the shared cursor, so the per-page fallback re-locks per page).
+    fn read_all(&mut self, buf: &mut [u8]) -> Result<()> {
+        use std::io::{Read, Seek, SeekFrom};
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.read_exact(buf)?;
+        Ok(())
+    }
 }
 
 #[cfg(unix)]
@@ -892,6 +926,23 @@ pub struct Pager {
     /// RSS per big commit (torture S17). Grown once, reused forever,
     /// zeroed between uses.
     ckpt_scratch: Mutex<Vec<u8>>,
+    /// REUSED scratch for the DELETE-commit spill arena (the
+    /// `SPILL_ARENA_CAP` bulk read): grown once to the workload's
+    /// largest bounded sidecar and reused every commit — a fresh
+    /// `Vec` per commit left the freed 11+ MiB in mimalloc's
+    /// never-purge queues across a bulk load's commits (+32 MiB of
+    /// resident growth at the 1M-row shape; the reuse holds the
+    /// arena's cost to its cap, once).
+    del_spill_arena: Mutex<Vec<u8>>,
+    /// Pages written by the most recent commit (dirty pages + drained
+    /// spill records in DELETE mode; frames appended in WAL mode) — the
+    /// DETERMINISTIC commit-work measure behind `Database::
+    /// last_commit_page_writes`: latency gates are hostage to the
+    /// runner's per-op I/O price (documented envelope: 13 us/page on
+    /// healthy Windows draws, ~650 us/page on IOPS-throttled ones), but
+    /// the PAGE COUNT is draw-free — the stress suites gate on it to
+    /// catch dirty-page-count regressions on ANY draw.
+    commit_page_writes: std::sync::atomic::AtomicU64,
     /// PRAGMA synchronous: 0=OFF, 1=NORMAL, 2=FULL (SQLite default).
     /// In WAL mode NORMAL skips the per-commit fsync (checkpoints carry
     /// durability) — SQLite's recommended high-throughput setting.
@@ -2319,6 +2370,8 @@ impl Pager {
             xlock_empty_absorb_streak: AtomicU64::new(0),
             delete_spill: Mutex::new(None),
             ckpt_scratch: Mutex::new(Vec::new()),
+            del_spill_arena: Mutex::new(Vec::new()),
+            commit_page_writes: std::sync::atomic::AtomicU64::new(0),
             synchronous: std::sync::atomic::AtomicU8::new(2),
             cache_misses: std::sync::atomic::AtomicU64::new(0),
             cache_hits: std::sync::atomic::AtomicU64::new(0),
@@ -4528,6 +4581,24 @@ impl Pager {
         self.write_file_at(offset, &out)
     }
 
+    /// [`Self::codec_write_page`]'s encode half, INTO a caller-owned slot
+    /// (the commit's run assembler): with no codec active this is a plain
+    /// 4-KiB copy — `encode_page` would hand back a fresh `Vec` per page,
+    /// and a 3000-page commit's run assembly would churn 12 MiB of
+    /// allocations per commit.
+    fn encode_page_into(&self, id: PageId, data: &[u8], slot: &mut [u8]) -> Result<()> {
+        debug_assert_eq!(slot.len(), self.page_size() as usize);
+        let cs = self.codec.read();
+        if !cs.is_active() {
+            slot.copy_from_slice(data);
+            return Ok(());
+        }
+        let out = cs.encode_page(id == 0, data)?;
+        let n = out.len().min(slot.len());
+        slot[..n].copy_from_slice(&out[..n]);
+        Ok(())
+    }
+
     // ============================================================ xlock ==
     // Cross-process locking (see storage::xlock for the protocol). All of
     // these are no-ops for pagers without a lock file (in-memory stores,
@@ -5385,16 +5456,26 @@ impl Pager {
         let run_buf: &mut Vec<u8> = &mut scratch_guard;
         run_buf.clear();
         let mut frame = vec![0u8; psz as usize];
+        let fold_dbg = std::env::var_os("RSQL_WAL_TIMING").is_some();
+        let fold_t0 = std::time::Instant::now();
+        let mut fold_hits: u64 = 0;
+        let mut fold_reads: u64 = 0;
         for &id in ids.iter() {
             if id == 0 {
                 continue; // header goes LAST (crash safety)
             }
             let cached_page = cache_read_page(id, &cached);
             let bytes: &[u8] = if let Some(b) = cached_page.as_deref() {
+                if fold_dbg {
+                    fold_hits += 1;
+                }
                 b
             } else {
                 let off = state.map[&id];
                 state.wal.read_frame_at(off, &mut frame)?;
+                if fold_dbg {
+                    fold_reads += 1;
+                }
                 &frame[..]
             };
             let contiguous = match run_start {
@@ -5468,6 +5549,15 @@ impl Pager {
             state.wal.reset_synced(sync_mode >= 1)?;
         } else {
             state.wal.reset_keep_size_synced(sync_mode >= 1)?;
+        }
+        if fold_dbg {
+            eprintln!(
+                "[wal] fold: {} pages (cache-hits {fold_hits}, frame-reads {fold_reads}) \
+                 +{} header, {fold_t0:?}, wal-len {}B",
+                ids.len(),
+                if state.map.contains_key(&0) { 1 } else { 0 },
+                state.wal.file_len(),
+            );
         }
         state.map.clear();
         Ok(())
@@ -5675,6 +5765,8 @@ impl Pager {
         }
 
         self.dirty_count_approx.store(0, Ordering::Release);
+        self.commit_page_writes
+            .store(frame_offsets.len() as u64, Ordering::Release);
 
         // --- auto-checkpoint ---
         let frames = {
@@ -5693,6 +5785,22 @@ impl Pager {
         // on mass delete either (its file keeps the high-water length
         // until a later checkpoint; the committed page-0 frame carries
         // the smaller n_pages).
+        let wal_dbg = std::env::var_os("RSQL_WAL_TIMING").is_some();
+        if wal_dbg {
+            let committed_pages = self.wal.read().as_ref().map(|s| s.map.len()).unwrap_or(0);
+            eprintln!(
+                "[wal] commit: +{} frames (dirty {}), wal {} frames / {} committed-map pages{}",
+                frame_offsets.len(),
+                dirty_ids.len(),
+                frames,
+                committed_pages,
+                if checkpoint && frames >= WAL_AUTOCHECKPOINT_FRAMES {
+                    " -> AUTO-CHECKPOINT"
+                } else {
+                    ""
+                },
+            );
+        }
         if checkpoint && frames >= WAL_AUTOCHECKPOINT_FRAMES {
             self.checkpoint_wal()?;
             // The checkpoint's transient allocations (up to 512
@@ -6470,6 +6578,12 @@ impl Pager {
     /// True when no page is currently spilled to the DELETE-mode
     /// sidecar (quiescent-state check for journal-mode switches and
     /// integrity probes).
+    /// Pages written by the most recent commit (the deterministic
+    /// commit-work measure — see `commit_page_writes`).
+    pub fn last_commit_page_writes(&self) -> u64 {
+        self.commit_page_writes.load(Ordering::Acquire)
+    }
+
     pub fn delete_spill_empty(&self) -> bool {
         self.delete_spill
             .lock()
@@ -6589,6 +6703,7 @@ impl Pager {
         let dirty_ids: Vec<PageId> = {
             let mut set = self.dirty_pages.lock();
             let ids = set.drain().filter(|&id| id != 0).collect::<Vec<_>>();
+
             // Reset the last-noted hint: the set was drained, so a page
             // re-dirtied after this flush MUST re-enter the set or its new
             // content would never reach the file (the hint fast-path
@@ -6633,6 +6748,16 @@ impl Pager {
                 _ => Vec::new(),
             }
         };
+        let dirty_ids_len_v = dirty_ids.len();
+        let del_dbg = std::env::var_os("RSQL_WAL_TIMING").is_some();
+        let del_t0 = std::time::Instant::now();
+        if del_dbg {
+            eprintln!(
+                "[del] commit: dirty {} + spilled {} pages",
+                dirty_ids_len_v,
+                spilled_index.len()
+            );
+        }
         let mut spilled_map: std::collections::HashMap<PageId, u64, PageIdHashBuild> =
             spilled_index.iter().copied().collect();
 
@@ -6657,6 +6782,7 @@ impl Pager {
             .collect();
         write_order.sort_unstable_by(|a, b| b.cmp(a));
         write_order.dedup();
+        let write_order_len = write_order.len();
 
         // THREE-PHASE WRITE SCHEDULE (crash safety, part 3):
         //   phase 1 — NEW pages (id >= the durable committed count)
@@ -6683,7 +6809,6 @@ impl Pager {
         // stronger than the old per-page restore, which dropped the
         // already-drained entries on a retry.
         let psz_bytes = self.page_size() as usize;
-        let mut spill_scratch = vec![0u8; psz_bytes];
         let restore_unwritten =
             |spilled_map: &std::collections::HashMap<PageId, u64, PageIdHashBuild>| {
                 let mut spill_guard = self.delete_spill.lock();
@@ -6693,68 +6818,277 @@ impl Pager {
                     }
                 }
             };
-        let mut write_page = |id: PageId| -> Result<()> {
-            if let Some(&off) = spilled_map.get(&id) {
-                let written = {
-                    let read = {
-                        let mut spill_guard = self.delete_spill.lock();
-                        match spill_guard.as_mut() {
-                            Some(spill) => spill.read_page_at(off, &mut spill_scratch),
-                            // The sidecar cannot legitimately vanish
-                            // mid-drain (only rollback removes it, and
-                            // rollback cannot run while COMMIT holds the
-                            // write path): corruption class.
-                            None => Err(Error::corruption("delete sidecar vanished mid-drain")),
-                        }
-                    };
-                    match read {
-                        Ok(()) => self.codec_write_page(id, &spill_scratch),
-                        Err(e) => Err(e),
+
+        // ---- SPILL ARENA (the 37773610851 commit-tail fix, read side) --
+        // When the whole sidecar fits [`SPILL_ARENA_CAP`], ONE bulk read
+        // replaces the per-page positioned reads of the drain: the
+        // scattered-index bulk load's late commits drain ~3000 spilled
+        // pages, and an IOPS-throttled draw pays 0.1-1 ms PER READ (the
+        // failing draw: ~650 us/page — a 2 s tail from reads alone). The
+        // arena is a per-commit transient (freed at the end of the
+        // flush); bigger-than-cap sidecars keep the streaming per-page
+        // drain and its bounded-RSS contract.
+        // The arena borrows the Pager's REUSED scratch (`del_spill_arena`)
+        // for the bulk read; the guard lives for the walk (nothing else
+        // touches the scratch, and the commit path is exclusive).
+        let mut arena_guard = self.del_spill_arena.lock();
+        let arena_ref: Option<&[u8]> = if !spilled_index.is_empty() {
+            let len = {
+                let g = self.delete_spill.lock();
+                g.as_ref().map(|s| s.file_len()).unwrap_or(0)
+            };
+            if len > 0 && len as usize <= SPILL_ARENA_CAP {
+                let buf: &mut Vec<u8> = &mut arena_guard;
+                buf.clear();
+                buf.resize(len as usize, 0);
+                let ok = {
+                    let mut g = self.delete_spill.lock();
+                    match g.as_mut() {
+                        Some(spill) => spill.read_all(buf).is_ok(),
+                        None => false,
                     }
                 };
-                if let Err(e) = written {
-                    restore_unwritten(&spilled_map);
-                    return Err(e);
+                if ok {
+                    Some(arena_guard.as_slice())
+                } else {
+                    None
                 }
-                spilled_map.remove(&id);
-                return Ok(());
+            } else {
+                None
             }
-            // Use a single cache read lock to look up the page; clone the
-            // Arc and release the lock before doing I/O.
-            let page_ref = self.cache.read().get(id).cloned();
+        } else {
+            None
+        };
+
+        // ---- CONTIGUOUS-RUN WRITE WALK (the same fix, write side) -----
+        // The walk keeps the THREE-PHASE schedule and the descending-page
+        // crash contract exactly; it only coalesces runs of ADJACENT page
+        // ids (a bulk load's phase 1 is one long contiguous tail) into
+        // ONE positioned write per run (capped at [`COMMIT_RUN_CAP_BYTES`]).
+        // Between-syscall crash states are a strict SUBSET of the old
+        // per-page state space (a run write is atomic-at-syscall
+        // granularity; the cuts INSIDE a run disappear), so the
+        // fault-injection-validated ordering contract is preserved. A
+        // defensive clean/missing page mid-run splits the run (the walk
+        // skips it, exactly as the per-page loop did).
+        let mut spill_scratch = vec![0u8; psz_bytes];
+        let run_cap_pages = (COMMIT_RUN_CAP_BYTES / psz_bytes.max(1)).max(1);
+        let mut seg: Vec<PageId> = Vec::with_capacity(run_cap_pages);
+        let mut seg_buf: Vec<u8> = Vec::new();
+        let mut seg_dirty: Vec<(PageId, PageRef)> = Vec::new();
+        let mut seg_spilled: Vec<PageId> = Vec::new();
+        let mut write_ops: u64 = 0;
+
+        // The legacy per-page writer (macro so the run flusher can
+        // delegate a run's odd-page remainder to it): identical semantics
+        // to the previous per-page loop.
+        macro_rules! write_page_m {
+            ($id:expr) => {{
+                let id: PageId = $id;
+                if let Some(&off) = spilled_map.get(&id) {
+                    let written = {
+                        let read = {
+                            let mut spill_guard = self.delete_spill.lock();
+                            match spill_guard.as_mut() {
+                                Some(spill) => spill.read_page_at(off, &mut spill_scratch),
+                                // The sidecar cannot legitimately vanish
+                                // mid-drain (only rollback removes it, and
+                                // rollback cannot run while COMMIT holds
+                                // the write path): corruption class.
+                                None => Err(Error::corruption("delete sidecar vanished mid-drain")),
+                            }
+                        };
+                        match read {
+                            Ok(()) => self.codec_write_page(id, &spill_scratch),
+                            Err(e) => Err(e),
+                        }
+                    };
+                    if let Err(e) = written {
+                        restore_unwritten(&spilled_map);
+                        return Err(e);
+                    }
+                    spilled_map.remove(&id);
+                    write_ops += 1;
+                } else {
+                    // Use a single cache read lock to look up the page;
+                    // clone the Arc and release the lock before doing I/O.
+                    let page_ref = self.cache.read().get(id).cloned();
+                    if let Some(page_ref) = page_ref {
+                        let mut borrowed = page_ref.lock();
+                        if borrowed.dirty {
+                            if let Err(e) = self.codec_write_page(id, &borrowed.data) {
+                                // The flush aborts here: the unwritten
+                                // spilled pages' sidecar records must
+                                // survive for a retry.
+                                restore_unwritten(&spilled_map);
+                                return Err(e);
+                            }
+                            borrowed.dirty = false;
+                            write_ops += 1;
+                        }
+                    }
+                }
+            }};
+        }
+
+        // Flush `seg` (a descending, contiguous, <= cap run): assemble
+        // ASCENDING-in-file-order (a torn prefix leaves a valid file
+        // prefix), ONE positioned write, then the per-page bookkeeping
+        // (dirty flags cleared and spill records dropped only AFTER the
+        // write landed — a failed write leaves both untouched, so the
+        // retry/restore contract is byte-identical to the per-page loop).
+        // A defensive clean/missing page MID-run writes the assembled
+        // prefix as its own run and hands the remainder (odd page up) to
+        // the per-page writer — the per-page loop's skip semantics.
+        macro_rules! flush_seg {
+            () => {{
+                if !seg.is_empty() {
+                    seg_buf.resize(seg.len() * psz_bytes, 0);
+                    seg_dirty.clear();
+                    seg_spilled.clear();
+                    let mut assembled = 0usize;
+                    let mut odd_at: Option<usize> = None;
+                    for (i, &id) in seg.iter().rev().enumerate() {
+                        let slot = &mut seg_buf[i * psz_bytes..(i + 1) * psz_bytes];
+                        if let Some(&off) = spilled_map.get(&id) {
+                            // Spilled page: serve from the arena (one bulk
+                            // read up front) or the per-page fallback.
+                            let bytes: &[u8] = if let Some(ar) = arena_ref {
+                                let s = off as usize + 4;
+                                &ar[s..s + psz_bytes]
+                            } else {
+                                let read = {
+                                    let mut spill_guard = self.delete_spill.lock();
+                                    match spill_guard.as_mut() {
+                                        Some(spill) => spill.read_page_at(off, &mut spill_scratch),
+                                        None => Err(Error::corruption(
+                                            "delete sidecar vanished mid-drain",
+                                        )),
+                                    }
+                                };
+                                if let Err(e) = read {
+                                    restore_unwritten(&spilled_map);
+                                    return Err(e);
+                                }
+                                &spill_scratch[..]
+                            };
+                            if let Err(e) = self.encode_page_into(id, bytes, slot) {
+                                restore_unwritten(&spilled_map);
+                                return Err(e);
+                            }
+                            seg_spilled.push(id);
+                            assembled += 1;
+                        } else {
+                            // Cache-served dirty page: copy under the page
+                            // lock (a leaf lock — same discipline as the
+                            // per-page loop), then RELEASE before the Arc
+                            // moves into the bookkeeping list. The dirty
+                            // flag is NOT cleared yet — only after the
+                            // run's write lands.
+                            let page_ref = self.cache.read().get(id).cloned();
+                            let Some(page_ref) = page_ref else {
+                                odd_at = Some(i);
+                                break;
+                            };
+                            let borrowed = page_ref.lock();
+                            if !borrowed.dirty {
+                                drop(borrowed);
+                                odd_at = Some(i);
+                                break;
+                            }
+                            let enc = self.encode_page_into(id, &borrowed.data, slot);
+                            drop(borrowed);
+                            if let Err(e) = enc {
+                                restore_unwritten(&spilled_map);
+                                return Err(e);
+                            }
+                            seg_dirty.push((id, page_ref));
+                            assembled += 1;
+                        }
+                    }
+                    let lo = seg[seg.len() - 1] as u64;
+                    if assembled > 0 {
+                        if let Err(e) = self
+                            .write_file_at(lo * psz_bytes as u64, &seg_buf[..assembled * psz_bytes])
+                        {
+                            restore_unwritten(&spilled_map);
+                            return Err(e);
+                        }
+                        write_ops += 1;
+                        for (_, page_ref) in seg_dirty.drain(..) {
+                            let mut borrowed = page_ref.lock();
+                            borrowed.dirty = false;
+                        }
+                        for id in seg_spilled.drain(..) {
+                            spilled_map.remove(&id);
+                        }
+                    }
+                    match odd_at {
+                        Some(i) => {
+                            // The odd page sits `i` ASCENDING slots in
+                            // (descending index seg.len() - 1 - i); the
+                            // pages ABOVE it (indices 0 .. seg.len()-1-i,
+                            // still unwritten) go through the per-page
+                            // writer in the segment's own (descending)
+                            // order — the run's cuts stay a subset of the
+                            // per-page state space.
+                            let rem_end = seg.len() - i;
+                            for k in 0..rem_end {
+                                write_page_m!(seg[k]);
+                            }
+                        }
+                        None => {}
+                    }
+                    seg.clear();
+                }
+            }};
+        }
+
+        // Per-phase walk: feed contiguous runs; a gap (or the run cap)
+        // flushes the segment. `prev.is_some_and(p == id + 1)` = the ids
+        // are ADJACENT (the walk is descending).
+        let mut walk_phase = |phase_new: bool| -> Result<()> {
+            let mut prev: Option<PageId> = None;
+            for &id in write_order.iter().filter(|&&id| {
+                if phase_new {
+                    id >= committed_bound
+                } else {
+                    id < committed_bound
+                }
+            }) {
+                let contiguous = prev.is_some_and(|p| p == id.wrapping_add(1));
+                if (!contiguous || seg.len() >= run_cap_pages) && prev.is_some() {
+                    flush_seg!();
+                }
+                seg.push(id);
+                prev = Some(id);
+            }
+            if prev.is_some() {
+                flush_seg!();
+            }
+            Ok(())
+        };
+        walk_phase(true)?;
+        // ---- header: commit the new page count NOW (phase 2) ----
+        if let Some(header) = &header_direct {
+            if let Err(e) = self.codec_write_page(0, header) {
+                restore_unwritten(&spilled_map);
+                return Err(e);
+            }
+        } else {
+            let page_ref = self.cache.read().get(0).cloned();
             if let Some(page_ref) = page_ref {
                 let mut borrowed = page_ref.lock();
                 if borrowed.dirty {
-                    if let Err(e) = self.codec_write_page(id, &borrowed.data) {
-                        // The flush aborts here: the unwritten spilled
-                        // pages' sidecar records must survive for a retry.
+                    if let Err(e) = self.codec_write_page(0, &borrowed.data) {
                         restore_unwritten(&spilled_map);
                         return Err(e);
                     }
                     borrowed.dirty = false;
                 }
             }
-            Ok(())
-        };
-        for &id in write_order.iter().filter(|&&id| id >= committed_bound) {
-            write_page(id)?;
         }
-        // ---- header: commit the new page count NOW (phase 2) ----
-        if let Some(header) = &header_direct {
-            self.codec_write_page(0, header)?;
-        } else {
-            let page_ref = self.cache.read().get(0).cloned();
-            if let Some(page_ref) = page_ref {
-                let mut borrowed = page_ref.lock();
-                if borrowed.dirty {
-                    self.codec_write_page(0, &borrowed.data)?;
-                    borrowed.dirty = false;
-                }
-            }
-        }
-        for &id in write_order.iter().filter(|&&id| id < committed_bound) {
-            write_page(id)?;
-        }
+        walk_phase(false)?;
         // Reset the sidecar for the next transaction (truncate in place —
         // cheaper than delete + recreate).
         if !spilled_index.is_empty() {
@@ -6779,6 +7113,18 @@ impl Pager {
         // Publish the committed page count (see flush_wal).
         self.committed_n_pages
             .store(self.n_pages.load(Ordering::Acquire), Ordering::Release);
+        self.commit_page_writes.store(
+            (write_order_len + spilled_index.len()) as u64,
+            Ordering::Release,
+        );
+        if del_dbg {
+            eprintln!(
+                "[del] commit done in {:?} ({} write ops, arena {})",
+                del_t0.elapsed(),
+                write_ops,
+                if arena_ref.is_some() { "on" } else { "off" }
+            );
+        }
         Ok(())
     }
 

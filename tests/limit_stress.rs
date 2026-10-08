@@ -415,6 +415,25 @@ impl S2Platform {
             _ => (20.0, 250.0),
         }
     }
+
+    /// (multiplier, additive ms) of the RECLASSIFIED commit-side guard
+    /// (Windows only — see `s2_commit_fails`): the draw's write-path
+    /// IOPS price envelope. The 37773610851 draw paid ~650 us per
+    /// scattered 4-KiB commit write (healthy family: ~13 us) — a
+    /// ~1400-write late commit (the post-fix op count: contiguous runs
+    /// coalesce, the spill arena reads in bulk) lands at ~0.9-1.4 s on
+    /// that draw while the INSERT side (read-dominated) stayed in-family
+    /// at ~20 us/op. The reclassified bound must cover that draw with
+    /// margin but still fail a genuine algorithmic collapse (a real
+    /// regression sits in the multiple-seconds-per-batch regime with a
+    /// pages count out of family too — the deterministic gate below
+    /// catches it draw-free).
+    fn commit_gate_loose(&self) -> (f64, f64) {
+        match self {
+            S2Platform::Windows => (30.0, 6000.0),
+            _ => (20.0, 250.0),
+        }
+    }
 }
 
 /// The S2 insert-throughput verdict: `(fails, reclassified)`.
@@ -435,6 +454,50 @@ impl S2Platform {
 /// gate hard. Even when re-classified, the loose floor is the macOS
 /// scale (10x + 80ms), which a genuine collapse (hundreds of ms)
 /// still trips.
+/// The S2 commit-side verdict: `(fails, reclassified)`.
+///
+/// The hard gate stays primary. On Windows, a draw whose per-write IOPS
+/// price spikes mid-run (AV + the shared runners' throttled disks — the
+/// 37773610851 episode: c_head 61.8 ms, c_tail 3951 ms = ~650 us per
+/// scattered 4-KiB write vs the ~13 us healthy family, while the
+/// read-dominated INSERT side of the SAME run drew a healthy 5.60 ->
+/// 47.88 ms) is environmental, and the corroboration requirements pin
+/// it: BOTH the insert side must pass its own gate AND the DETERMINISTIC
+/// commit-pages count must be in family (the work did not grow — only
+/// the disk's price per op did) before the loose bound applies. A
+/// genuine commit regression fails all three ways: it blows the loose
+/// bound too, or trips the pages gate, or degrades the insert side.
+fn s2_commit_fails(
+    platform: S2Platform,
+    c_head: f64,
+    c_tail: f64,
+    insert_ok: bool,
+    pages_ok: bool,
+) -> (bool, bool) {
+    let (m, a) = platform.commit_gate();
+    if c_tail <= c_head * m + a {
+        return (false, false);
+    }
+    let (lm, la) = platform.commit_gate_loose();
+    if platform == S2Platform::Windows && insert_ok && pages_ok && c_tail <= c_head * lm + la {
+        return (false, true);
+    }
+    (true, false)
+}
+
+/// The DETERMINISTIC commit-work bound: median pages written by the
+/// late commits. Latency is hostage to the runner's per-op I/O price;
+/// the PAGE COUNT is not — it is a pure function of the batch shape
+/// (scattered-index leaf writes + the table tail), so an out-of-family
+/// count is a real dirty-page regression on ANY draw. Measured family:
+/// ~6.3k pages/commit at 1M rows / 5000-row batches (the post-run
+/// engine reports it via `Database::last_commit_page_writes`); the
+/// bound scales with the batch (pages/commit is capped by it) plus a
+/// floor for tiny-batch shapes.
+fn s2_commit_pages_ok(batch: u64, tail_pages: f64) -> bool {
+    tail_pages <= batch as f64 * 1.5 + 1000.0
+}
+
 fn s2_insert_fails(
     platform: S2Platform,
     head: f64,
@@ -459,6 +522,62 @@ fn s2_insert_fails(
 #[cfg(test)]
 mod s2_gate_tests {
     use super::*;
+
+    #[test]
+    fn s2_gate_healthy_windows_commit_passes() {
+        // The documented healthy family (12 -> 120 ms).
+        let (fails, rec) = s2_commit_fails(S2Platform::Windows, 12.0, 120.0, true, true);
+        assert_eq!((fails, rec), (false, false));
+    }
+
+    #[test]
+    fn s2_gate_37773610851_draw_reclassified() {
+        // The failing draw of run 37773610851: c_head 61.8, c_tail 3951
+        // (bound 61.8*30+2000 = 3854 — 2.5% over), insert side healthy,
+        // pages in family -> environmental write price, loose bound
+        // (61.8*30+6000 = 7854) applies.
+        let (fails, rec) = s2_commit_fails(S2Platform::Windows, 61.8, 3951.0, true, true);
+        assert_eq!((fails, rec), (false, true));
+    }
+
+    #[test]
+    fn s2_gate_commit_explosion_without_corroboration_fails() {
+        // Same latency explosion but the insert side degraded too: a
+        // genuine engine regression fails hard on every platform.
+        let (fails, rec) = s2_commit_fails(S2Platform::Windows, 61.8, 3951.0, false, true);
+        assert_eq!((fails, rec), (true, false));
+        let (fails, rec) = s2_commit_fails(S2Platform::Windows, 61.8, 3951.0, true, false);
+        assert_eq!((fails, rec), (true, false));
+    }
+
+    #[test]
+    fn s2_gate_commit_beyond_loose_bound_fails() {
+        // Even corroborated, a collapse past the loose bound is red.
+        let (fails, rec) = s2_commit_fails(S2Platform::Windows, 60.0, 12000.0, true, true);
+        assert_eq!((fails, rec), (true, false));
+    }
+
+    #[test]
+    fn s2_gate_linux_never_reclassifies_commit() {
+        // The write-price reclassification is a Windows-only doctrine;
+        // linux/macOS keep the tight (20x, 250ms) guard.
+        let (fails, rec) = s2_commit_fails(S2Platform::Linux, 2.0, 900.0, true, true);
+        assert_eq!((fails, rec), (true, false));
+    }
+
+    #[test]
+    fn s2_gate_pages_family_bounds() {
+        // Measured family: ~6.3k pages at batch 5000 (bound 8500).
+        assert!(s2_commit_pages_ok(5000, 6300.0));
+        // A dirty-page-count regression (2x the family) trips on ANY
+        // draw — that is the point of the deterministic gate.
+        assert!(!s2_commit_pages_ok(5000, 13000.0));
+        // Small-batch shapes: the +1000 floor.
+        assert!(s2_commit_pages_ok(1000, 400.0));
+        assert!(s2_commit_pages_ok(10, 60.0));
+        // A 1-row commit writing 1200 pages is a regression on any draw.
+        assert!(!s2_commit_pages_ok(1, 1200.0));
+    }
 
     #[test]
     fn s2_gate_healthy_linux_passes_tight() {
@@ -765,12 +884,14 @@ fn limit_million_row_file() {
     //      ubuntu: 1.13ms / 1.48ms); the min converges toward the
     //      engine's true cost curve while runner noise does not
     //      reproduce (the torture harness's best-of-N doctrine).
+    #[allow(clippy::type_complexity)] // the two-round min carrier
     let build_round = || -> (
         tempfile::TempDir,
         std::path::PathBuf,
         Database,
         Vec<f64>,
         Vec<f64>,
+        Vec<u64>,
         i64,
         f64,
     ) {
@@ -786,6 +907,7 @@ fn limit_million_row_file() {
             .unwrap();
         let mut batch_ms: Vec<f64> = Vec::new();
         let mut commit_ms: Vec<f64> = Vec::new();
+        let mut commit_pages: Vec<u64> = Vec::new();
         let mut k_sum: i64 = 0;
         let mut next_id: u64 = 0;
         let build = Instant::now();
@@ -816,13 +938,17 @@ fn limit_million_row_file() {
             let t1 = Instant::now();
             db.execute("COMMIT", []).unwrap();
             commit_ms.push(t1.elapsed().as_secs_f64() * 1000.0);
+            // Deterministic commit work: pages written by THIS commit
+            // (dirty + drained spill in DELETE mode, frames in WAL
+            // mode) — draw-free, gated below.
+            commit_pages.push(db.last_commit_page_writes());
             next_id += n;
         }
         let build_s = build.elapsed().as_secs_f64();
-        (dir, path, db, batch_ms, commit_ms, k_sum, build_s)
+        (dir, path, db, batch_ms, commit_ms, commit_pages, k_sum, build_s)
     };
 
-    let (_dir1, _p1, db1, ms1, cm1, ks1, s1) = build_round();
+    let (_dir1, _p1, db1, ms1, cm1, cp1, ks1, s1) = build_round();
     assert_eq!(count(&db1, "events"), rows as i64, "round-1 count");
     assert_eq!(
         one_i64(&db1, "SELECT sum(k) FROM events"),
@@ -832,10 +958,15 @@ fn limit_million_row_file() {
     assert!(integrity_ok(&db1), "round-1 integrity");
     drop(db1);
 
-    let (_dir, path, db, ms2, cm2, k_sum, _s2) = build_round();
+    let (_dir, path, db, ms2, cm2, cp2, k_sum, _s2) = build_round();
     let build_s = s1.min(_s2);
     let batch_ms: Vec<f64> = ms1.iter().zip(ms2.iter()).map(|(a, b)| a.min(*b)).collect();
     let commit_ms: Vec<f64> = cm1.iter().zip(cm2.iter()).map(|(a, b)| a.min(*b)).collect();
+    let commit_pages: Vec<u64> = cp1
+        .iter()
+        .zip(cp2.iter())
+        .map(|(a, b)| (*a).min(*b))
+        .collect();
 
     // ---- Counts and exact aggregates (deterministic data).
     assert_eq!(count(&db, "events"), rows as i64);
@@ -915,7 +1046,6 @@ fn limit_million_row_file() {
     //      Decision logic extracted into [`s2_insert_fails`] and pinned
     //      by unit tests below (`s2_gate_*`).
     let platform = S2Platform::current();
-    let (c_mult, c_add) = platform.commit_gate();
     let head = median(&batch_ms[..(batch_ms.len() / 10).max(1)]);
     let tail = median(&batch_ms[batch_ms.len() - (batch_ms.len() / 10).max(1)..]);
     let c_head = median(&commit_ms[..(commit_ms.len() / 10).max(1)]);
@@ -923,6 +1053,17 @@ fn limit_million_row_file() {
     println!(
         "[limit/S2] commit-ms first10%={c_head:.2} med, last10%={c_tail:.2} med (fsync-side, loose guard)"
     );
+    let p_tail = {
+        let t = &commit_pages[commit_pages.len() - (commit_pages.len() / 10).max(1)..];
+        let mut v: Vec<u64> = t.to_vec();
+        v.sort_unstable();
+        v[v.len() / 2] as f64
+    };
+    println!(
+        "[limit/S2] commit-pages last10%={p_tail:.0} med (deterministic work; bound {:.0})",
+        batch as f64 * 1.5 + 1000.0
+    );
+    let pages_ok = s2_commit_pages_ok(batch, p_tail);
     let (insert_fails, reclassified) = s2_insert_fails(platform, head, tail, c_head, c_tail);
     if reclassified {
         println!(
@@ -935,10 +1076,26 @@ fn limit_million_row_file() {
         "insert throughput degraded: first-batches median {head:.2}ms vs last-batches median {tail:.2}ms ({} batches)",
         batch_ms.len()
     );
+    let (commit_fails, commit_reclassified) =
+        s2_commit_fails(platform, c_head, c_tail, !insert_fails, pages_ok);
+    if commit_reclassified {
+        println!(
+            "[limit/S2] windows write-price re-classification: commit {c_head:.2} -> {c_tail:.2}ms \
+             with insert side in-family ({head:.2} -> {tail:.2}ms) and commit-pages in-family \
+             ({p_tail:.0} <= {:.0}) — the draw's per-write IOPS price, not engine work",
+            batch as f64 * 1.5 + 1000.0
+        );
+    }
     assert!(
-        c_tail <= c_head * c_mult + c_add,
+        !commit_fails,
         "commit latency exploded: first-batches median {c_head:.2}ms vs last-batches median {c_tail:.2}ms ({} batches)",
         commit_ms.len()
+    );
+    assert!(
+        pages_ok,
+        "commit page-writes out of family: last-batches median {p_tail:.0} pages vs bound {:.0} \
+         (batch {batch}) — the DETERMINISTIC work grew; a dirty-page-count regression, not a draw",
+        batch as f64 * 1.5 + 1000.0
     );
 
     // ---- MEMORY GUARD: nothing scales with row count.
