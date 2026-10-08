@@ -636,9 +636,17 @@ fn reader_survives_foreign_sidecar_reset_with_smaller_regrowth() {
         std::fs::copy(&copy_sidecar, &sidecar).unwrap();
         drop(hc);
     }
+    // PASSIVE checkpoints do NOT truncate the sidecar (SQLite's own
+    // contract: only the TRUNCATE mode shrinks the log) — the file keeps
+    // its high-water length with a FRESH header (new salts) and the old
+    // frames inert: every stale frame fails the new header's salt check
+    // at recovery/absorb time. The transplant below therefore carries
+    // the fresh-header-plus-stale-frames shape, and the freeze/regrowth
+    // assertions that follow pin that the reader handles it exactly.
+    let sidecar_len = std::fs::metadata(&sidecar).unwrap().len();
     assert!(
-        std::fs::metadata(&sidecar).unwrap().len() <= 4096,
-        "post-reset sidecar must be the fresh-header shape, not the old log"
+        sidecar_len >= 32,
+        "post-reset sidecar must carry a header (got {sidecar_len} bytes)"
     );
 
     // Regrowth SMALLER than the pre-reset log: the post-reset file stays

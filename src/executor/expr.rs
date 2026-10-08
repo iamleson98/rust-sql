@@ -684,34 +684,75 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
                 Some(a) if plain_operand(high) => (lo, apply_operand_affinity(a, &hi)),
                 _ => (lo, hi),
             };
-            // SQL three-valued logic: BETWEEN is sugar for `expr >= low AND
-            // expr <= high`. If any operand is NULL, the AND result is NULL
-            // (UNKNOWN), which WHERE filters out. So a NULL val yields NULL
-            // — meaning `val BETWEEN 20 AND 40` returns no row for NULL val,
-            // and `val NOT BETWEEN 20 AND 40` ALSO returns no row (because
-            // NOT NULL is still NULL).
-            if v.is_null() || lo.is_null() || hi.is_null() {
-                return Ok(Value::Null);
-            }
+            // SQL three-valued logic: BETWEEN is sugar for `expr >= low
+            // AND expr <= high`, and that AND is KLEENE — FALSE dominates
+            // NULL. Bailing to NULL on ANY null operand is WRONG for the
+            // NOT form: `93 NOT BETWEEN NULL AND 36` is NOT(NULL AND
+            // FALSE) = NOT FALSE = TRUE in SQLite (pinned by the
+            // canonical sqllogictest corpus: the old early-bail returned
+            // NULL and dropped rows SQLite keeps —
+            // `SELECT 79 ... WHERE 93 NOT BETWEEN NULL AND col1+33`).
+            // Compute both comparisons NULL-aware, then Kleene-AND:
+            //   FALSE AND anything     = FALSE
+            //   NULL  AND TRUE|NULL    = NULL
+            //   TRUE  AND TRUE         = TRUE
+            let ge_null = v.is_null() || lo.is_null();
+            let le_null = v.is_null() || hi.is_null();
             // A COLLATE on the value operand applies to both bound
-            // comparisons (SQLite).
-            let in_range = if let Some(name) = comparison_collation(expr) {
+            // comparisons (SQLite). Both sides evaluate as
+            // Option<bool>: None = the comparison is NULL (unknown).
+            let (ge, le): (Option<bool>, Option<bool>) = if let Some(name) =
+                comparison_collation(expr)
+            {
                 let coll = crate::plugin::lookup_collation(&name).ok_or_else(|| {
                     crate::error::Error::semantic(format!("no such collation sequence: {}", name))
                 })?;
-                let ge = crate::plugin::compare_collated(&v, &lo, coll.as_ref())
-                    != std::cmp::Ordering::Less;
-                let le = crate::plugin::compare_collated(&v, &hi, coll.as_ref())
-                    != std::cmp::Ordering::Greater;
-                ge && le
+                let ge = if ge_null {
+                    None
+                } else {
+                    Some(
+                        crate::plugin::compare_collated(&v, &lo, coll.as_ref())
+                            != std::cmp::Ordering::Less,
+                    )
+                };
+                let le = if le_null {
+                    None
+                } else {
+                    Some(
+                        crate::plugin::compare_collated(&v, &hi, coll.as_ref())
+                            != std::cmp::Ordering::Greater,
+                    )
+                };
+                (ge, le)
             } else {
                 // Encoding-aware bounds: TEXT×TEXT pairs order under the
                 // connection's file encoding (same rule as the binary
                 // comparison operators — see apply_binary).
-                crate::executor::value_cmp_conn(&v, &lo) != std::cmp::Ordering::Less
-                    && crate::executor::value_cmp_conn(&v, &hi) != std::cmp::Ordering::Greater
+                let ge = if ge_null {
+                    None
+                } else {
+                    Some(crate::executor::value_cmp_conn(&v, &lo) != std::cmp::Ordering::Less)
+                };
+                let le = if le_null {
+                    None
+                } else {
+                    Some(crate::executor::value_cmp_conn(&v, &hi) != std::cmp::Ordering::Greater)
+                };
+                (ge, le)
             };
-            Ok(Value::Integer(if in_range ^ negated { 1 } else { 0 }))
+            // Kleene AND: FALSE dominates; NULL only when neither side
+            // is FALSE and at least one is NULL.
+            let in_range: Option<bool> = match (ge, le) {
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                (Some(true), Some(true)) => Some(true),
+                _ => None,
+            };
+            match in_range {
+                Some(b) => Ok(Value::Integer(if b ^ negated { 1 } else { 0 })),
+                // UNKNOWN: BETWEEN and NOT BETWEEN are both NULL — WHERE
+                // filters the row either way (NOT NULL is still NULL).
+                None => Ok(Value::Null),
+            }
         }
         Expr::In {
             expr,

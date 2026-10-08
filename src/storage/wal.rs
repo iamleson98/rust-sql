@@ -707,6 +707,30 @@ impl Wal {
         Ok(())
     }
 
+    /// NON-TRUNCATING reset — SQLite's PASSIVE auto-checkpoint shape: a
+    /// fresh header with new salts is written over the old one, but the
+    /// file KEEPS its high-water length (SQLite's WAL does exactly this;
+    /// only the explicit TRUNCATE mode truncates). Subsequent appends
+    /// overwrite the stale frames from offset 32; every stale frame
+    /// beyond the new chain fails the salt check at recovery, so the
+    /// high-water tail is dead weight on disk and nothing else. This
+    /// saves the per-checkpoint `ftruncate(0)` — a metadata-heavy ext4
+    /// operation (page-cache teardown of a multi-MB file + regrowth on
+    /// the next append cycle) that the auto-checkpoint paid on every
+    /// 1000-frame fold of a bulk load (measured ~3% of the whole build).
+    pub fn reset_keep_size_synced(&mut self, sync: bool) -> Result<()> {
+        self.header = WalHeader::new(self.page_size);
+        self.checksum = (self.header.checksum1, self.header.checksum2);
+        self.n_frames = 0;
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.write_all(&self.header.encode())?;
+        self.header_dirty = false;
+        if sync {
+            self.file.sync_all()?;
+        }
+        Ok(())
+    }
+
     /// fsync the WAL file (the durability point of a commit; callers decide
     /// based on `PRAGMA synchronous`).
     pub fn sync(&mut self) -> Result<()> {
@@ -758,6 +782,12 @@ impl Wal {
         (self.header.salt1, self.header.salt2)
     }
 
+    /// The header's checkpoint sequence (diagnostics / the reader-side
+    /// generation probe — see `Pager`'s resync).
+    pub fn header_checkpoint_seq(&self) -> u32 {
+        self.header.checkpoint_seq
+    }
+
     /// Append a frame to the WAL. Returns the byte offset of the frame
     /// header so the caller can record it in its page map. `commit` marks
     /// the frame as ending a transaction; syncing is the caller's decision.
@@ -805,6 +835,115 @@ impl Wal {
         Ok(offset)
     }
 
+    /// Append a whole commit's frames as ONE positioned write — the
+    /// COMMIT fast path. A 250-frame commit was paying ~750 syscalls +
+    /// 250 scratch Vecs through [`Self::append`] (seek + frame-header
+    /// write + page write + check_data allocation per frame); this
+    /// assembles every frame into a single buffer (copying each page's
+    /// bytes ONCE, directly into its frame slot under the page's own
+    /// short-lived lock) and writes it with one seek + one write.
+    ///
+    /// `pages` are (page_id, PageRef) in append order. Entries whose
+    /// page is no longer dirty (spilled and not re-dirtied — the cache
+    /// snapshot's `continue` arm) are skipped, exactly as the previous
+    /// per-frame loop did. The LAST WRITTEN frame carries the commit
+    /// marker; at least one frame always lands in practice (the header
+    /// page 0 is dirtied by every flush and is virtually always
+    /// resident), and a fully-skipped batch is a no-op (the caller's
+    /// spill-absorb path owns that commit). Frame checksums chain
+    /// exactly as `append` computes them: two seeded CRC32s over
+    /// `id_be || commit_be || page`, fed incrementally (bit-identical
+    /// to the single-buffer update). Returns the (page_id,
+    /// frame-offset) pairs of the frames actually written via
+    /// `out_offsets`.
+    pub fn append_batch(
+        &mut self,
+        pages: &[(PageId, crate::storage::pager::PageRef)],
+        out_offsets: &mut Vec<(PageId, u64)>,
+    ) -> Result<()> {
+        if pages.is_empty() {
+            return Ok(());
+        }
+        if self.page_size as usize == 0 {
+            return Err(Error::corruption("WAL append_batch: zero page size"));
+        }
+        // Deferred fresh-WAL header (see `append`).
+        if self.header_dirty {
+            self.file.seek(SeekFrom::Start(0))?;
+            self.file.write_all(&self.header.encode())?;
+            self.header_dirty = false;
+        }
+        let psz = self.page_size as usize;
+        let frame_size = (FRAME_HEADER_SIZE as usize) + psz;
+        // Peek pass: which pages are live (dirty)? The commit marker
+        // rides the LAST live frame, so the assembly pass needs the
+        // live count before the first checksum can be finalized.
+        let live: Vec<usize> = pages
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, pr))| pr.lock().dirty)
+            .map(|(i, _)| i)
+            .collect();
+        if live.is_empty() {
+            return Ok(());
+        }
+        let mut out: Vec<u8> = Vec::with_capacity(live.len() * frame_size);
+        out_offsets.reserve(live.len());
+        let (mut c1, mut c2) = self.checksum;
+        let start = self.n_frames;
+        let start_offset = WAL_HEADER_SIZE as u64 + start as u64 * frame_size as u64;
+        let mut fh = [0u8; FRAME_HEADER_SIZE as usize];
+        fh[8..12].copy_from_slice(&self.header.salt1.to_be_bytes());
+        fh[12..16].copy_from_slice(&self.header.salt2.to_be_bytes());
+        for (n, &i) in live.iter().enumerate() {
+            let (page_id, page_ref) = &pages[i];
+            let hdr_at = out.len();
+            out.resize(hdr_at + frame_size, 0);
+            let slot = &mut out[hdr_at + FRAME_HEADER_SIZE as usize..][..psz];
+            {
+                let mut borrowed = page_ref.lock();
+                if !borrowed.dirty {
+                    // Dirtiness changed between the peek and here (a
+                    // concurrent flush of the same pages): drop the
+                    // reservation. Its dirtiness is the next flush's.
+                    out.truncate(hdr_at);
+                    continue;
+                }
+                slot.copy_from_slice(&borrowed.data);
+                borrowed.dirty = false;
+            }
+            let commit = (n + 1 == live.len()) as u32;
+            let mut pre = [0u8; 8];
+            pre[0..4].copy_from_slice(&page_id.to_be_bytes());
+            pre[4..8].copy_from_slice(&commit.to_be_bytes());
+            let mut h1 = crc32fast::Hasher::new_with_initial(c1);
+            let mut h2 = crc32fast::Hasher::new_with_initial(c2 ^ 0xA5A5A5A5);
+            h1.update(&pre);
+            h2.update(&pre);
+            h1.update(slot);
+            h2.update(slot);
+            c1 = h1.finalize();
+            c2 = h2.finalize();
+            fh[0..4].copy_from_slice(&page_id.to_be_bytes());
+            fh[4..8].copy_from_slice(&commit.to_be_bytes());
+            fh[16..20].copy_from_slice(&c1.to_be_bytes());
+            fh[20..24].copy_from_slice(&c2.to_be_bytes());
+            out[hdr_at..hdr_at + FRAME_HEADER_SIZE as usize].copy_from_slice(&fh);
+            out_offsets.push((
+                *page_id,
+                start_offset + out_offsets.len() as u64 * frame_size as u64,
+            ));
+        }
+        if out.is_empty() {
+            return Ok(());
+        }
+        self.checksum = (c1, c2);
+        self.n_frames += (out.len() / frame_size) as u32;
+        self.file.seek(SeekFrom::Start(start_offset))?;
+        self.file.write_all(&out)?;
+        Ok(())
+    }
+
     /// Incrementally absorb FOREIGN-COMMITTED growth (the cross-process
     /// reader freshness path): walk frames past `n_frames`, verifying
     /// the salt + chained checksums, and advance visibility to the last
@@ -823,6 +962,28 @@ impl Wal {
     pub fn absorb_foreign_growth(&mut self) -> Result<Option<Vec<(PageId, u64)>>> {
         let frame_size = (FRAME_HEADER_SIZE + self.page_size) as u64;
         let file_len = self.file.metadata()?.len();
+        // GENERATION CHECK - re-read the LIVE header before trusting any
+        // frame: PASSIVE/auto checkpoints reset the log IN PLACE (new
+        // salts, file keeps its high-water length - see
+        // `reset_keep_size_synced`), so a frozen reader's frame-walk can
+        // find its OWN generation's stale frames still sitting past its
+        // horizon, chain-validate them against its cached salts, and
+        // report "no visible growth" forever - a reader frozen across a
+        // sidecar transplant (the cross_process_locking freeze shape).
+        // The frame-level salt check below only catches frames from a
+        // DIFFERENT generation; the header comparison catches the
+        // generation CHANGE itself. Mismatch = the log was reset under
+        // us = full reopen territory.
+        {
+            let mut live_hdr = [0u8; WAL_HEADER_SIZE as usize];
+            if read_at_full(&self.file, &mut live_hdr, 0)? {
+                if let Ok(live) = WalHeader::decode(&live_hdr) {
+                    if live.salt1 != self.header.salt1 || live.salt2 != self.header.salt2 {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
         let first_new = self.n_frames as u64;
         let mut absorbed: Vec<(PageId, u64)> = Vec::new();
         let mut running = self.checksum;

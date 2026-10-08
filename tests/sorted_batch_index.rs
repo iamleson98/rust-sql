@@ -552,3 +552,287 @@ fn band_update_null_transitions() {
         .collect();
     assert_eq!(got, expect, "NULL-transition entries diverged");
 }
+
+// ============================================================================
+// INSERT sorted-batch maintenance (the multi-VALUES load round)
+// ============================================================================
+
+/// Build `rows` rows through ONE giant multi-VALUES INSERT per statement
+/// (the buffered-sweep shape) with cyclic k — and return the db.
+fn build_events_multirow(db: &mut Database, rows: i64, cycle: i64, batch: i64) {
+    db.execute("BEGIN", ()).unwrap();
+    let mut next = 0i64;
+    while next < rows {
+        let n = batch.min(rows - next);
+        let mut sql = String::from("INSERT INTO events (id, k) VALUES ");
+        for j in 0..n {
+            let i = next + j + 1;
+            if j > 0 {
+                sql.push(',');
+            }
+            sql.push_str(&format!("({}, {})", i, i % cycle));
+        }
+        db.execute(&sql, ()).unwrap();
+        next += n;
+    }
+    db.execute("COMMIT", ()).unwrap();
+}
+
+/// The identical dataset through single-row statements (per-row
+/// immediate maintenance) — the reference implementation.
+fn build_events_per_row(db: &mut Database, rows: i64, cycle: i64) {
+    db.execute("BEGIN", ()).unwrap();
+    for i in 1..=rows {
+        db.execute(
+            "INSERT INTO events (id, k) VALUES (?, ?)",
+            vec![Value::Integer(i), Value::Integer(i % cycle)],
+        )
+        .unwrap();
+    }
+    db.execute("COMMIT", ()).unwrap();
+}
+
+fn events_schema(db: &mut Database) {
+    db.execute("PRAGMA journal_mode = WAL", ()).unwrap();
+    db.execute(
+        "CREATE TABLE events (id INTEGER PRIMARY KEY, k INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX ix_events_k ON events (k)", ())
+        .unwrap();
+}
+
+/// The buffered sweep must equal per-row maintenance for a bulk
+/// multi-VALUES load — same rows, same index, different maintenance
+/// path — and survive the close/reopen boundary.
+#[test]
+fn multirow_insert_batched_matches_per_row() {
+    let (rows, cycle) = (6_000i64, 997i64);
+    let path_a = tmpdb("ins-a");
+    let mut a = Database::open(&path_a).unwrap();
+    events_schema(&mut a);
+    build_events_multirow(&mut a, rows, cycle, 2_000);
+
+    let mut b = Database::open(tmpdb("ins-b")).unwrap();
+    events_schema(&mut b);
+    build_events_per_row(&mut b, rows, cycle);
+
+    let got_a = index_pairs(&mut a);
+    let got_b = index_pairs(&mut b);
+    let mut want: Vec<(i64, i64)> = (1..=rows).map(|i| (i % cycle, i)).collect();
+    want.sort_unstable();
+    assert_eq!(got_a, want, "batched INSERT diverged from expectation");
+    assert_eq!(got_a, got_b, "batched INSERT diverged from per-row");
+    assert_eq!(integrity(&mut a), "ok");
+    assert_eq!(integrity(&mut b), "ok");
+
+    // Persistence: reopen and re-verify (the sweep's pages went through
+    // the WAL + checkpoint path like any committed write).
+    drop(a);
+    let mut a2 = Database::open(&path_a).unwrap();
+    assert_eq!(index_pairs(&mut a2), want, "reopened index diverged");
+    assert_eq!(integrity(&mut a2), "ok");
+}
+
+/// A LATE row failure inside a giant multi-VALUES statement (NOT NULL on
+/// the last row) must roll the WHOLE statement back — rows and index —
+/// through the un-flushed-buffer contract.
+#[test]
+fn multirow_insert_mid_statement_failure_atomic() {
+    let (rows, cycle) = (3_000i64, 997i64);
+    let mut db = Database::open(tmpdb("ins-fail")).unwrap();
+    events_schema(&mut db);
+    build_events_multirow(&mut db, rows, cycle, 2_000);
+    let before = index_pairs(&mut db);
+    let count_before = db.query("SELECT count(*) FROM events", ()).unwrap()[0][0].as_integer();
+
+    // One statement: 500 good rows, then a NULL k (NOT NULL is on the
+    // column? k is nullable here — use the id column instead: a TEXT id
+    // on the LAST tuple trips the rowid-alias datatype-mismatch check).
+    let mut sql = String::from("INSERT INTO events (id, k) VALUES ");
+    for j in 0..500i64 {
+        if j > 0 {
+            sql.push(',');
+        }
+        let i = rows + 1 + j;
+        sql.push_str(&format!("({}, {})", i, i % cycle));
+    }
+    sql.push_str(", ('bad', 1)");
+    let err = db.execute(&sql, ()).unwrap_err();
+    assert!(
+        format!("{err}")
+            .to_lowercase()
+            .contains("datatype mismatch"),
+        "expected datatype-mismatch error, got {err}"
+    );
+
+    let after = index_pairs(&mut db);
+    let count_after = db.query("SELECT count(*) FROM events", ()).unwrap()[0][0].as_integer();
+    assert_eq!(count_after, count_before, "rows leaked past the failure");
+    assert_eq!(after, before, "index entries leaked past the failure");
+    assert_eq!(integrity(&mut db), "ok");
+
+    // And the table is still writable with the batched path afterwards
+    // (continuation rows 3001..3500 — the failed statement's ids are
+    // NOT burned: nothing landed, so the same id range is free again).
+    let mut sql = String::from("INSERT INTO events (id, k) VALUES ");
+    for j in 0..500i64 {
+        if j > 0 {
+            sql.push(',');
+        }
+        let i = rows + 1 + j;
+        sql.push_str(&format!("({}, {})", i, i % cycle));
+    }
+    db.execute(&sql, ()).unwrap();
+    let got = index_pairs(&mut db);
+    let mut want: Vec<(i64, i64)> = (1..=rows + 500).map(|i| (i % cycle, i)).collect();
+    want.sort_unstable();
+    assert_eq!(got, want, "post-failure insert diverged");
+    assert_eq!(integrity(&mut db), "ok");
+}
+
+/// UNIQUE maintenance stays per-row (eligibility excludes it): a
+/// duplicate key inside one giant statement errors with SQLite's exact
+/// message and leaves nothing behind.
+#[test]
+fn multirow_insert_unique_collision_rolls_back() {
+    let mut db = Database::open(tmpdb("ins-uniq")).unwrap();
+    db.execute("PRAGMA journal_mode = WAL", ()).unwrap();
+    db.execute(
+        "CREATE TABLE events (id INTEGER PRIMARY KEY, k INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE UNIQUE INDEX ux ON events (k)", ())
+        .unwrap();
+    // Seed 100 rows per-row.
+    for i in 1..=100i64 {
+        db.execute(
+            "INSERT INTO events (id, k) VALUES (?, ?)",
+            vec![Value::Integer(i), Value::Integer(i)],
+        )
+        .unwrap();
+    }
+    // Giant batch whose LAST row duplicates k=1.
+    let mut sql = String::from("INSERT INTO events (id, k) VALUES ");
+    for j in 0..200i64 {
+        if j > 0 {
+            sql.push(',');
+        }
+        sql.push_str(&format!("({}, {})", 1000 + j, 1000 + j));
+    }
+    sql.push_str(", (5000, 1)");
+    let err = db.execute(&sql, ()).unwrap_err();
+    assert!(
+        format!("{err}").contains("UNIQUE constraint failed: events.k"),
+        "expected UNIQUE error, got {err}"
+    );
+    let n = db.query("SELECT count(*) FROM events", ()).unwrap()[0][0].as_integer();
+    assert_eq!(n, 100, "rows leaked past the UNIQUE failure");
+    assert_eq!(integrity(&mut db), "ok");
+}
+
+/// Mixed indexes: a plain (buffered) index alongside a UNIQUE
+/// (per-row) index on the same giant statement — both exact.
+#[test]
+fn multirow_insert_mixed_unique_and_plain_indexes() {
+    let rows = 500i64;
+    let mut db = Database::open(tmpdb("ins-mix")).unwrap();
+    db.execute("PRAGMA journal_mode = WAL", ()).unwrap();
+    db.execute(
+        "CREATE TABLE events (id INTEGER PRIMARY KEY, k INTEGER, u INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX ix_k ON events (k)", ()).unwrap();
+    db.execute("CREATE UNIQUE INDEX ux_u ON events (u)", ())
+        .unwrap();
+    let mut sql = String::from("INSERT INTO events (id, k, u) VALUES ");
+    for i in 1..=rows {
+        if i > 1 {
+            sql.push(',');
+        }
+        sql.push_str(&format!("({}, {}, {})", i, i % 31, i * 7));
+    }
+    db.execute(&sql, ()).unwrap();
+    let got_k: Vec<(i64, i64)> = db
+        .query("SELECT k, id FROM events ORDER BY k, id", ())
+        .unwrap()
+        .iter()
+        .map(|r| (r[0].as_integer(), r[1].as_integer()))
+        .collect();
+    let mut want_k: Vec<(i64, i64)> = (1..=rows).map(|i| (i % 31, i)).collect();
+    want_k.sort_unstable();
+    assert_eq!(got_k, want_k, "buffered plain index diverged");
+    let got_u: Vec<(i64, i64)> = db
+        .query("SELECT u, id FROM events ORDER BY u", ())
+        .unwrap()
+        .iter()
+        .map(|r| (r[0].as_integer(), r[1].as_integer()))
+        .collect();
+    let mut want_u: Vec<(i64, i64)> = (1..=rows).map(|i| (i * 7, i)).collect();
+    want_u.sort_unstable();
+    assert_eq!(got_u, want_u, "per-row unique index diverged");
+    assert_eq!(integrity(&mut db), "ok");
+}
+
+/// INSERT ... SELECT with a statement-large source takes the same
+/// buffered path and must equal the per-row reference.
+#[test]
+fn insert_select_batched_matches_per_row() {
+    let (rows, cycle) = (2_500i64, 997i64);
+    let mut a = Database::open(tmpdb("ins-sel-a")).unwrap();
+    events_schema(&mut a);
+    a.execute("CREATE TABLE src (sid INTEGER PRIMARY KEY, sk INTEGER)", ())
+        .unwrap();
+    // Source rows via one giant multi-VALUES statement (this also rides
+    // the buffered path for src's own absence of indexes — src has none).
+    let mut sql = String::from("INSERT INTO src (sid, sk) VALUES ");
+    for i in 1..=rows {
+        if i > 1 {
+            sql.push(',');
+        }
+        sql.push_str(&format!("({}, {})", i, i % cycle));
+    }
+    a.execute(&sql, ()).unwrap();
+    a.execute("INSERT INTO events (id, k) SELECT sid, sk FROM src", ())
+        .unwrap();
+    let got_a = index_pairs(&mut a);
+
+    let mut b = Database::open(tmpdb("ins-sel-b")).unwrap();
+    events_schema(&mut b);
+    build_events_per_row(&mut b, rows, cycle);
+    let got_b = index_pairs(&mut b);
+    assert_eq!(got_a, got_b, "INSERT..SELECT batched diverged from per-row");
+    assert_eq!(integrity(&mut a), "ok");
+}
+
+/// An INSERT trigger forces the per-row path (eligibility) — same
+/// answers, and the trigger's own writes land intact.
+#[test]
+fn multirow_insert_with_trigger_falls_back() {
+    let (rows, cycle) = (2_000i64, 997i64);
+    let mut a = Database::open(tmpdb("ins-trg")).unwrap();
+    events_schema(&mut a);
+    a.execute("CREATE TABLE log (n INTEGER)", ()).unwrap();
+    a.execute(
+        "CREATE TRIGGER trg AFTER INSERT ON events BEGIN INSERT INTO log VALUES (NEW.k); END",
+        (),
+    )
+    .unwrap();
+    build_events_multirow(&mut a, rows, cycle, 2_000);
+    let got_a = index_pairs(&mut a);
+    let logged = db_count(&mut a, "log");
+    let mut want: Vec<(i64, i64)> = (1..=rows).map(|i| (i % cycle, i)).collect();
+    want.sort_unstable();
+    assert_eq!(got_a, want, "trigger-shape INSERT diverged");
+    assert_eq!(logged, rows, "trigger did not fire per row");
+    assert_eq!(integrity(&mut a), "ok");
+}
+
+fn db_count(db: &mut Database, table: &str) -> i64 {
+    db.query(&format!("SELECT count(*) FROM {table}"), ())
+        .unwrap()[0][0]
+        .as_integer()
+}

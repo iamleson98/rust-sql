@@ -19012,6 +19012,18 @@ pub(crate) struct IndexMaintState {
     pub hint: Option<crate::storage::btree::AppendHint>,
     /// Reusable order-key encoding buffer.
     pub key_buf: Vec<u8>,
+    /// SORTED-BATCH MODE (see `INDEX_BATCH_MIN_ROWS`): `Some(buf)` = this
+    /// index's inserts are BUFFERED as (key, rowid) pairs and applied as
+    /// ONE pinned-leaf sorted sweep at statement end (or at the chunk
+    /// threshold mid-statement), instead of a per-row root-to-leaf
+    /// descent. Eligibility is per-statement (the caller sets it):
+    /// non-unique plain-Btree non-partial index, statement-large row
+    /// count, no INSERT triggers, plain-ABORT conflict resolution with
+    /// no upsert — the shapes whose per-row maintenance has no
+    /// user-visible ordering. The undo journal tolerates un-flushed
+    /// buffers (`delete_index` on an absent pair is a clean no-op;
+    /// `insert_index_entry_if_absent` heals re-inserts).
+    pub op_buf: Option<IndexOpBuf>,
 }
 
 impl IndexMaintState {
@@ -19380,6 +19392,7 @@ pub(crate) fn make_index_states(
                 col_names,
                 hint: None,
                 key_buf: Vec::with_capacity(16),
+                op_buf: None,
             }
         })
         .collect()
@@ -19655,6 +19668,24 @@ fn exec_insert_inner(
     // per statement), this saves 1k Vec<String> + 2k String allocations
     // (column1/column2) + 1k Vec<Vec<Value>> overheads.
     if let Plan::Values { rows: expr_rows } = source {
+        // SORTED-BATCH arm (see `arm_insert_index_bufs`): hoist the
+        // trigger-presence probe the per-row firing checks pay anyway —
+        // eligible shapes (statement-large, plain-ABORT, no upsert)
+        // buffer their non-unique secondary-index entries into sorted
+        // sweeps. The per-row trigger checks below stay exactly as
+        // they are (they gate firing, not maintenance shape).
+        let has_insert_triggers = crate::executor::triggers::has_triggers_for(
+            ctx,
+            &table,
+            &crate::sql::ast::TriggerEvent::Insert,
+        );
+        arm_insert_index_bufs(
+            &mut index_states,
+            expr_rows.len(),
+            has_insert_triggers,
+            on_conflict,
+            upsert.is_some(),
+        );
         for exprs in expr_rows {
             // Arity check (SQLite): a positional/column-list INSERT must
             // supply exactly one value per target column. An EMPTY expr
@@ -19949,6 +19980,10 @@ fn exec_insert_inner(
         // replay: trg10 (AFTER DELETE) inserting a row that fires trg4
         // (AFTER INSERT) whose insert split ix3's root; the outer
         // statement's write-back reverted the root and lost 106 entries.
+        // Buffered index sweeps land before the commit/scratch epilogue
+        // (error paths above dropped them un-flushed — the journal
+        // handles those rows; see `flush_insert_index_bufs`).
+        flush_insert_index_bufs(ctx, &mut index_states)?;
         if !ctx.in_transaction && !ctx.deferred_flush {
             ctx.pager.flush()?;
         }
@@ -19984,6 +20019,22 @@ fn exec_insert_inner(
             source_res.columns.len()
         )));
     }
+    // SORTED-BATCH arm for INSERT ... SELECT: the source rows are fully
+    // materialized above (a self-referencing INSERT sees the pre-statement
+    // snapshot — buffering cannot change what the source returns), so
+    // the same eligibility rules apply as the VALUES branch.
+    let has_insert_triggers = crate::executor::triggers::has_triggers_for(
+        ctx,
+        &table,
+        &crate::sql::ast::TriggerEvent::Insert,
+    );
+    arm_insert_index_bufs(
+        &mut index_states,
+        source_res.rows.len(),
+        has_insert_triggers,
+        on_conflict,
+        upsert.is_some(),
+    );
     for row in &source_res.rows {
         // Reset the row buffer to all-NULLs without releasing capacity.
         // `Value::Null` is a no-op to drop, so this is just a memset.
@@ -20146,6 +20197,8 @@ fn exec_insert_inner(
     // trg10 (AFTER DELETE) inserting a row that fires trg4 (AFTER
     // INSERT) whose insert split ix3's root; the outer statement's
     // write-back reverted the root and lost 106 entries.
+    // Buffered index sweeps land before the commit/scratch epilogue.
+    flush_insert_index_bufs(ctx, &mut index_states)?;
     if !ctx.in_transaction && !ctx.deferred_flush {
         ctx.pager.flush()?;
     }
@@ -20286,6 +20339,18 @@ pub fn fast_insert_literal_rows(
         &crate::sql::ast::TriggerEvent::Insert,
     );
     let fk_enforced = !table.foreign_keys.is_empty() && ctx.pager.foreign_keys_enabled();
+    // SORTED-BATCH secondary-index maintenance (see
+    // `arm_insert_index_bufs`): the fast path's contract is exactly the
+    // eligible shape — literal VALUES rows, plain-ABORT conflicts, no
+    // upsert. Multi-row bulk loads with a secondary index stop paying
+    // the per-row root-to-leaf descent + in-leaf search per entry.
+    arm_insert_index_bufs(
+        &mut index_states,
+        rows.len(),
+        has_insert_triggers,
+        crate::sql::ast::ConflictResolution::Abort,
+        false,
+    );
 
     for row in rows {
         // Reset the row buffer without releasing capacity.
@@ -20448,6 +20513,10 @@ pub fn fast_insert_literal_rows(
     // possibly-stale st.root would CLOBBER a root that a nested
     // AFTER-INSERT trigger body's split moved after these states were
     // captured (orphaned split pages — "row N missing from index").
+    // Buffered indexes flush HERE (the statement's success tail): the
+    // sorted sweeps re-root through `flush_index_op_buf`, which writes
+    // the live root back itself.
+    flush_insert_index_bufs(ctx, &mut index_states)?;
     // (rows inserted, final live root, final max rowid) — the caller's
     // INSERT-chain setup consumes the live root / max-rowid so the next
     // same-shape statement can skip the derivation entirely.
@@ -21146,8 +21215,12 @@ fn exec_insert_one_row(
     for st in index_states.iter_mut() {
         if crate::executor::dbg_index_trace() {
             eprintln!(
-                "[idx1+] {} rowid={} root={} hint={:?}",
-                st.idx.name, rowid, st.root, st.hint
+                "[idx1+] {} rowid={} root={} hint={:?} buffered={}",
+                st.idx.name,
+                rowid,
+                st.root,
+                st.hint,
+                st.op_buf.is_some()
             );
         }
         if st.idx.partial_expr.is_some()
@@ -21172,6 +21245,21 @@ fn exec_insert_one_row(
             st.root = ibt.root;
             continue;
         }
+        // SORTED-BATCH MODE: buffer the (key, rowid) pair — no per-row
+        // root-to-leaf descent, no per-row binary search, no hint
+        // churn. The sweep at flush applies the whole multiset with one
+        // pinned-leaf pass per contiguous key range (see
+        // `Btree::insert_index_sorted`). Partial indexes never buffer
+        // (eligibility excludes them), so the partial gate above has
+        // already passed.
+        if st.op_buf.is_some() {
+            let key_bytes = st.encode_key(full_row);
+            let key = key_bytes.to_vec();
+            if let Some(buf) = st.op_buf.as_mut() {
+                buf.1.push((key, rowid));
+            }
+            continue;
+        }
         // Copy the root/hint out first: `encode_key` holds a mutable
         // borrow of `st` for as long as `key_bytes` is live.
         let root = st.root;
@@ -21188,6 +21276,20 @@ fn exec_insert_one_row(
             ctx.set_index_root(&st.idx.name, ibt.root);
         }
         st.root = ibt.root;
+    }
+    // Chunk-threshold flush for buffered indexes (RSS bound at any
+    // statement scale — a 100M-row single-statement load carries at
+    // most INDEX_BATCH_CHUNK_OPS pairs per index). No-op for the
+    // all-None statement shapes (the common OLTP case).
+    for st in index_states.iter_mut() {
+        if let Some(buf) = st.op_buf.as_mut() {
+            if buf.0.len() + buf.1.len() >= INDEX_BATCH_CHUNK_OPS {
+                let idx = std::sync::Arc::clone(&st.idx);
+                let mut root = st.root;
+                flush_index_op_buf(ctx, &idx, &mut root, buf)?;
+                st.root = root;
+            }
+        }
     }
     ctx.last_insert_rowid = rowid;
     ctx.changes += 1;
@@ -22256,6 +22358,74 @@ pub(crate) fn flush_index_op_buf(
     }
     dels.clear();
     ins.clear();
+    Ok(())
+}
+
+/// Arm the SORTED-BATCH insert path for this statement's index states
+/// (see `IndexMaintState::op_buf`). Eligibility mirrors the UPDATE
+/// executor's rules: a statement-large multi-row load, no INSERT
+/// triggers, plain-ABORT conflict resolution with no upsert clause, and
+/// per-index a non-unique, non-partial, plain-Btree access method — the
+/// shapes whose per-row maintenance has no user-visible ordering. The
+/// buffered multiset is applied as pinned-leaf sorted sweeps; it is
+/// identical to per-row maintenance because rowids are unique per row.
+pub(crate) fn arm_insert_index_bufs(
+    index_states: &mut [IndexMaintState],
+    n_rows: usize,
+    has_insert_triggers: bool,
+    on_conflict: crate::sql::ast::ConflictResolution,
+    has_upsert: bool,
+) {
+    let batch_worthy = n_rows >= INDEX_BATCH_MIN_ROWS
+        && !has_insert_triggers
+        && !has_upsert
+        && matches!(on_conflict, crate::sql::ast::ConflictResolution::Abort);
+    for st in index_states.iter_mut() {
+        let eligible = batch_worthy
+            && !st.idx.unique
+            && st.idx.partial_expr.is_none()
+            && matches!(st.idx.kind, crate::schema::IndexKind::Btree);
+        if eligible {
+            match st.op_buf.as_mut() {
+                Some((dels, ins)) => {
+                    // Scratch-carried state: reuse the allocations, but
+                    // nothing may leak from a previous statement.
+                    dels.clear();
+                    ins.clear();
+                }
+                None => st.op_buf = Some((Vec::new(), Vec::new())),
+            }
+            // A buffered statement never consumes the per-row append
+            // hint; drop any carried pin so the flush's sweep starts
+            // from a clean descent.
+            st.hint = None;
+        } else {
+            st.op_buf = None;
+        }
+    }
+}
+
+/// Flush every buffered index of an INSERT statement (the success
+/// tail). Error paths DROP un-flushed buffers instead — the statement
+/// journal's reverse replay undoes the table rows (and any
+/// already-flushed chunk entries) on its own, and the un-flushed pairs
+/// never touched the tree (`delete_index` on an absent pair is a clean
+/// no-op, so the replay is exact for ANY mix of flushed and un-flushed
+/// buffers — the same contract the UPDATE batch path pinned).
+pub(crate) fn flush_insert_index_bufs(
+    ctx: &mut ExecContext<'_>,
+    index_states: &mut [IndexMaintState],
+) -> Result<()> {
+    for st in index_states.iter_mut() {
+        if st.op_buf.is_some() {
+            let idx = std::sync::Arc::clone(&st.idx);
+            let mut root = st.root;
+            if let Some(buf) = st.op_buf.as_mut() {
+                flush_index_op_buf(ctx, &idx, &mut root, buf)?;
+            }
+            st.root = root;
+        }
+    }
     Ok(())
 }
 

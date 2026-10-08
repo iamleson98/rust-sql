@@ -2605,6 +2605,36 @@ impl Parser {
                 left = self.parse_is_operator(left)?;
                 continue;
             }
+            // The LIKE/GLOB/REGEXP/MATCH/IN/BETWEEN family (with their
+            // NOT- forms) sits at the same comparison level — see
+            // `parse_comparison_op`.
+            if PREC_IS >= min_prec && self.starts_comparison_op() {
+                left = self
+                    .parse_comparison_op(left)?
+                    .expect("starts_comparison_op checked");
+                continue;
+            }
+            // A trailing COLLATE binds tighter than every operator in
+            // this loop (`%left CONCAT.` sits under `%left COLLATE.`),
+            // so an operand-position COLLATE never gets here —
+            // `parse_postfix` absorbs it onto the nearest operand.
+            // The ONLY way one lands at this level is after a
+            // completed family/IS node, and there the yacc grammar has
+            // no shift candidate: it reduces the family rule first,
+            // then attaches COLLATE to the WHOLE node. SQLite parses
+            // `tag IN ('A') COLLATE NOCASE` as
+            // `(tag IN ('A')) COLLATE NOCASE` (the family's old
+            // postfix placement produced exactly this shape; pinned
+            // by update_from_collate's nocase_index_in_list).
+            if self.peek().is_keyword("COLLATE") {
+                self.advance();
+                let c = self.parse_ident()?;
+                left = Expr::Collate {
+                    expr: Box::new(left),
+                    collation: c,
+                };
+                continue;
+            }
             let op = match self.try_binary_op() {
                 Some(o) => o,
                 None => break,
@@ -2749,6 +2779,121 @@ impl Parser {
         self.parse_postfix()
     }
 
+    /// The comparison-level keyword operators — SQLite's
+    /// `%left IS MATCH LIKE_KW BETWEEN IN ISNULL NOTNULL NE EQ.` family.
+    ///
+    /// These attach at the `=`/`<>` precedence level, NOT as tight
+    /// postfixes: `- 10 BETWEEN 8 AND 95` is `(-10) BETWEEN 8 AND 95`
+    /// and `a + b IN (…)` is `(a + b) IN (…)` in SQLite (the old
+    /// parse_postfix placement bound the family TIGHTER than unary
+    /// minus and every arithmetic operator — found by the canonical
+    /// sqllogictest corpus's random/expr farm, where `- 62 NOT IN (…)
+    /// AND - col0 * + 51 BETWEEN + 8 AND - - 95` mis-evaluated).
+    /// Pattern operands parse one level tighter than the family
+    /// (`x LIKE a || '%'` is `x LIKE (a || '%')`).
+    /// Pure peek: does the next token (or NOT + next) start the family?
+    fn starts_comparison_op(&self) -> bool {
+        let t = self.peek();
+        if t.is_keyword("LIKE")
+            || t.is_keyword("GLOB")
+            || t.is_keyword("REGEXP")
+            || t.is_keyword("MATCH")
+            || t.is_keyword("IN")
+            || t.is_keyword("BETWEEN")
+        {
+            return true;
+        }
+        if t.is_keyword("NOT") {
+            let nx = self.peek_n(1);
+            return nx.is_keyword("LIKE")
+                || nx.is_keyword("GLOB")
+                || nx.is_keyword("REGEXP")
+                || nx.is_keyword("MATCH")
+                || nx.is_keyword("IN")
+                || nx.is_keyword("BETWEEN");
+        }
+        false
+    }
+
+    fn parse_comparison_op(&mut self, left: Expr) -> Result<Option<Expr>> {
+        let not_prefixed = self.starts_comparison_op() && self.peek().is_keyword("NOT");
+        if not_prefixed {
+            self.advance(); // NOT
+        }
+        if self.peek().is_keyword("LIKE") {
+            self.advance();
+            let pat = self.parse_binary(PREC_IS + 1)?;
+            let esc = if self.peek().is_keyword("ESCAPE") {
+                self.advance();
+                Some(Box::new(self.parse_binary(PREC_IS + 1)?))
+            } else {
+                None
+            };
+            return Ok(Some(Expr::Like {
+                op: LikeOp::Like,
+                expr: Box::new(left),
+                pattern: Box::new(pat),
+                escape: esc,
+                negated: not_prefixed,
+            }));
+        }
+        if self.peek().is_keyword("GLOB") {
+            self.advance();
+            let pat = self.parse_binary(PREC_IS + 1)?;
+            return Ok(Some(Expr::Like {
+                op: LikeOp::Glob,
+                expr: Box::new(left),
+                pattern: Box::new(pat),
+                escape: None,
+                negated: not_prefixed,
+            }));
+        }
+        if self.peek().is_keyword("REGEXP") {
+            self.advance();
+            let pat = self.parse_binary(PREC_IS + 1)?;
+            return Ok(Some(Expr::Like {
+                op: LikeOp::Regexp,
+                expr: Box::new(left),
+                pattern: Box::new(pat),
+                escape: None,
+                negated: not_prefixed,
+            }));
+        }
+        if self.peek().is_keyword("MATCH") {
+            self.advance();
+            let pat = self.parse_binary(PREC_IS + 1)?;
+            return Ok(Some(Expr::Like {
+                op: LikeOp::Match,
+                expr: Box::new(left),
+                pattern: Box::new(pat),
+                escape: None,
+                negated: not_prefixed,
+            }));
+        }
+        if self.peek().is_keyword("IN") {
+            self.advance();
+            let src = self.parse_in_source()?;
+            return Ok(Some(Expr::In {
+                expr: Box::new(left),
+                source: src,
+                negated: not_prefixed,
+            }));
+        }
+        if self.peek().is_keyword("BETWEEN") {
+            self.advance();
+            let low = self.parse_binary(PREC_IS)?;
+            self.expect_keyword("AND")?;
+            let high = self.parse_binary(PREC_IS)?;
+            return Ok(Some(Expr::Between {
+                expr: Box::new(left),
+                low: Box::new(low),
+                high: Box::new(high),
+                negated: not_prefixed,
+            }));
+        }
+        Ok(None)
+    }
+
     fn parse_postfix(&mut self) -> Result<Expr> {
         let mut e = self.parse_primary_expr()?;
         loop {
@@ -2758,148 +2903,6 @@ impl Parser {
                 e = Expr::Collate {
                     expr: Box::new(e),
                     collation: c,
-                };
-            } else if self.peek().is_keyword("NOT") {
-                // NOT LIKE / NOT IN / NOT BETWEEN
-                self.advance();
-                if self.peek().is_keyword("LIKE") {
-                    self.advance();
-                    let pat = self.parse_primary_expr()?;
-                    let esc = if self.peek().is_keyword("ESCAPE") {
-                        self.advance();
-                        Some(Box::new(self.parse_primary_expr()?))
-                    } else {
-                        None
-                    };
-                    e = Expr::Like {
-                        op: LikeOp::Like,
-                        expr: Box::new(e),
-                        pattern: Box::new(pat),
-                        escape: esc,
-                        negated: true,
-                    };
-                } else if self.peek().is_keyword("GLOB") {
-                    self.advance();
-                    let pat = self.parse_primary_expr()?;
-                    e = Expr::Like {
-                        op: LikeOp::Glob,
-                        expr: Box::new(e),
-                        pattern: Box::new(pat),
-                        escape: None,
-                        negated: true,
-                    };
-                } else if self.peek().is_keyword("REGEXP") {
-                    self.advance();
-                    let pat = self.parse_primary_expr()?;
-                    e = Expr::Like {
-                        op: LikeOp::Regexp,
-                        expr: Box::new(e),
-                        pattern: Box::new(pat),
-                        escape: None,
-                        negated: true,
-                    };
-                } else if self.peek().is_keyword("MATCH") {
-                    self.advance();
-                    let pat = self.parse_primary_expr()?;
-                    e = Expr::Like {
-                        op: LikeOp::Match,
-                        expr: Box::new(e),
-                        pattern: Box::new(pat),
-                        escape: None,
-                        negated: true,
-                    };
-                } else if self.peek().is_keyword("IN") {
-                    self.advance();
-                    let src = self.parse_in_source()?;
-                    e = Expr::In {
-                        expr: Box::new(e),
-                        source: src,
-                        negated: true,
-                    };
-                } else if self.peek().is_keyword("BETWEEN") {
-                    self.advance();
-                    let low = self.parse_binary(PREC_IS)?;
-                    self.expect_keyword("AND")?;
-                    let high = self.parse_binary(PREC_IS)?;
-                    e = Expr::Between {
-                        expr: Box::new(e),
-                        low: Box::new(low),
-                        high: Box::new(high),
-                        negated: true,
-                    };
-                } else {
-                    // NOT was consumed but no follow-up — that's a parse error.
-                    let t = self.peek();
-                    return Err(Error::parse(
-                        t.line,
-                        t.col,
-                        format!("unexpected token after NOT: {:?}", t.token),
-                    ));
-                }
-            } else if self.peek().is_keyword("LIKE") {
-                self.advance();
-                let pat = self.parse_primary_expr()?;
-                let esc = if self.peek().is_keyword("ESCAPE") {
-                    self.advance();
-                    Some(Box::new(self.parse_primary_expr()?))
-                } else {
-                    None
-                };
-                e = Expr::Like {
-                    op: LikeOp::Like,
-                    expr: Box::new(e),
-                    pattern: Box::new(pat),
-                    escape: esc,
-                    negated: false,
-                };
-            } else if self.peek().is_keyword("GLOB") {
-                self.advance();
-                let pat = self.parse_primary_expr()?;
-                e = Expr::Like {
-                    op: LikeOp::Glob,
-                    expr: Box::new(e),
-                    pattern: Box::new(pat),
-                    escape: None,
-                    negated: false,
-                };
-            } else if self.peek().is_keyword("REGEXP") {
-                self.advance();
-                let pat = self.parse_primary_expr()?;
-                e = Expr::Like {
-                    op: LikeOp::Regexp,
-                    expr: Box::new(e),
-                    pattern: Box::new(pat),
-                    escape: None,
-                    negated: false,
-                };
-            } else if self.peek().is_keyword("MATCH") {
-                self.advance();
-                let pat = self.parse_primary_expr()?;
-                e = Expr::Like {
-                    op: LikeOp::Match,
-                    expr: Box::new(e),
-                    pattern: Box::new(pat),
-                    escape: None,
-                    negated: false,
-                };
-            } else if self.peek().is_keyword("IN") {
-                self.advance();
-                let src = self.parse_in_source()?;
-                e = Expr::In {
-                    expr: Box::new(e),
-                    source: src,
-                    negated: false,
-                };
-            } else if self.peek().is_keyword("BETWEEN") {
-                self.advance();
-                let low = self.parse_binary(PREC_IS)?;
-                self.expect_keyword("AND")?;
-                let high = self.parse_binary(PREC_IS)?;
-                e = Expr::Between {
-                    expr: Box::new(e),
-                    low: Box::new(low),
-                    high: Box::new(high),
-                    negated: false,
                 };
             } else if self.peek().is_keyword("FILTER") {
                 self.advance();
@@ -3268,6 +3271,14 @@ impl Parser {
 
     fn parse_function_call(&mut self, name: String) -> Result<Expr> {
         let distinct = self.consume_keyword("DISTINCT");
+        // `ALL` is SQL's other aggregate quantifier — the DEFAULT (every
+        // value counted). SQLite accepts `min(ALL x)` / `count(ALL (x))`
+        // as plain `min(x)` / `count(x)`; the canonical sqllogictest
+        // corpus's random/expr farm uses it heavily. Consumed and
+        // ignored (the executor's default IS all-rows).
+        if !distinct {
+            let _ = self.consume_keyword("ALL");
+        }
         let mut args = Vec::new();
         if self.peek().is_op("*") {
             // COUNT(*) special case

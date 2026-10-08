@@ -4025,7 +4025,7 @@ impl Database {
             // URGENT: the image swap below rebinds the store to the main
             // file — a deferred fold would leave stale frames as the
             // crash-recovery base.
-            self.pager.checkpoint_wal_now()?;
+            self.pager.checkpoint_wal_now(true)?;
         }
 
         // IN-PLACE FAST PATH (WAL install only): compact the live pages
@@ -5093,6 +5093,16 @@ impl Database {
         }
     }
 
+    /// Drop a hot INSERT chain WITHOUT flushing its cached root /
+    /// max-rowid / leaf hint into the maps — used after an autocommit
+    /// page-level restore discarded the very pages the chain pinned
+    /// (a failed fast-path statement's splits). Flushing there would
+    /// plant a root that points at a never-committed page.
+    pub(crate) fn discard_insert_chain(&self) {
+        self.insert_chain.lock().take();
+        self.insert_chain_hot.store(false, Ordering::Relaxed);
+    }
+
     /// Build (and store) an INSERT chain for `table` when the table is
     /// plain enough for the lean chained path. Called after a successful
     /// cold-path fast insert; the chain serves SUBSEQUENT same-shape
@@ -5220,12 +5230,24 @@ impl Database {
             && !self.deferred_flush.load(Ordering::Acquire)
             && self.pager.dirty_set_marked() != dirty_at_start
         {
-            if let Err(rb_err) = self.pager.rollback_autocommit_stmt() {
-                eprintln!("autocommit-statement rollback failed after fast-path error: {rb_err}");
+            match self.pager.rollback_autocommit_stmt() {
+                Err(rb_err) => {
+                    eprintln!(
+                        "autocommit-statement rollback failed after fast-path error: {rb_err}"
+                    );
+                }
+                // Real restore: the chain's cached root / hints point at
+                // the pages it discarded — drop WITHOUT flushing (see
+                // `restore_failed_autocommit_stmt_pages`).
+                Ok(true) => self.discard_insert_chain(),
+                // Declined (in-memory): the chain state is still valid —
+                // the normal flush-break keeps the maps current.
+                Ok(false) => self.break_insert_chain(),
             }
+        } else {
+            self.break_insert_chain();
         }
         self.invalidate_stmt_cache();
-        self.break_insert_chain();
     }
 
     /// ROLLBACK may have restored a content-shadow vtab's pages under its
@@ -5258,19 +5280,39 @@ impl Database {
     /// the 53-line inline block bloated the hot execute() epilogue and
     /// cost mixed-RW autocommit 3.5x (bench-gate ubuntu; local A/B 1.14ms
     /// -> 4.5ms).
+    ///
+    /// Returns Ok(true) when the page-level restore ACTUALLY ran (a
+    /// file-backed pager in flush-per-statement mode: cache dropped,
+    /// metadata reloaded from the durable header) and Ok(false) when it
+    /// declined (in-memory / lazy write-back: the cache IS the committed
+    /// truth and the failed statement's page writes stand — the row-level
+    /// stmt_undo is the whole recovery). Callers use the flag to decide
+    /// whether the statement's root overlays are poison (restore ran:
+    /// they point at discarded pages) or truth (declined: a failed
+    /// statement's split root is still valid, in-cache data).
     #[inline(never)]
-    fn restore_failed_autocommit_stmt_pages(&self) -> Result<()> {
+    fn restore_failed_autocommit_stmt_pages(&self) -> Result<bool> {
         let r = self.pager.rollback_autocommit_stmt();
-        if r.is_ok() {
+        if let Ok(restored) = r {
             // Statement-embedded plans may carry the failed statement's
-            // roots; the next execute re-plans. The chained-insert fast
-            // path's hints (leaf, max rowid) were built over the discarded
-            // pages. (Runs on BOTH Ok arms: the declined arm's row-level
-            // stmt_undo also rewrote rows/roots since the plans cached.)
+            // roots; the next execute re-plans. (Runs on BOTH Ok arms:
+            // the declined arm's row-level stmt_undo also rewrote
+            // rows/roots since the plans cached.)
             self.invalidate_stmt_cache();
-            self.break_insert_chain();
+            if restored {
+                // The chain's cached root / max-rowid / leaf hint were
+                // built over pages the restore just discarded — flushing
+                // them into the maps would poison the next statement
+                // with a root pointing at a never-committed page (the
+                // "index tree is corrupt: page N out of range" class,
+                // pinned by sorted_batch_index::multirow_insert_
+                // unique_collision_rolls_back). Discard WITHOUT flush.
+                self.discard_insert_chain();
+            } else {
+                self.break_insert_chain();
+            }
         }
-        r.map(|_| ())
+        r
     }
 
     /// Execute a fast-path INSERT (see `try_fast_insert_parse`).
@@ -5367,6 +5409,9 @@ impl Database {
         // The original column-list shape (empty = supplies-all) decides the
         // chain's scanner gate — take it out before `fi.values` moves.
         let stmt_columns: Vec<&str> = fi.columns.clone();
+        // Pre-statement dirty-set mark for the autocommit failure restore
+        // below (the same DELTA gate the general path uses).
+        let fast_dirty_at_start = self.pager.dirty_set_marked();
         let result =
             crate::executor::fast_insert_literal_rows(&mut ctx, &table, &col_indices, fi.values)
                 .map(|(inserted, root, max_rowid)| {
@@ -5401,6 +5446,45 @@ impl Database {
             }
         }
 
+        // ── AUTO-COMMIT FAILURE RESTORE (page level) — MUST run BEFORE the
+        // map-merge epilogue below. The merge keeps a failed statement's
+        // root overlays on purpose when the page writes stand (explicit
+        // transactions, deferred flush, in-memory DBs — the cache is the
+        // committed truth there). But in flush-per-statement autocommit
+        // the pager restore DISCARDS those pages (cache drop + durable
+        // metadata reload), so the overlays pointing at them are poison:
+        // merging them planted a root at a never-committed page and every
+        // later index walk read "page N out of range (n_pages=...)"
+        // (pinned by sorted_batch_index::multirow_insert_unique_
+        // collision_rolls_back: a 200-row giant INSERT whose LAST tuple
+        // tripped UNIQUE after both trees split). Clear the overlays when
+        // — and only when — the restore actually ran; the invalidation
+        // lists stay (they REMOVE keys the in-place fast paths may have
+        // written through to shared, exactly as the general path keeps
+        // them). Mirrors the general path's epilogue block.
+        if result.is_err()
+            && !ctx.in_transaction
+            && !ctx.deferred_flush
+            && self.pager.dirty_set_marked() != fast_dirty_at_start
+        {
+            match self.restore_failed_autocommit_stmt_pages() {
+                Ok(true) => {
+                    ctx.root_overrides.clear();
+                    ctx.max_rowids.clear();
+                    ctx.index_roots.clear();
+                }
+                Ok(false) => {
+                    // In-memory / lazy write-back: nothing was restored
+                    // and nothing needs clearing — the failed statement's
+                    // split root is still valid, in-cache data.
+                }
+                Err(rb_err) => {
+                    eprintln!(
+                        "autocommit-statement rollback failed after fast-insert error: {rb_err}"
+                    );
+                }
+            }
+        }
         // Epilogue: same write-backs as `execute` (merge into the
         // detached maps in place, then attach back).
         self.in_transaction
@@ -6957,26 +7041,41 @@ impl Database {
             // (200/iteration, 4x total; found by the CI bench gate).
             && self.pager.dirty_set_marked() != dirty_at_start
         {
-            if let Err(rb_err) = self.restore_failed_autocommit_stmt_pages() {
-                // Loud: the engine is now in an unspecified dirty state.
-                eprintln!("autocommit-statement rollback failed after statement error: {rb_err}");
-            } else {
-                // The overlay maps below hold the failed statement's root
-                // moves / rowid caches / index roots — they point at
-                // pages the restore just discarded. Clearing them makes
-                // the epilogue's `extend` merges no-ops, so `ctx.shared`
-                // (the detached pre-statement maps) re-attaches without
-                // them. The INVALIDATED lists are deliberately KEPT and
-                // replayed: `set_max_rowid_lc`'s autocommit fast path
-                // writes max-rowid bumps THROUGH to `ctx.shared` in
-                // place (zero-alloc hot path), so the shared maps are
-                // NOT pristine after a failed statement — the undo's
-                // invalidation entries are exactly what removes those
-                // poisoned keys (clearing them left a stale raised max
-                // behind and burned AUTOINCREMENT ids).
-                ctx.root_overrides.clear();
-                ctx.max_rowids.clear();
-                ctx.index_roots.clear();
+            match self.restore_failed_autocommit_stmt_pages() {
+                Err(rb_err) => {
+                    // Loud: the engine is now in an unspecified dirty state.
+                    eprintln!(
+                        "autocommit-statement rollback failed after statement error: {rb_err}"
+                    );
+                }
+                Ok(true) => {
+                    // The overlay maps below hold the failed statement's
+                    // root moves / rowid caches / index roots — they point
+                    // at pages the restore just discarded. Clearing them
+                    // makes the epilogue's `extend` merges no-ops, so
+                    // `ctx.shared` (the detached pre-statement maps)
+                    // re-attaches without them. The INVALIDATED lists are
+                    // deliberately KEPT and replayed:
+                    // `set_max_rowid_lc`'s autocommit fast path writes
+                    // max-rowid bumps THROUGH to `ctx.shared` in place
+                    // (zero-alloc hot path), so the shared maps are NOT
+                    // pristine after a failed statement — the undo's
+                    // invalidation entries are exactly what removes those
+                    // poisoned keys (clearing them left a stale raised max
+                    // behind and burned AUTOINCREMENT ids).
+                    ctx.root_overrides.clear();
+                    ctx.max_rowids.clear();
+                    ctx.index_roots.clear();
+                }
+                Ok(false) => {
+                    // Declined (in-memory / lazy write-back): the cache IS
+                    // the committed truth and the failed statement's page
+                    // writes — including splits — stand behind the row-level
+                    // undo above. The overlays are VALID here; clearing them
+                    // would orphan live subtrees (the maps would point back
+                    // at the pre-split root while the data sits under the
+                    // new one).
+                }
             }
         }
         self.in_transaction
@@ -8478,7 +8577,7 @@ impl Database {
             // URGENT: serialize returns the MAIN file bytes — a deferred
             // fold would serialize the stale pre-WAL image (the very bug
             // this path fixed).
-            self.pager.checkpoint_wal_now()?;
+            self.pager.checkpoint_wal_now(true)?;
             std::fs::read(&self.path).map_err(Error::from)
         } else {
             // A flush failure on a read-only handle must not fail the
@@ -15046,7 +15145,17 @@ impl Database {
                     // WAL).
                     // URGENT: an explicit user checkpoint request —
                     // defer-and-say-nothing would be a silent no-op.
-                    ctx.pager.checkpoint_wal_now()?;
+                    // Mode contract (SQLite): only TRUNCATE shrinks the
+                    // sidecar; PASSIVE/FULL/RESTART (and the numeric
+                    // `= 1` spelling) fold + reset at high-water length.
+                    let mode = match (&v, value_as_expr(value)) {
+                        (Value::Text(t), _) => t.to_ascii_lowercase(),
+                        (_, crate::sql::ast::Expr::Column { name, .. }) => {
+                            name.to_ascii_lowercase()
+                        }
+                        _ => String::new(),
+                    };
+                    ctx.pager.checkpoint_wal_now(mode == "truncate")?;
                 }
                 "cache_size" => {
                     // SQLite semantics: positive N = N pages, negative N =
@@ -15712,7 +15821,9 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
             // sole-ness, SQLITE_BUSY error when it expires — the
             // blocking class SQLite gives explicit requests).
             let res = if mode == "full" || mode == "restart" || mode == "truncate" {
-                db.pager.checkpoint_wal_now().map(|_| ())
+                // Only TRUNCATE shrinks the sidecar (SQLite's mode
+                // contract); FULL/RESTART fold + reset at high-water.
+                db.pager.checkpoint_wal_now(mode == "truncate").map(|_| ())
             } else {
                 db.pager.checkpoint_wal().map(|_| ())
             };
@@ -17742,6 +17853,9 @@ impl Database {
         ctx.shared = std::mem::replace(self.maps.get_mut(), empty_maps());
         ctx.shared_detached = true;
         let mut changed: i64 = 0;
+        // Pre-statement dirty mark for the autocommit failure restore
+        // (see the exec_fast_insert epilogue for the full rationale).
+        let bound_dirty_at_start = self.pager.dirty_set_marked();
         let result = (|| -> Result<()> {
             let root = ctx.table_root(table);
             let mut bt = Btree::new(ctx.pager, root, false);
@@ -17789,6 +17903,23 @@ impl Database {
             self.note_alloc_burst(changed.unsigned_abs(), 0);
             if changed > 0 && !ctx.in_transaction {
                 self.pager.note_tx_autocommit();
+            }
+        }
+        // AUTO-COMMIT FAILURE RESTORE — before the merge, mirroring
+        // exec_fast_insert's epilogue block (a failed bound DELETE /
+        // bound UPDATE in flush-per-statement mode must not plant its
+        // root overlays into the maps: the pager restore discards the
+        // very pages they point at — the "tree is corrupt: page N out
+        // of range" class).
+        if result.is_err()
+            && !ctx.in_transaction
+            && !ctx.deferred_flush
+            && self.pager.dirty_set_marked() != bound_dirty_at_start
+        {
+            if let Ok(true) = self.restore_failed_autocommit_stmt_pages() {
+                ctx.root_overrides.clear();
+                ctx.max_rowids.clear();
+                ctx.index_roots.clear();
             }
         }
         if ctx.roots_changed {
@@ -17849,6 +17980,9 @@ impl Database {
         ctx.shared = std::mem::replace(self.maps.get_mut(), empty_maps());
         ctx.shared_detached = true;
         let mut changed: i64 = 0;
+        // Pre-statement dirty mark for the autocommit failure restore
+        // (see the exec_fast_insert epilogue for the full rationale).
+        let bound_dirty_at_start = self.pager.dirty_set_marked();
         let result = (|| -> Result<()> {
             let root = ctx.table_root(table);
             let mut bt = Btree::new(ctx.pager, root, false);
@@ -17917,6 +18051,23 @@ impl Database {
             self.note_alloc_burst(changed.unsigned_abs(), 0);
             if changed > 0 && !ctx.in_transaction {
                 self.pager.note_tx_autocommit();
+            }
+        }
+        // AUTO-COMMIT FAILURE RESTORE — before the merge, mirroring
+        // exec_fast_insert's epilogue block (a failed bound DELETE /
+        // bound UPDATE in flush-per-statement mode must not plant its
+        // root overlays into the maps: the pager restore discards the
+        // very pages they point at — the "tree is corrupt: page N out
+        // of range" class).
+        if result.is_err()
+            && !ctx.in_transaction
+            && !ctx.deferred_flush
+            && self.pager.dirty_set_marked() != bound_dirty_at_start
+        {
+            if let Ok(true) = self.restore_failed_autocommit_stmt_pages() {
+                ctx.root_overrides.clear();
+                ctx.max_rowids.clear();
+                ctx.index_roots.clear();
             }
         }
         if ctx.roots_changed {

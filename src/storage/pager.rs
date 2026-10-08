@@ -169,9 +169,11 @@ impl Pager {
         };
         if let Some(pages) = saved.cache_capacity_pages {
             self.cache_capacity.store(pages.max(1), Ordering::Relaxed);
+            self.cache_size_pinned.store(true, Ordering::Release);
         }
         if let Some(k) = saved.cache_size_setting {
             self.cache_size_setting.store(k, Ordering::Release);
+            self.cache_size_pinned.store(true, Ordering::Release);
         }
         if let Some(level) = saved.synchronous {
             self.synchronous.store(level.min(3), Ordering::Release);
@@ -433,6 +435,19 @@ pub struct WalState {
 /// `wal_autocheckpoint` is 1000 pages at 4 KiB; ours is the same frame
 /// count).
 const WAL_AUTOCHECKPOINT_FRAMES: u32 = 1000;
+
+/// Adaptive cache growth's ceiling (pages). 16k pages = 64 MiB at the
+/// default 4 KiB page — an interior-ring + sweep working set that keeps
+/// even a 1B-row index's upper levels resident, still far inside the
+/// marathon's RSS budget (bundled SQLite's own RSS at 100M rows was
+/// 476-508 MB against this engine's ~140 MB).
+const ADAPTIVE_CACHE_MAX_PAGES: usize = 16 * 1024;
+
+/// Adaptive growth engages only past this many pages (~1 GiB at 4 KiB):
+/// below it, the default 512-page cache already holds every interior
+/// node of the hot trees (a 10M-row marathon's whole upper ring is
+/// ~130 pages), so growth buys nothing.
+const ADAPTIVE_CACHE_MIN_FILE_PAGES: usize = 256 * 1024;
 
 /// How long an URGENT fold (`checkpoint_wal_now`) waits for every other
 /// handle on the file — any process — to close before returning busy.
@@ -696,7 +711,9 @@ impl Pager {
     /// In-memory stores never evict (the cache IS the store), so the
     /// DELETE-mode spill never engages for them.
     pub fn is_memory(&self) -> bool {
-        self.store.read().is_memory()
+        // Latched at construction (immutable) — the hot fetch paths ask
+        // this on every page; see `store_is_memory`.
+        self.store_is_memory.load(Ordering::Relaxed)
     }
 }
 
@@ -712,6 +729,15 @@ pub struct Pager {
     page_size: AtomicU32,
     /// Total number of pages in the file (updated on writes).
     pub(crate) n_pages: AtomicU32,
+    /// Latched at construction: the store's memory-ness is immutable for
+    /// the pager's lifetime (the one-shot `adopt_file_backing` rebind
+    /// updates it), but the hot paths (get_page's hit/miss sequencing,
+    /// `note_seq_access` on EVERY fetch) paid an RwLock read on `store`
+    /// just to ask. One relaxed atomic load instead.
+    store_is_memory: std::sync::atomic::AtomicBool,
+    /// True once PRAGMA cache_size (or a persisted file setting) has
+    /// pinned the cache explicitly — the adaptive growth stands down.
+    cache_size_pinned: std::sync::atomic::AtomicBool,
     /// Head of the freelist (0 if empty).
     freelist_head: AtomicU32,
     /// Number of pages on the freelist.
@@ -1855,7 +1881,7 @@ impl Drop for Pager {
                 // hazard: this block used to remove the sidecar even
                 // after an eprintln'd fold failure.)
                 let folded = match self.xlock_sole_gate() {
-                    Ok(Some(_sole)) => self.checkpoint_wal_locked().is_ok(),
+                    Ok(Some(_sole)) => self.checkpoint_wal_locked(true).is_ok(),
                     _ => false,
                 };
                 if !folded {
@@ -2128,6 +2154,9 @@ impl Pager {
         {
             let mut store = self.store.write();
             *store = Store::File(file);
+            // The latched memory-ness flips with the rebind (see
+            // `store_is_memory`).
+            self.store_is_memory.store(false, Ordering::Release);
         }
         self.skip_fsync.store(false, Ordering::Release);
         self.lazy_writeback.store(false, Ordering::Release);
@@ -2251,8 +2280,11 @@ impl Pager {
         cache_capacity: usize,
         skip_sync: bool,
     ) -> Result<Self> {
+        let store_is_memory = store.is_memory();
         let pager = Self {
             store: parking_lot::RwLock::new(store),
+            store_is_memory: std::sync::atomic::AtomicBool::new(store_is_memory),
+            cache_size_pinned: std::sync::atomic::AtomicBool::new(false),
             path,
             page_size: AtomicU32::new(DEFAULT_PAGE_SIZE),
             n_pages: AtomicU32::new(0),
@@ -3413,7 +3445,7 @@ impl Pager {
     /// touches per get_page for nothing).
     #[inline]
     fn note_seq_access(&self, id: PageId, is_miss: bool) {
-        if self.store.read().is_memory() {
+        if self.store_is_memory.load(Ordering::Relaxed) {
             return;
         }
         SEQ_RUN_TL.with(|c| {
@@ -4708,9 +4740,39 @@ impl Pager {
         // statement, forever) was a reopen storm on fresh databases
         // (run 37142144108: 209 spurious `SHRUNK expected=32 len=0`
         // reopens from one helper).
+        // * IN-PLACE HIGH-WATER RESET (PASSIVE/auto checkpoint folds:
+        // `reset_keep_size_synced` — fresh salts over the old header, the
+        // file KEEPS its length). Neither the identity probe nor the
+        // shrink probe can see it; the reader's horizon stays equal to
+        // the file length and the `len <= expected` arm below returns
+        // "no growth" forever — a frozen reader across a sidecar
+        // transplant (`cross_process_locking`'s freeze shape). The
+        // generation is only visible in the header BYTES: compare the
+        // live file's salts + checkpoint sequence against this handle's
+        // cached header, and treat a mismatch as the same
+        // full-reopen condition.
+        let mut generation_flipped = false;
+        {
+            let g = self.wal.read();
+            if let Some(state) = g.as_ref() {
+                let mut hdr = [0u8; crate::storage::wal::WAL_HEADER_SIZE as usize];
+                let ok = self
+                    .read_file_at(0, &mut hdr)
+                    .map(|n| n == crate::storage::wal::WAL_HEADER_SIZE as usize)
+                    .unwrap_or(false);
+                if ok {
+                    if let Ok(live) = crate::storage::wal::WalHeader::decode(&hdr) {
+                        let (s1, s2) = state.wal.salts();
+                        generation_flipped = live.salt1 != s1
+                            || live.salt2 != s2
+                            || live.checkpoint_seq != state.wal.header_checkpoint_seq();
+                    }
+                }
+            }
+        }
         let shrunk =
             expected > crate::storage::wal::WAL_HEADER_SIZE as u64 && meta.len() < expected;
-        if replaced || shrunk {
+        if replaced || shrunk || generation_flipped {
             xlock_trace!(|| {
                 format!(
                     "resync: sidecar {} under horizon expected={} len={} \
@@ -4993,7 +5055,7 @@ impl Pager {
         // URGENT: journal_mode=DELETE must actually fold + remove the
         // sidecar, or the persisted-mode flip below would lie (the next
         // open would come up in WAL mode with a pre-fold main file).
-        self.checkpoint_wal_now()?;
+        self.checkpoint_wal_now(true)?;
         // The mode flip is durable: clear the persisted WAL marker in the
         // header (in-cache page 0, flagged dirty for the next DELETE-mode
         // flush, AND the raw file bytes + fsync now) — a reopen of this
@@ -5059,6 +5121,8 @@ impl Pager {
     /// Copy every committed WAL page back into the main database file,
     /// sync it, and reset the WAL. Readers stay correct throughout: the
     /// map is dropped only after the main file holds every page.
+    /// Fold + reset WITHOUT truncating the sidecar (SQLite's PASSIVE /
+    /// auto-checkpoint contract — the file keeps its high-water length).
     pub fn checkpoint_wal(&self) -> Result<()> {
         // LIFECYCLE GUARD — every fold+reset of the sidecar (main-file
         // page copies + WAL reset) is serialized against engine
@@ -5115,7 +5179,7 @@ impl Pager {
             let r = match self.xlock_sole_gate()? {
                 Some(_sole) => {
                     xlock_trace!(|| "checkpoint: sole gate OPEN — folding + resetting".to_string());
-                    self.checkpoint_wal_locked()
+                    self.checkpoint_wal_locked(false)
                 }
                 None => {
                     xlock_trace!(|| {
@@ -5136,7 +5200,7 @@ impl Pager {
             }
             r
         } else {
-            self.checkpoint_wal_locked()
+            self.checkpoint_wal_locked(false)
         }
     }
 
@@ -5148,10 +5212,12 @@ impl Pager {
     /// checkpoint / change journal_mode while another connection is open"
     /// behavior class. Callers that CANNOT tolerate a deferred fold use
     /// this; auto-checkpoints and close-time folds stay best-effort.
-    pub fn checkpoint_wal_now(&self) -> Result<()> {
+    /// `truncate` = SQLite's per-mode contract: only TRUNCATE shrinks the
+    /// sidecar; FULL/RESTART fold + reset at high-water length.
+    pub fn checkpoint_wal_now(&self, truncate: bool) -> Result<()> {
         let _lifecycle = crate::storage::wal::lifecycle_guard().lock();
         if self.store.read().is_memory() {
-            return self.checkpoint_wal_locked();
+            return self.checkpoint_wal_locked(true);
         }
         let sidecar = crate::storage::wal::wal_path_for(&self.path);
         let acquired = match crate::storage::wal::acquire_wal_lease(&sidecar, self.instance_id) {
@@ -5172,7 +5238,7 @@ impl Pager {
         }
         let gate = self.xlock_wait_sole(std::time::Instant::now() + XLOCK_URGENT_DEADLINE)?;
         let r = match gate {
-            Some(_sole) => self.checkpoint_wal_locked(),
+            Some(_sole) => self.checkpoint_wal_locked(truncate),
             None => Err(crate::error::Error::Transaction(format!(
                 "database is locked (SQLITE_BUSY): cannot checkpoint {} while another \
                  connection (this process or another) holds the database open; committed \
@@ -5189,7 +5255,10 @@ impl Pager {
     }
 
     /// [`Self::checkpoint_wal`] with the writer lease already held.
-    fn checkpoint_wal_locked(&self) -> Result<()> {
+    /// `truncate` = the explicit TRUNCATE-mode contract (fold + reset +
+    /// `set_len(0)`); `false` = SQLite's PASSIVE/auto shape (fold + reset,
+    /// file keeps its high-water length — see `Wal::reset_keep_size_synced`).
+    fn checkpoint_wal_locked(&self, truncate: bool) -> Result<()> {
         // CACHE-SNAPSHOT-FIRST — LOCK-ORDER DISCIPLINE. The engine's
         // global order is [cache → wal]: get_page's miss path holds
         // cache.write while it probes the WAL's spill map (wal.write),
@@ -5374,7 +5443,11 @@ impl Pager {
         if sync_mode >= 1 && !self.skip_fsync.load(Ordering::Acquire) {
             self.store.read().sync_all()?;
         }
-        state.wal.reset_synced(sync_mode >= 1)?;
+        if truncate {
+            state.wal.reset_synced(sync_mode >= 1)?;
+        } else {
+            state.wal.reset_keep_size_synced(sync_mode >= 1)?;
+        }
         state.map.clear();
         Ok(())
     }
@@ -5524,23 +5597,19 @@ impl Pager {
                     .flush_inner_delete()
                     .map(|_| self.wal_frames_total.load(Ordering::Acquire));
             };
-            let mut scratch = vec![0u8; psz as usize];
-            for (i, id) in dirty_ids.iter().enumerate() {
-                let Some(page_ref) = page_refs.get(id) else {
-                    continue;
-                };
-                {
-                    let mut borrowed = page_ref.lock();
-                    if !borrowed.dirty {
-                        continue;
-                    }
-                    scratch.copy_from_slice(&borrowed.data);
-                    borrowed.dirty = false;
-                }
-                let is_last = i + 1 == dirty_ids.len();
-                let offset = state.wal.append(*id, &scratch, is_last)?;
-                frame_offsets.push((*id, offset));
-            }
+            // Hand the whole commit to the WAL as ONE positioned write
+            // (page bytes copied once, directly into the frame stream
+            // under each page's own short-lived lock — see
+            // `Wal::append_batch`). A 250-frame commit previously paid
+            // ~750 syscalls + 250 scratch Vecs through the per-frame
+            // `append` (seek + header write + page write + check_data
+            // allocation EACH).
+            let commit_pages: Vec<(PageId, PageRef)> = dirty_ids
+                .iter()
+                .filter_map(|id| page_refs.get(id).map(|pr| (*id, pr.clone())))
+                .collect();
+            debug_assert!(frame_offsets.is_empty());
+            state.wal.append_batch(&commit_pages, &mut frame_offsets)?;
             // Durability point. synchronous=NORMAL (the recommended WAL
             // setting) skips this fsync: commits survive process crashes
             // (the OS page cache holds them) but not power loss; the next
@@ -5621,6 +5690,10 @@ impl Pager {
         // and the header's n_pages) is now committed.
         self.committed_n_pages
             .store(self.n_pages.load(Ordering::Acquire), Ordering::Release);
+        // Re-evaluate the adaptive cache size at every commit boundary
+        // (the page count just moved; two relaxed loads when nothing
+        // changes).
+        self.maybe_grow_cache_adaptive();
         Ok(ticket_out)
     }
 
@@ -5913,7 +5986,7 @@ impl Pager {
         //    fresh header. URGENT: the swap below rebinds the store to
         //    this file — a deferred fold would leave the pre-VACUUM main
         //    image as the crash-recovery base.
-        self.checkpoint_wal_now()?;
+        self.checkpoint_wal_now(true)?;
 
         // 6. Stale BEGIN-time pre-images from earlier committed-view
         //    scopes must not serve old-tree bytes over the compact
@@ -6043,7 +6116,7 @@ impl Pager {
         self.freelist_count.store(0, Ordering::Release);
         self.schema_cookie.fetch_add(1, Ordering::AcqRel);
         self.flush()?;
-        self.checkpoint_wal_now()?;
+        self.checkpoint_wal_now(true)?;
         self.clear_committed_view();
         Ok(())
     }
@@ -6206,7 +6279,7 @@ impl Pager {
         // 7. Copy the committed frames into the main file, apply the
         //    armed truncation, and reset the WAL. URGENT — same reason as
         //    the page-level path's step 5.
-        self.checkpoint_wal_now()?;
+        self.checkpoint_wal_now(true)?;
         // 8. Stale BEGIN-time pre-images from earlier committed-view
         //    scopes must not serve old-tree bytes over the compact state.
         self.clear_committed_view();
@@ -7100,6 +7173,7 @@ impl Pager {
     /// Store the raw PRAGMA cache_size setting.
     pub fn set_cache_size_setting(&self, k: i64) {
         self.cache_size_setting.store(k, Ordering::Release);
+        self.cache_size_pinned.store(true, Ordering::Release);
         self.persist_file_setting(|s| s.cache_size_setting = Some(k));
     }
 
@@ -7139,7 +7213,36 @@ impl Pager {
     pub fn set_cache_capacity(&self, pages: usize) {
         let pages = pages.max(1);
         self.cache_capacity.store(pages, Ordering::Relaxed);
+        self.cache_size_pinned.store(true, Ordering::Release);
         self.persist_file_setting(|s| s.cache_capacity_pages = Some(pages));
+    }
+
+    /// Adaptive cache-capacity growth (build-scale throughput): at
+    /// multi-GB file sizes, a fixed 512-page cache thrashes the B+tree's
+    /// interior ring (at 100M rows the secondary index's level-3 ring is
+    /// ~600 pages ALONE — every descent faults). Size the cache from the
+    /// live page count instead: ~n/256 pages (about twice the interior
+    /// footprint at the ~470 fanout, plus the sorted-sweep working set),
+    /// clamped to [1024, ADAPTIVE_CACHE_MAX_PAGES], and MONOTONIC —
+    /// growth only, so a battery of reads after a build sees flat RSS
+    /// (M7's swing gates). Stands down entirely when the user (or a
+    /// persisted file setting) pinned `PRAGMA cache_size`, on
+    /// memory stores, and below ADAPTIVE_CACHE_MIN_FILE_PAGES.
+    pub(crate) fn maybe_grow_cache_adaptive(&self) {
+        if self.store_is_memory.load(Ordering::Relaxed)
+            || self.cache_size_pinned.load(Ordering::Acquire)
+        {
+            return;
+        }
+        let n = self.n_pages.load(Ordering::Acquire) as usize;
+        if n < ADAPTIVE_CACHE_MIN_FILE_PAGES {
+            return;
+        }
+        let target = (n / 256).clamp(1024, ADAPTIVE_CACHE_MAX_PAGES);
+        let cur = self.cache_capacity.load(Ordering::Relaxed);
+        if target > cur {
+            self.cache_capacity.store(target, Ordering::Relaxed);
+        }
     }
 
     // ----- File I/O helpers: positioned I/O so multiple threads can
@@ -7463,7 +7566,7 @@ mod tests {
             }
             pager.note_write();
             pager.flush().unwrap();
-            pager.checkpoint_wal_now().unwrap();
+            pager.checkpoint_wal_now(true).unwrap();
             n_before = pager.n_pages();
         }
         // The flushed file is a valid (compact) image of the current
