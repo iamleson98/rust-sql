@@ -135,14 +135,24 @@ fn sqlite_create_index(conn: &rusqlite::Connection) {
 fn sqlite_insert_single(conn: &rusqlite::Connection, n: usize) -> Duration {
     // PREPARE PARITY: rusqlite's `prepare_cached` is SQLite's own statement
     // cache — the twin of the engine's internal cache (parse once, not per row).
-    let start = Instant::now();
-    for i in 1..=n as i64 {
-        conn.prepare_cached("INSERT INTO t (name, val, score) VALUES (?1, ?2, ?3)")
-            .unwrap()
-            .execute(params![format!("name{}", i), i * 2, i as f64 * 1.5])
-            .unwrap();
-    }
-    start.elapsed()
+    //
+    // STEADY-STATE best-of-N (run 37810966788's macOS draw: a single pass
+    // measured 3.88 ms against ubuntu's 353 us for the same pure-`:memory:`
+    // work — a ~3.5 ms one-time lump in the only timed window, while the
+    // same binary drew 2.8x/3.1x WINS on ubuntu/windows; the d6b90b8
+    // point-lookup class). Mutating workload, but per-op work is flat
+    // across the 1k-9k-row growth (the 5530e96 UPDATE-range precedent:
+    // both engines grow identically through the same discipline).
+    best_of::<7>(|| {
+        let start = Instant::now();
+        for i in 1..=n as i64 {
+            conn.prepare_cached("INSERT INTO t (name, val, score) VALUES (?1, ?2, ?3)")
+                .unwrap()
+                .execute(params![format!("name{}", i), i * 2, i as f64 * 1.5])
+                .unwrap();
+        }
+        start.elapsed()
+    })
 }
 
 fn sqlite_insert_single_in_txn(conn: &rusqlite::Connection, n: usize) -> Duration {
@@ -751,20 +761,24 @@ fn rustqlite_create_index(db: &mut rustqlite::Database) {
 }
 
 fn rustqlite_insert_single(db: &mut rustqlite::Database, n: usize) -> Duration {
+    // STEADY-STATE best-of-N — the same discipline as the SQLite twin
+    // (run 37810966788's macOS single-window draw; see that side's note).
     let sql = "INSERT INTO t (name, val, score) VALUES (?, ?, ?)";
-    let start = Instant::now();
-    for i in 1..=n as i64 {
-        db.execute(
-            sql,
-            [
-                Value::Text(format!("name{}", i).into()),
-                Value::Integer(i * 2),
-                Value::Real(i as f64 * 1.5),
-            ],
-        )
-        .unwrap();
-    }
-    start.elapsed()
+    best_of::<7>(|| {
+        let start = Instant::now();
+        for i in 1..=n as i64 {
+            db.execute(
+                sql,
+                [
+                    Value::Text(format!("name{}", i).into()),
+                    Value::Integer(i * 2),
+                    Value::Real(i as f64 * 1.5),
+                ],
+            )
+            .unwrap();
+        }
+        start.elapsed()
+    })
 }
 
 fn rustqlite_insert_single_in_txn(db: &mut rustqlite::Database, n: usize) -> Duration {
