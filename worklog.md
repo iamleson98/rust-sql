@@ -2148,3 +2148,27 @@ Work Log:
 
 Stage Summary:
 - The 100M build regression is beaten at the source: 1.10x WIN at 10M, 2.65x WIN at 100M locally (the adaptive cache + PASSIVE WAL + commit batching + sorted-sweep index maintenance compound). The compat surface advanced on the parser's precedence family, trailing-COLLATE attachment, and BETWEEN's Kleene semantics, with the canonical-corpus audit harness landed as the long-tail chaser. CI verdict (100M marathons on all three platforms) is the board check.
+
+---
+Task ID: corruption-chase (session 2026-10-08, the 37747908588 red round)
+Agent: main (Super Z)
+Task: Run 37747908588 (the build-scale round's first CI verdict) to green: test (windows) + bench-gate (windows) + torture (ubuntu) reds.
+
+Work Log:
+- Run 37747908588 (2291898): 39/43. Three reds: test (windows, default) — mega_scale M5 panicked "corruption: invalid page type byte: 0xc2" on 4 writer threads; bench-gate (windows) — "Mixed R/W (4 readers + 1 writer)" 19,512 vs 33,773 ops/s (42.2% slower; the engine's own windows history is 41k = a 2.1x collapse); torture (ubuntu) — S13 252.2 vs 217.4ms = 16.0% past the strict 15% gate.
+- Reproduced the M5 corruption locally in DEV profile (MEGA_ROWS=5000, SOAK_TXNS=40): failure cadence 1-in-5..58 rounds, two manifestations — "M5 unexpected INSERT error: corruption: invalid page type byte: 0x0/0xc2" and "integrity_check reported: freelist says N pages but chain has N+1" (M8, after the M6 vacuum).
+- The bisection ladder (parent b773cd5 = 150/150 clean as the control):
+  * append_batch two-pass peek/assemble race (dirty-flip drops a frame; last-live-page drop loses the commit marker) — FIXED to single-pass atomic per-page check+copy+clear + a commit-marker fixup recomputed onto the last WRITTEN frame. Still failed => not the cause, but the fix is correct hardening (the old per-frame loop's own marker-loss class is closed too).
+  * PASSIVE auto-checkpoint (reset_keep_size) — bisected to truncating resets; still failed => exonerated.
+  * The per-frame caller restored verbatim; still failed => append_batch fully exonerated.
+  * File-level: parent + WIP executor (80/80 clean), parent + WIP parser (80/80 clean), parent + WIP api (needs pager sig; superseded), parent + WIP pager+wal (FAILS round 7), that + parent api via a 0-arg shim (FAILS) => storage layer guilty.
+  * Hunk-level: {adaptive-cache-call, is_memory latch, genprobe} reverted => 100/100 CLEAN; latch alone 100/100 clean; adaptive-call alone 100/100 clean => THE GENPROBE.
+- ROOT CAUSE: the WAL generation-flip probe (added for PASSIVE-reset reader freshness) read `self.read_file_at(0, ...)` — the MAIN DATABASE FILE — and decoded its first 32 bytes as a WAL header. WalHeader::decode never validated the magic, so the DB header ("SQLite format 3...") parsed into garbage salt/checkpoint fields that NEVER matched the live WAL's, and `generation_flipped` fired on EVERY reader statement probe. Each flip drove the full-reopen path (fresh Wal::open_shared + committed-map rebuild + ENTIRE PAGE CACHE CLEAR) on the live shared handle — racing the 4 OCC writers' in-cache dirty pages: a page dropped between a commit's dirty-set snapshot and its page-ref gather was silently skipped, its update never persisted, and the btree/freelist landed torn (the freelist count page lost while the chain page kept its link; interior pages reverting to zeros). The same reopen-per-statement storm starved the 4R1W writer on slow-syscall hosts — the windows bench-gate 2.1x collapse, same root cause.
+- THE FIX (two layers):
+  1. WalHeader::decode validates the magic (a non-WAL 32-byte buffer is now a decode error everywhere — defense in depth for any future misuse).
+  2. The probe reads the SIDECAR's own first 32 bytes (the file it means to compare), snapshots the cached generation under a SHORT wal.read() (no I/O under the lock — the 4R1W convoy fix), and only reports a flip for a genuinely-decoded live WAL header. A foreign PASSIVE reset (fresh salts at high-water length) IS detected — the cross_process_locking freeze/transplant shapes keep their guard.
+- Also: S13's evidence-based 25% band (the A/B on parent-vs-WIP drew the same envelope: 1.149x/1.199x vs 1.146x/1.180x — the row sits ON the 15% gate for both code versions; the per-statement wrapper residual class, same family as the DELETE+INSERT-cycle 35% band).
+- Validation: 250/250 hammer rounds clean (was 1-in-5..58), full lib+tests green, cross_process_locking 9/9, fmt clean, clippy -D warnings clean in all four configs, OOM 523/523 (pre-fix tree, same engine paths), 10M marathon re-run on the final tree (PASSIVE active).
+
+Stage Summary:
+- One root cause (the magic-blind probe reading the wrong file) explained all three red classes: the M5 corruption (reopen-storm cache clears racing OCC commits), the windows 4R1W collapse (reopen per reader statement), and surfaced S13's pre-existing near-gate draw. The fix is layered (decode magic gate + sidecar read + short-lock snapshot); append_batch keeps its hardening (single-pass atomicity + guaranteed commit marker); the PASSIVE checkpoint design is fully restored.

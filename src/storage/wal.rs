@@ -136,6 +136,18 @@ impl WalHeader {
         if buf.len() < WAL_HEADER_SIZE as usize {
             return Err(Error::corruption("WAL header too small"));
         }
+        // MAGIC GATE — a 32-byte buffer is not necessarily a WAL header
+        // (the reader-side freshness probe once fed the MAIN database
+        // file's header here; the lenient parse produced garbage salts
+        // that never matched, and the probe reported a generation flip
+        // on EVERY statement). A non-WAL magic is a decode error, not a
+        // WAL header with surprising fields.
+        let magic = u32::from_be_bytes(buf[0..4].try_into().unwrap());
+        if magic != WAL_MAGIC {
+            return Err(Error::corruption(format!(
+                "not a WAL header (magic {magic:#x}, want {WAL_MAGIC:#x})"
+            )));
+        }
         Ok(Self {
             magic: u32::from_be_bytes(buf[0..4].try_into().unwrap()),
             format_version: u32::from_be_bytes(buf[4..8].try_into().unwrap()),
@@ -875,44 +887,57 @@ impl Wal {
         }
         let psz = self.page_size as usize;
         let frame_size = (FRAME_HEADER_SIZE as usize) + psz;
-        // Peek pass: which pages are live (dirty)? The commit marker
-        // rides the LAST live frame, so the assembly pass needs the
-        // live count before the first checksum can be finalized.
-        let live: Vec<usize> = pages
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, pr))| pr.lock().dirty)
-            .map(|(i, _)| i)
-            .collect();
-        if live.is_empty() {
-            return Ok(());
-        }
-        let mut out: Vec<u8> = Vec::with_capacity(live.len() * frame_size);
-        out_offsets.reserve(live.len());
+        // SINGLE-PASS assembly: the dirty check, the byte copy, and the
+        // dirty clear happen under ONE lock hold per page — the
+        // per-frame `append` loop's atomicity contract. A two-pass
+        // peek-then-assemble shape raced any concurrent page flip
+        // (a failed statement's page-level restore discarding this
+        // commit's pages, a rollback dropping cache entries): a page
+        // dirty at the PEEK and clean at the ASSEMBLY was silently
+        // dropped from the commit's frame stream, and the commit
+        // returned success WITHOUT that page's update — the
+        // freelist-header page losing its count while the chain page
+        // kept its link ("freelist says N pages but chain has N+1"),
+        // or an interior btree page reverting mid-descent ("invalid
+        // page type byte"). The commit marker is PATCHED onto the last
+        // WRITTEN frame after the loop (its checksum recomputed — the
+        // commit byte participates in it), so a batch that skips its
+        // tail entries can never land marker-less.
+        let mut out: Vec<u8> = Vec::with_capacity(pages.len() * frame_size);
+        out_offsets.reserve(pages.len());
         let (mut c1, mut c2) = self.checksum;
         let start = self.n_frames;
         let start_offset = WAL_HEADER_SIZE as u64 + start as u64 * frame_size as u64;
         let mut fh = [0u8; FRAME_HEADER_SIZE as usize];
         fh[8..12].copy_from_slice(&self.header.salt1.to_be_bytes());
         fh[12..16].copy_from_slice(&self.header.salt2.to_be_bytes());
-        for (n, &i) in live.iter().enumerate() {
-            let (page_id, page_ref) = &pages[i];
+        // The chain value BEFORE the last written frame + that frame's
+        // id/header slot, for the commit-marker fixup below.
+        let mut chain_before_last: Option<(u32, u32)> = None;
+        let mut last_hdr_at: Option<usize> = None;
+        let mut last_page_id: PageId = 0;
+        for (page_id, page_ref) in pages {
+            let page_id = *page_id;
             let hdr_at = out.len();
             out.resize(hdr_at + frame_size, 0);
-            let slot = &mut out[hdr_at + FRAME_HEADER_SIZE as usize..][..psz];
             {
                 let mut borrowed = page_ref.lock();
                 if !borrowed.dirty {
-                    // Dirtiness changed between the peek and here (a
-                    // concurrent flush of the same pages): drop the
-                    // reservation. Its dirtiness is the next flush's.
+                    // Not this commit's to write (never dirtied since
+                    // the cache snapshot, or a concurrent flush already
+                    // persisted it under ITS marker) — the per-frame
+                    // loop's skip, decided atomically with the copy.
                     out.truncate(hdr_at);
                     continue;
                 }
-                slot.copy_from_slice(&borrowed.data);
+                out[hdr_at + FRAME_HEADER_SIZE as usize..][..psz].copy_from_slice(&borrowed.data);
                 borrowed.dirty = false;
             }
-            let commit = (n + 1 == live.len()) as u32;
+            // commit is patched onto the last WRITTEN frame below.
+            // The chain value BEFORE this frame feeds the fixup if this
+            // frame ends up last.
+            let chain_now = (c1, c2);
+            let commit = 0u32;
             let mut pre = [0u8; 8];
             pre[0..4].copy_from_slice(&page_id.to_be_bytes());
             pre[4..8].copy_from_slice(&commit.to_be_bytes());
@@ -920,6 +945,7 @@ impl Wal {
             let mut h2 = crc32fast::Hasher::new_with_initial(c2 ^ 0xA5A5A5A5);
             h1.update(&pre);
             h2.update(&pre);
+            let slot = &out[hdr_at + FRAME_HEADER_SIZE as usize..][..psz];
             h1.update(slot);
             h2.update(slot);
             c1 = h1.finalize();
@@ -929,13 +955,41 @@ impl Wal {
             fh[16..20].copy_from_slice(&c1.to_be_bytes());
             fh[20..24].copy_from_slice(&c2.to_be_bytes());
             out[hdr_at..hdr_at + FRAME_HEADER_SIZE as usize].copy_from_slice(&fh);
+            chain_before_last = Some(chain_now);
+            last_hdr_at = Some(hdr_at);
+            last_page_id = page_id;
             out_offsets.push((
-                *page_id,
+                page_id,
                 start_offset + out_offsets.len() as u64 * frame_size as u64,
             ));
         }
         if out.is_empty() {
             return Ok(());
+        }
+        // COMMIT-MARKER FIXUP: the last WRITTEN frame carries the
+        // commit flag. Its checksum must be recomputed (the commit
+        // byte feeds the CRC chain) from the chain value BEFORE that
+        // frame; the patched pair becomes the running chain so the
+        // next append chains from the marker'd values.
+        if let Some(hdr_at) = last_hdr_at {
+            let (p1, p2) = chain_before_last.expect("last frame tracked with its chain");
+            let mut pre = [0u8; 8];
+            pre[0..4].copy_from_slice(&last_page_id.to_be_bytes());
+            pre[4..8].copy_from_slice(&1u32.to_be_bytes());
+            let slot = &out[hdr_at + FRAME_HEADER_SIZE as usize..][..psz];
+            let mut h1 = crc32fast::Hasher::new_with_initial(p1);
+            let mut h2 = crc32fast::Hasher::new_with_initial(p2 ^ 0xA5A5A5A5);
+            h1.update(&pre);
+            h2.update(&pre);
+            h1.update(slot);
+            h2.update(slot);
+            c1 = h1.finalize();
+            c2 = h2.finalize();
+            fh[0..4].copy_from_slice(&last_page_id.to_be_bytes());
+            fh[4..8].copy_from_slice(&1u32.to_be_bytes());
+            fh[16..20].copy_from_slice(&c1.to_be_bytes());
+            fh[20..24].copy_from_slice(&c2.to_be_bytes());
+            out[hdr_at..hdr_at + FRAME_HEADER_SIZE as usize].copy_from_slice(&fh);
         }
         self.checksum = (c1, c2);
         self.n_frames += (out.len() / frame_size) as u32;

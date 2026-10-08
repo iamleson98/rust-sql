@@ -4753,20 +4753,41 @@ impl Pager {
         // full-reopen condition.
         let mut generation_flipped = false;
         {
-            let g = self.wal.read();
-            if let Some(state) = g.as_ref() {
-                let mut hdr = [0u8; crate::storage::wal::WAL_HEADER_SIZE as usize];
-                let ok = self
-                    .read_file_at(0, &mut hdr)
-                    .map(|n| n == crate::storage::wal::WAL_HEADER_SIZE as usize)
-                    .unwrap_or(false);
-                if ok {
-                    if let Ok(live) = crate::storage::wal::WalHeader::decode(&hdr) {
-                        let (s1, s2) = state.wal.salts();
-                        generation_flipped = live.salt1 != s1
-                            || live.salt2 != s2
-                            || live.checkpoint_seq != state.wal.header_checkpoint_seq();
-                    }
+            // Snapshot THIS handle's cached generation under a SHORT
+            // wal.read() (no I/O under the lock — the probe runs at
+            // every reader statement-start, and a positioned read under
+            // the read lock convoys the writer's wal.write() commit
+            // path on slow-syscall hosts).
+            let (mine_s1, mine_s2, mine_seq) = {
+                let g = self.wal.read();
+                match g.as_ref() {
+                    Some(state) => (
+                        state.wal.salts().0,
+                        state.wal.salts().1,
+                        state.wal.header_checkpoint_seq(),
+                    ),
+                    None => (0, 0, 0),
+                }
+            };
+            // Read the SIDECAR's own header — the file whose generation
+            // is being compared. (The first cut of this probe read the
+            // MAIN database file at offset 0; WalHeader::decode was
+            // magic-blind, so the DB header parsed as garbage salts and
+            // the flip fired on EVERY probe — a full-reopen storm that
+            // raced concurrent writers' in-cache dirty pages. The magic
+            // gate in decode now rejects non-WAL buffers as well.)
+            let mut hdr = [0u8; crate::storage::wal::WAL_HEADER_SIZE as usize];
+            let read_ok = std::fs::File::open(&sidecar)
+                .and_then(|mut f| {
+                    use std::io::Read;
+                    f.read_exact(&mut hdr)
+                })
+                .is_ok();
+            if read_ok {
+                if let Ok(live) = crate::storage::wal::WalHeader::decode(&hdr) {
+                    generation_flipped = live.salt1 != mine_s1
+                        || live.salt2 != mine_s2
+                        || live.checkpoint_seq != mine_seq;
                 }
             }
         }
