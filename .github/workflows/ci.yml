@@ -881,13 +881,17 @@ jobs:
       - name: Build engine C ABI library (libsqlite3.so / sqlite3.dll)
         run: cargo build -p rustqlite-compat
       - name: sqlx core (pool, DDL, binds, fetch_all, query_as, tx)
-        run: cargo run --manifest-path sqlx-interop/Cargo.toml --bin sqlx-interop
+        shell: bash
+        run: .github/scripts/annotate_failure.sh sqlx-interop cargo run --manifest-path sqlx-interop/Cargo.toml --bin sqlx-interop
       - name: sqlx::migrate! (migrations, checksums, atomic rollback)
-        run: cargo run --manifest-path sqlx-interop/Cargo.toml --bin migrate_interop
+        shell: bash
+        run: .github/scripts/annotate_failure.sh migrate_interop cargo run --manifest-path sqlx-interop/Cargo.toml --bin migrate_interop
       - name: sea-orm (entities, CRUD, tx rollback, error propagation)
-        run: cargo run --manifest-path sqlx-interop/Cargo.toml --bin sea_orm_interop
+        shell: bash
+        run: .github/scripts/annotate_failure.sh sea_orm_interop cargo run --manifest-path sqlx-interop/Cargo.toml --bin sea_orm_interop
       - name: sea-orm (relations, joins, paginator)
-        run: cargo run --manifest-path sqlx-interop/Cargo.toml --bin sea_orm_relations
+        shell: bash
+        run: .github/scripts/annotate_failure.sh sea_orm_relations cargo run --manifest-path sqlx-interop/Cargo.toml --bin sea_orm_relations
 
   # ------------------------------------------------------------ aggregate OK
   ci-ok:
