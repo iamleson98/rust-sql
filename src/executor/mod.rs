@@ -5307,26 +5307,77 @@ fn collect_nested_selects<'a>(sel: &'a SelectStatement, out: &mut Vec<&'a Select
 }
 
 fn collect_expr_selects<'a>(e: &'a Expr, out: &mut Vec<&'a SelectStatement>) {
+    // EVERY child expression is walked: a subquery under CAST / COLLATE /
+    // BETWEEN / IS / IS NULL / LIKE / an IN list / a row value used to be
+    // invisible here, so `k < CAST((SELECT … WHERE g < l) AS TEXT)` read
+    // as uncorrelated and was planned as an index BOUND evaluated once
+    // per statement (with no current row: the scan returned nothing).
     match e {
         Expr::Subquery(sel) | Expr::Exists(sel) => {
             out.push(sel);
             collect_nested_selects(sel, out);
         }
-        Expr::In {
-            source: InSource::Subquery(sel),
-            ..
-        } => {
-            out.push(sel);
-            collect_nested_selects(sel, out);
+        Expr::In { expr, source, .. } => {
+            collect_expr_selects(expr, out);
+            match source {
+                InSource::Subquery(sel) => {
+                    out.push(sel);
+                    collect_nested_selects(sel, out);
+                }
+                InSource::List(list) => {
+                    for v in list.iter() {
+                        collect_expr_selects(v, out);
+                    }
+                }
+                InSource::Table(_) => {}
+            }
         }
-        Expr::Binary { left, right, .. } => {
+        Expr::Binary { left, right, .. } | Expr::Is { left, right, .. } => {
             collect_expr_selects(left, out);
             collect_expr_selects(right, out);
         }
-        Expr::Unary { expr, .. } => collect_expr_selects(expr, out),
-        Expr::Function { args, .. } => {
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. } => collect_expr_selects(expr, out),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_expr_selects(expr, out);
+            collect_expr_selects(low, out);
+            collect_expr_selects(high, out);
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            collect_expr_selects(expr, out);
+            collect_expr_selects(pattern, out);
+            if let Some(esc) = escape {
+                collect_expr_selects(esc, out);
+            }
+        }
+        Expr::Row(items) => {
+            for v in items {
+                collect_expr_selects(v, out);
+            }
+        }
+        Expr::Function {
+            args,
+            filter,
+            order_by,
+            ..
+        } => {
             for a in args {
                 collect_expr_selects(a, out);
+            }
+            if let Some(f) = filter {
+                collect_expr_selects(f, out);
+            }
+            for t in order_by {
+                collect_expr_selects(&t.expr, out);
             }
         }
         Expr::Case {
@@ -5345,7 +5396,13 @@ fn collect_expr_selects<'a>(e: &'a Expr, out: &mut Vec<&'a SelectStatement>) {
                 collect_expr_selects(e, out);
             }
         }
-        _ => {}
+        Expr::Raise {
+            message: Some(m), ..
+        } => collect_expr_selects(m, out),
+        Expr::Literal(_)
+        | Expr::Parameter(_)
+        | Expr::Column { .. }
+        | Expr::Raise { message: None, .. } => {}
     }
 }
 
@@ -10863,24 +10920,47 @@ pub(crate) fn group_term_collations(
     group_by: &[Expr],
     table: &crate::schema::Table,
 ) -> Vec<Option<String>> {
+    let resolve = |_: Option<&str>, name: &str| -> Option<String> {
+        let i = table.find_column(name)?;
+        if table.rowid_alias == Some(i) {
+            return None;
+        }
+        table.columns.get(i).map(|c| c.collation.clone())
+    };
     group_by
         .iter()
-        .map(|g| match g {
-            Expr::Collate { collation, .. } => {
-                if collation.is_empty() || collation.eq_ignore_ascii_case("BINARY") {
-                    None
-                } else {
-                    Some(collation.clone())
-                }
-            }
-            Expr::Column { name, .. } => table
-                .find_column(name)
-                .and_then(|i| table.columns.get(i))
-                .map(|c| c.collation.clone())
-                .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("BINARY")),
-            _ => None,
-        })
+        .map(|g| group_key_collation(g, &resolve))
         .collect()
+}
+
+/// A GROUP BY term's grouping collation — sqlite3ExprCollSeq: an explicit
+/// COLLATE anywhere in the term (EP_Collate propagates up through every
+/// operator and function argument: `'p' || (j COLLATE NOCASE)` groups
+/// NOCASE), else — through CAST and unary `+` — a column's declared
+/// collation via `resolve` (the rowid has none). `None` = BINARY.
+fn group_key_collation(
+    g: &Expr,
+    resolve: &dyn Fn(Option<&str>, &str) -> Option<String>,
+) -> Option<String> {
+    let binary_is_none =
+        |c: String| (!c.is_empty() && !c.eq_ignore_ascii_case("BINARY")).then_some(c);
+    if let Some(c) = crate::executor::expr::explicit_collation(g) {
+        return binary_is_none(c);
+    }
+    let mut p = g;
+    loop {
+        match p {
+            Expr::Cast { expr, .. }
+            | Expr::Unary {
+                op: crate::sql::ast::UnaryOp::Pos,
+                expr,
+            } => p = expr,
+            Expr::Column { table, name } => {
+                return resolve(table.as_deref(), name).and_then(binary_is_none)
+            }
+            _ => return None,
+        }
+    }
 }
 
 /// Collect (effective prefix, table) pairs from every base-table access
@@ -14161,6 +14241,9 @@ fn exec_aggregate(
         let mut scopes: Vec<(String, Arc<crate::schema::Table>)> = Vec::new();
         collect_plan_tables(input, &mut scopes);
         let resolve = |t: Option<&str>, name: &str| -> Option<String> {
+            if crate::planner::is_rowid_spelling(name) {
+                return None;
+            }
             let tables: Vec<&Arc<crate::schema::Table>> = scopes
                 .iter()
                 .filter(|(prefix, _)| t.map(|q| q.eq_ignore_ascii_case(prefix)).unwrap_or(true))
@@ -14176,25 +14259,16 @@ fn exec_aggregate(
                 None
             };
             tbl.and_then(|tbl| {
-                tbl.find_column(name)
-                    .and_then(|i| tbl.columns.get(i))
-                    .map(|c| c.collation.clone())
-                    .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("BINARY"))
+                let i = tbl.find_column(name)?;
+                if tbl.rowid_alias == Some(i) {
+                    return None;
+                }
+                tbl.columns.get(i).map(|c| c.collation.clone())
             })
         };
         let collations: Vec<Option<String>> = group_by
             .iter()
-            .map(|g| match g {
-                Expr::Collate { collation, .. } => {
-                    if collation.is_empty() || collation.eq_ignore_ascii_case("BINARY") {
-                        None
-                    } else {
-                        Some(collation.clone())
-                    }
-                }
-                Expr::Column { table, name } => resolve(table.as_deref(), name),
-                _ => None,
-            })
+            .map(|g| group_key_collation(g, &resolve))
             .collect();
         grouper_key_collations = collations;
         grouper.set_key_collations(grouper_key_collations.clone());

@@ -941,7 +941,9 @@ fn eq_class(v: &V, nocase: bool) -> V {
 ///   INTERSECT / EXCEPT / GROUP BY group — SQLite's own pick depends on
 ///   its plan (first row for DISTINCT, last insert for UNION's ephemeral
 ///   index, ...);
-/// * the ORDER of rows whose ORDER BY keys tie under the same equality.
+/// * the ORDER of rows whose ORDER BY keys tie under the same equality —
+///   and, under LIMIT / OFFSET, WHICH tied rows fall inside the window;
+/// * the representative a top-level `min()` / `max()` returns.
 ///
 /// Anything else — a row count, a value outside the equality class, a
 /// storage class that is not one of the tied candidates, an order that
@@ -1000,8 +1002,16 @@ fn unspecified_only(
     if ordered {
         // Same sequence of equality classes; when no dedup is involved
         // the two answers must hold the very same rows (only tied rows
-        // may trade places).
-        co == ct && (dedups || normalize(ours.clone(), false) == normalize(theirs.clone(), false))
+        // may trade places) — unless a LIMIT / OFFSET window cuts through
+        // a run of tied rows: which of them land inside it follows the
+        // scan order (SQLite's top-N sorter keeps the first-inserted
+        // ties, and it may scan a covering index where we scan the
+        // table), so only the per-position equality classes are fixed.
+        let windowed = up.contains(" LIMIT ") || up.contains(" OFFSET ");
+        co == ct
+            && (dedups
+                || windowed
+                || normalize(ours.clone(), false) == normalize(theirs.clone(), false))
     } else {
         normalize(co, false) == normalize(ct, false)
     }
