@@ -209,11 +209,11 @@ struct CtxDeltas {
     /// first split's new root was dropped and every subsequent insert/read
     /// went through the STALE root — a 5000-row insert silently retained
     /// ~391 rows (one leaf's worth).
-    root_overrides: HashMap<String, u32>,
+    root_overrides: crate::executor::NameMap<u32>,
     index_roots: HashMap<String, u32>,
     roots_changed: bool,
     index_roots_changed: bool,
-    max_rowids: HashMap<String, i64>,
+    max_rowids: crate::executor::NameMap<i64>,
     max_rowids_invalidated: Vec<String>,
     max_rowids_changed: bool,
     /// DDL-retired table roots (DROP TABLE / rename) — replayed as

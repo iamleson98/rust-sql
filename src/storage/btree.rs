@@ -75,7 +75,27 @@ pub mod varint {
     }
 
     /// Decode a varint. Returns (value, bytes consumed).
+    ///
+    /// Inlined 1-3 byte fast path (SQLite's getVarint32 macro shape):
+    /// cell lengths, small rowids and keys up to 2^21 resolve without the
+    /// general loop — the b-tree searches decode one or two varints per
+    /// probe, and the out-of-line loop was the top self-time symbol of a
+    /// multi-index insert load.
+    #[inline]
     pub fn decode(buf: &[u8]) -> Option<(u64, usize)> {
+        match *buf {
+            [b0, ..] if b0 < 0x80 => Some((b0 as u64, 1)),
+            [b0, b1, ..] if b1 < 0x80 => Some(((((b0 & 0x7F) as u64) << 7) | b1 as u64, 2)),
+            [b0, b1, b2, ..] if b2 < 0x80 => Some((
+                (((b0 & 0x7F) as u64) << 14) | (((b1 & 0x7F) as u64) << 7) | b2 as u64,
+                3,
+            )),
+            _ => decode_slow(buf),
+        }
+    }
+
+    #[inline(never)]
+    fn decode_slow(buf: &[u8]) -> Option<(u64, usize)> {
         if buf.is_empty() {
             return None;
         }
@@ -98,6 +118,38 @@ pub mod varint {
         Some((v, 9))
     }
 
+    #[cfg(test)]
+    #[test]
+    fn fast_path_matches_the_general_loop() {
+        let check = |v: u64| {
+            let mut b = [0u8; 9];
+            let n = encode(v, &mut b);
+            assert_eq!(decode(&b[..n]), decode_slow(&b[..n]), "{v}");
+            assert_eq!(decode(&b[..n]), Some((v, n)), "{v}");
+            // Trailing bytes never change the result; truncation fails.
+            assert_eq!(decode(&b), decode_slow(&b), "{v} padded");
+            assert_eq!(decode(&b[..n - 1]), decode_slow(&b[..n - 1]), "{v} cut");
+        };
+        (0..1u64 << 22).for_each(check);
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..200_000 {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            check(x >> (x % 64));
+            check(x);
+        }
+        for v in [
+            u64::MAX,
+            i64::MIN as u64,
+            (-1i64) as u64,
+            1 << 56,
+            (1 << 56) - 1,
+        ] {
+            check(v);
+        }
+    }
+
     /// Encode a signed i64 as a varint (using SQLite's zig-zag-like encoding).
     pub fn encode_signed(v: i64, out: &mut [u8]) -> usize {
         // SQLite uses two's complement, big-endian, but stored as varint
@@ -105,6 +157,7 @@ pub mod varint {
         encode(v as u64, out)
     }
 
+    #[inline]
     pub fn decode_signed(buf: &[u8]) -> Option<(i64, usize)> {
         decode(buf).map(|(v, n)| (v as i64, n))
     }
@@ -1250,6 +1303,28 @@ fn biased_rowid_search(
     Ok(None)
 }
 
+/// Binary search of a table LEAF for `rowid`: `Ok(i)` = cell `i` holds
+/// it, `Err(pos)` = absent, `pos` is where it would be inserted.
+fn table_leaf_search(
+    borrowed: &crate::storage::page::Page,
+    rowid: i64,
+) -> Result<std::result::Result<u16, u16>> {
+    let (mut lo, mut hi) = (0u16, borrowed.n_cells());
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let ptr = borrowed.cell_pointer(mid) as usize;
+        let Some((r, _)) = decode_rowid_only(borrowed.cell_slice_checked(ptr)?) else {
+            return Err(Error::corruption("truncated leaf rowid in search"));
+        };
+        match r.cmp(&rowid) {
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Greater => hi = mid,
+            std::cmp::Ordering::Equal => return Ok(Ok(mid)),
+        }
+    }
+    Ok(Err(lo))
+}
+
 /// Software-prefetch the page header + cell-pointer array (first 1 KiB).
 ///
 /// A cold-leaf binary search touches the header line, then pointer-array
@@ -1813,6 +1888,10 @@ pub struct Btree<'a> {
     /// `insert_table` / `insert_index` (which journal on their own
     /// success). See `insert_table_append`.
     journal_suppress: bool,
+    /// `insert_table_absent`: a table-leaf placement that finds the rowid
+    /// already present returns `InsertResult::Duplicate` (nothing
+    /// written) instead of inserting a second cell.
+    reject_dup_rowid: bool,
     /// Pinned root page for the read path: avoids a page-cache read-lock +
     /// Arc refcount round-trip on EVERY descent (a 10-row join seeks the
     /// tree 10 times; each seek re-fetched the root). Validated against
@@ -1869,6 +1948,9 @@ const TL_HINT_DISABLE_AT: u32 = 16;
 /// entry of the left page — the left child's separator for the parent.
 enum InsertResult {
     Done,
+    /// `reject_dup_rowid` placement: the table leaf already holds the
+    /// rowid; nothing was written.
+    Duplicate,
     Split {
         new_page: PageId,
         split_key: i64,
@@ -2077,6 +2159,7 @@ impl<'a> Btree<'a> {
             root,
             is_index,
             journal_suppress: false,
+            reject_dup_rowid: false,
             pinned_root: None,
             pinned_epoch: 0,
             table_leaf: None,
@@ -2397,6 +2480,7 @@ impl<'a> Btree<'a> {
             root,
             is_index,
             journal_suppress: false,
+            reject_dup_rowid: false,
             pinned_root: None,
             pinned_epoch: 0,
             table_leaf: None,
@@ -3085,6 +3169,55 @@ impl<'a> Btree<'a> {
         r
     }
 
+    /// Insert `rowid` unless the table already holds it: ONE root-to-leaf
+    /// descent serves both the conflict probe and the placement (SQLite's
+    /// OP_NotExists seek followed by an OP_Insert that reuses the cursor
+    /// position) — the INSERT path used to pay a `lookup_table` descent
+    /// and then a second descent in `insert_table`. `Ok(false)` = the
+    /// rowid is present and nothing was written.
+    pub fn insert_table_absent(&mut self, rowid: i64, payload: &[u8]) -> Result<bool> {
+        // Concurrent regime: the absence probe must stay a recorded
+        // semantic point read (a sibling's commit of the same rowid is
+        // caught at validation) — the fused descent runs inside the
+        // structural scope and records none, so take the probe + insert.
+        if self.pager.concurrent_scope_armed() {
+            if let LookupResult::Found(_) = self.lookup_table(rowid)? {
+                return Ok(false);
+            }
+            self.insert_table(rowid, payload)?;
+            return Ok(true);
+        }
+        let _structural = self.pager.structural_scope();
+        // As insert_table_inner: announce the write before any page
+        // changes (a duplicate only costs an advisory-cache epoch bump).
+        self.pager.note_write();
+        self.reject_dup_rowid = true;
+        let r = self
+            .make_leaf_cell(rowid, payload)
+            .and_then(|cell| self.place_cell_root_aware(cell));
+        self.reject_dup_rowid = false;
+        match r {
+            Ok(true) => {
+                if !self.journal_suppress {
+                    self.pager.note_row_write(
+                        self.root,
+                        false,
+                        JournalKind::Insert,
+                        rowid,
+                        &[],
+                        payload,
+                    );
+                }
+                Ok(true)
+            }
+            Ok(false) => Ok(false),
+            Err(e) => {
+                self.pager.note_journal_invalidated();
+                Err(e)
+            }
+        }
+    }
+
     fn insert_table_inner(&mut self, rowid: i64, payload: &[u8]) -> Result<()> {
         // Notify the pager that a write is about to happen. This maintains
         // the O(1) dirty-page counter used by `flush()`'s fast path
@@ -3100,8 +3233,16 @@ impl<'a> Btree<'a> {
     /// pre-built overflow cell WITHOUT materializing a contiguous
     /// payload first.
     fn insert_cell_root_aware(&mut self, cell: Cell) -> Result<()> {
+        self.place_cell_root_aware(cell).map(|_| ())
+    }
+
+    /// [`Self::insert_cell_root_aware`] reporting whether the cell was
+    /// placed (`false` only under `reject_dup_rowid`, for a rowid the
+    /// table already holds).
+    fn place_cell_root_aware(&mut self, cell: Cell) -> Result<bool> {
         match self.insert_into_page(self.root, cell)? {
-            InsertResult::Done => Ok(()),
+            InsertResult::Done => Ok(true),
+            InsertResult::Duplicate => Ok(false),
             InsertResult::Split {
                 new_page,
                 split_key,
@@ -3154,7 +3295,7 @@ impl<'a> Btree<'a> {
                     );
                 }
                 self.root = new_root;
-                Ok(())
+                Ok(true)
             }
         }
     }
@@ -4871,6 +5012,15 @@ impl<'a> Btree<'a> {
 
         if pt.is_leaf() {
             // Leaf: insert directly.
+            // insert_table_absent: the probe for an existing rowid shares
+            // this descent; its search position places the cell.
+            let mut known_pos: Option<u16> = None;
+            if self.reject_dup_rowid && pt == PageType::LeafTable {
+                match table_leaf_search(&page.lock(), cell.key())? {
+                    Ok(_) => return Ok(InsertResult::Duplicate),
+                    Err(pos) => known_pos = Some(pos),
+                }
+            }
             let cell_size = cell.encoded_size();
             let free = page.lock().free_space();
             // Need space for the cell + a 2-byte pointer. When the GAP
@@ -4886,7 +5036,7 @@ impl<'a> Btree<'a> {
                 drop(page);
                 return self.split_leaf(page_id, cell);
             }
-            self.insert_cell_into_ref(page_id, &page, &cell)?;
+            self.insert_cell_into_ref_at(page_id, &page, &cell, known_pos)?;
             Ok(InsertResult::Done)
         } else {
             // Interior: find the child to descend into.
@@ -4968,6 +5118,7 @@ impl<'a> Btree<'a> {
             drop(page);
             match self.insert_into_page(child_id, cell)? {
                 InsertResult::Done => Ok(InsertResult::Done),
+                InsertResult::Duplicate => Ok(InsertResult::Duplicate),
                 InsertResult::Split {
                     new_page,
                     split_key,
@@ -5504,6 +5655,18 @@ impl<'a> Btree<'a> {
     /// it a second time was one full cache round-trip (RwLock + hash +
     /// Arc clone) per inserted cell, paid by every scattered-key insert.
     fn insert_cell_into_ref(&mut self, page_id: PageId, page: &PageRef, cell: &Cell) -> Result<()> {
+        self.insert_cell_into_ref_at(page_id, page, cell, None)
+    }
+
+    /// [`Self::insert_cell_into_ref`] at a position the caller already
+    /// searched for (under the same descent, page unchanged since).
+    fn insert_cell_into_ref_at(
+        &mut self,
+        page_id: PageId,
+        page: &PageRef,
+        cell: &Cell,
+        known_pos: Option<u16>,
+    ) -> Result<()> {
         if crate::executor::dbg_index_trace() {
             let pt = self
                 .pager
@@ -5540,7 +5703,9 @@ impl<'a> Btree<'a> {
         // binary search over cell VIEWS. (The old code decoded a full
         // allocating `Cell` — one Vec per probe, ~9 probes per insert —
         // which made page rebuilds after splits O(n) allocations.)
-        let pos = {
+        let pos = if let Some(p) = known_pos {
+            p
+        } else {
             let borrowed = &*borrowed;
             let mut lo: u16 = 0;
             let mut hi: u16 = n;
@@ -5608,22 +5773,12 @@ impl<'a> Btree<'a> {
             .cell_content_start()
             .saturating_sub(cell_size as u32);
 
-        // Write the cell bytes. Stack buffer with heap fallback: index
-        // cells are typically 5-20 bytes and rows rarely exceed 512 —
-        // the `Vec::with_capacity` here was one allocation per inserted
-        // cell (the multi-index load path pays it per index per row).
+        // Write the cell bytes STRAIGHT into the page's content area (no
+        // staging buffer: a 2 KB row used to be encoded into a heap Vec
+        // and copied again — one allocation + one full copy per wide
+        // insert).
         {
             let borrowed = &mut *borrowed;
-            let mut cell_stack = [0u8; 512];
-            let mut cell_heap: Vec<u8>;
-            let buf: &[u8] = if cell_size <= cell_stack.len() {
-                cell.encode_into(&mut cell_stack);
-                &cell_stack[..cell_size]
-            } else {
-                cell_heap = Vec::with_capacity(cell_size);
-                cell.encode(&mut cell_heap);
-                &cell_heap
-            };
             let off = new_content_start as usize;
             // No-clobber guard: a cell larger than the page's remaining
             // content area would underflow the content start to 0 and
@@ -5649,7 +5804,7 @@ impl<'a> Btree<'a> {
                     page_id
                 )));
             }
-            borrowed.data[off..off + cell_size].copy_from_slice(buf);
+            cell.encode_into(&mut borrowed.data[off..off + cell_size]);
             borrowed.set_cell_content_start(new_content_start);
 
             // Shift cell pointers to make room at position `pos` — one
@@ -9707,6 +9862,9 @@ impl<'a> Btree<'a> {
         };
         match self.insert_into_page(self.root, cell)? {
             InsertResult::Done => Ok(()),
+            InsertResult::Duplicate => Err(Error::corruption(
+                "index placement reported a duplicate table rowid",
+            )),
             InsertResult::Split {
                 new_page,
                 split_key,

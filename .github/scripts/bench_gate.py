@@ -704,6 +704,14 @@ def tail(text: str, n: int = 60) -> str:
     return "\n".join(lines[-n:])
 
 
+def annotate(title: str, message: str) -> None:
+    """A GitHub error annotation (readable through the public check-runs
+    API, unlike job logs and step summaries) — only under Actions."""
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(f"::error title={title}::{message}")
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         description="CI gate: every head-to-head bench row must beat (or tie) SQLite."
@@ -826,6 +834,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         for err in run_errors:
             print(f"  - {err}")
+            annotate(f"bench-gate {args.parser}", f"harness exited non-zero: {err}")
         return 2
     if len(merged) < min_rows:
         print(
@@ -946,11 +955,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"{len(failed)} row(s):"
         )
         for row in failed:
-            print(
-                f"  - {row.name}: rustqlite {fmt_row_value(row, row.best_rust)} vs "
+            line = (
+                f"{row.name}: rustqlite {fmt_row_value(row, row.best_rust)} vs "
                 f"SQLite {fmt_row_value(row, row.best_sql)} "
                 f"({row.loss_pct:.1f}% slower, ratio {row.ratio:.2f}x)"
             )
+            print(f"  - {line}")
+            annotate(f"bench-gate {args.parser}", line)
         return 1
 
     print(f"[bench-gate:{args.parser}] PASS — every row beats (or ties) SQLite")

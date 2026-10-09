@@ -177,6 +177,13 @@ pub fn install_owned(hook: Box<dyn FnMut(&PreupdateEvent) + Send>) -> SinkGuard 
     SinkGuard { prev }
 }
 
+/// True when any preupdate consumer (a session capture or a hook) would
+/// observe a write — i.e. a write must be announced BEFORE it lands.
+#[inline]
+pub(crate) fn armed() -> bool {
+    sessions_armed() || hook_installed()
+}
+
 /// True when a sink is installed — the write sites' one-TLS-load
 /// hot-path check.
 #[inline]

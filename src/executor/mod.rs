@@ -532,12 +532,18 @@ use std::sync::Arc;
 #[derive(Default, Clone)]
 pub struct StmtMaps {
     /// table name (lowercase) -> current root page
-    pub roots: HashMap<String, u32>,
+    pub roots: NameMap<u32>,
     /// index name (lowercase) -> current root page
-    pub index_roots: HashMap<String, u32>,
+    pub index_roots: NameMap<u32>,
     /// table name (lowercase) -> cached max rowid
-    pub max_rowids: HashMap<String, i64>,
+    pub max_rowids: NameMap<i64>,
 }
+
+/// A map keyed by a table / index name, hashed with the Fx hasher: the
+/// write path probes these by name several times per inserted row (root
+/// overlay, shared root, max-rowid overlay + shared), and std's SipHash
+/// cost ~10% of a keyed single-row INSERT stream.
+pub type NameMap<V> = HashMap<String, V, crate::api::FxHashBuild>;
 
 impl StmtMaps {
     pub fn empty() -> Self {
@@ -1116,7 +1122,7 @@ pub struct ExecContext<'a> {
     /// LOCAL root-page overrides written by THIS statement (table_name ->
     /// current root page). Starts empty; merged into the Database's shared
     /// snapshot at statement end (see `shared`).
-    pub root_overrides: HashMap<String, u32>,
+    pub root_overrides: NameMap<u32>,
     /// READ-ONLY snapshot of the Database's accumulated bookkeeping maps
     /// (table roots, index roots, max-rowid cache) behind ONE Arc.
     /// Lookups check the local overlays first, then these.
@@ -1124,7 +1130,7 @@ pub struct ExecContext<'a> {
     /// LOCAL index-root overrides written by this statement.
     pub index_roots: HashMap<String, u32>,
     /// LOCAL max-rowid cache entries written by this statement.
-    pub max_rowids: HashMap<String, i64>,
+    pub max_rowids: NameMap<i64>,
     /// Row-level statement journal: rows this statement has LANDed so
     /// far (inserts + deletes incl. trigger-written rows). Replayed in
     /// reverse by the api layer when the statement fails — SQLite's
@@ -1238,10 +1244,10 @@ impl<'a> ExecContext<'a> {
             deferred_flush: false,
             txn_snapshot: None,
             catalog_ptr: catalog,
-            root_overrides: HashMap::new(),
+            root_overrides: NameMap::default(),
             shared: crate::executor::StmtMaps::empty_arc(),
             index_roots: HashMap::new(),
-            max_rowids: HashMap::new(),
+            max_rowids: NameMap::default(),
             stmt_undo: Vec::new(),
             roots_changed: false,
             triggers_fired_epoch: 0,
@@ -1285,10 +1291,10 @@ impl<'a> ExecContext<'a> {
             deferred_flush: false,
             txn_snapshot: None,
             catalog_ptr: catalog,
-            root_overrides: HashMap::new(),
+            root_overrides: NameMap::default(),
             shared,
             index_roots: HashMap::new(),
-            max_rowids: HashMap::new(),
+            max_rowids: NameMap::default(),
             stmt_undo: Vec::new(),
             roots_changed: false,
             triggers_fired_epoch: 0,
@@ -22538,7 +22544,7 @@ pub fn fast_insert_literal_rows(
     // (SQLite allocates tree-max+1 per row, per OP_NewRowid).
     let mut max_rowid = ctx.get_or_scan_max_rowid_opt(table)?;
     let indexes = ctx.catalog().indexes_on_table(&table.name);
-    let mut index_states = make_index_states(ctx, &indexes, table);
+    let mut index_states = take_fast_index_states(ctx, table, &indexes);
     let table_name_lc = table.name.to_ascii_lowercase();
     let n_cols = table.n_columns();
     let mut full_row: Vec<Value> = vec![Value::Null; n_cols];
@@ -22741,10 +22747,58 @@ pub fn fast_insert_literal_rows(
     // sorted sweeps re-root through `flush_index_op_buf`, which writes
     // the live root back itself.
     flush_insert_index_bufs(ctx, &mut index_states)?;
+    return_fast_index_states(table, index_states);
     // (rows inserted, final live root, final max rowid) — the caller's
     // INSERT-chain setup consumes the live root / max-rowid so the next
     // same-shape statement can skip the derivation entirely.
     Ok((inserted, current_root, max_rowid.unwrap_or(0)))
+}
+
+std::thread_local! {
+    /// The literal fast path's index states, carried to the next
+    /// statement on the same table (the general path's `InsertScratch`
+    /// twin): single-row INSERT streams keep each index's validated
+    /// append hint AND its stream statistics. Without them every
+    /// statement started cold — a scattered index re-walked the right
+    /// edge and tried a doomed append before its real insert (two
+    /// descents per entry), the dominant fixed cost of a multi-index
+    /// single-row load.
+    static FAST_INDEX_STATES: std::cell::RefCell<Option<(Arc<Table>, Vec<IndexMaintState>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The carried index states when they belong to this table and its
+/// CURRENT index list (identity-compared — a CREATE / DROP INDEX in
+/// between rebuilds them); fresh ones otherwise. Roots are always
+/// re-read from the context (DDL, ROLLBACK or a nested write may have
+/// moved them); hints re-validate their pinned page on use.
+fn take_fast_index_states(
+    ctx: &ExecContext<'_>,
+    table: &Arc<Table>,
+    indexes: &[Arc<crate::schema::Index>],
+) -> Vec<IndexMaintState> {
+    if let Some((t, mut states)) = FAST_INDEX_STATES.with(|s| s.borrow_mut().take()) {
+        if Arc::ptr_eq(&t, table)
+            && states.len() == indexes.len()
+            && states
+                .iter()
+                .zip(indexes)
+                .all(|(st, ix)| Arc::ptr_eq(&st.idx, ix))
+        {
+            for st in states.iter_mut() {
+                st.root = ctx.index_root(&st.idx);
+                st.op_buf = None;
+            }
+            return states;
+        }
+    }
+    make_index_states(ctx, indexes, table)
+}
+
+fn return_fast_index_states(table: &Arc<Table>, states: Vec<IndexMaintState>) {
+    if !states.is_empty() {
+        FAST_INDEX_STATES.with(|s| *s.borrow_mut() = Some((Arc::clone(table), states)));
+    }
 }
 
 pub fn fast_insert_single_row(
@@ -23319,12 +23373,30 @@ fn exec_insert_one_row(
             // bytes).
             encode_row_aliased_into(full_row, table.rowid_alias, payload_buf);
             let payload: &[u8] = payload_buf;
-            // Single lookup_table call (was 2 before — redundant when
-            // the rowid existed and we needed the old payload for the
-            // REPLACE index cleanup path).
-            let lookup = bt.lookup_table(rowid)?;
+            // A plain INSERT (no upsert, no REPLACE / IGNORE, nobody to
+            // announce the write to first) probes and places in ONE
+            // descent; a rowid it finds present can only raise, so the
+            // Found arm below needs no payload. Conflict-resolving shapes
+            // keep the single lookup_table probe: their conflicts are
+            // common and need the existing row.
+            let plain = upsert.is_none()
+                && !matches!(
+                    on_conflict,
+                    ConflictResolution::Replace | ConflictResolution::Ignore
+                )
+                && !crate::preupdate::armed();
+            let lookup = if plain {
+                if bt.insert_table_absent(rowid, payload)? {
+                    None
+                } else {
+                    Some(LookupResult::Found(Vec::new()))
+                }
+            } else {
+                Some(bt.lookup_table(rowid)?)
+            };
             match lookup {
-                LookupResult::Found(existing_payload) => {
+                None => old_payload_opt = None,
+                Some(LookupResult::Found(existing_payload)) => {
                     // Rowid conflict. UPSERT applies when the target is
                     // empty (any constraint) or the rowid PK itself.
                     if let Some(u) = upsert {
@@ -23374,7 +23446,7 @@ fn exec_insert_one_row(
                         }
                     }
                 }
-                LookupResult::NotFound => {
+                Some(LookupResult::NotFound) => {
                     old_payload_opt = None;
                     crate::preupdate::fire(
                         crate::preupdate::PreupdateOp::Insert,

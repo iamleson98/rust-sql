@@ -141,8 +141,8 @@ impl Problems {
 pub fn integrity_check(
     catalog: &Catalog,
     pager: &Pager,
-    roots: &std::collections::HashMap<String, u32>,
-    index_roots: &std::collections::HashMap<String, u32>,
+    roots: &crate::executor::NameMap<u32>,
+    index_roots: &crate::executor::NameMap<u32>,
     quick: bool,
 ) -> Vec<Value> {
     let mut p = Problems::new(MAX_REPORTED_PROBLEMS);

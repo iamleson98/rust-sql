@@ -3092,6 +3092,14 @@ impl Pager {
         crate::storage::concurrent::StructuralScope::enter(self.concurrent.scope_armed_any())
     }
 
+    /// True while any BEGIN CONCURRENT scope is armed on this pager — a
+    /// rowid probe must then be a recorded point read (commit-time
+    /// validation), so fused probe+write shortcuts stand down.
+    #[inline]
+    pub(crate) fn concurrent_scope_armed(&self) -> bool {
+        self.concurrent.scope_armed_any()
+    }
+
     /// [`crate::storage::concurrent::PointReadScope`] for a rowid point
     /// lookup on tree `root`.
     #[inline]

@@ -5399,6 +5399,16 @@ impl Database {
         // The original column-list shape (empty = supplies-all) decides the
         // chain's scanner gate — take it out before `fi.values` moves.
         let stmt_columns: Vec<&str> = fi.columns.clone();
+        // A statement that supplies an explicit (non-NULL) rowid-alias
+        // value is a shape the chain never serves (its scanner rejects
+        // explicit rowids): building one would only be flushed by the next
+        // such statement — per-statement waste on keyed insert streams.
+        let explicit_rowid = table.rowid_alias.is_some_and(|alias| {
+            col_indices
+                .iter()
+                .position(|&c| c == alias)
+                .is_some_and(|k| fi.values.iter().any(|row| !row[k].is_null()))
+        });
         // Pre-statement dirty-set mark for the autocommit failure restore
         // below (the same DELTA gate the general path uses).
         let fast_dirty_at_start = self.pager.dirty_set_marked();
@@ -5409,6 +5419,9 @@ impl Database {
                     // is checked inside; plain tables only). The chain
                     // serves the NEXT same-shape statement; this one paid
                     // the cold-path setup.
+                    if explicit_rowid {
+                        return inserted;
+                    }
                     let table_key = Arc::as_ptr(&table) as usize;
                     let leaf_hint = ctx
                         .table_append_hint

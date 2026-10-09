@@ -925,7 +925,7 @@ impl Affinity {
 
             (Affinity::Text, Value::Integer(i)) => Value::Text(i.to_string().into()),
             (Affinity::Text, Value::Real(f)) => Value::Text(format_real(f).into()),
-            (Affinity::Text, Value::Text(s)) => Value::Text(s.duplicate()),
+            (Affinity::Text, Value::Text(s)) => Value::Text(s),
             // SQLite: a BLOB is never converted to TEXT by affinity —
             // lossy UTF-8 decoding here would corrupt every binary value
             // (sqlx stores UUIDs as 16-byte BLOBs in uuid-text columns).
