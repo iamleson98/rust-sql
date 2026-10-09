@@ -1931,6 +1931,10 @@ pub struct Btree<'a> {
     /// keys past a separator a sibling's split installed (the S4 soak's
     /// stranded-rows corruption). No-op outside the concurrent regime.
     right_walk_for_write: bool,
+    /// The index LEAF the latest cell placement landed in (pin taken
+    /// after the write) — `insert_index_scattered` hands it back as the
+    /// next entry's placement hint.
+    last_index_leaf: Option<AppendHint>,
 }
 
 /// After this many consecutive thread-local hint misses, the lookup path
@@ -2169,6 +2173,7 @@ impl<'a> Btree<'a> {
             collect_frees: false,
             freed_during_op: Vec::new(),
             right_walk_for_write: false,
+            last_index_leaf: None,
         }
     }
 
@@ -2490,6 +2495,7 @@ impl<'a> Btree<'a> {
             collect_frees: false,
             freed_during_op: Vec::new(),
             right_walk_for_write: false,
+            last_index_leaf: None,
         })
     }
 
@@ -4085,6 +4091,23 @@ impl<'a> Btree<'a> {
         rowid: i64,
         hint: Option<AppendHint>,
     ) -> Result<Option<AppendHint>> {
+        self.insert_index_append_placed(key, rowid, hint, &mut None)
+    }
+
+    /// [`Self::insert_index_append_hinted`] with a PLACEMENT hint for the
+    /// stream's non-append entries: `place` pins the leaf the previous
+    /// scattered entry landed in, and an entry that falls strictly inside
+    /// that leaf's key range goes straight into it — no root-to-leaf
+    /// descent (see [`Self::insert_index_scattered`]). Clustered streams
+    /// (`d = i % 1000`, sequential text keys) land next to their
+    /// predecessor most of the time.
+    pub fn insert_index_append_placed(
+        &mut self,
+        key: &[u8],
+        rowid: i64,
+        hint: Option<AppendHint>,
+        place: &mut Option<AppendHint>,
+    ) -> Result<Option<AppendHint>> {
         let _structural = self.pager.structural_scope();
         let root = self.root;
         self.journal_suppress = true;
@@ -4109,7 +4132,7 @@ impl<'a> Btree<'a> {
             Some(txn) => hint.filter(|h| h.scope == Some(txn)),
             None => hint,
         };
-        let r = self.insert_index_append_hinted_inner(key, rowid, hint);
+        let r = self.insert_index_append_hinted_inner(key, rowid, hint, place);
         self.right_walk_for_write = false;
         // Stamp the outgoing hint with the CURRENT scope so its next use
         // (this transaction only) passes the guard above — the table
@@ -4141,6 +4164,7 @@ impl<'a> Btree<'a> {
         key: &[u8],
         rowid: i64,
         hint: Option<AppendHint>,
+        place: &mut Option<AppendHint>,
     ) -> Result<Option<AppendHint>> {
         self.pager.note_write();
 
@@ -4155,7 +4179,7 @@ impl<'a> Btree<'a> {
             if !attempt {
                 let mut h = h;
                 h.probe_in = h.probe_in.saturating_sub(1);
-                self.insert_index(key, rowid)?;
+                self.insert_index_scattered(key, rowid, place)?;
                 return Ok(Some(h));
             }
             match self.try_append_into_index_leaf(h, key, rowid)? {
@@ -4175,7 +4199,7 @@ impl<'a> Btree<'a> {
                     // general insert — turned each scattered index entry
                     // into a double descent (insert + re-pin walk) and
                     // was the dominant per-row cost of multi-index load.
-                    self.insert_index(key, rowid)?;
+                    self.insert_index_scattered(key, rowid, place)?;
                     let mut h = h;
                     h.miss_streak = h.miss_streak.saturating_add(1);
                     if h.miss_streak == APPEND_SUPPRESS_AFTER {
@@ -4206,7 +4230,7 @@ impl<'a> Btree<'a> {
             // The fresh pin is still valid after an out-of-order general
             // insert (validation, not freshness, is the safety contract).
             AppendTry::OutOfOrder => {
-                self.insert_index(key, rowid)?;
+                self.insert_index_scattered(key, rowid, place)?;
                 Ok(Some(leaf_pin))
             }
             // Not an append / full leaf — the normal insert path handles
@@ -4216,6 +4240,122 @@ impl<'a> Btree<'a> {
                 Ok(Some(self.right_most_index_leaf_hinted()?))
             }
         }
+    }
+
+    /// A non-append index entry: into the leaf the PREVIOUS scattered
+    /// entry landed in when it falls strictly inside that leaf's key
+    /// range (see [`Self::try_insert_into_placed_leaf`]); otherwise the
+    /// general insert, re-pinning `place` to wherever the entry landed.
+    /// Off in the concurrent regime: an armed writer's placements route
+    /// through the descent's decision-read marking.
+    fn insert_index_scattered(
+        &mut self,
+        key: &[u8],
+        rowid: i64,
+        place: &mut Option<AppendHint>,
+    ) -> Result<()> {
+        if self.pager.concurrent_scope_armed() {
+            *place = None;
+            return self.insert_index(key, rowid);
+        }
+        // Adaptive suppression (the append hint's discipline): a stream
+        // whose entries keep missing the previous leaf (`a = (i*7919)%N`)
+        // stops paying the declined fetch + bound decodes, probing again
+        // every APPEND_PROBE_EVERY entries.
+        let mut streak = (0u16, 0u16);
+        if let Some(h) = place.take() {
+            if h.miss_streak < APPEND_SUPPRESS_AFTER || h.probe_in == 0 {
+                if let Some(pin) = self.try_insert_into_placed_leaf(h, key, rowid)? {
+                    *place = Some(pin);
+                    return Ok(());
+                }
+                let misses = h.miss_streak.saturating_add(1);
+                let probe = if misses >= APPEND_SUPPRESS_AFTER {
+                    APPEND_PROBE_EVERY
+                } else {
+                    0
+                };
+                streak = (misses, probe);
+            } else {
+                streak = (h.miss_streak, h.probe_in.saturating_sub(1));
+            }
+        }
+        self.last_index_leaf = None;
+        self.insert_index(key, rowid)?;
+        *place = self.last_index_leaf.take().map(|mut pin| {
+            (pin.miss_streak, pin.probe_in) = streak;
+            pin
+        });
+        Ok(())
+    }
+
+    /// Insert `(key, rowid)` into the pinned index leaf when that is
+    /// provably its home: the pin is current (no write touched the page
+    /// since), the entry sorts STRICTLY between the leaf's first and last
+    /// entries (a B-tree leaf owns every key between its own bounds), the
+    /// key needs no overflow chain and the cell fits without a split.
+    /// `None` = declined, nothing written.
+    fn try_insert_into_placed_leaf(
+        &mut self,
+        hint: AppendHint,
+        key: &[u8],
+        rowid: i64,
+    ) -> Result<Option<AppendHint>> {
+        let psz = self.pager.page_size() as usize;
+        if key.len() > index_max_local(psz) {
+            return Ok(None);
+        }
+        let leaf_id = hint.page;
+        let Ok(page) = self.pager.get_page(leaf_id) else {
+            return Ok(None);
+        };
+        let cell = Cell::IndexLeaf {
+            key: key.to_vec(),
+            rowid,
+        };
+        let need = cell.encoded_size() as u32 + 2;
+        let pos = {
+            let b = page.lock();
+            if !matches!(b.page_type(), Ok(PageType::LeafIndex)) || !hint.still_pins(&b) {
+                return Ok(None);
+            }
+            let n = b.n_cells();
+            if n < 2 || b.free_space() < need {
+                return Ok(None);
+            }
+            let page_size = b.page_size();
+            let view = |i: u16| -> Result<IndexCellView<'_>> {
+                let ptr = b.cell_pointer(i) as usize;
+                decode_index_cell(b.cell_slice_checked(ptr)?, false, page_size)
+                    .ok_or_else(|| Error::corruption("truncated index cell in placed insert"))
+            };
+            let (first, last) = (view(0)?, view(n - 1)?);
+            if first.overflow != 0
+                || last.overflow != 0
+                || (first.key, first.rowid) >= (key, rowid)
+                || (key, rowid) >= (last.key, last.rowid)
+            {
+                return Ok(None);
+            }
+            // Position in (0, n - 1]: cells [0, lo) sort below the entry.
+            let (mut lo, mut hi) = (1u16, n - 1);
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let v = view(mid)?;
+                if v.overflow != 0 {
+                    return Ok(None);
+                }
+                if (v.key, v.rowid) < (key, rowid) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo
+        };
+        self.insert_cell_into_ref_at(leaf_id, &page, &cell, Some(pos))?;
+        let b = page.lock();
+        Ok(Some(AppendHint::fresh(leaf_id, b.serial, b.epoch)))
     }
 
     /// Descend the right-most-child chain to the right-most INDEX leaf
@@ -5827,6 +5967,10 @@ impl<'a> Btree<'a> {
             borrowed.data[dst..dst + 2].copy_from_slice(&(new_content_start as u16).to_be_bytes());
             borrowed.set_n_cells(n + 1);
             borrowed.touch();
+            if pt == PageType::LeafIndex {
+                self.last_index_leaf =
+                    Some(AppendHint::fresh(page_id, borrowed.serial, borrowed.epoch));
+            }
         }
         drop(borrowed);
         self.pager.note_dirty(page_id);

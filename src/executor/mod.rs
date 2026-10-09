@@ -21219,6 +21219,11 @@ pub(crate) struct IndexMaintState {
     /// entry declines against the pinned leaf's own last cell — keep the
     /// still-valid pin instead of paying a right-edge re-pin walk per row.
     pub hint: Option<crate::storage::btree::AppendHint>,
+    /// Pinned leaf of this index's previous NON-append entry (see
+    /// `Btree::insert_index_append_placed`): a clustered stream lands its
+    /// next entry there without a root-to-leaf descent. Validated per use
+    /// like `hint`.
+    pub place: Option<crate::storage::btree::AppendHint>,
     /// Reusable order-key encoding buffer.
     pub key_buf: Vec<u8>,
     /// SORTED-BATCH MODE (see `INDEX_BATCH_MIN_ROWS`): `Some(buf)` = this
@@ -21236,6 +21241,13 @@ pub(crate) struct IndexMaintState {
 }
 
 impl IndexMaintState {
+    /// Drop both leaf pins (a write outside this state's own stream —
+    /// a trigger body, a nested statement — may have moved the tree).
+    pub(crate) fn clear_hints(&mut self) {
+        self.hint = None;
+        self.place = None;
+    }
+
     /// Encode `row`'s index key into `buf` (cleared first) using the
     /// pre-resolved column positions — zero allocations, no name lookups.
     /// Collated index columns (NOCASE / RTRIM) fold their TEXT values so
@@ -21600,6 +21612,7 @@ pub(crate) fn make_index_states(
                 cols,
                 col_names,
                 hint: None,
+                place: None,
                 key_buf: Vec::with_capacity(16),
                 op_buf: None,
             }
@@ -22069,7 +22082,7 @@ fn exec_insert_inner(
                 // append hints) — the pinned leaves may have split or been
                 // freed. Invalidate every hint; they re-pin on next use.
                 for st in index_states.iter_mut() {
-                    st.hint = None;
+                    st.clear_hints();
                 }
                 ctx.table_append_hint = None;
                 // The trigger body's writes run through the GENERIC path:
@@ -22175,7 +22188,7 @@ fn exec_insert_inner(
                 )?;
                 // Same hint invalidation as BEFORE triggers.
                 for st in index_states.iter_mut() {
-                    st.hint = None;
+                    st.clear_hints();
                 }
                 ctx.table_append_hint = None;
                 // The trigger body's writes run through the GENERIC path:
@@ -22673,7 +22686,7 @@ pub fn fast_insert_literal_rows(
             // Triggers may mutate this table through the generic path —
             // invalidate all append hints (they re-pin on next use).
             for st in index_states.iter_mut() {
-                st.hint = None;
+                st.clear_hints();
             }
             ctx.table_append_hint = None;
             // The trigger body's writes run through the GENERIC path: a
@@ -22722,7 +22735,7 @@ pub fn fast_insert_literal_rows(
             )?;
             // Same hint invalidation as BEFORE triggers.
             for st in index_states.iter_mut() {
-                st.hint = None;
+                st.clear_hints();
             }
             ctx.table_append_hint = None;
             // The trigger body's writes run through the GENERIC path: a
@@ -23156,7 +23169,7 @@ fn exec_insert_one_row(
         // Any REPLACE/UPSERT path below mutates the index trees, so the
         // append hint may go stale — drop it (it re-pins on the next
         // plain insert).
-        st.hint = None;
+        st.clear_hints();
         let key_bytes = st.encode_key(full_row)?.to_vec();
         let idx_root = st.root;
         let mut ibt = Btree::new(ctx.pager, idx_root, true);
@@ -23577,10 +23590,12 @@ fn exec_insert_one_row(
         // borrow of `st` for as long as `key_bytes` is live.
         let root = st.root;
         let hint = st.hint.take();
+        let mut place = st.place.take();
         let key_bytes = st.encode_key(full_row)?;
         let mut ibt = Btree::new(ctx.pager, root, true);
-        let new_hint = ibt.insert_index_append_hinted(key_bytes, rowid, hint)?;
+        let new_hint = ibt.insert_index_append_placed(key_bytes, rowid, hint, &mut place)?;
         st.hint = new_hint;
+        st.place = place;
         if root != ibt.root {
             // Immediate ctx write-back on split (rare): a LATER row of
             // this statement may fail, and the statement-journal undo +
@@ -23870,7 +23885,7 @@ fn exec_upsert_row(
                     continue;
                 }
                 // The tree shape changes here — drop any append hint.
-                st.hint = None;
+                st.clear_hints();
                 let mut ibt = Btree::new(ctx.pager, st.root, true);
                 for old_key in &old_keys {
                     ibt.delete_index(old_key, existing_rowid)?;
@@ -24697,7 +24712,7 @@ pub(crate) fn arm_insert_index_bufs(
             // A buffered statement never consumes the per-row append
             // hint; drop any carried pin so the flush's sweep starts
             // from a clean descent.
-            st.hint = None;
+            st.clear_hints();
         } else {
             st.op_buf = None;
         }
