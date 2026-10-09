@@ -21,5 +21,17 @@ path = "src/lib.rs"
 rustqlite = { path = "../.." }
 parking_lot = "0.12"
 
+# This crate ships as `libsqlite3.so` — a library programs (and rustc's
+# proc-macro host, via sqlx-macros) load with dlopen(). mimalloc's C
+# thread-locals default to the initial-exec TLS model, which glibc can
+# satisfy for a dlopen()ed library only from its small static-TLS surplus:
+# once that ran out, loading failed with "cannot allocate memory in static
+# TLS block" (the sqlx interop build on ubuntu). local-dynamic TLS is
+# mimalloc's documented setting for dynamically loaded libraries. Feature
+# unification applies it only to builds that include this crate; the
+# engine's own builds keep initial-exec.
+[target.'cfg(unix)'.dependencies]
+libmimalloc-sys = { version = "0.1", features = ["local_dynamic_tls"] }
+
 [features]
 default = []

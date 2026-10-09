@@ -1214,6 +1214,7 @@ dependencies = [
 name = "rustqlite-compat"
 version = "0.1.0"
 dependencies = [
+ "libmimalloc-sys",
  "parking_lot",
  "rustqlite",
 ]
