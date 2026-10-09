@@ -471,6 +471,37 @@ impl<'a> EvalContext<'a> {
         }
     }
 
+    /// sqlite3ExprCollSeq for a SQLITE_FUNC_NEEDCOLL argument (scalar
+    /// min / max, nullif — "the first argument that has a collation"):
+    /// like [`Self::expr_collation`] but without its no-collated-scope
+    /// shortcut, because here a plain column DEFINES one (BINARY) and
+    /// stops the search — `nullif(j, upper(j COLLATE NOCASE))` compares
+    /// BINARY. The rowid defines none.
+    pub(crate) fn needcoll_arg_collation(&self, e: &Expr) -> Option<String> {
+        if let Some(c) = explicit_collation(e) {
+            return Some(c);
+        }
+        let mut p = e;
+        loop {
+            match p {
+                Expr::Cast { expr, .. }
+                | Expr::Unary {
+                    op: crate::sql::ast::UnaryOp::Pos,
+                    expr,
+                } => p = expr,
+                Expr::Column { table, name } => {
+                    let q = self.source_qualifier(table.as_deref(), name);
+                    return match collation_scope_lookup_ex(q.as_deref(), name) {
+                        Some(found) => found,
+                        None if crate::planner::is_rowid_spelling(name) => None,
+                        None => Some("BINARY".to_string()),
+                    };
+                }
+                _ => return None,
+            }
+        }
+    }
+
     /// sqlite3BinaryCompareCollSeq: an explicit COLLATE on the left
     /// operand, else on the right, else the left operand's collation
     /// (a left COLUMN decides even when it is the default BINARY), else
@@ -691,6 +722,12 @@ fn affinity_scope_lookup(qualifier: Option<&str>, name: &str) -> Option<crate::t
 /// a column declaring none and for the rowid; `None` when the reference
 /// is not a table column in scope.
 fn collation_scope_lookup(qualifier: Option<&str>, name: &str) -> Option<String> {
+    collation_scope_lookup_ex(qualifier, name).flatten()
+}
+
+/// [`collation_scope_lookup`] telling "resolved, no collation" (the
+/// rowid: `Some(None)`) apart from "not resolved in any scope" (`None`).
+fn collation_scope_lookup_ex(qualifier: Option<&str>, name: &str) -> Option<Option<String>> {
     AFFINITY_SCOPES.with(|s| {
         let s = s.borrow();
         for frame in s.iter().rev() {
@@ -707,18 +744,18 @@ fn collation_scope_lookup(qualifier: Option<&str>, name: &str) -> Option<String>
                 // compares NOCASE; `id = h` takes h's collation).
                 if let Some(i) = table.find_column(name) {
                     if table.rowid_alias == Some(i) {
-                        return None;
+                        return Some(None);
                     }
-                    return table.columns.get(i).map(|c| {
+                    return Some(table.columns.get(i).map(|c| {
                         if c.collation.is_empty() {
                             "BINARY".to_string()
                         } else {
                             c.collation.clone()
                         }
-                    });
+                    }));
                 }
                 if crate::planner::is_rowid_spelling(name) && !table.without_rowid {
-                    return None;
+                    return Some(None);
                 }
                 if qualifier.is_some() {
                     return None;
@@ -2152,7 +2189,9 @@ fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext<'_>) -> Result
         _ => false,
     };
     if needs_coll {
-        if let Some(coll) = resolve_collation(args.iter().find_map(|a| ctx.expr_collation(a)))? {
+        if let Some(coll) =
+            resolve_collation(args.iter().find_map(|a| ctx.needcoll_arg_collation(a)))?
+        {
             let cmp = |a: &Value, b: &Value| crate::plugin::compare_collated(a, b, coll.as_ref());
             if fname == "nullif" {
                 return Ok(
