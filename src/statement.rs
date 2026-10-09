@@ -3683,35 +3683,12 @@ impl Driver for LimitDriver {
     }
 }
 
-/// Display name for an expression column (a practical subset of the
-/// executor's naming rules, sufficient for statement consumers).
+/// The output name of an unaliased projection expression — the
+/// executor's naming (SQLite's short-column rule: `t.a` reports `a`; the
+/// hidden rowid slot reports `rowid`). This route used to keep the
+/// qualifier (`t.a`) and name every other expression "".
 fn expr_display(e: &Expr) -> String {
-    match e {
-        Expr::Column {
-            table: Some(t),
-            name,
-        } => {
-            if crate::planner::is_hidden_rowid(name) {
-                // Hidden rowid slot renders under its user spelling
-                // (SQLite reports "rowid") — the NUL marker must never
-                // leak into an output column name.
-                "rowid".to_string()
-            } else {
-                format!("{}.{}", t, name)
-            }
-        }
-        Expr::Column { table: None, name } => {
-            if crate::planner::is_hidden_rowid(name) {
-                "rowid".to_string()
-            } else {
-                name.clone()
-            }
-        }
-        Expr::Literal(Value::Text(s)) => s.as_str().to_string(),
-        Expr::Literal(Value::Integer(i)) => i.to_string(),
-        Expr::Literal(Value::Real(f)) => f.to_string(),
-        _ => String::new(),
-    }
+    crate::executor::expr_display_name(e)
 }
 
 /// Output columns of a precompiled FastPath result.

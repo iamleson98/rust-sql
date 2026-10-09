@@ -65,6 +65,11 @@ pub struct SpannedToken {
     pub token: Token,
     pub line: usize,
     pub col: usize,
+    /// Byte range of the token in the source text (`start..end`) — the
+    /// parser slices result-column spans with it (SQLite names an
+    /// unaliased expression column after its source text).
+    pub start: usize,
+    pub end: usize,
 }
 
 impl SpannedToken {
@@ -119,16 +124,21 @@ impl<'a> Lexer<'a> {
                     token: Token::Eof,
                     line: self.line,
                     col: self.col,
+                    start: self.pos,
+                    end: self.pos,
                 });
                 break;
             }
             let line = self.line;
             let col = self.col;
+            let start = self.pos;
             let tok = self.next_token()?;
             out.push(SpannedToken {
                 token: tok,
                 line,
                 col,
+                start,
+                end: self.pos,
             });
         }
         Ok(out)

@@ -515,3 +515,71 @@ fn view_and_projection_names_survive_reopen() {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+// ===========================================================================
+// Unaliased EXPRESSION columns: SQLite names them after their source text
+// ===========================================================================
+
+/// Every route (query, prepare/step) reports SQLite's own names, checked
+/// against the bundled SQLite: an unaliased expression is named by its
+/// source text exactly as typed (spacing, case, parentheses, comments
+/// trimmed only at the ends) — it used to be a canonical re-rendering
+/// that respaced it and, after the aggregate rewrite, leaked internal
+/// slot names (`typeof(__agg_0)`).
+#[test]
+fn expression_names_are_the_source_text_like_sqlite() {
+    let mut db = setup();
+    let lite = rusqlite::Connection::open_in_memory().unwrap();
+    for s in [
+        "CREATE TABLE t (a INTEGER, b TEXT)",
+        "CREATE TABLE u (a INTEGER, x INTEGER)",
+        "INSERT INTO t (a, b) VALUES (1,'one'),(2,'two'),(3,'three')",
+        "INSERT INTO u (a, x) VALUES (1,10),(2,20),(2,200)",
+    ] {
+        lite.execute_batch(s).unwrap();
+    }
+    db.execute("CREATE VIEW ve AS SELECT a+1, b || '!' FROM t", [])
+        .unwrap();
+    lite.execute_batch("CREATE VIEW ve AS SELECT a+1, b || '!' FROM t")
+        .unwrap();
+    db.execute("CREATE TABLE ct AS SELECT a * 2, upper(b) FROM t", [])
+        .unwrap();
+    lite.execute_batch("CREATE TABLE ct AS SELECT a * 2, upper(b) FROM t")
+        .unwrap();
+    for sql in [
+        "SELECT a+1, ( a + 1 ), a  *  2, -a, b || 'x' FROM t",
+        "SELECT (a), t.a, a COLLATE NOCASE, CAST(a AS TEXT), a IS TRUE FROM t",
+        "SELECT count(*), COUNT(*), Sum(a), typeof(max(a)), max(a) + 1 FROM t",
+        "SELECT 1, 'lit', NULL, 2.5, x'01', ? IS NULL FROM t",
+        "SELECT a, count(*), group_concat(b ORDER BY b DESC) FROM t GROUP BY a",
+        "SELECT CASE WHEN a > 1 THEN 'big' ELSE 'small' END, (SELECT max(x) FROM u) FROM t",
+        "SELECT abs( a ) /* trailing comment */ FROM t",
+        "SELECT a+1 FROM t UNION SELECT x FROM u",
+        "SELECT * FROM ve",
+        "SELECT * FROM ct",
+        "SELECT * FROM (SELECT a+1, b FROM t)",
+        "WITH c AS (SELECT a * 10 FROM t) SELECT * FROM c",
+        "SELECT t.a + u.x FROM t JOIN u ON u.a = t.a",
+        "SELECT a, row_number() OVER (ORDER BY a) FROM t",
+    ] {
+        let want: Vec<String> = {
+            let st = lite.prepare(sql).unwrap();
+            st.column_names().iter().map(|s| s.to_string()).collect()
+        };
+        assert_eq!(q_names(&db, sql), want, "query route: {sql}");
+        assert_eq!(s_names(&db, sql), want, "step route: {sql}");
+    }
+    // RETURNING columns are named the same way.
+    let (cols, _) = db
+        .query_with_columns("INSERT INTO t (a, b) VALUES (9, 'z') RETURNING a+1, b", [])
+        .unwrap();
+    let want: Vec<String> = {
+        let mut st = lite
+            .prepare("INSERT INTO t (a, b) VALUES (9, 'z') RETURNING a+1, b")
+            .unwrap();
+        let names = st.column_names().iter().map(|s| s.to_string()).collect();
+        let _ = st.raw_query().next();
+        names
+    };
+    assert_eq!(cols, want);
+}

@@ -11,6 +11,8 @@ use crate::types::Value;
 
 pub struct Parser {
     toks: Vec<SpannedToken>,
+    /// The source text (result-column spans slice it).
+    src: String,
     pos: usize,
     /// Current expression nesting depth (SQLite's sqlite3Parser stack
     /// guard). Deeply nested input — `SELECT ((((...1...))))` — would
@@ -35,6 +37,7 @@ impl Parser {
         let toks = Lexer::new(src).tokenize()?;
         Ok(Self {
             toks,
+            src: src.to_string(),
             pos: 0,
             expr_depth: 0,
         })
@@ -2146,6 +2149,23 @@ impl Parser {
         })
     }
 
+    /// The output NAME of an unaliased result expression: SQLite reports
+    /// the expression's source text (`sqlite3ExprListSetSpan`, trimmed) —
+    /// `a+1`, `( a + 1 )`, `COUNT(*)` — where a canonical rendering
+    /// would respace it and, after the aggregate rewrite, leak internal
+    /// slot names (`typeof(__agg_0)`). A bare column keeps its column
+    /// name (no alias), as in SQLite.
+    fn span_alias(&self, e: &Expr, start_tok: usize) -> Option<String> {
+        if matches!(e, Expr::Column { .. }) || self.pos <= start_tok {
+            return None;
+        }
+        // SQLite's span ends where the NEXT token starts (its `scanpt`),
+        // whitespace trimmed — a comment before `FROM` stays in the name.
+        let (a, b) = (self.toks[start_tok].start, self.toks[self.pos].start);
+        let text = self.src.get(a..b)?.trim();
+        (!text.is_empty()).then(|| text.to_string())
+    }
+
     fn parse_result_columns(&mut self) -> Result<Vec<ResultColumn>> {
         let mut out = Vec::new();
         loop {
@@ -2187,7 +2207,9 @@ impl Parser {
                         self.advance(); // *
                         out.push(ResultColumn::TableStar(table));
                     } else {
+                        let start_tok = self.pos;
                         let e = self.parse_expr()?;
+                        let span = self.span_alias(&e, start_tok);
                         let alias = if self.peek().is_keyword("AS") {
                             self.advance();
                             Some(self.parse_ident()?)
@@ -2197,13 +2219,15 @@ impl Parser {
                         } else if let Token::QuotedIdent(s) = &self.peek().token {
                             Some(s.clone())
                         } else {
-                            None
+                            span
                         };
                         out.push(ResultColumn::Expr { expr: e, alias });
                     }
                 }
             } else {
+                let start_tok = self.pos;
                 let e = self.parse_expr()?;
+                let span = self.span_alias(&e, start_tok);
                 let alias = if self.peek().is_keyword("AS") {
                     self.advance();
                     Some(self.parse_ident()?)
@@ -2211,10 +2235,10 @@ impl Parser {
                     if !is_clause_keyword(&self.peek().token) {
                         Some(self.parse_ident()?)
                     } else {
-                        None
+                        span
                     }
                 } else {
-                    None
+                    span
                 };
                 out.push(ResultColumn::Expr { expr: e, alias });
             }
