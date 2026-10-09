@@ -128,9 +128,12 @@ fn assert_fixture_data(db: &mut Database) {
         q_count(db, "SELECT count(*) FROM t_text WHERE b = x'00AA'"),
         1
     );
+    // `||` always yields TEXT (SQLite OP_Concat: typeof(x'00' || x'') is
+    // 'text'), and TEXT never equals a BLOB — verified against the
+    // bundled 3.53.4, which answers 0 here.
     assert_eq!(
         q_count(db, "SELECT count(*) FROM t_text WHERE b = x'00' || x''"),
-        1
+        0
     );
     // NULL blobs are exempt from the index (count via table): id 6 plus
     // every row inserted without a `b` value (ids 20-27, 1000).

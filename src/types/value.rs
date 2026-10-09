@@ -225,29 +225,53 @@ impl Value {
         matches!(self, Value::Null)
     }
 
-    /// Coerce to i64 using SQL semantics. NULL → 0, Real → truncated,
-    /// Text → parsed (0 on failure), Blob → 0.
+    /// Coerce to i64 with SQLite's `sqlite3VdbeIntValue` semantics:
+    /// NULL → 0, REAL → clamping truncation (`sqlite3RealToI64`), TEXT
+    /// and BLOB → the longest integer PREFIX of their bytes
+    /// (`sqlite3Atoi64`: `'12abc'` → 12, `' 7 '` → 7, `'1.9'` → 1,
+    /// `'abc'` → 0, out-of-range clamps).
     pub fn as_integer(&self) -> i64 {
         match self {
             Value::Null => 0,
             Value::Integer(i) => *i,
-            Value::Real(f) => *f as i64,
-            Value::Text(s) => s.trim().parse().unwrap_or(0),
-            Value::Blob(_) => 0,
+            Value::Real(f) => crate::types::numeric::real_to_i64(*f),
+            Value::Text(s) => crate::types::numeric::atoi64(s.as_bytes()).0,
+            Value::Blob(b) => crate::types::numeric::atoi64(b).0,
         }
     }
 
-    /// Coerce to f64. NULL → 0.0, Integer → as f64, Text → parsed.
+    /// Coerce to f64 with SQLite's `sqlite3VdbeRealValue` semantics:
+    /// TEXT and BLOB read the longest REAL prefix of their bytes
+    /// (`sqlite3AtoF` — `'1.5x'` → 1.5, and never Rust-only spellings
+    /// such as `inf`/`NaN`, which read as 0.0).
     pub fn as_real(&self) -> f64 {
         match self {
             Value::Null => 0.0,
             Value::Integer(i) => *i as f64,
             Value::Real(f) => *f,
-            Value::Text(s) => s.trim().parse().unwrap_or(0.0),
-            Value::Blob(b) => std::str::from_utf8(b)
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
-                .unwrap_or(0.0),
+            Value::Text(s) => crate::types::numeric::atof(s.as_bytes()).0,
+            Value::Blob(b) => crate::types::numeric::atof(b).0,
+        }
+    }
+
+    /// The value as an arithmetic operand (vdbe.c `numericType`): NULL
+    /// stays NULL, INTEGER/REAL pass through, TEXT/BLOB read as INTEGER
+    /// when their text is an integer (prefix) and REAL otherwise —
+    /// `'12abc'` → 12, `'1.5'` → 1.5, `'abc'` → 0,
+    /// `'9223372036854775808'` → 9.223372036854775808e18.
+    pub fn to_numeric(&self) -> Value {
+        match self {
+            Value::Null => Value::Null,
+            Value::Integer(i) => Value::Integer(*i),
+            Value::Real(f) => Value::Real(*f),
+            Value::Text(s) => match crate::types::numeric::numeric_type(s.as_bytes()) {
+                Ok(i) => Value::Integer(i),
+                Err(r) => Value::Real(r),
+            },
+            Value::Blob(b) => match crate::types::numeric::numeric_type(b) {
+                Ok(i) => Value::Integer(i),
+                Err(r) => Value::Real(r),
+            },
         }
     }
 
@@ -262,48 +286,50 @@ impl Value {
         }
     }
 
-    /// Returns the byte length of the value as SQLite's `length()` function would.
+    /// SQLite's `length()` (func.c lengthFunc): BLOB → byte count;
+    /// INTEGER / REAL → byte length of their TEXT rendering
+    /// (`length(123)` is 3, `length(1.5)` is 3); TEXT → characters up to
+    /// the first NUL (the C-string walk).
     pub fn length(&self) -> i64 {
         match self {
             Value::Null => 0,
-            Value::Integer(_) | Value::Real(_) => 8,
-            Value::Text(s) => s.chars().count() as i64,
+            Value::Integer(_) | Value::Real(_) => self.as_text().len() as i64,
+            Value::Text(s) => {
+                let b = s.as_bytes();
+                let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+                b[..end].iter().filter(|&&c| c & 0xc0 != 0x80).count() as i64
+            }
             Value::Blob(b) => b.len() as i64,
         }
     }
 
     /// Truthiness in a boolean context (WHERE / ON / HAVING / CHECK /
-    /// trigger WHEN). SQLite's rules, probed empirically against 3.45+:
-    /// NULL is never true; INTEGER/REAL compare against 0; TEXT is
-    /// numerically coerced with the `sqlite3AtoF` PREFIX semantics
-    /// (`'abc'` -> 0 = false, `'1x'` -> 1 = true, `'inf'` -> 0 = false);
-    /// a non-empty BLOB is TRUE and an empty blob is FALSE (a blob is
-    /// "something", not a number — `SELECT 1 WHERE x'31'` passes while
-    /// `SELECT 1 WHERE x''` does not).
+    /// trigger WHEN / NOT / AND / OR) — `sqlite3VdbeBooleanValue`: NULL
+    /// is never true; INTEGER/REAL compare against 0; TEXT **and BLOB**
+    /// read their bytes with the `sqlite3AtoF` PREFIX semantics
+    /// (`'abc'` → false, `'1x'` → true, `'inf'` → false, `x'31'` ('1') →
+    /// true, `x'41'` ('A') → false). A blob is NOT "true because it is
+    /// non-empty" — `DELETE FROM t WHERE blobcol` must only delete rows
+    /// whose blob reads as a non-zero number, exactly like SQLite.
     pub fn is_truthy(&self) -> bool {
         match self {
             Value::Null => false,
             Value::Integer(i) => *i != 0,
             Value::Real(f) => *f != 0.0,
-            Value::Text(s) => parse_real_prefix(s) != 0.0,
-            Value::Blob(b) => !b.is_empty(),
+            Value::Text(s) => crate::types::numeric::atof(s.as_bytes()).0 != 0.0,
+            Value::Blob(b) => crate::types::numeric::atof(b).0 != 0.0,
         }
     }
 
-    /// Concatenate two values as text (SQLite `||` operator).
+    /// Concatenate two values as text (SQLite `||` operator, OP_Concat):
+    /// NULL on either side is NULL; otherwise BOTH operands are rendered
+    /// as text and the result is ALWAYS TEXT — `typeof(x'41' || x'42')` is
+    /// 'text' ('AB') in SQLite. (BLOB bytes are taken as UTF-8 text;
+    /// invalid sequences cannot be represented in a Rust string and are
+    /// replaced.)
     pub fn concat(&self, other: &Value) -> Value {
         if self.is_null() || other.is_null() {
             return Value::Null;
-        }
-        // SQLite's || result type: BLOB only when BOTH operands are
-        // blobs (byte concatenation); any other pairing is TEXT with the
-        // operands text-coerced. `SELECT typeof(x'41' || x'42')` is
-        // "blob" — the old text-always form returned "text".
-        if let (Value::Blob(a), Value::Blob(b)) = (self, other) {
-            let mut bytes = Vec::with_capacity(a.len() + b.len());
-            bytes.extend_from_slice(a);
-            bytes.extend_from_slice(b);
-            return Value::Blob(bytes);
         }
         Value::Text(format!("{}{}", self.as_text(), other.as_text()).into())
     }
@@ -810,6 +836,20 @@ pub(crate) fn real_stored(f: f64) -> f64 {
 /// inside ±2^63, and is not i64::MIN. Empirical pins vs real SQLite:
 /// 2^62 → integer, 2^63 (any spelling) → real, i64::MIN → real,
 /// -0.0 → integer 0, 1e30/1e19 → real, 8.0/'8e0'/'8.0' → integer 8.
+/// NUMERIC / INTEGER column affinity applied to TEXT (vdbe.c
+/// `applyNumericAffinity` with bTryForInt): the WHOLE text must be a
+/// well-formed SQLite number (surrounding ASCII whitespace allowed) —
+/// `'8.0'`/`'8e0'` squeeze to INTEGER 8, `'1e400'` becomes an infinite
+/// REAL, while `'Inf'`, `'NaN'`, `'0x1F'` and `'12abc'` keep their TEXT
+/// storage class.
+fn numeric_text_affinity(s: Text) -> Value {
+    match crate::types::numeric::apply_numeric_affinity(s.as_bytes()) {
+        Some(crate::types::numeric::NumericAffinity::Integer(i)) => Value::Integer(i),
+        Some(crate::types::numeric::NumericAffinity::Real(f)) => Value::Real(real_stored(f)),
+        None => Value::Text(s),
+    }
+}
+
 fn numeric_real_affinity(f: f64) -> Value {
     let i = f as i64; // saturating cast
     if f.is_finite() && i != i64::MIN && f == (i as f64) && f.abs() < 9_223_372_036_854_775_808.0 {
@@ -855,20 +895,7 @@ impl Affinity {
             // -0.0 → 0, 1e30 stays REAL.
             (Affinity::Integer, Value::Integer(i)) => Value::Integer(i),
             (Affinity::Integer, Value::Real(f)) => numeric_real_affinity(f),
-            (Affinity::Integer, Value::Text(s)) => {
-                // SQLite affinity rules: try to parse the (trimmed) text as
-                // an integer; if that fails, try as a real; if BOTH fail,
-                // store the text as-is (SQLite quirk: non-numeric text
-                // retains its TEXT type even in an INTEGER column).
-                let trimmed = s.trim();
-                if let Ok(i) = trimmed.parse::<i64>() {
-                    Value::Integer(i)
-                } else if let Ok(f) = trimmed.parse::<f64>() {
-                    numeric_real_affinity(f)
-                } else {
-                    Value::Text(s)
-                }
-            }
+            (Affinity::Integer, Value::Text(s)) => numeric_text_affinity(s),
             // SQLite (datatype3.html §3.1): a BLOB value is NEVER
             // converted by column affinity — it stays a BLOB.
             (Affinity::Integer, Value::Blob(b)) => Value::Blob(b),
@@ -878,12 +905,16 @@ impl Affinity {
             (Affinity::Real, Value::Real(f)) => Value::Real(real_stored(f)),
             (Affinity::Real, Value::Text(s)) => {
                 // SQLite affinity: REAL column with TEXT input — convert if
-                // the text looks like a number; otherwise keep as Text.
-                let trimmed = s.trim();
-                if let Ok(f) = trimmed.parse::<f64>() {
-                    Value::Real(real_stored(f))
-                } else {
-                    Value::Text(s)
+                // the WHOLE text is a well-formed SQLite number (never
+                // `'Inf'`/`'NaN'`); otherwise keep it as TEXT.
+                match crate::types::numeric::apply_numeric_affinity(s.as_bytes()) {
+                    Some(crate::types::numeric::NumericAffinity::Integer(i)) => {
+                        Value::Real(i as f64)
+                    }
+                    Some(crate::types::numeric::NumericAffinity::Real(f)) => {
+                        Value::Real(real_stored(f))
+                    }
+                    None => Value::Text(s),
                 }
             }
             (Affinity::Real, Value::Blob(b)) => {
@@ -911,19 +942,7 @@ impl Affinity {
             // storage class; BLOBs are never converted by any affinity.
             (Affinity::Numeric, Value::Integer(i)) => Value::Integer(i),
             (Affinity::Numeric, Value::Real(f)) => numeric_real_affinity(f),
-            (Affinity::Numeric, Value::Text(s)) => {
-                let trimmed = s.trim();
-                if let Ok(i) = trimmed.parse::<i64>() {
-                    Value::Integer(i)
-                } else if let Ok(f) = trimmed.parse::<f64>() {
-                    // '8.0'/'8e0': SQLite's applyNumericAffinity parses the
-                    // text as REAL then squeezes the integral result to
-                    // INTEGER (bTryForInt = 1).
-                    numeric_real_affinity(f)
-                } else {
-                    Value::Text(s)
-                }
-            }
+            (Affinity::Numeric, Value::Text(s)) => numeric_text_affinity(s),
             (Affinity::Numeric, v) => v,
 
             // BLOB and None: leave as-is
@@ -1152,46 +1171,7 @@ pub type Row = Vec<Value>;
 /// optional exponent that only counts when at least one digit follows.
 /// `inf`/`nan` are NOT accepted by CAST (they yield 0.0).
 pub(crate) fn parse_real_prefix(s: &str) -> f64 {
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() && b[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    let start = i;
-    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
-        i += 1;
-    }
-    let mut mantissa_digits = 0usize;
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-        mantissa_digits += 1;
-    }
-    if i < b.len() && b[i] == b'.' {
-        i += 1;
-        while i < b.len() && b[i].is_ascii_digit() {
-            i += 1;
-            mantissa_digits += 1;
-        }
-    }
-    if mantissa_digits == 0 {
-        return 0.0;
-    }
-    let mut end = i;
-    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
-        let mut j = i + 1;
-        if j < b.len() && (b[j] == b'+' || b[j] == b'-') {
-            j += 1;
-        }
-        let mut exp_digits = 0usize;
-        while j < b.len() && b[j].is_ascii_digit() {
-            j += 1;
-            exp_digits += 1;
-        }
-        if exp_digits > 0 {
-            end = j;
-        }
-    }
-    s[start..end].parse::<f64>().unwrap_or(0.0)
+    crate::types::numeric::atof(s.as_bytes()).0
 }
 
 #[cfg(test)]

@@ -229,6 +229,18 @@ pub enum Plan {
     Subquery {
         plan: Box<Plan>,
     },
+    /// A FROM-subquery atom or view body that carries its OWN WITH
+    /// clause: its CTEs can only be materialized at execution time, so
+    /// the SELECT is planned and executed then (`exec_select_statement`
+    /// materializes the CTEs over the enclosing scope). Output names are
+    /// not statically known — planner analyses treat it like an opaque
+    /// subquery.
+    NestedSelect {
+        select: Box<crate::sql::ast::SelectStatement>,
+        /// The view this body expands (cycle detection at run time —
+        /// the planner's view-depth guard cannot see past this node).
+        view: Option<String>,
+    },
     /// A materialized CTE result (WITH clause). The rows were computed
     /// BEFORE planning (see api.rs's CTE materialization); references to
     /// the CTE name in FROM scan these rows. Recomputed per statement
@@ -341,6 +353,11 @@ pub struct AggExpr {
     /// the predicate contribute to this aggregate. Evaluated per-row
     /// against the aggregate's INPUT row (pre-grouping).
     pub filter: Option<Expr>,
+    /// Comparison collation of the argument (non-BINARY only): an explicit
+    /// COLLATE in it, else a column's DECLARED collation — SQLite's
+    /// NEEDCOLL aggregates (min/max) and DISTINCT de-duplication compare
+    /// through it (`count(DISTINCT b)` over a NOCASE column folds case).
+    pub collation: Option<String>,
 }
 
 /// A window function expression.

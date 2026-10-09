@@ -78,6 +78,25 @@ impl<'a> Planner<'a> {
     /// old vestigial pass re-planned CTE bodies without CTE scope, which
     /// broke nested WITH clauses.
     pub fn plan_select(&mut self, stmt: &SelectStatement) -> Result<Plan> {
+        // Positional GROUP BY (SQLite resolveOrderGroupBy): `GROUP BY K`
+        // with an integer constant K names the K-th result column. It was
+        // silently a constant grouping key — `SELECT b, count(*) FROM t
+        // GROUP BY 1` collapsed the whole table into ONE group. Resolved
+        // here, BEFORE the ORDER BY terms, so `GROUP BY 1 ORDER BY 1`
+        // maps the sort term onto the same group key.
+        let resolved_stmt;
+        let stmt = match &stmt.body {
+            SelectBody::Simple(sb) => match self.resolve_group_by_ordinals(sb)? {
+                Some(r) => {
+                    let mut st = stmt.clone();
+                    st.body = SelectBody::Simple(r);
+                    resolved_stmt = st;
+                    &resolved_stmt
+                }
+                None => stmt,
+            },
+            _ => stmt,
+        };
         // ORDER BY terms resolve BEFORE body planning: the aggregate
         // branch needs them (ORDER-ONLY aggregates + bare-column
         // representatives must be part of the Aggregate node's output so
@@ -236,12 +255,12 @@ impl<'a> Planner<'a> {
             .iter()
             .any(|c| !matches!(c, ResultColumn::Expr { .. }));
         if !has_star {
-            for t in terms {
-                if let Expr::Literal(Value::Integer(k)) = &t.expr {
-                    if *k >= 1 && (*k as usize) > s.columns.len() {
+            for (i, t) in terms.iter().enumerate() {
+                if let Some(k) = ordinal_term(&t.expr) {
+                    if k < 1 || (k as usize) > s.columns.len() {
                         return Err(Error::semantic(format!(
-                            "{}rd ORDER BY term out of range ({} output columns)",
-                            k,
+                            "{} ORDER BY term out of range - should be between 1 and {}",
+                            sqlite_ordinal(i as i64 + 1),
                             s.columns.len()
                         )));
                     }
@@ -261,12 +280,15 @@ impl<'a> Planner<'a> {
                 //    projections and compound bodies keep the literal and
                 //    let exec_sort resolve it against the materialized row
                 //    width (where input order == output order).
-                if let Expr::Literal(Value::Integer(k)) = &expr {
-                    if *k >= 1 {
+                if let Some(k) = ordinal_term(&expr) {
+                    if k >= 1 {
                         if let Some(ResultColumn::Expr { expr: ce, .. }) =
-                            s.columns.get(*k as usize - 1)
+                            s.columns.get(k as usize - 1)
                         {
-                            expr = ce.clone();
+                            // A resolved integer-literal column (`SELECT
+                            // 39 ... ORDER BY 1`) must stay a CONSTANT —
+                            // never be re-read as ordinal 39.
+                            expr = guard_ordinal_literal(ce.clone());
                         }
                         // else: star projection (validated at execution) —
                         // exec_sort turns the literal into `row[k-1]`.
@@ -281,7 +303,7 @@ impl<'a> Planner<'a> {
                         } = c
                         {
                             if a.eq_ignore_ascii_case(name) {
-                                expr = ce.clone();
+                                expr = guard_ordinal_literal(ce.clone());
                                 break;
                             }
                         }
@@ -371,6 +393,16 @@ impl<'a> Planner<'a> {
     }
 
     fn plan_simple_select(&mut self, s: &SimpleSelect, order_terms: &[OrderTerm]) -> Result<Plan> {
+        // Positional GROUP BY for bodies planned outside plan_select
+        // (compound arms, subqueries): see resolve_group_by_ordinals.
+        let resolved_owned;
+        let s = match self.resolve_group_by_ordinals(s)? {
+            Some(r) => {
+                resolved_owned = r;
+                &resolved_owned
+            }
+            None => s,
+        };
         // SQLite's collation resolution: a comparison whose operand is a
         // column with a DECLARED collation (e.g. `email TEXT COLLATE
         // NOCASE`) uses that collation even without an explicit COLLATE in
@@ -797,7 +829,16 @@ impl<'a> Planner<'a> {
                             )));
                         }
                         self.view_depth += 1;
-                        let inner = self.plan_select(&view.select);
+                        // A view body with its own WITH clause plans at
+                        // run time, once its CTEs are materialized.
+                        let inner = if view.select.with.is_some() {
+                            Ok(Plan::NestedSelect {
+                                select: Box::new(view.select.clone()),
+                                view: Some(name.to_ascii_lowercase()),
+                            })
+                        } else {
+                            self.plan_select(&view.select)
+                        };
                         self.view_depth -= 1;
                         let inner = inner?;
                         // Optional column rename (CREATE VIEW v(a, b) AS
@@ -924,7 +965,17 @@ impl<'a> Planner<'a> {
                 alias,
                 column_aliases,
             } => {
-                let inner = self.plan_select(select)?;
+                // `FROM (WITH c AS (…) SELECT …)`: the nested CTEs can only
+                // be materialized at execution time (this used to fail
+                // with "no such table: c").
+                let inner = if select.with.is_some() {
+                    Plan::NestedSelect {
+                        select: select.clone(),
+                        view: None,
+                    }
+                } else {
+                    self.plan_select(select)?
+                };
                 // FROM-subquery column list (`FROM (…) s(a, b)`, an engine
                 // superset — SQLite itself does not parse this syntax):
                 // rename the body's output columns positionally, exactly
@@ -1225,7 +1276,25 @@ impl<'a> Planner<'a> {
                 alias: None,
                 display_name: display,
                 filter: None,
+                collation: None,
             });
+        }
+        // NEEDCOLL / DISTINCT comparison collation per aggregate (see
+        // AggExpr::collation): explicit COLLATE in the argument first,
+        // else the argument column's declared collation.
+        let coll_scope: Vec<(std::sync::Arc<crate::schema::Table>, String)> = s
+            .from
+            .as_ref()
+            .map(|from| collect_collation_scope(self.catalog, from))
+            .unwrap_or_default();
+        for a in aggregates.iter_mut() {
+            if a.func == "bare" {
+                continue;
+            }
+            let Some(arg) = &a.arg else { continue };
+            a.collation = crate::executor::expr::explicit_collation(arg)
+                .or_else(|| column_declared_collation(self.catalog, arg, &coll_scope))
+                .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("BINARY"));
         }
         Ok(aggregates)
     }
@@ -1278,6 +1347,104 @@ impl<'a> Planner<'a> {
             }
         }
         Some(out)
+    }
+
+    /// `GROUP BY K` → the K-th result-column expression (SQLite's
+    /// resolveOrderGroupBy for GROUP BY). `Ok(None)` when no term is an
+    /// integer constant. Out-of-range ordinals (including 0 and negative
+    /// values) raise SQLite's exact error. A resolved expression that is
+    /// itself an integer literal is wrapped in unary `+` so no later pass
+    /// can re-read it as an ordinal.
+    fn resolve_group_by_ordinals(&self, s: &SimpleSelect) -> Result<Option<SimpleSelect>> {
+        if !s.group_by.iter().any(|g| ordinal_term(g).is_some()) {
+            return Ok(None);
+        }
+        let has_star = s
+            .columns
+            .iter()
+            .any(|c| !matches!(c, ResultColumn::Expr { .. }));
+        let result_exprs: Vec<Expr> = if has_star {
+            // Plan-time star expansion; shapes it cannot expand keep the
+            // old constant-key behavior rather than guessing a width.
+            let Some(stars) = self.expand_star_exprs(s) else {
+                return Ok(None);
+            };
+            let mut out = Vec::new();
+            let mut star_iter = stars.into_iter();
+            for c in &s.columns {
+                match c {
+                    ResultColumn::Expr { expr, .. } => out.push(expr.clone()),
+                    // expand_star_exprs emits the star columns in
+                    // projection order; interleave them back.
+                    _ => {
+                        let width = match c {
+                            ResultColumn::Star => self.star_width(s, None),
+                            ResultColumn::TableStar(t) => self.star_width(s, Some(t)),
+                            ResultColumn::Expr { .. } => 0,
+                        };
+                        for _ in 0..width {
+                            if let Some(e) = star_iter.next() {
+                                out.push(e);
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        } else {
+            s.columns
+                .iter()
+                .filter_map(|c| match c {
+                    ResultColumn::Expr { expr, .. } => Some(expr.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let n = result_exprs.len();
+        let mut s2 = s.clone();
+        for (i, g) in s2.group_by.iter_mut().enumerate() {
+            if let Some(k) = ordinal_term(g) {
+                if k < 1 || k as usize > n {
+                    return Err(Error::semantic(format!(
+                        "{} GROUP BY term out of range - should be between 1 and {}",
+                        sqlite_ordinal(i as i64 + 1),
+                        n
+                    )));
+                }
+                let e = result_exprs[k as usize - 1].clone();
+                if expr_has_aggregate(&e) {
+                    return Err(Error::semantic(
+                        "aggregate functions are not allowed in the GROUP BY clause",
+                    ));
+                }
+                *g = guard_ordinal_literal(e);
+            }
+        }
+        Ok(Some(s2))
+    }
+
+    /// Number of columns a `*` / `t.*` arm expands to (see
+    /// expand_star_exprs' FROM walk).
+    fn star_width(&self, s: &SimpleSelect, table: Option<&str>) -> usize {
+        let Some(from) = s.from.as_ref() else {
+            return 0;
+        };
+        let mut sides: Vec<(String, Option<String>)> = Vec::new();
+        if !collect_plain_table_sides(from, &mut sides) {
+            return 0;
+        }
+        sides
+            .iter()
+            .filter(|(n, a)| match table {
+                None => true,
+                Some(t) => {
+                    n.eq_ignore_ascii_case(t)
+                        || a.as_deref().is_some_and(|x| x.eq_ignore_ascii_case(t))
+                }
+            })
+            .filter_map(|(n, _)| self.catalog.get_table(n))
+            .map(|t| t.columns.len())
+            .sum()
     }
 
     /// Star expansion for ONE projection arm (see expand_star_exprs);
@@ -1470,12 +1637,34 @@ impl<'a> Planner<'a> {
         cols: &[ResultColumn],
         defs: &[WindowDef],
     ) -> Result<Vec<WindowExpr>> {
-        let _ = defs;
+        // The WINDOW clause, resolved in order (a definition may build on
+        // an EARLIER one: `WINDOW w1 AS (PARTITION BY g), w2 AS (w1 ORDER
+        // BY id)`). It used to be ignored outright — `OVER w1` ran over
+        // the whole input as one partition.
+        let mut named: Vec<ResolvedWindow> = Vec::new();
+        for d in defs {
+            let r = chain_window(
+                d.base.as_deref(),
+                &d.partition_by,
+                &d.order_by,
+                &d.frame,
+                &named,
+            )?;
+            named.push(ResolvedWindow {
+                name: d.name.to_ascii_lowercase(),
+                ..r
+            });
+        }
         let mut out = Vec::new();
         for c in cols {
             if let ResultColumn::Expr { expr, alias } = c {
-                collect_windows_rec(expr, alias, &mut out);
+                collect_windows_rec(expr, alias, &named, &mut out)?;
             }
+        }
+        if out.iter().any(|w| w.distinct) {
+            return Err(Error::semantic(
+                "DISTINCT is not supported for window functions",
+            ));
         }
         Ok(out)
     }
@@ -1718,6 +1907,11 @@ pub fn rewrite_aggregates_and_groups(
                         filter: None,
                     });
                     synthesized.as_ref()
+                } else if let Some(wrapped) =
+                    json_group_array_input(&name.to_ascii_lowercase(), args)
+                {
+                    synthesized = Some(wrapped);
+                    synthesized.as_ref()
                 } else {
                     args.first()
                 };
@@ -1865,6 +2059,55 @@ pub fn rewrite_aggregates_and_groups(
             )),
             collation: collation.clone(),
         },
+        // LIKE / GLOB / REGEXP and IN operands can hold aggregates and
+        // group keys too (`HAVING count(*) IN (2, 3)`, `max(b) LIKE 'y%'`)
+        // — they fell through to the clone arm and evaluated the raw
+        // aggregate call per group ("no such function: count").
+        Expr::Like {
+            op,
+            expr,
+            pattern,
+            escape,
+            negated,
+        } => Expr::Like {
+            op: *op,
+            expr: Box::new(rewrite_aggregates_and_groups(
+                expr, aggregates, group_by, n_group,
+            )),
+            pattern: Box::new(rewrite_aggregates_and_groups(
+                pattern, aggregates, group_by, n_group,
+            )),
+            escape: escape.as_ref().map(|x| {
+                Box::new(rewrite_aggregates_and_groups(
+                    x, aggregates, group_by, n_group,
+                ))
+            }),
+            negated: *negated,
+        },
+        Expr::In {
+            expr,
+            source,
+            negated,
+        } => Expr::In {
+            expr: Box::new(rewrite_aggregates_and_groups(
+                expr, aggregates, group_by, n_group,
+            )),
+            source: match source {
+                InSource::List(list) => InSource::List(std::sync::Arc::new(
+                    list.iter()
+                        .map(|x| rewrite_aggregates_and_groups(x, aggregates, group_by, n_group))
+                        .collect(),
+                )),
+                other => other.clone(),
+            },
+            negated: *negated,
+        },
+        Expr::Row(items) => Expr::Row(
+            items
+                .iter()
+                .map(|x| rewrite_aggregates_and_groups(x, aggregates, group_by, n_group))
+                .collect(),
+        ),
         _ => e.clone(),
     }
 }
@@ -2028,6 +2271,62 @@ pub(crate) fn rewrite_window_refs(e: &Expr, windows: &[WindowExpr]) -> Expr {
                 .map(|x| rewrite_window_refs(x, windows))
                 .collect(),
         ),
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => Expr::Between {
+            expr: Box::new(rewrite_window_refs(expr, windows)),
+            low: Box::new(rewrite_window_refs(low, windows)),
+            high: Box::new(rewrite_window_refs(high, windows)),
+            negated: *negated,
+        },
+        Expr::In {
+            expr,
+            source,
+            negated,
+        } => Expr::In {
+            expr: Box::new(rewrite_window_refs(expr, windows)),
+            source: match source {
+                InSource::List(l) => InSource::List(
+                    l.iter()
+                        .map(|x| rewrite_window_refs(x, windows))
+                        .collect::<Vec<_>>()
+                        .into(),
+                ),
+                other => other.clone(),
+            },
+            negated: *negated,
+        },
+        Expr::IsNull { expr, negated } => Expr::IsNull {
+            expr: Box::new(rewrite_window_refs(expr, windows)),
+            negated: *negated,
+        },
+        Expr::Is {
+            left,
+            right,
+            negated,
+        } => Expr::Is {
+            left: Box::new(rewrite_window_refs(left, windows)),
+            right: Box::new(rewrite_window_refs(right, windows)),
+            negated: *negated,
+        },
+        Expr::Like {
+            op,
+            expr,
+            pattern,
+            escape,
+            negated,
+        } => Expr::Like {
+            op: *op,
+            expr: Box::new(rewrite_window_refs(expr, windows)),
+            pattern: Box::new(rewrite_window_refs(pattern, windows)),
+            escape: escape
+                .as_ref()
+                .map(|x| Box::new(rewrite_window_refs(x, windows))),
+            negated: *negated,
+        },
         _ => e.clone(),
     }
 }
@@ -2188,6 +2487,7 @@ fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExp
                         alias: alias.clone(),
                         display_name: aggregate_display_name(name, *distinct, args),
                         filter: filter.clone().map(|b| (*b).clone()),
+                        collation: None,
                     });
                     return;
                 } else if (fname == "percentile_cont" || fname == "percentile_disc")
@@ -2233,6 +2533,7 @@ fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExp
                         alias: alias.clone(),
                         display_name: aggregate_display_name(name, *distinct, args),
                         filter: filter.clone().map(|b| (*b).clone()),
+                        collation: None,
                     });
                     return;
                 } else if (fname == "json_group_object" || fname == "jsonb_group_object")
@@ -2253,6 +2554,8 @@ fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExp
                         over: None,
                         filter: None,
                     })
+                } else if let Some(wrapped) = json_group_array_input(&fname, args) {
+                    Some(wrapped)
                 } else {
                     // MAX(x) / MIN(x) / SUM(x): the single argument is the
                     // aggregate input; multi-arg calls (e.g. MAX(1,5,3))
@@ -2267,6 +2570,7 @@ fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExp
                     alias: alias.clone(),
                     display_name: aggregate_display_name(name, *distinct, args),
                     filter: filter.clone().map(|b| (*b).clone()),
+                    collation: None,
                 });
                 return;
             }
@@ -2341,7 +2645,105 @@ fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExp
     }
 }
 
-fn collect_windows_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<WindowExpr>) {
+/// json_group_array(X) over a JSON-subtyped X (json_object(...), `->`,
+/// ...): the element is EMBEDDED as JSON, not quoted as a string — the
+/// aggregate's input becomes `jsonb(X)`, whose blob the accumulator embeds.
+/// (json_extract() is subtyped only for array/object results; its
+/// scalar results stay plain values — `__json_extract_subtyped`.) Shared
+/// by the collector and the projection matcher so both see one input.
+fn json_group_array_input(fname: &str, args: &[Expr]) -> Option<Expr> {
+    if !(fname == "json_group_array" || fname == "jsonb_group_array") || args.len() != 1 {
+        return None;
+    }
+    let a = &args[0];
+    if !crate::executor::json::expr_has_json_subtype(a) {
+        return None;
+    }
+    if let (true, Expr::Function { args: inner, .. }) =
+        (crate::executor::json::is_json_extract_call(a), a)
+    {
+        return Some(Expr::Function {
+            name: "__json_extract_subtyped".into(),
+            distinct: false,
+            args: inner.clone(),
+            over: None,
+            filter: None,
+        });
+    }
+    Some(Expr::Function {
+        name: "jsonb".into(),
+        distinct: false,
+        args: vec![a.clone()],
+        over: None,
+        filter: None,
+    })
+}
+
+/// A WINDOW-clause definition with its base chain applied.
+#[derive(Clone, Default)]
+struct ResolvedWindow {
+    name: String,
+    partition_by: Vec<Expr>,
+    order_by: Vec<OrderTerm>,
+    frame: Option<crate::sql::ast::WindowFrame>,
+}
+
+/// sqlite3WindowChain: apply `base` (a named window) under a definition's
+/// own clauses. The base supplies PARTITION BY (the definition may not
+/// add one), its ORDER BY unless the definition has its own (both is an
+/// error), and must not carry a frame.
+fn chain_window(
+    base: Option<&str>,
+    partition_by: &[Expr],
+    order_by: &[OrderTerm],
+    frame: &Option<Box<crate::sql::ast::WindowFrame>>,
+    named: &[ResolvedWindow],
+) -> Result<ResolvedWindow> {
+    let own_frame = frame.as_ref().map(|f| (**f).clone());
+    let Some(b) = base else {
+        return Ok(ResolvedWindow {
+            name: String::new(),
+            partition_by: partition_by.to_vec(),
+            order_by: order_by.to_vec(),
+            frame: own_frame,
+        });
+    };
+    let exist = named
+        .iter()
+        .find(|w| w.name.eq_ignore_ascii_case(b))
+        .ok_or_else(|| Error::semantic(format!("no such window: {b}")))?;
+    let what = if !partition_by.is_empty() {
+        Some("PARTITION clause")
+    } else if !exist.order_by.is_empty() && !order_by.is_empty() {
+        Some("ORDER BY clause")
+    } else if exist.frame.is_some() {
+        Some("frame specification")
+    } else {
+        None
+    };
+    if let Some(what) = what {
+        return Err(Error::semantic(format!(
+            "cannot override {what} of window: {b}"
+        )));
+    }
+    Ok(ResolvedWindow {
+        name: String::new(),
+        partition_by: exist.partition_by.clone(),
+        order_by: if order_by.is_empty() {
+            exist.order_by.clone()
+        } else {
+            order_by.to_vec()
+        },
+        frame: own_frame,
+    })
+}
+
+fn collect_windows_rec(
+    e: &Expr,
+    alias: &Option<String>,
+    named: &[ResolvedWindow],
+    out: &mut Vec<WindowExpr>,
+) -> Result<()> {
     match e {
         Expr::Function {
             name,
@@ -2351,14 +2753,21 @@ fn collect_windows_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<WindowExp
             filter,
         } => {
             if let Some(spec) = over {
-                let (partition_by, order_by, frame) = match spec.as_ref() {
-                    WindowSpec::Named(_) => (Vec::new(), Vec::new(), None),
-                    WindowSpec::Inline(def) => (
-                        def.partition_by.clone(),
-                        def.order_by.clone(),
-                        def.frame.as_ref().map(|f| (**f).clone()),
-                    ),
+                let r = match spec.as_ref() {
+                    WindowSpec::Named(n) => named
+                        .iter()
+                        .find(|w| w.name.eq_ignore_ascii_case(n))
+                        .cloned()
+                        .ok_or_else(|| Error::semantic(format!("no such window: {n}")))?,
+                    WindowSpec::Inline(def) => chain_window(
+                        def.base.as_deref(),
+                        &def.partition_by,
+                        &def.order_by,
+                        &def.frame,
+                        named,
+                    )?,
                 };
+                let (partition_by, order_by, frame) = (r.partition_by, r.order_by, r.frame);
                 let arg = if args.is_empty()
                     || (args.len() == 1
                         && matches!(&args[0], Expr::Column { name, .. } if name == "*"))
@@ -2385,21 +2794,73 @@ fn collect_windows_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<WindowExp
                     filter: filter.clone().map(|b| (*b).clone()),
                     expr_key: format!("{:?}", e),
                 });
-                return;
+                return Ok(());
             }
             for a in args {
-                collect_windows_rec(a, &None, out);
+                collect_windows_rec(a, &None, named, out)?;
             }
         }
-        Expr::Binary { left, right, .. } => {
-            collect_windows_rec(left, &None, out);
-            collect_windows_rec(right, &None, out);
+        // Every expression position `expr_has_window` recognizes (a
+        // window call under CASE / BETWEEN / IN / IS went uncollected).
+        Expr::Binary { left, right, .. } | Expr::Is { left, right, .. } => {
+            collect_windows_rec(left, &None, named, out)?;
+            collect_windows_rec(right, &None, named, out)?;
         }
-        Expr::Unary { expr, .. } => collect_windows_rec(expr, &None, out),
-        Expr::Cast { expr, .. } => collect_windows_rec(expr, &None, out),
-        Expr::Collate { expr, .. } => collect_windows_rec(expr, &None, out),
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => collect_windows_rec(expr, &None, named, out)?,
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            for x in [expr, low, high] {
+                collect_windows_rec(x, &None, named, out)?;
+            }
+        }
+        Expr::In { expr, source, .. } => {
+            collect_windows_rec(expr, &None, named, out)?;
+            if let InSource::List(l) = source {
+                for x in l.iter() {
+                    collect_windows_rec(x, &None, named, out)?;
+                }
+            }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            collect_windows_rec(expr, &None, named, out)?;
+            collect_windows_rec(pattern, &None, named, out)?;
+            if let Some(x) = escape {
+                collect_windows_rec(x, &None, named, out)?;
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(o) = operand {
+                collect_windows_rec(o, &None, named, out)?;
+            }
+            for (c, v) in whens {
+                collect_windows_rec(c, &None, named, out)?;
+                collect_windows_rec(v, &None, named, out)?;
+            }
+            if let Some(x) = else_ {
+                collect_windows_rec(x, &None, named, out)?;
+            }
+        }
+        Expr::Row(items) => {
+            for x in items {
+                collect_windows_rec(x, &None, named, out)?;
+            }
+        }
         _ => {}
     }
+    Ok(())
 }
 
 /// May `index` serve a query whose top-level WHERE conjuncts are
@@ -2547,6 +3008,166 @@ fn estimate_eq_stat4(
 }
 
 pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> Plan {
+    // Access-path bounds (rowid lookups / ranges / IN seeks, index
+    // lookups / ranges) are evaluated ONCE, with no current row. A
+    // conjunct whose "value" side reads the scanned table's own columns
+    // (`id > g - 3`, `id > length(h)`, `idx_col = other_col + 0`) is
+    // row-dependent and can never be a bound: it used to be planned as
+    // `SEARCH t USING INTEGER PRIMARY KEY (rowid>?)` with the bound
+    // evaluated against no row (NULL) — the statement matched NOTHING,
+    // and an UPDATE/DELETE with such a WHERE silently touched no rows.
+    // Split those conjuncts off into a residual Filter over the rest.
+    if let Plan::Scan { table, alias, .. } = &plan {
+        let qual = alias.as_deref().unwrap_or(&table.name).to_string();
+        let conjuncts = split_and_chain(predicate);
+        let (row_dependent, sargable): (Vec<Expr>, Vec<Expr>) = conjuncts
+            .into_iter()
+            .partition(|c| conjunct_bound_reads_row(c, catalog, table, &qual));
+        if !row_dependent.is_empty() {
+            let inner = if sargable.is_empty() {
+                plan
+            } else {
+                apply_where_for_scan_inner(catalog, plan, &combine_and(&sargable))
+            };
+            return attach_residual(inner, combine_and(&row_dependent));
+        }
+    }
+    apply_where_for_scan_inner(catalog, plan, predicate)
+}
+
+/// AND `pred` into an access path's own residual (scan predicate /
+/// `residual`) — the flat shape every DML fast path recognizes; a
+/// separate Filter node on top sent `DELETE` / `UPDATE` of a WITHOUT
+/// ROWID table to the generic path, which could not identify its rows.
+/// Shapes without a residual slot get a Filter.
+fn attach_residual(plan: Plan, pred: Expr) -> Plan {
+    let and = |old: Option<Expr>| -> Option<Expr> {
+        Some(match old {
+            Some(o) => combine_and(&[o, pred.clone()]),
+            None => pred.clone(),
+        })
+    };
+    match plan {
+        Plan::Scan {
+            table,
+            alias,
+            index,
+            predicate,
+        } => Plan::Scan {
+            table,
+            alias,
+            index,
+            predicate: and(predicate),
+        },
+        Plan::RowidIn {
+            table,
+            alias,
+            values,
+            residual,
+        } => Plan::RowidIn {
+            table,
+            alias,
+            values,
+            residual: and(residual),
+        },
+        Plan::RowidRange {
+            table,
+            alias,
+            start,
+            end,
+            residual,
+        } => Plan::RowidRange {
+            table,
+            alias,
+            start,
+            end,
+            residual: and(residual),
+        },
+        Plan::IndexIn {
+            table,
+            alias,
+            index,
+            key_exprs,
+            residual,
+        } => Plan::IndexIn {
+            table,
+            alias,
+            index,
+            key_exprs,
+            residual: and(residual),
+        },
+        Plan::IndexRange {
+            table,
+            alias,
+            index,
+            start,
+            end,
+            residual,
+        } => Plan::IndexRange {
+            table,
+            alias,
+            index,
+            start,
+            end,
+            residual: and(residual),
+        },
+        other => Plan::Filter {
+            input: Box::new(other),
+            predicate: pred,
+        },
+    }
+}
+
+/// True when `c` has an access-path shape (`col = v`, `col OP v`,
+/// `col BETWEEN lo AND hi`, `col IN (list)`) on a column of the scanned
+/// table whose value side reads that same table's row: a bare column of
+/// the table, a reference qualified with the scan's qualifier, a rowid
+/// spelling, or a subquery correlated to this scan's row (see
+/// `subquery_reads_scan_row`).
+fn conjunct_bound_reads_row(c: &Expr, catalog: &Catalog, table: &Table, qual: &str) -> bool {
+    let reads_row = |v: &Expr| -> bool {
+        if crate::executor::expr_has_subquery(v)
+            && crate::executor::subquery_reads_scan_row(v, catalog, qual, table)
+        {
+            return true;
+        }
+        collect_column_refs(v).iter().any(|(t, name)| match t {
+            Some(t) => t.eq_ignore_ascii_case(qual),
+            None => {
+                table.find_column(name).is_some()
+                    || (is_rowid_spelling(name) && !table.without_rowid)
+            }
+        })
+    };
+    if let Some((_, lo, hi)) = extract_between(c) {
+        if reads_row(&lo) || reads_row(&hi) {
+            return true;
+        }
+    }
+    if let Some((_, _, v)) = extract_range(c) {
+        if reads_row(&v) {
+            return true;
+        }
+    }
+    if let Some((_, v)) = extract_eq_predicate(c) {
+        if reads_row(&v) {
+            return true;
+        }
+    }
+    if let Expr::In {
+        expr,
+        source: InSource::List(list),
+        negated: false,
+    } = c
+    {
+        if column_name_of(expr).is_some() && list.iter().any(reads_row) {
+            return true;
+        }
+    }
+    false
+}
+
+fn apply_where_for_scan_inner(catalog: &Catalog, plan: Plan, predicate: &Expr) -> Plan {
     if let Plan::Scan { table, .. } = &plan {
         // Virtual tables have NO B+tree: the rowid lookup/range/in plans
         // below would btree-seek the vtab's non-existent root (garbage
@@ -2725,6 +3346,9 @@ pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> 
                 if !index_column_serves_conjunct(conjunct, first_col) {
                     continue;
                 }
+                if !index_affinity_ok(table, &first_col.name, &value_expr) {
+                    continue;
+                }
                 // Bind index prefix columns 1.. from OTHER equality
                 // conjuncts, in INDEX column order.
                 let mut key_exprs = vec![value_expr.clone()];
@@ -2739,6 +3363,9 @@ pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> 
                         // Prefix columns bind only same-collation
                         // conjuncts (same rule as the first column).
                         if !index_column_serves_conjunct(oc, want) {
+                            return None;
+                        }
+                        if !index_affinity_ok(table, &want.name, &ve) {
                             return None;
                         }
                         cn.eq_ignore_ascii_case(&want.name).then_some(ve.clone())
@@ -3027,13 +3654,23 @@ fn try_rowid_range(
     let mut residual: Vec<Expr> = Vec::new();
     let mut saw_rowid_ref = false;
 
+    // Slot rule (same as try_index_range): each of the two bounds is
+    // claimed by AT MOST one conjunct; any further rowid conjunct rides
+    // in the residual. Overwriting a claimed bound used to answer
+    // `id >= 3 AND id >= 1` with the looser [1, inf) range and NO
+    // residual — rows 1 and 2 leaked into the result (and into
+    // UPDATE/DELETE row sets).
     for conjunct in conjuncts {
         // Try `col BETWEEN ? AND ?`
         if let Some((col, lo, hi)) = extract_between(conjunct) {
             if is_rowid_col(&col, &rowid_col_name) {
                 saw_rowid_ref = true;
-                start = Some(lo);
-                end = Some(hi);
+                if start.is_none() && end.is_none() {
+                    start = Some(lo);
+                    end = Some(hi);
+                } else {
+                    residual.push(conjunct.clone());
+                }
                 continue;
             }
         }
@@ -3042,27 +3679,29 @@ fn try_rowid_range(
             if is_rowid_col(&col, &rowid_col_name) {
                 saw_rowid_ref = true;
                 match op.as_str() {
-                    ">" => {
-                        // col > v  → start = v + 1 (inclusive)
-                        // We model as start = v with strict flag, but RowidRange
-                        // is inclusive. To keep semantics correct we transform
-                        // `col > v` into `col >= v + 1` at execution time via
-                        // a residual predicate; here we set start = v as a hint
-                        // and push the strict `col > v` back into residual.
-                        start = Some(val.clone());
-                        residual.push(conjunct.clone());
+                    // `col > v` / `col < v`: the inclusive bound is a hint
+                    // and the strict conjunct stays in the residual.
+                    ">" | ">=" => {
+                        if start.is_none() {
+                            start = Some(val);
+                            if op == ">" {
+                                residual.push(conjunct.clone());
+                            }
+                        } else {
+                            residual.push(conjunct.clone());
+                        }
                     }
-                    ">=" => {
-                        start = Some(val);
+                    "<" | "<=" => {
+                        if end.is_none() {
+                            end = Some(val);
+                            if op == "<" {
+                                residual.push(conjunct.clone());
+                            }
+                        } else {
+                            residual.push(conjunct.clone());
+                        }
                     }
-                    "<" => {
-                        end = Some(val.clone());
-                        residual.push(conjunct.clone());
-                    }
-                    "<=" => {
-                        end = Some(val);
-                    }
-                    _ => {}
+                    _ => residual.push(conjunct.clone()),
                 }
                 continue;
             }
@@ -3074,8 +3713,12 @@ fn try_rowid_range(
         if let Some((col, val)) = extract_eq_predicate(conjunct) {
             if is_rowid_col(&col, &rowid_col_name) {
                 saw_rowid_ref = true;
-                start = Some(val.clone());
-                end = Some(val);
+                if start.is_none() && end.is_none() {
+                    start = Some(val.clone());
+                    end = Some(val);
+                } else {
+                    residual.push(conjunct.clone());
+                }
                 continue;
             }
         }
@@ -3174,6 +3817,8 @@ fn try_index_range(
             if let Some((col, lo, hi)) = extract_between(conjunct) {
                 if bare_col(&col) == first_name
                     && index_column_serves_conjunct(conjunct, first_col)
+                    && index_affinity_ok(table, &first_col.name, &lo)
+                    && index_affinity_ok(table, &first_col.name, &hi)
                     && start.is_none()
                     && end.is_none()
                 {
@@ -3186,7 +3831,9 @@ fn try_index_range(
             // Range ops. Same slot rule: a bound already claimed by an
             // earlier conjunct means this one rides in the residual.
             if let Some((col, op, val)) = extract_range(conjunct) {
-                if bare_col(&col) == first_name && index_column_serves_conjunct(conjunct, first_col)
+                if bare_col(&col) == first_name
+                    && index_column_serves_conjunct(conjunct, first_col)
+                    && index_affinity_ok(table, &first_col.name, &val)
                 {
                     let (slot, inclusive) = match op.as_str() {
                         ">" => (&mut start, false),
@@ -3258,11 +3905,43 @@ fn try_index_range(
     None
 }
 
+/// sqlite3IndexAffinityOk for `col OP value`: a VALUE side with its own
+/// numeric affinity (a CAST to INTEGER / REAL / NUMERIC) makes the
+/// comparison NUMERIC, which an index on a TEXT / untyped column does not
+/// order by — `h = CAST(x AS FLOAT)` over a TEXT index probed with the
+/// value's text form and missed every numerically equal row. Such a
+/// conjunct must scan (the residual comparison then decides correctly).
+fn index_affinity_ok(table: &Table, col_name: &str, value: &Expr) -> bool {
+    use crate::types::Affinity as A;
+    let mut v = value;
+    while let Expr::Collate { expr, .. } = v {
+        v = expr;
+    }
+    let value_aff = match v {
+        Expr::Cast { type_name, .. } if !type_name.starts_with('\0') => {
+            A::from_declared_type(type_name)
+        }
+        _ => return true,
+    };
+    let numeric = |a: A| matches!(a, A::Integer | A::Real | A::Numeric);
+    let col_aff = match table.find_column(col_name) {
+        Some(i) => table.columns[i].affinity,
+        None => return true, // rowid: INTEGER — any comparison affinity works
+    };
+    !(numeric(value_aff) && !numeric(col_aff))
+}
+
 /// Extract `col BETWEEN lo AND hi` from an expression.
 /// Returns (col_name, lo, hi) on match.
 fn extract_between(expr: &Expr) -> Option<(String, Expr, Expr)> {
+    // NOT BETWEEN is the COMPLEMENT of the range — never an access path
+    // (it was planned as the range itself: `b NOT BETWEEN '1' AND 'b'`
+    // over an index on b returned exactly the rows it must exclude).
     if let Expr::Between {
-        expr, low, high, ..
+        expr,
+        low,
+        high,
+        negated: false,
     } = expr
     {
         if let Some(name) = column_name_of(expr.as_ref()) {
@@ -3348,7 +4027,14 @@ fn extract_like_prefix(expr: &Expr) -> Option<(String, String, bool, bool)> {
         p
     };
     let exact = !p.ends_with(wc_any);
-    if body.contains(wc_any) || body.contains(wc_one) {
+    // GLOB's `[...]` character class is a wildcard too (`[a-c]*` was taken
+    // as the LITERAL prefix "[a-c" — the range found nothing), and a NUL
+    // ends the C-string pattern early: neither has a literal prefix.
+    if body.contains(wc_any)
+        || body.contains(wc_one)
+        || (glob && body.contains('['))
+        || body.contains('\0')
+    {
         return None;
     }
     // A GLOB/LIKE with no trailing wildcard is an exact-match form.
@@ -7433,6 +8119,31 @@ fn inner_covering(
     true
 }
 
+/// True when something above the join reads the inner table's ROWID
+/// while the table has no INTEGER PRIMARY KEY alias: the index
+/// nested-loop join's combined rows carry no hidden rowid slot for the
+/// inner side, so such a reference would silently read NULL — keep the
+/// Hash/NL join (whose scans carry the slot) instead.
+fn inner_rowid_needed_without_alias(
+    needed: &NeededCols,
+    inner_table: &Arc<Table>,
+    inner_alias: &Option<String>,
+) -> bool {
+    if inner_table.rowid_alias.is_some() {
+        return false;
+    }
+    let key = inner_alias
+        .as_deref()
+        .unwrap_or(&inner_table.name)
+        .to_ascii_lowercase();
+    let is_rowid = |c: &String| is_rowid_spelling(c.as_str());
+    needed
+        .qualified
+        .get(&key)
+        .is_some_and(|cols| cols.iter().any(is_rowid))
+        || needed.any.iter().any(is_rowid)
+}
+
 /// Whether a join condition is a pure AND-chain of equi conjuncts (no
 /// residual predicates). The IndexNestedLoopJoin rewrite CONSUMES the
 /// condition — every conjunct that is not one of the equi keys would be
@@ -7466,6 +8177,126 @@ fn join_condition_is_pure_equi(cond: Option<&Expr>) -> bool {
     // then resolves the resolvable ones; expression-equality shapes like
     // `a.k + 1 = b.k` are still equi leaves and extract fine).
     all_leaves(c)
+}
+
+/// May the inner index serve the join key's equality? Its first column's
+/// collation must be the comparison's: an explicit COLLATE on either
+/// operand of the key leaf (rewrite_column_collations attaches a column's
+/// declared one — the LEFT column's, even BINARY, wins), else BINARY. A
+/// NOCASE index probed for `t1.b = t2.h` (BINARY: the left column
+/// decides) matched case variants SQLite's comparison rejects.
+fn inlj_index_collation_ok(
+    cond: Option<&Expr>,
+    left_key: (Option<&str>, &str),
+    right_key: (Option<&str>, &str),
+    idx: &crate::schema::Index,
+) -> bool {
+    let norm = |c: &str| {
+        if c.is_empty() {
+            "BINARY".to_string()
+        } else {
+            c.to_ascii_uppercase()
+        }
+    };
+    let Some(first) = idx.columns.first() else {
+        return false;
+    };
+    let index_coll = norm(&first.collation);
+    let Some(cond) = cond else {
+        return index_coll == "BINARY";
+    };
+    let bare = |e: &Expr| -> Option<(Option<String>, String)> {
+        let mut p = e;
+        while let Expr::Collate { expr, .. } = p {
+            p = expr;
+        }
+        match p {
+            Expr::Column { table, name } => Some((table.clone(), name.clone())),
+            _ => None,
+        }
+    };
+    let is_key = |e: &Expr, (q, n): (Option<&str>, &str)| match bare(e) {
+        Some((t, name)) => {
+            name.eq_ignore_ascii_case(n)
+                && match (t.as_deref(), q) {
+                    (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                    (None, None) => true,
+                    _ => false,
+                }
+        }
+        None => false,
+    };
+    for leaf in split_and_chain(cond) {
+        if let Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } = &leaf
+        {
+            let hit = (is_key(left, left_key) && is_key(right, right_key))
+                || (is_key(left, right_key) && is_key(right, left_key));
+            if hit {
+                let coll = crate::executor::expr::comparison_collation(left)
+                    .or_else(|| crate::executor::expr::comparison_collation(right))
+                    .unwrap_or_else(|| "BINARY".to_string());
+                return norm(&coll) == index_coll;
+            }
+        }
+    }
+    // Key leaf not identified textually: only a BINARY index is safe.
+    index_coll == "BINARY"
+}
+
+/// The ON-clause conjuncts an index nested-loop join does NOT enforce:
+/// every AND leaf except the ONE equality between the chosen key columns
+/// (either operand order). `None` when nothing remains.
+fn inlj_residual(
+    cond: Option<&Expr>,
+    left_key: (Option<&str>, &str),
+    right_key: (Option<&str>, &str),
+) -> Option<Expr> {
+    let cond = cond?;
+    let is_ref = |e: &Expr, (q, n): (Option<&str>, &str)| match e {
+        Expr::Column { table, name } => {
+            name.eq_ignore_ascii_case(n)
+                && match (table.as_deref(), q) {
+                    (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                    (None, None) => true,
+                    _ => false,
+                }
+        }
+        _ => false,
+    };
+    let mut consumed = false;
+    let mut rest: Vec<Expr> = Vec::new();
+    for leaf in split_and_chain(cond) {
+        if !consumed {
+            if let Expr::Binary {
+                op: BinaryOp::Eq,
+                left,
+                right,
+            } = &leaf
+            {
+                if (is_ref(left, left_key) && is_ref(right, right_key))
+                    || (is_ref(left, right_key) && is_ref(right, left_key))
+                {
+                    consumed = true;
+                    continue;
+                }
+            }
+        }
+        rest.push(leaf);
+    }
+    if !consumed {
+        // Could not identify the key leaf textually: keep the WHOLE
+        // condition as the residual (re-checking the key is harmless).
+        return Some(cond.clone());
+    }
+    if rest.is_empty() {
+        None
+    } else {
+        Some(combine_and(&rest))
+    }
 }
 
 fn inlj_walk(catalog: &Catalog, plan: Plan, needed: &NeededCols) -> Plan {
@@ -7582,23 +8413,58 @@ fn inlj_walk(catalog: &Catalog, plan: Plan, needed: &NeededCols) -> Plan {
                 // A pushed inner predicate (single-table WHERE conjunct)
                 // would be consumed and dropped by the rewrite — decline
                 // and keep the Hash join, which evaluates it.
-                if predicate.is_none() && outer_is_selective(&left) {
-                    // COVERING: only when nothing above (or in this join's
-                    // own condition beyond the equi key) reads an inner
-                    // column beyond the rowid alias.
-                    let covering = inner_covering(needed, r_table, r_alias);
-                    for (l_qual, l_col, _r_qual, r_col) in &eq_pairs {
+                if predicate.is_none()
+                    && outer_is_selective(&left)
+                    && !inner_rowid_needed_without_alias(needed, r_table, r_alias)
+                {
+                    for (l_qual, l_col, r_qual, r_col) in &eq_pairs {
                         if let Some(outer_key_col) =
                             resolve_outer_col_index(&left, l_qual.as_deref(), l_col)
                         {
-                            if let Some(idx) = find_index_for_column(catalog, r_table, r_col) {
-                                return Plan::IndexNestedLoopJoin {
+                            if let Some(idx) = find_index_for_column(catalog, r_table, r_col)
+                                .filter(|idx| {
+                                    inlj_index_collation_ok(
+                                        condition.as_ref(),
+                                        (l_qual.as_deref(), l_col),
+                                        (r_qual.as_deref(), r_col),
+                                        idx,
+                                    )
+                                })
+                            {
+                                // The index seek enforces ONE key; every other
+                                // conjunct of the ON clause (a second key of a
+                                // composite join, an expression equality)
+                                // rides as a residual filter — it used to be
+                                // silently DROPPED (`ON a.x = b.x AND a.y =
+                                // b.y` returned rows matching only x).
+                                let residual = inlj_residual(
+                                    condition.as_ref(),
+                                    (l_qual.as_deref(), l_col),
+                                    (r_qual.as_deref(), r_col),
+                                );
+                                // COVERING: only when nothing above — the
+                                // residual included — reads an inner column
+                                // beyond the rowid alias.
+                                let covering = match &residual {
+                                    Some(r) => {
+                                        inner_covering(&with_exprs(&[r], needed), r_table, r_alias)
+                                    }
+                                    None => inner_covering(needed, r_table, r_alias),
+                                };
+                                let inlj = Plan::IndexNestedLoopJoin {
                                     outer: left.clone(),
                                     inner_table: r_table.clone(),
                                     inner_alias: r_alias.clone(),
                                     inner_index: idx,
                                     outer_key_col,
                                     covering,
+                                };
+                                return match residual {
+                                    Some(predicate) => Plan::Filter {
+                                        input: Box::new(inlj),
+                                        predicate,
+                                    },
+                                    None => inlj,
                                 };
                             }
                         }
@@ -7615,20 +8481,50 @@ fn inlj_walk(catalog: &Catalog, plan: Plan, needed: &NeededCols) -> Plan {
                 ..
             } = left.as_ref()
             {
-                if predicate.is_none() && outer_is_selective(&right) {
-                    let covering = inner_covering(needed, l_table, l_alias);
-                    for (_l_qual, l_col, r_qual, r_col) in &eq_pairs {
+                if predicate.is_none()
+                    && outer_is_selective(&right)
+                    && !inner_rowid_needed_without_alias(needed, l_table, l_alias)
+                {
+                    for (l_qual, l_col, r_qual, r_col) in &eq_pairs {
                         if let Some(outer_key_col) =
                             resolve_outer_col_index(&right, r_qual.as_deref(), r_col)
                         {
-                            if let Some(idx) = find_index_for_column(catalog, l_table, l_col) {
-                                return Plan::IndexNestedLoopJoin {
+                            if let Some(idx) = find_index_for_column(catalog, l_table, l_col)
+                                .filter(|idx| {
+                                    inlj_index_collation_ok(
+                                        condition.as_ref(),
+                                        (l_qual.as_deref(), l_col),
+                                        (r_qual.as_deref(), r_col),
+                                        idx,
+                                    )
+                                })
+                            {
+                                // Residual conjuncts: see the right-inner arm.
+                                let residual = inlj_residual(
+                                    condition.as_ref(),
+                                    (l_qual.as_deref(), l_col),
+                                    (r_qual.as_deref(), r_col),
+                                );
+                                let covering = match &residual {
+                                    Some(r) => {
+                                        inner_covering(&with_exprs(&[r], needed), l_table, l_alias)
+                                    }
+                                    None => inner_covering(needed, l_table, l_alias),
+                                };
+                                let inlj = Plan::IndexNestedLoopJoin {
                                     outer: right.clone(),
                                     inner_table: l_table.clone(),
                                     inner_alias: l_alias.clone(),
                                     inner_index: idx,
                                     outer_key_col,
                                     covering,
+                                };
+                                return match residual {
+                                    Some(predicate) => Plan::Filter {
+                                        input: Box::new(inlj),
+                                        predicate,
+                                    },
+                                    None => inlj,
                                 };
                             }
                         }
@@ -7868,7 +8764,7 @@ fn resolve_outer_col_index(
                 col_name,
             ) {
                 // Inner table columns come AFTER outer columns in the output.
-                let outer_n = plan_output_width(outer);
+                let outer_n = plan_output_width(outer)?;
                 return Some(outer_n + idx);
             }
             resolve_outer_col_index(outer, table_qualifier, col_name)
@@ -7879,7 +8775,7 @@ fn resolve_outer_col_index(
             if let Some(idx) = resolve_outer_col_index(left, table_qualifier, col_name) {
                 return Some(idx);
             }
-            let left_n = plan_output_width(left);
+            let left_n = plan_output_width(left)?;
             resolve_outer_col_index(right, table_qualifier, col_name).map(|i| left_n + i)
         }
 
@@ -7909,68 +8805,15 @@ fn resolve_table_col_index(
         .position(|c| c.name.eq_ignore_ascii_case(col_name))
 }
 
-/// Helper: compute the output column width of a plan.
-/// Used by `resolve_outer_col_index` to offset into Join/IndexNestedLoopJoin
-/// outputs.
-fn plan_output_width(plan: &Plan) -> usize {
-    match plan {
-        Plan::CteRows { rows, columns } => {
-            let _ = rows;
-            columns.len()
-        }
-        // Table-valued functions have a fixed output schema per family
-        // (json_each/json_tree: 8 columns; pragma_*: 3-8). A stable upper
-        // bound keeps Join slot-offset math conservative without binding
-        // the executor to this estimate.
-        Plan::TableFunction { .. } => 8,
-        Plan::Scan { table, .. } => table.n_columns(),
-        Plan::RowidLookup { table, .. } => table.n_columns(),
-        Plan::RowidIn { table, .. } => table.n_columns(),
-        Plan::IndexIn { table, .. } => table.n_columns(),
-        Plan::IndexLookup { table, .. } => table.n_columns(),
-        Plan::IndexRange { table, .. } => table.n_columns(),
-        Plan::InvertedIndexScan { table, .. } => table.n_columns(),
-        Plan::SpatialIndexScan { table, .. } => table.n_columns(),
-        Plan::SpatialKnn { table, .. } => table.n_columns(),
-        Plan::RowidRange { table, .. } => table.n_columns(),
-        Plan::Values { rows } => rows.first().map(|r| r.len()).unwrap_or(0),
-        Plan::Filter { input, .. } => plan_output_width(input),
-        Plan::Project { input, columns } => {
-            // Project may shrink or grow (via star expansion). We can't
-            // compute that without expanding stars, so we use a heuristic:
-            // count non-star columns + 1 per star (which is wrong in general
-            // but only used when no better signal is available).
-            let star_count = columns
-                .iter()
-                .filter(|c| matches!(&c.expr, Expr::Column { name, .. } if name == "*"))
-                .count();
-            if star_count == 0 {
-                columns.len()
-            } else {
-                // Fall back to the input's width — only correct if a star
-                // expands to the full input width.
-                plan_output_width(input)
-            }
-        }
-        Plan::Sort { input, .. } => plan_output_width(input),
-        Plan::Limit { input, .. } => plan_output_width(input),
-        Plan::Aggregate {
-            input,
-            group_by,
-            aggregates,
-        } => plan_output_width(input) + group_by.len() + aggregates.len(),
-        Plan::Window { input, windows } => plan_output_width(input) + windows.len(),
-        Plan::Join { left, right, .. } => plan_output_width(left) + plan_output_width(right),
-        Plan::IndexNestedLoopJoin {
-            outer, inner_table, ..
-        } => plan_output_width(outer) + inner_table.n_columns(),
-        Plan::Subquery { plan } => plan_output_width(plan),
-        Plan::Distinct { input } => plan_output_width(input),
-        Plan::Union { left, .. } => plan_output_width(left),
-        Plan::Intersect { left, .. } => plan_output_width(left),
-        Plan::Except { left, .. } => plan_output_width(left),
-        Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. } => 0,
-    }
+/// The output column width of a plan, used by `resolve_outer_col_index`
+/// to offset into Join outputs. EXACT or `None`: it mirrors the
+/// executors through `atom_out_cols` (hidden rowid slots included — a
+/// bare `n_columns()` was one short for every scan of a table without an
+/// INTEGER PRIMARY KEY, and the old star / table-function guesses could
+/// be off too); an index join keyed on a mis-offset slot reads the WRONG
+/// column, so an unknown width declines the index join instead.
+fn plan_output_width(plan: &Plan) -> Option<usize> {
+    atom_out_cols(plan).map(|c| c.len())
 }
 
 // ---------------------------------------------------------------------------
@@ -8309,7 +9152,7 @@ fn rewrite_rowid_refs_in_plan_multi(
 /// Plain-table FROM sides for plan-time star expansion: (table name,
 /// alias) in FROM order. Returns FALSE when any side is a subquery /
 /// table-function atom (the star is then not plan-time expandable).
-fn collect_plain_table_sides(
+pub(crate) fn collect_plain_table_sides(
     from: &TableExpression,
     out: &mut Vec<(String, Option<String>)>,
 ) -> bool {
@@ -8812,6 +9655,25 @@ fn column_declared_collation(
     None
 }
 
+/// True when `e` is a column reference that resolves to a table in
+/// `scope` (it then carries that column's collation — BINARY included).
+fn column_in_scope(e: &Expr, scope: &[(std::sync::Arc<crate::schema::Table>, String)]) -> bool {
+    let Expr::Column {
+        table: qualifier,
+        name,
+    } = e
+    else {
+        return false;
+    };
+    scope.iter().any(|(t, alias)| {
+        let qualified_match = match qualifier.as_deref() {
+            Some(q) => q.eq_ignore_ascii_case(alias) || q.eq_ignore_ascii_case(&t.name),
+            None => true,
+        };
+        qualified_match && t.find_column(name).is_some()
+    })
+}
+
 /// Does an expression (or a nested operand) carry an explicit COLLATE?
 fn has_explicit_collate(e: &Expr) -> bool {
     match e {
@@ -8929,7 +9791,11 @@ pub(crate) fn rewrite_column_collations(
                     return e.clone();
                 }
                 // Left operand's declared collation, else the right's
-                // (SQLite's rule).
+                // (sqlite3BinaryCompareCollSeq): a LEFT column decides even
+                // when its collation is the default BINARY — `t1.b = t2.h`
+                // with only `h` declared NOCASE compares BINARY. The right
+                // operand's collation applies only when the left is not a
+                // column.
                 if let Some(coll) = column_declared_collation(catalog, left, scope) {
                     return Expr::Binary {
                         op: *op,
@@ -8939,6 +9805,9 @@ pub(crate) fn rewrite_column_collations(
                         }),
                         right: right.clone(),
                     };
+                }
+                if column_in_scope(left, scope) {
+                    return e.clone();
                 }
                 if let Some(coll) = column_declared_collation(catalog, right, scope) {
                     return Expr::Binary {
@@ -9013,6 +9882,62 @@ pub(crate) fn dbg_reorder() -> bool {
 pub(crate) fn no_dp() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("RSQL_NO_DP").is_some())
+}
+
+/// An integer-constant ORDER BY / GROUP BY term (SQLite
+/// sqlite3ExprIsInteger after skipping COLLATE): `K`, `-K`, `+K`.
+pub(crate) fn ordinal_term(e: &Expr) -> Option<i64> {
+    // sqlite3ExprIsInteger only recognizes values that fit a 32-bit int
+    // (EP_IntValue): `GROUP BY 4294967296` is a constant, not an ordinal.
+    // Unary `+` / `-` recurse (`- -3` is the ordinal 3, `+ -2` is -2 —
+    // out of range); COLLATE is transparent (this parser binds `-K
+    // COLLATE x` as `-(K COLLATE x)`; SQLite: `(-K) COLLATE x`, same
+    // ordinal).
+    let fits = |k: i64| i32::try_from(k).is_ok();
+    match e {
+        Expr::Literal(Value::Integer(k)) if fits(*k) => Some(*k),
+        Expr::Collate { expr, .. } => ordinal_term(expr),
+        Expr::Unary {
+            op: crate::sql::ast::UnaryOp::Pos,
+            expr,
+        } => ordinal_term(expr),
+        Expr::Unary {
+            op: crate::sql::ast::UnaryOp::Neg,
+            expr,
+        } => ordinal_term(expr)?.checked_neg().filter(|k| fits(*k)),
+        _ => None,
+    }
+}
+
+/// A substituted integer-literal result column (`SELECT 39 … ORDER BY 1`)
+/// becomes the constant NULL: sorting / grouping by ANY constant is the
+/// same no-op, and NULL can never be re-read as an ordinal downstream
+/// (a `+39` wrapper would be constant-folded straight back to `39`).
+pub(crate) fn guard_ordinal_literal(e: Expr) -> Expr {
+    // Any CONSTANT term, not just a literal: the folder later turns a
+    // pure column-free expression such as `(-3 IS NOT NULL)` into the
+    // literal 1, which exec_sort (running BELOW the projection) would
+    // then read as "ordinal 1" against the INPUT row — sorting by the
+    // table's first column instead of by nothing.
+    if matches!(e, Expr::Literal(Value::Integer(_)))
+        || (crate::planner::fold::expr_is_pure(&e) && collect_column_refs(&e).is_empty())
+    {
+        Expr::Literal(Value::Null)
+    } else {
+        e
+    }
+}
+
+/// SQLite's `%r` ordinal rendering: 1st, 2nd, 3rd, 4th … 11th, 12th,
+/// 13th … 21st, 22nd.
+pub(crate) fn sqlite_ordinal(n: i64) -> String {
+    let x = n.rem_euclid(10);
+    let suffix = if x >= 4 || x == 0 || (n / 10) % 10 == 1 {
+        "th"
+    } else {
+        ["th", "st", "nd", "rd"][x as usize]
+    };
+    format!("{n}{suffix}")
 }
 
 #[cfg(test)]

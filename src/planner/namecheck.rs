@@ -300,7 +300,20 @@ fn view_output_names(ctx: &Ctx<'_>, v: &crate::schema::View) -> Option<Vec<Strin
     if let Some(list) = &v.columns {
         return Some(list.clone());
     }
-    subquery_output_names(ctx, &v.select)
+    // Star expansion recurses through view bodies: a circularly defined
+    // view (`CREATE VIEW v AS SELECT * FROM v`) recursed until the stack
+    // overflowed. Past a bounded depth the names are "uncomputable" (the
+    // planner's view-depth guard then reports the cycle).
+    thread_local! {
+        static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    if DEPTH.with(|d| d.get()) >= 16 {
+        return None;
+    }
+    DEPTH.with(|d| d.set(d.get() + 1));
+    let names = subquery_output_names(ctx, &v.select);
+    DEPTH.with(|d| d.set(d.get() - 1));
+    names
 }
 
 /// One SELECT statement's output names (aliases, bare column names,
@@ -1186,8 +1199,15 @@ fn validate_expr(ctx: &Ctx<'_>, e: &Expr, scope: &mut Scope, visible: &CteList) 
             validate_expr(ctx, right, scope, visible)
         }
         Expr::Function {
-            args, filter, over, ..
+            name,
+            args,
+            filter,
+            over,
+            ..
         } => {
+            if let Some(msg) = builtin_arity_error(name, args.len()) {
+                return Err(Error::semantic(msg));
+            }
             for a in args {
                 if let Expr::Column { name, .. } = a {
                     if name == "*" {
@@ -1767,5 +1787,64 @@ fn validate_alter(ctx: &Ctx<'_>, a: &AlterStatement) -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+/// SQLite's arity contract for the built-in (non-overridable) functions:
+/// `wrong number of arguments to function NAME()` at PREPARE time — the
+/// engine used to accept `coalesce(x)`, `substr('abc')`, `abs()` and
+/// friends and silently return NULL / a guess. Names outside this table
+/// (JSON, FTS, geo, plugins, date/time) keep their own runtime checks.
+pub(crate) fn builtin_arity_error(name: &str, n: usize) -> Option<String> {
+    let lname = name.to_ascii_lowercase();
+    // (min, max) inclusive; usize::MAX = variadic.
+    let (lo, hi): (usize, usize) = match lname.as_str() {
+        "abs"
+        | "hex"
+        | "length"
+        | "likely"
+        | "lower"
+        | "octet_length"
+        | "quote"
+        | "randomblob"
+        | "sign"
+        | "soundex"
+        | "sqlite_compileoption_get"
+        | "sqlite_compileoption_used"
+        | "typeof"
+        | "unicode"
+        | "unistr"
+        | "unistr_quote"
+        | "unlikely"
+        | "upper"
+        | "zeroblob"
+        | "subtype" => (1, 1),
+        "changes" | "last_insert_rowid" | "random" | "sqlite_source_id" | "sqlite_version"
+        | "total_changes" | "pi" => (0, 0),
+        "coalesce" => (2, usize::MAX),
+        "concat" => (1, usize::MAX),
+        "concat_ws" => (2, usize::MAX),
+        "glob" | "ifnull" | "instr" | "likelihood" | "nullif" | "timediff" | "atan2" | "mod"
+        | "pow" | "power" => (2, 2),
+        "iif" | "if" => (2, usize::MAX),
+        "like" => (2, 3),
+        "ltrim" | "rtrim" | "trim" | "round" | "unhex" | "log" => (1, 2),
+        "max" | "min" => (1, usize::MAX),
+        "replace" => (3, 3),
+        "substr" | "substring" => (2, 3),
+        "acos" | "acosh" | "asin" | "asinh" | "atan" | "atanh" | "ceil" | "ceiling" | "cos"
+        | "cosh" | "degrees" | "exp" | "floor" | "ln" | "log10" | "log2" | "radians" | "sin"
+        | "sinh" | "sqrt" | "tan" | "tanh" | "trunc" => (1, 1),
+        // JSON1 (json.c aJsonFunc nArg values).
+        "json" | "jsonb" | "json_quote" | "json_error_position" => (1, 1),
+        "json_patch" | "jsonb_patch" => (2, 2),
+        "json_valid" | "json_type" | "json_array_length" | "json_pretty" => (1, 2),
+        "json_extract" | "jsonb_extract" | "json_remove" | "jsonb_remove" => (1, usize::MAX),
+        _ => return None,
+    };
+    if n < lo || n > hi {
+        Some(format!("wrong number of arguments to function {}()", name))
+    } else {
+        None
     }
 }

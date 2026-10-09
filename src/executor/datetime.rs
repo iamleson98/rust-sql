@@ -259,7 +259,8 @@ fn parse_timezone(z: &[u8], p: &mut DateTime) -> bool {
         return false;
     }
     let n_mn = digits(z, i + 4, 2);
-    if n_mn.is_none() {
+    // getDigits "20b:20e": hours 0..=14, minutes 0..=59.
+    if n_mn.is_none() || n_hr.unwrap() > 14 || n_mn.unwrap() > 59 {
         return false;
     }
     p.tz = sgn * (n_mn.unwrap() as i32 + n_hr.unwrap() as i32 * 60);
@@ -287,12 +288,17 @@ fn parse_hhmmss(z: &[u8], p: &mut DateTime) -> bool {
         Some(v) => v as i32,
         None => return false,
     };
+    // parseHhMmSs's getDigits "20c:20e" / "20e": hours 0..=24, minutes
+    // and seconds 0..=59 (`25:00`, `23:60`, `23:59:60` are not times).
+    if h > 24 || m > 59 {
+        return false;
+    }
     let mut i = 5;
     let mut s: f64 = 0.0;
     if i < z.len() && z[i] == b':' {
         s = match digits(z, i + 1, 2) {
-            Some(v) => v as f64,
-            None => return false,
+            Some(v) if v <= 59 => v as f64,
+            _ => return false,
         };
         i += 3;
         if i < z.len() && z[i] == b'.' && i + 1 < z.len() && z[i + 1].is_ascii_digit() {
@@ -349,8 +355,13 @@ fn parse_ymd(z: &[u8], p: &mut DateTime) -> bool {
         Some(v) => v as i32,
         None => return false,
     };
+    // getDigits "40f-21a-21d": month 1..=12, day 1..=31.
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return false;
+    }
+    // Only an UPPERCASE `T` separates date and time (parseYyyyMmDd).
     let mut j = i + 10;
-    while j < z.len() && (z[j].is_ascii_whitespace() || z[j] == b'T' || z[j] == b't') {
+    while j < z.len() && (z[j].is_ascii_whitespace() || z[j] == b'T') {
         j += 1;
     }
     if j < z.len() {
@@ -1309,48 +1320,108 @@ pub fn unixepoch_func(args: &[Value]) -> Option<Value> {
     }
 }
 
-/// `timediff(A, B)` — the exact interval from B to A, rendered as
-/// `+YYYY-MM-DD HH:MM:SS.SSS` (SQLite 3.35+ format).
+/// `timediff(A, B)` — the interval from B to A as `±YYYY-MM-DD
+/// HH:MM:SS.SSS`. A port of date.c's timediffFunc: whole years and
+/// months are stepped off B's calendar date (so month lengths count the
+/// way a calendar does), the remainder is rendered as a day count plus
+/// a time of day.
 pub fn timediff_func(args: &[Value]) -> Option<Value> {
     if args.len() != 2 {
         return None;
     }
-    let a = is_date(&args[..1])?;
-    let b = is_date(&args[1..2])?;
-    // Compute A - B in ms, then break into Y/M/D HH:MM:SS.SSS using
-    // SQLite's algorithm (see timediffFunc in date.c).
-    let diff_ms = a.i_jd - b.i_jd;
-    let neg = diff_ms < 0;
-    let mut ms = diff_ms.abs();
-    // Days part.
-    let days = ms / 86400000;
-    ms -= days * 86400000;
-    let secs_of_day = ms / 1000;
-    let ms_frac = ms % 1000;
-    // Convert days into Y/M/D with month arithmetic: start at julian day 0
-    // (i.e. -4713-11-24 12:00) and add `days`.
-    let mut dt = DateTime {
-        i_jd: days * 86400000,
-        valid_jd: true,
-        ..DateTime::default()
-    };
-    compute_ymd(&mut dt);
-    // Adjust: JD 0 is -4713-11-24 12:00; the Y/M/D from computeYMD at
-    // iJD=0 is -4713-11-24 (with the 12:00 offset ignored).
-    // SQLite renders relative to -4713-11-24 12:00 by subtracting the base.
-    let (mut y, mut m, d) = (dt.y + 4713, dt.m - 11, dt.d - 24);
-    if m <= 0 {
-        m += 12;
-        y -= 1;
+    let mut d1 = is_date(&args[..1])?;
+    let mut d2 = is_date(&args[1..2])?;
+    compute_ymd_hms(&mut d1);
+    compute_ymd_hms(&mut d2);
+    if d1.is_error || d2.is_error {
+        return None;
     }
-    let h = secs_of_day / 3600;
-    let min = (secs_of_day % 3600) / 60;
-    let s = secs_of_day % 60;
-    let sign = if neg { "-" } else { "+" };
+    let reset = |d: &mut DateTime| {
+        d.valid_jd = false;
+        compute_jd(d);
+    };
+    let sign;
+    let (mut y, mut m);
+    if d1.i_jd >= d2.i_jd {
+        sign = '+';
+        y = d1.y - d2.y;
+        if y != 0 {
+            d2.y = d1.y;
+            reset(&mut d2);
+        }
+        m = d1.m - d2.m;
+        if m < 0 {
+            y -= 1;
+            m += 12;
+        }
+        if m != 0 {
+            d2.m = d1.m;
+            reset(&mut d2);
+        }
+        while d1.i_jd < d2.i_jd {
+            m -= 1;
+            if m < 0 {
+                m = 11;
+                y -= 1;
+            }
+            d2.m -= 1;
+            if d2.m < 1 {
+                d2.m = 12;
+                d2.y -= 1;
+            }
+            reset(&mut d2);
+        }
+        d1.i_jd -= d2.i_jd;
+    } else {
+        sign = '-';
+        y = d2.y - d1.y;
+        if y != 0 {
+            d2.y = d1.y;
+            reset(&mut d2);
+        }
+        m = d2.m - d1.m;
+        if m < 0 {
+            y -= 1;
+            m += 12;
+        }
+        if m != 0 {
+            d2.m = d1.m;
+            reset(&mut d2);
+        }
+        while d1.i_jd > d2.i_jd {
+            m -= 1;
+            if m < 0 {
+                m = 11;
+                y -= 1;
+            }
+            d2.m += 1;
+            if d2.m > 12 {
+                d2.m = 1;
+                d2.y += 1;
+            }
+            reset(&mut d2);
+        }
+        d1.i_jd = d2.i_jd - d1.i_jd;
+    }
+    // Re-base the remainder on 0000-01-01 00:00:00 so its calendar
+    // fields read as days / hours / minutes / seconds.
+    d1.i_jd += 1_486_995_408i64 * 100_000;
+    d1.valid_jd = true;
+    clear_ymd_hms_tz(&mut d1);
+    compute_ymd_hms(&mut d1);
+    if d1.is_error {
+        return None;
+    }
     Some(Value::Text(
         format!(
-            "{}{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
-            sign, y, m, d, h, min, s, ms_frac
+            "{}{:04}-{:02}-{:02} {:02}:{:02}:{:06.3}",
+            sign,
+            y,
+            m,
+            d1.d - 1,
+            d1.h,
+            d1.min,
+            d1.s
         )
         .into(),
     ))

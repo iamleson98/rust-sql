@@ -3044,6 +3044,29 @@ impl Pager {
         self.codec.read().active.clone()
     }
 
+    /// [`crate::storage::concurrent::StructuralScope`] for a B-tree write
+    /// entry point — armed only while some concurrent writer scope exists
+    /// (one atomic load otherwise).
+    #[inline]
+    pub(crate) fn structural_scope(&self) -> crate::storage::concurrent::StructuralScope {
+        crate::storage::concurrent::StructuralScope::enter(self.concurrent.scope_armed_any())
+    }
+
+    /// [`crate::storage::concurrent::PointReadScope`] for a rowid point
+    /// lookup on tree `root`.
+    #[inline]
+    pub(crate) fn point_read_scope(
+        &self,
+        root: PageId,
+        rowid: i64,
+    ) -> crate::storage::concurrent::PointReadScope {
+        crate::storage::concurrent::PointReadScope::enter(
+            self.concurrent.scope_armed_any(),
+            root,
+            rowid,
+        )
+    }
+
     /// Cache-invalidation epoch: packs (instance_id, write_version) so
     /// advisory caches can detect BOTH "content changed" and "this is a
     /// different database object than the one the cache was built for"
@@ -3055,6 +3078,38 @@ impl Pager {
     /// snapshot is returned instead (see `committed_view_epoch`).
     #[inline]
     pub fn write_epoch(&self) -> u64 {
+        self.write_epoch_inner()
+    }
+
+    /// [`crate::storage::concurrent::KeyProbeScope`] for an equality probe
+    /// of index tree `root`.
+    #[inline]
+    pub(crate) fn key_probe_scope(
+        &self,
+        root: PageId,
+        key: &[u8],
+    ) -> crate::storage::concurrent::KeyProbeScope {
+        crate::storage::concurrent::KeyProbeScope::enter(
+            self.concurrent.scope_armed_any(),
+            root,
+            key,
+        )
+    }
+
+    #[inline]
+    fn write_epoch_inner(&self) -> u64 {
+        // Armed BEGIN CONCURRENT writer scope: a FRESH epoch on every call
+        // (disjoint space: bits 46+47). No advisory cache keyed by the
+        // epoch — B-tree leaf hints, pinned roots, the hash-join build
+        // cache — can then serve a page fetch inside the transaction (a
+        // live-page hint would bypass the private shadows and the
+        // read-set tracking) or leak a build of the transaction's private
+        // view to other connections afterwards.
+        if self.concurrent.scope_armed_any() && self.armed_writer_scope().is_some() {
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = SEQ.fetch_add(1, Ordering::Relaxed) & ((1u64 << 46) - 1);
+            return (self.instance_id << 48) | (3u64 << 46) | n;
+        }
         // Committed-view scope armed on THIS thread: return the BEGIN-time
         // epoch. Hints built against BEGIN-time pages validate against it
         // for the whole transaction, so a concurrent writer's live bumps

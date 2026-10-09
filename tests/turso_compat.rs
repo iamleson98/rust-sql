@@ -33,7 +33,9 @@ fn scalar_concat_family() {
     let db = Database::open_in_memory().unwrap();
     // concat: NULLs skipped.
     assert_eq!(qt(&db, "SELECT concat('a', NULL, 'b', 1, 2.5)"), "ab12.5");
-    assert_eq!(qt(&db, "SELECT concat()"), "");
+    // concat() needs at least one argument (SQLite 3.53: "wrong number
+    // of arguments to function concat()").
+    assert!(db.query("SELECT concat()", ()).is_err());
     assert_eq!(qt(&db, "SELECT concat(NULL)"), "");
     // concat_ws: NULL separator -> NULL.
     assert!(q1(&db, "SELECT concat_ws(NULL, 'a', 'b')").is_null());

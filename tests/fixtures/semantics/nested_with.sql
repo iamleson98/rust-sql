@@ -1,0 +1,37 @@
+-- WITH clauses below the statement's top level: FROM subqueries,
+-- expression subqueries (scalar / IN / EXISTS, correlated or not),
+-- view bodies, recursive CTEs inside each, and shadowing. These all
+-- used to fail with "no such table".
+CREATE TABLE t(a INTEGER);
+INSERT INTO t VALUES(1),(2),(3);
+SELECT * FROM (WITH c(x) AS (SELECT 7) SELECT x FROM c);
+SELECT (WITH c(x) AS (SELECT 8) SELECT x FROM c);
+SELECT 1 WHERE 8 IN (WITH c(x) AS (SELECT 8) SELECT x FROM c);
+SELECT a FROM t WHERE EXISTS (WITH c AS (SELECT t.a AS q) SELECT 1 FROM c WHERE q > 1);
+SELECT a, (WITH c AS (SELECT t.a + 1 AS v) SELECT v FROM c) FROM t;
+SELECT a, (WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n < t.a) SELECT sum(n) FROM r) FROM t;
+WITH d AS (SELECT * FROM (WITH c AS (SELECT 5 y) SELECT y FROM c)) SELECT * FROM d;
+WITH d AS (SELECT 1) SELECT * FROM (WITH c AS (SELECT 5 y) SELECT y FROM c);
+WITH c AS (SELECT 1 x) SELECT (WITH c AS (SELECT 2 x) SELECT x FROM c), (SELECT x FROM c);
+WITH c AS (SELECT 3 k) SELECT * FROM (WITH d AS (SELECT k+1 AS k2 FROM c) SELECT k2 FROM d);
+SELECT t.a, s.y FROM t JOIN (WITH c AS (SELECT 2 y UNION ALL SELECT 3) SELECT y FROM c) s ON s.y = t.a;
+INSERT INTO t SELECT x + 10 FROM (WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x<5) SELECT x FROM c);
+SELECT count(*), sum(a) FROM t;
+DELETE FROM t WHERE a IN (WITH c AS (SELECT 15 z UNION ALL SELECT 14) SELECT z FROM c);
+UPDATE t SET a = (WITH c AS (SELECT 100 z) SELECT z FROM c) WHERE a = 13;
+SELECT a FROM t;
+CREATE VIEW v AS WITH c AS (SELECT 1 x UNION ALL SELECT 2) SELECT x FROM c;
+SELECT * FROM v;
+SELECT t.a, v.x FROM t, v WHERE t.a = v.x;
+CREATE VIEW rv AS WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n<4) SELECT n FROM r;
+SELECT * FROM rv JOIN t ON t.a = rv.n;
+SELECT count(*) FROM rv, rv AS r2;
+SELECT * FROM rv WHERE n IN (SELECT a+2 FROM t);
+-- Circular views error instead of overflowing the stack.
+CREATE VIEW selfv AS WITH c AS (SELECT 1) SELECT * FROM selfv;
+SELECT * FROM selfv;
+CREATE VIEW sv2 AS SELECT * FROM sv2;
+SELECT * FROM sv2;
+CREATE VIEW m1 AS WITH c AS (SELECT 1) SELECT * FROM m2;
+CREATE VIEW m2 AS SELECT * FROM m1;
+SELECT * FROM m1;

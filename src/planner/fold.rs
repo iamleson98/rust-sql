@@ -39,7 +39,7 @@ use crate::types::Value;
 /// execution cost that a fold could duplicate or skip: no function
 /// calls, no subqueries, no RAISE. (Column refs and parameters are fine
 /// — a discarded operand's column read is not observable.)
-fn expr_is_pure(e: &Expr) -> bool {
+pub(crate) fn expr_is_pure(e: &Expr) -> bool {
     match e {
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Column { .. } => true,
         Expr::Binary { left, right, .. } => expr_is_pure(left) && expr_is_pure(right),
@@ -536,7 +536,7 @@ pub(crate) fn fold_constants_in_plan(plan: &mut Plan) {
             fold_constants_in_plan(plan);
             Vec::new()
         }
-        Plan::CteRows { .. } => Vec::new(),
+        Plan::CteRows { .. } | Plan::NestedSelect { .. } => Vec::new(),
         Plan::TableFunction { args, .. } => args.iter_mut().collect(),
         Plan::Distinct { input } => {
             fold_constants_in_plan(input);

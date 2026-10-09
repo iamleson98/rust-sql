@@ -371,6 +371,10 @@ fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64) {
         Plan::CteRows { .. } => {
             push_row(parent, rows, next_id, "SCAN CTE".to_string());
         }
+        Plan::NestedSelect { .. } => {
+            // Planned at run time (its CTEs materialize first).
+            push_row(parent, rows, next_id, "SCAN SUBQUERY WITH CTE".to_string());
+        }
         Plan::Union { left, right, .. } => {
             walk(left, parent, rows, next_id);
             walk(right, parent, rows, next_id);
@@ -643,6 +647,7 @@ pub(crate) fn node_detail(plan: &Plan) -> Option<String> {
         }
         Plan::Subquery { .. } => Some("SUBQUERY".to_string()),
         Plan::CteRows { .. } => Some("SCAN CTE".to_string()),
+        Plan::NestedSelect { .. } => Some("SCAN SUBQUERY WITH CTE".to_string()),
         Plan::Union { .. } => Some("USE TEMP B-TREE FOR UNION".to_string()),
         Plan::Intersect { .. } => Some("USE TEMP B-TREE FOR INTERSECT".to_string()),
         Plan::Except { .. } => Some("USE TEMP B-TREE FOR EXCEPT".to_string()),

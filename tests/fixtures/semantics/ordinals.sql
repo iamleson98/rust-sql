@@ -1,0 +1,27 @@
+-- Positional GROUP BY / ORDER BY (resolveOrderGroupBy).
+CREATE TABLE t(a INTEGER, b TEXT);
+INSERT INTO t VALUES (1, 'x'), (2, 'x'), (3, 'y');
+/*ordered*/ SELECT b, count(*) FROM t GROUP BY 1 ORDER BY 1;
+/*ordered*/ SELECT a % 2, count(*) FROM t GROUP BY 1 ORDER BY 1;
+/*ordered*/ SELECT b, a % 2, count(*) FROM t GROUP BY 1, 2 ORDER BY 1, 2;
+SELECT 39, 91 FROM t ORDER BY 1;
+SELECT 5 AS x FROM t ORDER BY x;
+/*ordered*/ SELECT * FROM t GROUP BY 2 ORDER BY 2;
+SELECT 7, count(*) FROM t GROUP BY 1;
+/*ordered*/ SELECT a = '1', count(*) FROM t GROUP BY 1 ORDER BY 1;
+/*ordered*/ SELECT b FROM t UNION SELECT b FROM t ORDER BY 1;
+/*ordered*/ SELECT x FROM (SELECT b AS x, count(*) FROM t GROUP BY 1) ORDER BY 1;
+SELECT a FROM t GROUP BY 3;
+SELECT a FROM t GROUP BY 0;
+SELECT a FROM t ORDER BY 0;
+SELECT a, b FROM t ORDER BY 1, 5;
+SELECT count(*) FROM t GROUP BY 1;
+SELECT 5 FROM t GROUP BY 4294967296;
+SELECT b FROM t ORDER BY 2147483648;
+CREATE TABLE o(g);
+INSERT INTO o VALUES (1), (5), (NULL), ('.5'), (-3), (12);
+/*ordered*/ SELECT (-3 IS NOT NULL), (ltrim(g) - '.5') FROM o ORDER BY 1 DESC, 2 LIMIT 4 OFFSET 1;
+/*ordered*/ SELECT (-3 IS NOT NULL), (ltrim(g) - '.5') FROM o ORDER BY 1 DESC, 2;
+SELECT count(*) FROM t GROUP BY (-63 COLLATE RTRIM);
+SELECT 1, count(*) FROM t GROUP BY (-1 COLLATE BINARY);
+SELECT a FROM t ORDER BY (-1 COLLATE NOCASE);

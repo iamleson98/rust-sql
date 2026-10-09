@@ -165,6 +165,43 @@ fn concurrent_begin_requires_no_plain_txn() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn concurrent_cross_read_cycle_second_committer_aborts() {
+    // T1 writes `a` after reading `b`; T2 writes `b` after reading `a`.
+    // Under snapshot isolation both would commit (each believing the
+    // other table empty) — a non-serializable outcome. SQLite's
+    // begin-concurrent validates read pages, so the second COMMIT fails
+    // with SQLITE_BUSY_SNAPSHOT and is rolled back.
+    let (mut db, path) = waldb("cw_cross_cycle");
+    db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
+    db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
+    Database::set_conn_identity(1);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    assert_eq!(count(&db, "b"), 0);
+    db.execute("INSERT INTO a (v) VALUES ('a1')", []).unwrap();
+    Database::set_conn_identity(2);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    assert_eq!(count(&db, "a"), 0);
+    db.execute("INSERT INTO b (v) VALUES ('b1')", []).unwrap();
+    Database::set_conn_identity(1);
+    db.execute("COMMIT", []).unwrap();
+    Database::set_conn_identity(2);
+    let r = db.execute("COMMIT", []);
+    assert!(
+        r.is_err(),
+        "the second committer read data the first changed"
+    );
+    assert!(r.unwrap_err().to_string().contains("SQLITE_BUSY_SNAPSHOT"));
+    let _ = db.execute("ROLLBACK", []);
+    Database::set_conn_identity(0);
+    assert_eq!(count(&db, "a"), 1);
+    assert_eq!(count(&db, "b"), 0);
+    drop(db);
+    cleanup(&path);
+}
+
+#[test]
 fn concurrent_two_writers_disjoint_tables_both_commit() {
     let (mut db, path) = waldb("cw_disjoint");
     db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, v TEXT)", [])
@@ -184,13 +221,16 @@ fn concurrent_two_writers_disjoint_tables_both_commit() {
     db.execute("INSERT INTO a (v) VALUES ('a2')", []).unwrap();
     Database::set_conn_identity(2);
     db.execute("INSERT INTO b (v) VALUES ('b2')", []).unwrap();
-    // Each sees ONLY its own writes (snapshot isolation).
+    // Each sees its own writes. (Each must NOT also read the OTHER's
+    // table here: T1 reading `b` empty and T2 reading `a` empty while
+    // both write would be a read/write cycle — no serial order exists,
+    // and SQLite's begin-concurrent read-set validation rejects the
+    // second committer. That case is pinned by
+    // `concurrent_cross_read_cycle_second_committer_aborts`.)
     Database::set_conn_identity(1);
     assert_eq!(count(&db, "a"), 2);
-    assert_eq!(count(&db, "b"), 0);
     Database::set_conn_identity(2);
     assert_eq!(count(&db, "b"), 2);
-    assert_eq!(count(&db, "a"), 0);
     // Both commit — the single-writer model would have serialized these.
     Database::set_conn_identity(1);
     db.execute("COMMIT", []).unwrap();
@@ -660,11 +700,6 @@ fn concurrent_insert_then_update_own_row_indexed() {
     // shadows — the committed view does not have it yet).
     let r1: f64 = db.query("SELECT b FROM t WHERE a = 1000", []).unwrap()[0][0].as_real();
     assert_eq!(r1, 501.0, "identity 1 sees its own updated row");
-    assert_eq!(
-        count(&db, "t"),
-        101,
-        "identity 1 sees base + its own insert"
-    );
     Database::set_conn_identity(2);
     db.execute("BEGIN CONCURRENT", []).unwrap();
     db.execute(
@@ -681,17 +716,19 @@ fn concurrent_insert_then_update_own_row_indexed() {
     // uncommitted row (snapshot isolation).
     let r2: f64 = db.query("SELECT b FROM t WHERE a = 2000", []).unwrap()[0][0].as_real();
     assert_eq!(r2, 1002.0, "identity 2 sees its own updated row");
-    assert_eq!(
-        count(&db, "t"),
-        101,
-        "identity 2 sees base + its own insert only"
-    );
+    // (No full-table count / probe of identity 1's key inside both
+    // transactions: whole-table reads by BOTH writers form a read/write
+    // cycle the read-set validation rightly rejects. The uncommitted
+    // row's invisibility is checked from a plain reader instead.)
+    Database::set_conn_identity(3);
     assert!(
         db.query("SELECT b FROM t WHERE a = 1000", [])
             .unwrap()
             .is_empty(),
-        "identity 2 must not see identity 1's uncommitted row"
+        "a reader must not see identity 1's uncommitted row"
     );
+    assert_eq!(count(&db, "t"), 100, "a reader sees only committed rows");
+    Database::set_conn_identity(2);
     // Commit both (disjoint `a` ranges: no conflict).
     Database::set_conn_identity(1);
     db.execute("COMMIT", []).unwrap();

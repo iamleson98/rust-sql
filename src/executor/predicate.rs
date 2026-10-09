@@ -193,6 +193,12 @@ fn in_list_probe(
     positions: &[usize],
     params: &[Value],
 ) -> (bool, bool) {
+    // Empty list: nothing to compare against — not a member and NO
+    // unknown comparison either, even for a NULL value (`NULL NOT IN ()`
+    // is TRUE).
+    if vals.is_empty() {
+        return (false, false);
+    }
     if let Some(set) = int_set {
         // All-integer-literal fast path: one probe. Reals match
         // numerically when exactly representable (1.0 in (1,2)); a real
@@ -459,18 +465,12 @@ impl CompiledPredicate {
             CompiledPredicate::And(..) | CompiledPredicate::Or(..) => false,
             CompiledPredicate::Not(a) => a.eval_null(row, positions, params),
             CompiledPredicate::IsNull { .. } => false,
-            CompiledPredicate::Between { col, lo, hi, .. } => {
-                let v = row.get(positions[*col]).unwrap_or(null_ref());
-                if matches!(v, Value::Null) {
-                    return true;
-                }
-                let l = lo.eval(row, positions, params);
-                if matches!(&*l, Value::Null) {
-                    return true;
-                }
-                let h = hi.eval(row, positions, params);
-                matches!(&*h, Value::Null)
-            }
+            CompiledPredicate::Between { col, lo, hi, .. } => between_kleene(
+                row.get(positions[*col]).unwrap_or(null_ref()),
+                &lo.eval(row, positions, params),
+                &hi.eval(row, positions, params),
+            )
+            .is_none(),
             CompiledPredicate::InList {
                 col,
                 vals,
@@ -572,21 +572,18 @@ impl CompiledPredicate {
                     let in_range = x >= lo_i && x <= hi_i;
                     return in_range != *negated;
                 }
-                // SQL three-valued logic, mirroring the general path
-                // exactly: any NULL operand → result NULL → WHERE filters
-                // the row out (true for BETWEEN *and* NOT BETWEEN).
-                let v = row.get(positions[*col]).unwrap_or(null_ref());
-                let l = lo.eval(row, positions, params);
-                let h = hi.eval(row, positions, params);
-                if matches!(v, Value::Null)
-                    || matches!(&*l, Value::Null)
-                    || matches!(&*h, Value::Null)
-                {
-                    return false;
+                // SQL three-valued logic, mirroring the general path:
+                // `x >= lo AND x <= hi` is a KLEENE AND (FALSE dominates
+                // NULL), so `93 NOT BETWEEN NULL AND 36` is TRUE — a NULL
+                // operand used to filter the row out of NOT BETWEEN too.
+                match between_kleene(
+                    row.get(positions[*col]).unwrap_or(null_ref()),
+                    &lo.eval(row, positions, params),
+                    &hi.eval(row, positions, params),
+                ) {
+                    Some(in_range) => in_range != *negated,
+                    None => false,
                 }
-                let in_range = apply_binary(BinaryOp::GtEq, v, &l).is_truthy()
-                    && apply_binary(BinaryOp::LtEq, v, &h).is_truthy();
-                in_range != *negated
             }
             CompiledPredicate::InList {
                 col,
@@ -651,10 +648,20 @@ impl CompiledPredicate {
                 // for LIKE; the general path handles that).
                 let v = row.get(positions[*col]).unwrap_or(null_ref());
                 let Value::Text(t) = v else {
-                    let p = Value::Text(needle_text(needle));
+                    // The FULL `%needle%` pattern: the bare needle matched
+                    // only values EQUAL to it — `int_col LIKE '%5%'`
+                    // found no rows at all.
+                    let mut pat = Vec::with_capacity(needle.len() + 2);
+                    pat.push(b'%');
+                    pat.extend_from_slice(needle);
+                    pat.push(b'%');
+                    let p = Value::Text(needle_text(&pat));
                     return crate::executor::expr::like_match(v, &p, None, false);
                 };
-                crate::executor::expr::like_contains_bytes(t.as_bytes(), needle)
+                // C-string subject: LIKE stops at the first NUL byte.
+                let b = t.as_bytes();
+                let b = &b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())];
+                crate::executor::expr::like_contains_bytes(b, needle)
             }
         }
     }
@@ -720,10 +727,21 @@ fn fold_cmp_operands(
             use crate::types::Affinity::*;
             let numeric = |x: crate::types::Affinity| matches!(x, Integer | Real | Numeric);
             let texty = |x: crate::types::Affinity| matches!(x, Text | Blob | None);
+            // Both sides are columns: the comparison affinity is NUMERIC
+            // and applies to BOTH operand values (OP_Eq converts whichever
+            // side holds numeric-looking TEXT) — the column side must be
+            // wrapped too, `coerce_operand` leaves bare columns alone.
+            let wrap = |pv: PredValue| match pv {
+                PredValue::Col(_) => PredValue::Coerce {
+                    inner: Box::new(pv),
+                    affinity: Numeric,
+                },
+                other => coerce_operand(other, Numeric),
+            };
             if numeric(a) && texty(b) {
-                (lhs, coerce_operand(rhs, Numeric))
+                (lhs, wrap(rhs))
             } else if numeric(b) && texty(a) {
-                (coerce_operand(lhs, Numeric), rhs)
+                (wrap(lhs), rhs)
             } else {
                 (lhs, rhs)
             }
@@ -775,8 +793,78 @@ fn compile_pred_expr(e: &Expr, table: &crate::schema::Table, prefix: &str) -> Op
             }
             let l = compile_pred_expr(left, table, prefix)?;
             let r = compile_pred_expr(right, table, prefix)?;
+            // A NESTED comparison (`(a = '1') + 1`, a GROUP BY key
+            // `a > '5'`) carries comparison affinity the eager tree does
+            // not model: compile only when no conversion can occur.
+            if is_cmp_op(*op) && !nested_cmp_affinity_free(&l, &r, table) {
+                return None;
+            }
             Some(PredExpr::Binary(*op, Box::new(l), Box::new(r)))
         }
+        _ => None,
+    }
+}
+
+/// True when a compiled nested comparison needs no affinity conversion:
+/// the static comparison affinity is none, or every non-column operand
+/// is a literal already of the class the affinity would convert to
+/// (numeric literals against a numeric affinity, TEXT literals against
+/// TEXT). Columns of a numeric-affinity table never hold numeric-looking
+/// TEXT (storage affinity converted it), so they need no conversion
+/// either.
+fn nested_cmp_affinity_free(l: &PredExpr, r: &PredExpr, table: &crate::schema::Table) -> bool {
+    use crate::executor::expr::{comparison_affinity, CmpAffinity};
+    // A column with a DECLARED collation compares through it; the
+    // compiled nested comparison is BINARY — leave it to the evaluator
+    // (`WHERE (b = 'A') = 1` over a NOCASE column).
+    let collated = |e: &PredExpr| match e {
+        PredExpr::Col(i) => table.columns.get(*i).is_some_and(|c| {
+            !c.collation.is_empty() && !c.collation.eq_ignore_ascii_case("BINARY")
+        }),
+        _ => false,
+    };
+    if collated(l) || collated(r) {
+        return false;
+    }
+    let aff = |e: &PredExpr| match e {
+        PredExpr::Col(i) => table.columns.get(*i).map(|c| c.affinity),
+        _ => None,
+    };
+    match comparison_affinity(aff(l), aff(r)) {
+        CmpAffinity::None => true,
+        CmpAffinity::Numeric => [l, r].iter().all(|e| match e {
+            PredExpr::Col(i) => table.columns.get(*i).is_some_and(|c| {
+                matches!(
+                    c.affinity,
+                    crate::types::Affinity::Integer
+                        | crate::types::Affinity::Real
+                        | crate::types::Affinity::Numeric
+                )
+            }),
+            PredExpr::Literal(v) => matches!(v, Value::Integer(_) | Value::Real(_) | Value::Null),
+            _ => false,
+        }),
+        CmpAffinity::Text => [l, r].iter().all(|e| match e {
+            PredExpr::Col(_) => true,
+            PredExpr::Literal(v) => matches!(v, Value::Text(_) | Value::Null),
+            _ => false,
+        }),
+    }
+}
+
+/// `v BETWEEN l AND h` as SQL's Kleene `v >= l AND v <= h`: `None` =
+/// NULL (unknown), FALSE dominating a NULL on the other side.
+fn between_kleene(v: &Value, l: &Value, h: &Value) -> Option<bool> {
+    let cmp = |op: BinaryOp, a: &Value, b: &Value| -> Option<bool> {
+        if matches!(a, Value::Null) || matches!(b, Value::Null) {
+            None
+        } else {
+            Some(apply_binary(op, a, b).is_truthy())
+        }
+    };
+    match (cmp(BinaryOp::GtEq, v, l), cmp(BinaryOp::LtEq, v, h)) {
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (Some(true), Some(true)) => Some(true),
         _ => None,
     }
 }
@@ -918,6 +1006,11 @@ pub(crate) fn try_int_column_range(
             let col = column_index(expr, table, prefix)?;
             let lo = bind_leaf(low, table, prefix)?;
             let hi = bind_leaf(high, table, prefix)?;
+            // Column bounds compare column-to-column (see the compiled
+            // BETWEEN arm) — not an int-range shape.
+            if matches!(lo, PredValue::Col(_)) || matches!(hi, PredValue::Col(_)) {
+                return None;
+            }
             Some(IntRangePred { col, lo, hi })
         }
         Expr::Binary {
@@ -1131,6 +1224,13 @@ pub(crate) fn compile_predicate(
                     if let Some(col) = table.find_column(name) {
                         let lo = bind_leaf(low, table, prefix)?;
                         let hi = bind_leaf(high, table, prefix)?;
+                        // A COLUMN bound compares column-to-column (both
+                        // affinities decide — sqlite3CompareAffinity), not
+                        // through this column's affinity: leave it to the
+                        // evaluator.
+                        if matches!(lo, PredValue::Col(_)) || matches!(hi, PredValue::Col(_)) {
+                            return None;
+                        }
                         // Both bounds take the column's affinity
                         // (SQLite: BETWEEN desugars to two comparisons).
                         let aff = table.columns.get(col).map(|c| c.affinity);
@@ -1160,7 +1260,26 @@ pub(crate) fn compile_predicate(
             if vals.is_empty() {
                 return None;
             }
-            let Expr::Column { table: ref_t, name } = expr.as_ref() else {
+            // A materialized `IN (SELECT …)` carries its column's affinity
+            // on the operand (expr::IN_RHS_MARKER): unwrap it, and decline
+            // only when the combined comparison affinity would have to
+            // convert the COLUMN's values per row (a TEXT / untyped column
+            // probed against a numeric subquery column) — the compiled
+            // member coercion below covers every other combination.
+            let (lhs, rhs_aff) = match expr.as_ref() {
+                Expr::Cast {
+                    expr: inner,
+                    type_name,
+                } if type_name.starts_with(crate::executor::expr::IN_RHS_MARKER) => (
+                    inner.as_ref(),
+                    crate::executor::expr::marker_affinity(
+                        type_name,
+                        crate::executor::expr::IN_RHS_MARKER,
+                    ),
+                ),
+                other => (other, None),
+            };
+            let Expr::Column { table: ref_t, name } = lhs else {
                 return None;
             };
             let matches = ref_t
@@ -1182,6 +1301,14 @@ pub(crate) fn compile_predicate(
                 return None;
             }
             let col = table.find_column(name)?;
+            if let Some(ra) = rhs_aff {
+                use crate::types::Affinity as A;
+                let col_aff = table.columns.get(col).map(|c| c.affinity);
+                let numeric = |a: A| matches!(a, A::Integer | A::Real | A::Numeric);
+                if numeric(ra) && !col_aff.is_some_and(numeric) {
+                    return None;
+                }
+            }
             let mut bound = Vec::with_capacity(vals.len());
             for v in vals.iter() {
                 bound.push(bind_leaf(v, table, prefix)?);
@@ -1582,6 +1709,13 @@ pub(crate) fn compile_expr(
             }
             let l = compile_expr(left, col_names, params_len)?;
             let r = compile_expr(right, col_names, params_len)?;
+            // A comparison touching a column carries comparison affinity
+            // this affinity-blind tree cannot model — general path.
+            if is_cmp_op(*op)
+                && (matches!(l, CompiledExpr::Col(_)) || matches!(r, CompiledExpr::Col(_)))
+            {
+                return None;
+            }
             Some(CompiledExpr::Binary(*op, Box::new(l), Box::new(r)))
         }
         // ? positional parameters arrive as Parameter(name); numeric names

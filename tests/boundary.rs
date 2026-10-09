@@ -332,8 +332,10 @@ fn text_and_blob_boundaries() {
             "TEXT round-trip failed at {}",
             i
         );
-        // length() counts CHARACTERS in SQLite.
-        let expected_len = t.chars().count() as i64;
+        // length() counts CHARACTERS in SQLite — up to the first NUL
+        // (func.c lengthFunc walks the C string: `length('a' || char(0)
+        // || 'b')` is 1, verified against the bundled 3.53.4).
+        let expected_len = t.split('\0').next().unwrap().chars().count() as i64;
         assert_eq!(
             rows[0][1],
             Value::Integer(expected_len),

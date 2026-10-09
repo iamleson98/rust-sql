@@ -14,6 +14,7 @@ use crate::error::Error;
 use crate::executor::jsonb::{
     self, jb_patch, jb_remove_at, jb_set_at, parse_lenient, parse_strict, value_to_jb, Jb,
 };
+use crate::sql::ast::Expr;
 use crate::types::Value;
 
 // ---------------------------------------------------------------------------
@@ -537,6 +538,111 @@ fn json_valid(args: &[Value]) -> Result<Value, Error> {
         valid |= jsonb::jb_from_bytes(bytes).is_ok();
     }
     Ok(Value::Integer(if valid { 1 } else { 0 }))
+}
+
+// ---------------------------------------------------------------------------
+// JSON subtype (SQLite's 'J' value subtype)
+// ---------------------------------------------------------------------------
+
+/// Does `e` produce a value that carries SQLite's JSON subtype — text a
+/// JSON constructor must EMBED as JSON rather than quote as a string?
+/// The JSON-returning functions and the `->` operator always do
+/// (`json_array(json('[1]'))` is `[[1]]`, not `["[1]"]`); json_extract()
+/// does only for an array / object result (`json_subtype_value` checks).
+pub(crate) fn expr_has_json_subtype(e: &Expr) -> bool {
+    match e {
+        Expr::Function {
+            name, over: None, ..
+        } => matches!(
+            name.to_ascii_lowercase().as_str(),
+            "json"
+                | "json_array"
+                | "json_object"
+                | "json_set"
+                | "json_insert"
+                | "json_replace"
+                | "json_remove"
+                | "json_patch"
+                | "json_quote"
+                | "json_group_array"
+                | "json_group_object"
+                | "json_extract"
+        ),
+        Expr::Binary {
+            op: crate::sql::ast::BinaryOp::Arrow,
+            ..
+        } => true,
+        _ => false,
+    }
+}
+
+/// The argument positions of a JSON constructor that take a VALUE (and so
+/// honor the JSON subtype); `None` for functions that ignore subtypes.
+fn json_value_position(fname: &str, i: usize) -> bool {
+    match fname {
+        "json_array" | "jsonb_array" => true,
+        "json_object" | "jsonb_object" | "__json_object_frag" | "__jsonb_object_frag" => i % 2 == 1,
+        "json_set" | "json_insert" | "json_replace" | "jsonb_set" | "jsonb_insert"
+        | "jsonb_replace" => i >= 2 && i % 2 == 0,
+        _ => false,
+    }
+}
+
+/// Apply the JSON subtype to a constructor's evaluated arguments: a TEXT
+/// value produced by a JSON function (see `expr_has_json_subtype`) is
+/// handed over as its JSONB encoding, which every constructor already
+/// embeds as JSON. json_extract() qualifies only when its result is an
+/// array or object (its scalar results are plain SQL values).
+pub(crate) fn apply_json_subtypes(fname: &str, args: &[Expr], vals: &mut [Value]) {
+    for (i, (a, v)) in args.iter().zip(vals.iter_mut()).enumerate() {
+        if !json_value_position(fname, i) || !expr_has_json_subtype(a) || is_json_extract_call(a) {
+            continue; // json_extract: decided from its node (json_extract_subtyped)
+        }
+        let Value::Text(t) = &*v else { continue };
+        let Ok(jb) = parse_lenient(t) else { continue };
+        *v = Value::Blob(jsonb::jb_to_bytes(&jb));
+    }
+}
+
+/// Is `e` a json_extract(...) call (whose JSON subtype depends on the
+/// extracted node — see `json_extract_subtyped`)?
+pub(crate) fn is_json_extract_call(e: &Expr) -> bool {
+    matches!(e, Expr::Function { name, over: None, .. } if name.eq_ignore_ascii_case("json_extract"))
+}
+
+/// May argument `i` of `fname` consume a JSON subtype?
+pub(crate) fn takes_json_value(fname: &str, i: usize) -> bool {
+    json_value_position(fname, i)
+}
+
+/// json_extract(X, P...) as a JSON-subtype-aware VALUE: the JSONB
+/// encoding when SQLite's result carries the JSON subtype — several
+/// paths (always an array), or one path selecting an array / object —
+/// else exactly json_extract's SQL value (a string "[1]" stays text).
+pub(crate) fn json_extract_subtyped(args: &[Value]) -> Result<Value, Error> {
+    let v = json_extract(args, Out::Text)?;
+    let subtyped = match args.len() {
+        0 | 1 => false,
+        2 => {
+            let Some(doc) = load_doc(&args[0])? else {
+                return Ok(v);
+            };
+            let path = parse_doc_path(&args[1])?;
+            matches!(
+                jsonb::jb_resolve(&doc, path.segs()),
+                Some(Jb::Array(_) | Jb::Object(_))
+            )
+        }
+        _ => true,
+    };
+    if subtyped {
+        if let Value::Text(t) = &v {
+            if let Ok(jb) = parse_lenient(t) {
+                return Ok(Value::Blob(jsonb::jb_to_bytes(&jb)));
+            }
+        }
+    }
+    Ok(v)
 }
 
 // ---------------------------------------------------------------------------

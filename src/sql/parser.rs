@@ -1892,10 +1892,52 @@ impl Parser {
     /// reports whether the FINAL compound term is a VALUES core (the
     /// trailing-VALUES grammar restriction above keys off it).
     fn parse_select_body(&mut self) -> Result<(SelectBody, bool)> {
-        // Top-level VALUES (..), (..), ... — a multi-row table
-        // constructor (SQLite: a compound of single-row SELECTs). Parse
-        // every row here (before set-op chaining) so all rows survive:
-        // the old parse_simple_select arm kept only the first row.
+        // Compound operators all share ONE precedence and associate to
+        // the LEFT (SQLite's `selectnowith ::= selectnowith multiselect_op
+        // oneselect`): `A UNION ALL B UNION C` is `(A UNION ALL B) UNION
+        // C`. The old right-recursive parse built `A op (B op C)` — wrong
+        // for mixed operators and for EXCEPT chains (rows dropped or
+        // duplicated), and it put the middle arm of a 3-arm recursive CTE
+        // into the RECURSIVE part.
+        let (mut body, mut ends_on_values) = self.parse_compound_core()?;
+        loop {
+            let op = if self.peek().is_keyword("UNION") {
+                self.advance();
+                if self.consume_keyword("ALL") {
+                    SetOp::UnionAll
+                } else {
+                    SetOp::Union
+                }
+            } else if self.peek().is_keyword("INTERSECT") {
+                self.advance();
+                SetOp::Intersect
+            } else if self.peek().is_keyword("EXCEPT") {
+                self.advance();
+                SetOp::Except
+            } else {
+                break;
+            };
+            // A multi-row VALUES operand stays ONE operand (its rows'
+            // UNION ALL chain is the right subtree — SQLite wraps it as a
+            // subquery for the same reason).
+            let (core, core_is_values) = self.parse_compound_core()?;
+            body = SelectBody::Binary {
+                op,
+                left: Box::new(body),
+                right: Box::new(core),
+            };
+            ends_on_values = core_is_values;
+        }
+        Ok((body, ends_on_values))
+    }
+
+    /// One compound operand: a SELECT core, or a top-level `VALUES (..),
+    /// (..), ...` table constructor (a UNION ALL chain of one-row cores —
+    /// SQLite's own model). The flag reports a VALUES operand (see the
+    /// trailing-VALUES ORDER BY / LIMIT quirk in parse_select).
+    fn parse_compound_core(&mut self) -> Result<(SelectBody, bool)> {
+        // Parse every VALUES row here so all rows survive (the old
+        // parse_simple_select arm kept only the first row).
         if self.peek().is_keyword("VALUES") {
             self.advance();
             let mut rows: Vec<Vec<Expr>> = Vec::new();
@@ -1931,9 +1973,6 @@ impl Parser {
                     ));
                 }
             }
-            // Chain rows as UNION ALL of one-row Values bodies (SQLite's
-            // own model) — ORDER BY / LIMIT / set-ops above apply to the
-            // whole chain uniformly.
             let mut body = SelectBody::Simple(SimpleSelect::values_row(rows.remove(0)));
             for row in rows {
                 body = SelectBody::Binary {
@@ -1942,69 +1981,9 @@ impl Parser {
                     right: Box::new(SelectBody::Simple(SimpleSelect::values_row(row))),
                 };
             }
-            // A set-op may follow the VALUES chain itself.
-            if self.peek().is_keyword("UNION")
-                || self.peek().is_keyword("INTERSECT")
-                || self.peek().is_keyword("EXCEPT")
-            {
-                let op = if self.peek().is_keyword("UNION") {
-                    self.advance();
-                    if self.consume_keyword("ALL") {
-                        SetOp::UnionAll
-                    } else {
-                        SetOp::Union
-                    }
-                } else if self.peek().is_keyword("INTERSECT") {
-                    self.advance();
-                    SetOp::Intersect
-                } else {
-                    self.advance();
-                    SetOp::Except
-                };
-                let (right, right_ends_on_values) = self.parse_select_body()?;
-                return Ok((
-                    SelectBody::Binary {
-                        op,
-                        left: Box::new(body),
-                        right: Box::new(right),
-                    },
-                    right_ends_on_values,
-                ));
-            }
-            // The VALUES chain itself is the trailing core.
             return Ok((body, true));
         }
-        let left = self.parse_simple_select()?;
-        // Look for set operators
-        if self.peek().is_keyword("UNION")
-            || self.peek().is_keyword("INTERSECT")
-            || self.peek().is_keyword("EXCEPT")
-        {
-            let op = if self.peek().is_keyword("UNION") {
-                self.advance();
-                if self.consume_keyword("ALL") {
-                    SetOp::UnionAll
-                } else {
-                    SetOp::Union
-                }
-            } else if self.peek().is_keyword("INTERSECT") {
-                self.advance();
-                SetOp::Intersect
-            } else {
-                self.advance();
-                SetOp::Except
-            };
-            let (right, right_ends_on_values) = self.parse_select_body()?;
-            return Ok((
-                SelectBody::Binary {
-                    op,
-                    left: Box::new(SelectBody::Simple(left)),
-                    right: Box::new(right),
-                },
-                right_ends_on_values,
-            ));
-        }
-        Ok((SelectBody::Simple(left), false))
+        Ok((SelectBody::Simple(self.parse_simple_select()?), false))
     }
 
     fn parse_simple_select(&mut self) -> Result<SimpleSelect> {
@@ -2646,6 +2625,20 @@ impl Parser {
             self.advance_op();
             // Right-associative? None of ours are.
             let right = self.parse_binary(prec + 1)?;
+            // sqlite3ExprAnd: an AND with an integer-literal-0 operand IS
+            // the literal 0 — folded at parse time, so `GROUP BY (x AND
+            // 0)` reads as the out-of-range ordinal 0, exactly as in
+            // SQLite — UNLESS either side calls a function (EP_HasFunc
+            // blocks the fold: `GROUP BY (0 AND typeof(b))` stays an
+            // expression).
+            if op == BinaryOp::And
+                && (is_false_literal(&left) || is_false_literal(&right))
+                && !contains_function_call(&left)
+                && !contains_function_call(&right)
+            {
+                left = Expr::Literal(Value::Integer(0));
+                continue;
+            }
             left = Expr::Binary {
                 op,
                 left: Box::new(left),
@@ -2658,7 +2651,11 @@ impl Parser {
     /// Does the next token start an IS-family operator?
     fn starts_is_operator(&self) -> bool {
         let t = self.peek();
-        t.is_keyword("IS") || t.is_keyword("ISNULL") || t.is_keyword("NOTNULL")
+        t.is_keyword("IS")
+            || t.is_keyword("ISNULL")
+            || t.is_keyword("NOTNULL")
+            // `x NOT NULL` — SQLite's postfix spelling of NOTNULL.
+            || (t.is_keyword("NOT") && self.peek_n(1).is_keyword("NULL"))
     }
 
     /// Parse `IS [NOT] NULL` / `IS [NOT] expr` / `ISNULL` / `NOTNULL` as a
@@ -2667,13 +2664,23 @@ impl Parser {
     fn parse_is_operator(&mut self, left: Expr) -> Result<Expr> {
         if self.peek().is_keyword("IS") {
             self.advance();
-            let negated = self.consume_keyword("NOT");
+            let mut negated = self.consume_keyword("NOT");
+            // SQLite 3.39+: `x IS [NOT] DISTINCT FROM y` — the SQL-standard
+            // spelling of `x IS NOT y` / `x IS y`.
+            if self.peek().is_keyword("DISTINCT") {
+                self.advance();
+                self.expect_keyword("FROM")?;
+                negated = !negated;
+                let right = self.parse_binary(PREC_IS + 1)?;
+                return Ok(Expr::Is {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    negated,
+                });
+            }
             if self.peek().is_keyword("NULL") {
                 self.advance();
-                Ok(Expr::IsNull {
-                    expr: Box::new(left),
-                    negated,
-                })
+                Ok(is_null_expr(left, negated))
             } else {
                 let right = self.parse_binary(PREC_IS + 1)?;
                 Ok(Expr::Is {
@@ -2684,17 +2691,16 @@ impl Parser {
             }
         } else if self.peek().is_keyword("ISNULL") {
             self.advance();
-            Ok(Expr::IsNull {
-                expr: Box::new(left),
-                negated: false,
-            })
+            Ok(is_null_expr(left, false))
+        } else if self.peek().is_keyword("NOT") {
+            // `NOT NULL` (starts_is_operator checked the NULL)
+            self.advance();
+            self.advance();
+            Ok(is_null_expr(left, true))
         } else {
             // NOTNULL
             self.advance();
-            Ok(Expr::IsNull {
-                expr: Box::new(left),
-                negated: true,
-            })
+            Ok(is_null_expr(left, true))
         }
     }
 
@@ -2750,6 +2756,16 @@ impl Parser {
                 if *u == 9_223_372_036_854_775_808u64 {
                     self.advance();
                     return Ok(Expr::Literal(Value::Integer(i64::MIN)));
+                }
+            }
+            // A negative REAL literal folds at parse time (expr.c codeReal
+            // with negate): `-0.0` is the REAL negative zero, while a
+            // non-literal `-x` is coded as `0 - x` (and `0 - 0.0` is +0.0).
+            if let Token::Float(f) = &self.peek().token {
+                let f = *f;
+                if !self.peek_n(1).is_keyword("COLLATE") {
+                    self.advance();
+                    return Ok(Expr::Literal(Value::Real(-f)));
                 }
             }
             let e = self.parse_unary()?;
@@ -3897,6 +3913,86 @@ fn keyword_is_fallback_ident(k: &str) -> bool {
             | "REINDEX"
             | "RENAME"
     )
+}
+
+/// An integer literal 0 (SQLite's EP_IsFalse on the integer token `0`).
+fn is_false_literal(e: &Expr) -> bool {
+    matches!(e, Expr::Literal(Value::Integer(0)))
+}
+
+/// Does `e` call a function (SQLite's propagated EP_HasFunc)? Subquery
+/// bodies are their own expressions and do not propagate it.
+fn contains_function_call(e: &Expr) -> bool {
+    match e {
+        Expr::Function { .. } => true,
+        Expr::Binary { left, right, .. } | Expr::Is { left, right, .. } => {
+            contains_function_call(left) || contains_function_call(right)
+        }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => contains_function_call(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            contains_function_call(expr)
+                || contains_function_call(low)
+                || contains_function_call(high)
+        }
+        Expr::In { expr, source, .. } => {
+            contains_function_call(expr)
+                || matches!(source, InSource::List(l) if l.iter().any(contains_function_call))
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            contains_function_call(expr)
+                || contains_function_call(pattern)
+                || escape.as_deref().is_some_and(contains_function_call)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            operand.as_deref().is_some_and(contains_function_call)
+                || whens
+                    .iter()
+                    .any(|(c, v)| contains_function_call(c) || contains_function_call(v))
+                || else_.as_deref().is_some_and(contains_function_call)
+        }
+        Expr::Row(items) => items.iter().any(contains_function_call),
+        _ => false,
+    }
+}
+
+/// `X IS [NOT] NULL` / `ISNULL` / `NOTNULL` (sqlite3PExprIsNull): over a
+/// numeric / string / blob LITERAL — through unary `+` / `-` — the test
+/// folds to the integer constant at parse time (`'x' IS NULL` is 0), so
+/// it reads as an ORDINAL in GROUP BY / ORDER BY like any integer
+/// literal. A NULL literal is not folded.
+fn is_null_expr(left: Expr, negated: bool) -> Expr {
+    let mut p = &left;
+    while let Expr::Unary {
+        op: UnaryOp::Pos | UnaryOp::Neg,
+        expr,
+    } = p
+    {
+        p = expr;
+    }
+    if matches!(
+        p,
+        Expr::Literal(Value::Integer(_) | Value::Real(_) | Value::Text(_) | Value::Blob(_))
+    ) {
+        return Expr::Literal(Value::Integer(i64::from(negated)));
+    }
+    Expr::IsNull {
+        expr: Box::new(left),
+        negated,
+    }
 }
 
 #[cfg(test)]

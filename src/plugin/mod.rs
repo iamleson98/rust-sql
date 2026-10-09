@@ -164,19 +164,22 @@ impl Collation for NoCaseCollation {
         "NOCASE"
     }
     fn compare(&self, a: &str, b: &str) -> Ordering {
-        // Compare as bytes with ASCII folding, so multi-byte UTF-8 keeps
-        // byte ordering (matching SQLite, which compares raw bytes).
+        // main.c nocaseCollatingFunc, verbatim: sqlite3StrNICmp over the
+        // shorter length — a C-string walk that STOPS at a NUL in the
+        // left operand — then the byte lengths decide. Raw bytes with
+        // ASCII-only folding (multi-byte UTF-8 keeps byte order).
         let (a, b) = (a.as_bytes(), b.as_bytes());
         let n = a.len().min(b.len());
-        for i in 0..n {
-            let ca = a[i].to_ascii_lowercase();
-            let cb = b[i].to_ascii_lowercase();
-            match ca.cmp(&cb) {
-                Ordering::Equal => continue,
-                ord => return ord,
-            }
+        let mut i = 0;
+        while i < n && a[i] != 0 && a[i].eq_ignore_ascii_case(&b[i]) {
+            i += 1;
         }
-        a.len().cmp(&b.len())
+        let r = if i == n {
+            Ordering::Equal
+        } else {
+            a[i].to_ascii_lowercase().cmp(&b[i].to_ascii_lowercase())
+        };
+        r.then(a.len().cmp(&b.len()))
     }
 }
 
@@ -227,8 +230,15 @@ pub fn collation_fold_key_ref<'a>(collation: &str, v: &'a Value) -> std::borrow:
     }
     if collation.eq_ignore_ascii_case("NOCASE") {
         if let Value::Text(t) = v {
-            // ASCII-only fold (SQLite's NOCASE is ASCII-only).
-            let folded: String = t.as_str().chars().map(|c| c.to_ascii_lowercase()).collect();
+            // ASCII-only fold (SQLite's NOCASE is ASCII-only). The
+            // comparison stops at the first NUL and then compares LENGTHS
+            // (see NoCaseCollation::compare), so equal keys are: the
+            // folded prefix through that NUL plus the total byte length.
+            let s = t.as_str();
+            let folded: String = match s.find('\0') {
+                Some(z) => format!("{}\0{}", s[..z].to_ascii_lowercase(), s.len()),
+                None => s.to_ascii_lowercase(),
+            };
             return std::borrow::Cow::Owned(Value::Text(folded.into()));
         }
     } else if collation.eq_ignore_ascii_case("RTRIM") {

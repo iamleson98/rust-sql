@@ -2393,6 +2393,9 @@ impl<'a> Btree<'a> {
         rowid: i64,
         f: impl FnOnce(&[u8]) -> Result<R>,
     ) -> Result<Option<R>> {
+        // Concurrent regime: this lookup's leaf fetch is a ROW-level
+        // semantic read (see concurrent::PointReadScope).
+        let _point = self.pager.point_read_scope(self.root, rowid);
         // --- Hint probe --------------------------------------------------
         // Struct-local FIRST (~2 ns), then the thread-local map (~40 ns):
         // a hoisted B+tree handle probing scattered rowids misses both, but
@@ -2633,6 +2636,7 @@ impl<'a> Btree<'a> {
     /// the whole descent when the rowid falls inside the last-visited
     /// leaf's range: one page touch instead of one per level.
     pub fn lookup_table(&mut self, rowid: i64) -> Result<LookupResult> {
+        let _point = self.pager.point_read_scope(self.root, rowid);
         // --- Hint probe: try the remembered leaf directly ---------------
         let epoch = self.pager.write_epoch();
         {
@@ -2978,6 +2982,7 @@ impl<'a> Btree<'a> {
     }
 
     pub fn insert_table(&mut self, rowid: i64, payload: &[u8]) -> Result<()> {
+        let _structural = self.pager.structural_scope();
         // Concurrent-writer row journal: record the op AFTER success so
         // the journal never contains phantom effects of failed statements
         // (a statement-level abort would otherwise leave journal/pages
@@ -3093,6 +3098,7 @@ impl<'a> Btree<'a> {
     /// Precondition: `rowid > current_max_rowid` (caller's responsibility).
     /// If the precondition is violated, this falls back to the normal path.
     pub fn insert_table_append(&mut self, rowid: i64, payload: &[u8]) -> Result<()> {
+        let _structural = self.pager.structural_scope();
         let root = self.root;
         self.journal_suppress = true;
         self.right_walk_for_write = true;
@@ -3122,6 +3128,7 @@ impl<'a> Btree<'a> {
         payload: &[u8],
         hint: Option<AppendHint>,
     ) -> Result<Option<AppendHint>> {
+        let _structural = self.pager.structural_scope();
         let root = self.root;
         self.journal_suppress = true;
         self.right_walk_for_write = true;
@@ -3195,6 +3202,7 @@ impl<'a> Btree<'a> {
         body: &[u8],
         hint: Option<AppendHint>,
     ) -> Result<Option<AppendHint>> {
+        let _structural = self.pager.structural_scope();
         let root = self.root;
         self.journal_suppress = true;
         self.right_walk_for_write = true;
@@ -3685,6 +3693,7 @@ impl<'a> Btree<'a> {
     /// split stays valid — the right-most worker is just lighter).
     /// Returns 0 for an empty (or degenerate) tree.
     pub fn max_rowid_hint(&self) -> Result<i64> {
+        let _structural = self.pager.structural_scope();
         let leaf = self.right_most_leaf()?;
         let page = self.pager.get_page(leaf)?;
         let guard = page.lock();
@@ -3724,6 +3733,7 @@ impl<'a> Btree<'a> {
     /// materialized ~500 MB of page images per connection (the
     /// mega-scale marathon's M5 soak RSS spike).
     pub fn max_rowid_exact(&self) -> Result<Option<i64>> {
+        let _structural = self.pager.structural_scope();
         let leaf = self.right_most_leaf()?;
         let page = self.pager.get_page(leaf)?;
         let guard = page.lock();
@@ -3856,6 +3866,7 @@ impl<'a> Btree<'a> {
         rowid: i64,
         hint: Option<AppendHint>,
     ) -> Result<Option<AppendHint>> {
+        let _structural = self.pager.structural_scope();
         let root = self.root;
         self.journal_suppress = true;
         // The right-edge walks this entry takes (first append, Declined
@@ -4178,6 +4189,7 @@ impl<'a> Btree<'a> {
         updates: &[(i64, &[u8])],
         deferred: &mut Vec<usize>,
     ) -> Result<()> {
+        let _structural = self.pager.structural_scope();
         let root = self.root;
         let r = self.update_table_bulk_inner(updates, deferred);
         match r {
@@ -4383,6 +4395,7 @@ impl<'a> Btree<'a> {
     }
 
     pub fn update_table(&mut self, rowid: i64, new_payload: &[u8]) -> Result<bool> {
+        let _structural = self.pager.structural_scope();
         let root = self.root;
         let r = self.update_table_inner(rowid, new_payload);
         match r {
@@ -6923,6 +6936,7 @@ impl<'a> Btree<'a> {
     /// Delete a (rowid) from a table B+tree. Does not rebalance (we leave
     /// pages underfull rather than risk concurrent-merge bugs).
     pub fn delete_table(&mut self, rowid: i64) -> Result<bool> {
+        let _structural = self.pager.structural_scope();
         let root = self.root;
         let r = self.delete_table_inner(rowid);
         match r {
@@ -6953,6 +6967,7 @@ impl<'a> Btree<'a> {
     /// separate `lookup_table` descent. Returns `Ok(None)` when the rowid
     /// doesn't exist.
     pub fn delete_table_get_payload(&mut self, rowid: i64) -> Result<Option<Vec<u8>>> {
+        let _structural = self.pager.structural_scope();
         let root = self.root;
         let r = self.delete_table_get_payload_inner(rowid);
         match r {
@@ -7125,6 +7140,7 @@ impl<'a> Btree<'a> {
     /// ns/row. Callers that need the deleted payloads (index maintenance,
     /// RETURNING, triggers) keep the per-row path.
     pub fn delete_rowids_inorder(&mut self, rowids: &[i64]) -> Result<u64> {
+        let _structural = self.pager.structural_scope();
         let root = self.root;
         let r = self.delete_rowids_inorder_inner(rowids);
         match r {
@@ -8980,6 +8996,7 @@ impl<'a> Btree<'a> {
         match pt {
             PageType::LeafTable => {
                 batch.clear();
+                let mut stop = false;
                 // Phase 1: binary-search the range start + copy the
                 // in-range cells under ONE lock (visitor never runs here).
                 {
@@ -9003,7 +9020,6 @@ impl<'a> Btree<'a> {
                             _ => hi = mid,
                         }
                     }
-                    let mut stop = false;
                     for i in lo..n {
                         let cell_ptr = borrowed.cell_pointer(i) as usize;
                         if cell_ptr >= psz {
@@ -9054,13 +9070,16 @@ impl<'a> Btree<'a> {
                             }
                         }
                     }
-                    if stop {
-                        return Ok(false);
-                    }
                 }
                 drop(page);
-                // Phase 2: visitor with NO leaf lock held.
-                batch.visit(self, f)
+                // Phase 2: visitor with NO leaf lock held. The cells copied
+                // from THIS leaf are visited even when it holds the range
+                // end — returning before the visit (the old early `stop`
+                // exit) silently skipped every in-range row of the last
+                // leaf: a re-entrant `UPDATE t SET x = (correlated) WHERE
+                // id <= 2` touched nothing.
+                let cont = batch.visit(self, f)?;
+                Ok(cont && !stop)
             }
             PageType::InteriorTable => {
                 let n = page.lock().n_cells();
@@ -9551,6 +9570,7 @@ impl<'a> Btree<'a> {
     /// Insert a (key, rowid) pair into an index B+tree.
     /// The key is the encoded form of the indexed column value(s).
     pub fn insert_index(&mut self, key: &[u8], rowid: i64) -> Result<()> {
+        let _structural = self.pager.structural_scope();
         let root = self.root;
         let r = self.insert_index_inner(key, rowid);
         if r.is_ok() {
@@ -9648,6 +9668,7 @@ impl<'a> Btree<'a> {
     /// Delete a (key, rowid) pair from an index B+tree.
     /// The key is required because index pages are sorted by (key, rowid).
     pub fn delete_index(&mut self, key: &[u8], rowid: i64) -> Result<bool> {
+        let _structural = self.pager.structural_scope();
         let root = self.root;
         let r = self.delete_index_inner(key, rowid);
         match r {
@@ -10259,6 +10280,7 @@ impl<'a> Btree<'a> {
     /// predecessor costs one locked cell removal — no descent; boundary
     /// crossings re-pin by descent. Absent entries are tolerated misses.
     pub fn delete_index_sorted(&mut self, entries: &[(Vec<u8>, i64)]) -> Result<()> {
+        let _structural = self.pager.structural_scope();
         if entries.is_empty() {
             return Ok(());
         }
@@ -10316,6 +10338,7 @@ impl<'a> Btree<'a> {
     /// back to the per-op path op by op — the amortized descent cost
     /// stays one per leaf boundary plus one per split.
     pub fn insert_index_sorted(&mut self, entries: &[(Vec<u8>, i64)]) -> Result<()> {
+        let _structural = self.pager.structural_scope();
         if entries.is_empty() {
             return Ok(());
         }
@@ -10387,6 +10410,9 @@ impl<'a> Btree<'a> {
     /// a fresh Vec malloc + free (~25-30 ns) per query.
     pub fn lookup_index_into(&mut self, key: &[u8], out: &mut Vec<i64>) -> Result<()> {
         out.clear();
+        // Concurrent regime: an equality probe reads exactly the entries
+        // under `key` — tracked at key granularity (concurrent::sem_keys).
+        let _probe = self.pager.key_probe_scope(self.root, key);
         // --- Hint probe: if the key falls inside the remembered leaf's
         // bounds, search that leaf directly. All matches must be collected
         // from this leaf only if the leaf's LAST cell doesn't itself match

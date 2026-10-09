@@ -200,6 +200,11 @@ fn fused_plan_of(
     params: &[Value],
     named_params: &std::collections::HashMap<String, Value>,
 ) -> Option<FusedPlan> {
+    // Collated min/max / DISTINCT aggregates (AggExpr::collation) stay
+    // serial: the worker merge compares and de-duplicates BINARY.
+    if aggregates.iter().any(|a| a.collation.is_some()) {
+        return None;
+    }
     if aggregates.is_empty() {
         return None;
     }
@@ -284,6 +289,11 @@ pub(crate) fn try_parallel_fused_aggregate(
     filter_predicate: Option<&Expr>,
     aggregates: &[AggExpr],
 ) -> Result<Option<ExecResult>> {
+    // Collated min/max / DISTINCT aggregates (AggExpr::collation) stay
+    // serial: the worker merge compares and de-duplicates BINARY.
+    if aggregates.iter().any(|a| a.collation.is_some()) {
+        return Ok(None);
+    }
     // WITHOUT ROWID tables: the parallel drivers range-split the table's
     // internal ROWID store (INSERT order); SQLite's scan order for a
     // WITHOUT ROWID table is the PK b-tree order. The serial paths walk
@@ -429,6 +439,11 @@ pub(crate) fn try_parallel_distinct_aggregate(
     filter_predicate: Option<&Expr>,
     aggregates: &[AggExpr],
 ) -> Result<Option<ExecResult>> {
+    // Collated min/max / DISTINCT aggregates (AggExpr::collation) stay
+    // serial: the worker merge compares and de-duplicates BINARY.
+    if aggregates.iter().any(|a| a.collation.is_some()) {
+        return Ok(None);
+    }
     // WITHOUT ROWID tables: the parallel drivers range-split the table's
     // internal ROWID store (INSERT order); SQLite's scan order for a
     // WITHOUT ROWID table is the PK b-tree order. The serial paths walk
@@ -590,6 +605,7 @@ pub(crate) fn try_parallel_distinct_aggregate(
                             arg_val,
                             distincts[i],
                             seps[i].as_deref(),
+                            None,
                         );
                     }
                     true
@@ -670,6 +686,11 @@ pub(crate) fn try_parallel_groupby_selective(
     n_cols: usize,
     key_collations: &[Option<String>],
 ) -> Result<Option<HashGrouper>> {
+    // Collated min/max / DISTINCT aggregates (AggExpr::collation) stay
+    // serial: the worker merge compares and de-duplicates BINARY.
+    if aggregates.iter().any(|a| a.collation.is_some()) {
+        return Ok(None);
+    }
     // WITHOUT ROWID tables: the parallel drivers range-split the table's
     // internal ROWID store (INSERT order); SQLite's scan order for a
     // WITHOUT ROWID table is the PK b-tree order. The serial paths walk
@@ -818,6 +839,7 @@ pub(crate) fn try_parallel_groupby_selective(
                             arg_val,
                             distincts[i],
                             seps[i].as_deref(),
+                            None,
                         );
                     }
                     true
@@ -864,7 +886,7 @@ pub(crate) fn try_parallel_groupby_selective(
     // SERIAL per-prefix accumulation. Decline to the serial grouper.
     let mut sum_overflow = false;
     for g in groupers {
-        let mut iter = g.into_group_iter();
+        let mut iter = g.into_group_iter_unordered();
         while let Some((keys, states)) = iter.next_group() {
             let dst_gi = merged.intern_key(&keys);
             for i in 0..n_aggs {
@@ -907,11 +929,9 @@ fn merge_sums(dst: &mut super::AggState, src: &super::AggState) {
             Some(n) => dst.int_sum = n,
             None => {
                 dst.int_overflow = true;
-                let b = src.int_sum as f64;
-                dst.sum = dst.int_sum as f64;
+                super::kbn_init_int(&mut dst.sum, &mut dst.comp, dst.int_sum);
                 dst.sum_is_int = false;
-                dst.comp = 0.0;
-                super::kbn_step(&mut dst.sum, &mut dst.comp, b);
+                super::kbn_step_int(&mut dst.sum, &mut dst.comp, src.int_sum);
             }
         }
     } else {
@@ -922,9 +942,8 @@ fn merge_sums(dst: &mut super::AggState, src: &super::AggState) {
             src.sum
         };
         if dst.sum_is_int {
-            dst.sum = dst.int_sum as f64;
+            super::kbn_init_int(&mut dst.sum, &mut dst.comp, dst.int_sum);
             dst.sum_is_int = false;
-            dst.comp = 0.0;
         }
         super::kbn_step(&mut dst.sum, &mut dst.comp, b);
         dst.comp += src.comp;
@@ -962,7 +981,7 @@ pub(crate) fn merge_agg_state(
     if distinct {
         if let Some(set) = src.cold().and_then(|c| c.distinct.as_ref()) {
             for v in set.iter() {
-                super::update_agg_state(dst, func, &v.0, true, sep);
+                super::update_agg_state(dst, func, &v.0, true, sep, None);
             }
         }
         return;
@@ -985,15 +1004,18 @@ pub(crate) fn merge_agg_state(
             // dst ++ sep ++ src — chunk/range order preserves scan order
             // (all of dst's rows precede all of src's for one key).
             if let Some(b) = src.cold().and_then(|c| c.concat.clone()) {
-                if !b.is_empty() {
+                {
                     let c = dst.cold_mut();
                     let joiner = c
                         .concat_sep
                         .clone()
                         .or_else(|| sep.map(|s| s.to_string()))
                         .unwrap_or_else(|| ",".to_string());
+                    // A prior term exists iff dst already holds a buffer
+                    // (empty-string terms count — see groupConcatStep).
+                    let had_terms = c.concat.is_some();
                     let buf = c.concat.get_or_insert_with(String::new);
-                    if !buf.is_empty() {
+                    if had_terms {
                         buf.push_str(&joiner);
                         c.concat_sep = Some(joiner);
                     }
@@ -1106,6 +1128,11 @@ pub(crate) fn try_parallel_groupby_compiled(
     n_cols: usize,
     key_collations: &[Option<String>],
 ) -> Result<Option<HashGrouper>> {
+    // Collated min/max / DISTINCT aggregates (AggExpr::collation) stay
+    // serial: the worker merge compares and de-duplicates BINARY.
+    if aggregates.iter().any(|a| a.collation.is_some()) {
+        return Ok(None);
+    }
     // WITHOUT ROWID tables: the parallel drivers range-split the table's
     // internal ROWID store (INSERT order); SQLite's scan order for a
     // WITHOUT ROWID table is the PK b-tree order. The serial paths walk
@@ -1241,6 +1268,7 @@ pub(crate) fn try_parallel_groupby_compiled(
                                 &super::COUNT_STAR_ARG,
                                 distincts[i],
                                 seps[i].as_deref(),
+                                None,
                             );
                             continue;
                         }
@@ -1255,6 +1283,7 @@ pub(crate) fn try_parallel_groupby_compiled(
                             &arg_val,
                             distincts[i],
                             seps[i].as_deref(),
+                            None,
                         );
                     }
                     true
@@ -1300,7 +1329,7 @@ pub(crate) fn try_parallel_groupby_compiled(
     // merge): a group's merged SUM overflow cannot be decided here.
     let mut sum_overflow = false;
     for g in groupers {
-        let mut iter = g.into_group_iter();
+        let mut iter = g.into_group_iter_unordered();
         while let Some((keys, states)) = iter.next_group() {
             let dst_gi = merged.intern_key(&keys);
             for i in 0..n_aggs {
@@ -2098,6 +2127,11 @@ pub(crate) fn try_parallel_aggregate_rows(
     columns: &[String],
     aggregates: &[AggExpr],
 ) -> Result<Option<ExecResult>> {
+    // Collated min/max / DISTINCT aggregates (AggExpr::collation) stay
+    // serial: the worker merge compares and de-duplicates BINARY.
+    if aggregates.iter().any(|a| a.collation.is_some()) {
+        return Ok(None);
+    }
     // Aggregate-function gates (merge support + order-independence).
     for agg in aggregates {
         match AggFunc::from_name(&agg.func) {
@@ -2213,6 +2247,7 @@ pub(crate) fn try_parallel_aggregate_rows(
                             &arg_val,
                             distincts[i],
                             seps[i].as_deref(),
+                            None,
                         );
                     }
                 }
@@ -2295,6 +2330,11 @@ pub(crate) fn try_parallel_groupby_rows(
     aggregates: &[AggExpr],
     key_collations: &[StdOption<String>],
 ) -> Result<Option<HashGrouper>> {
+    // Collated min/max / DISTINCT aggregates (AggExpr::collation) stay
+    // serial: the worker merge compares and de-duplicates BINARY.
+    if aggregates.iter().any(|a| a.collation.is_some()) {
+        return Ok(None);
+    }
     // Aggregate-function gates (the compiled GROUP BY split's own set).
     for agg in aggregates {
         match AggFunc::from_name(&agg.func) {
@@ -2416,6 +2456,7 @@ pub(crate) fn try_parallel_groupby_rows(
                             &arg_val,
                             distincts[i],
                             seps[i].as_deref(),
+                            None,
                         );
                     }
                 }
@@ -2443,7 +2484,7 @@ pub(crate) fn try_parallel_groupby_rows(
     // post-merge decline leaves them intact for the serial loop.
     let mut sum_overflow = false;
     for g in partials {
-        let mut iter = g.into_group_iter();
+        let mut iter = g.into_group_iter_unordered();
         while let Some((keys, states)) = iter.next_group() {
             let dst_gi = merged.intern_key(&keys);
             for i in 0..n_aggs {

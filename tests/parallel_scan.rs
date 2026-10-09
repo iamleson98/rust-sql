@@ -513,17 +513,17 @@ fn groupby_driver_matches_materialized_path() {
         .collect();
     assert_eq!(cols_q, cols_s, "driver column names must match");
 
-    // First-seen order: a, b, NULL, c.
+    // Group KEY order, SQLite's (it groups through a sorter): NULL, a, b, c.
     assert_eq!(rows_q.len(), 4);
-    assert_eq!(rows_q[0][0], Value::Text("a".into()));
-    assert_eq!(rows_q[1][0], Value::Text("b".into()));
-    assert_eq!(rows_q[2][0], Value::Null);
+    assert_eq!(rows_q[0][0], Value::Null);
+    assert_eq!(rows_q[1][0], Value::Text("a".into()));
+    assert_eq!(rows_q[2][0], Value::Text("b".into()));
     assert_eq!(rows_q[3][0], Value::Text("c".into()));
     // a: count 3, sum 7, min 1, max 4.
-    assert_eq!(rows_q[0][1], Value::Integer(3));
-    assert_eq!(rows_q[0][2], Value::Integer(7));
-    assert_eq!(rows_q[0][3], Value::Integer(1));
-    assert_eq!(rows_q[0][4], Value::Integer(4));
+    assert_eq!(rows_q[1][1], Value::Integer(3));
+    assert_eq!(rows_q[1][2], Value::Integer(7));
+    assert_eq!(rows_q[1][3], Value::Integer(1));
+    assert_eq!(rows_q[1][4], Value::Integer(4));
 }
 
 #[test]
@@ -605,11 +605,11 @@ fn groupby_driver_multi_key_and_concat() {
         }
     }
     assert_eq!(rows_q, rows_s);
-    // (x,1): p,r,u; (y,2): q,t; (x,2): s — first-seen order.
+    // Group KEY order (SQLite's): (x,1): p,r,u; (x,2): s; (y,2): q,t.
     assert_eq!(rows_q.len(), 3);
     assert_eq!(rows_q[0][2], Value::Text("p,r,u".into()));
-    assert_eq!(rows_q[1][2], Value::Text("q,t".into()));
-    assert_eq!(rows_q[2][2], Value::Text("s".into()));
+    assert_eq!(rows_q[1][2], Value::Text("s".into()));
+    assert_eq!(rows_q[2][2], Value::Text("q,t".into()));
     assert_eq!(rows_q[0][3], Value::Integer(1));
 }
 

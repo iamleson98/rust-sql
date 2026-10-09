@@ -1192,38 +1192,6 @@ fn decode_projected(
     }
 }
 
-/// Split a recursive CTE's compound SELECT into (base, set-op, recursive arm).
-/// The body must be `... UNION [ALL] <recursive>`; more than two arms or a
-/// non-UNION top-level operator is rejected (SQLite requires the same shape).
-fn split_compound_cte(
-    sel: &SelectStatement,
-) -> Result<(SelectStatement, crate::sql::ast::SetOp, SelectStatement)> {
-    use crate::sql::ast::{SelectBody, SelectStatement as Sel};
-    // Rebuild a plain SelectStatement from a SelectBody by cloning the
-    // statement shell with the body swapped.
-    fn with_body(s: &Sel, body: SelectBody) -> Sel {
-        let mut out = s.clone();
-        out.body = body;
-        out.with = None; // the outer WITH doesn't apply to inner arms
-        out
-    }
-    match &sel.body {
-        SelectBody::Binary { op, left, right } => match op {
-            crate::sql::ast::SetOp::Union | crate::sql::ast::SetOp::UnionAll => Ok((
-                with_body(sel, (**left).clone()),
-                *op,
-                with_body(sel, (**right).clone()),
-            )),
-            _ => Err(Error::semantic(
-                "WITH RECURSIVE requires UNION or UNION ALL as the compound operator",
-            )),
-        },
-        SelectBody::Simple(_) => Err(Error::semantic(
-            "WITH RECURSIVE requires a compound SELECT (base UNION [ALL] recursive)",
-        )),
-    }
-}
-
 // ====================================================================
 // ALTER TABLE RENAME COLUMN / DROP COLUMN support
 // ====================================================================
@@ -9716,42 +9684,7 @@ impl Database {
         select: &SelectStatement,
         outer_ctes: &HashMap<String, crate::types::CteMaterialization>,
     ) -> Result<crate::executor::ExecResult> {
-        // WHERE pushdown into single-use CTE bodies (the pushDownWhereTerms
-        // analog for CTEs): a conjunct over a CTE referenced exactly once
-        // re-homes into the CTE body's WHERE before materialization, so the
-        // body's planning sees it (index ranges, rowid lookups). The
-        // modified statement clone carries both the reduced outer WHERE and
-        // the augmented bodies.
-        let pushed_stmt: Option<SelectStatement> =
-            if select.with.as_ref().is_some_and(|w| !w.recursive) {
-                crate::planner::Planner::new(&self.catalog).push_where_into_cte_bodies(select)
-            } else {
-                None
-            };
-        let select_ref: &SelectStatement = pushed_stmt.as_ref().unwrap_or(select);
-        // Materialize THIS select's own WITH clause (nested WITH), layered
-        // on top of the outer map (inner names shadow outer names).
-        let cte_map = if let Some(with) = &select_ref.with {
-            let mut m = outer_ctes.clone();
-            let own = self.materialize_ctes(with, &m, ctx)?;
-            m.extend(own);
-            m
-        } else {
-            outer_ctes.clone()
-        };
-        let mut planner = Planner::new(&self.catalog);
-        planner.set_ctes(cte_map.clone());
-        let plan = planner.plan_select(select_ref)?;
-        let mut plan = plan;
-        // Make the CTEs visible to subquery planning inside this statement.
-        ctx.ctes = Some(cte_map);
-        // Uncorrelated subquery substitution (same as the general path).
-        if crate::executor::plan_has_subqueries(&plan) {
-            plan = crate::executor::rewrite_plan_subqueries(&plan, ctx)?;
-        }
-        let res = crate::executor::execute(&plan, ctx);
-        ctx.ctes = None;
-        res
+        crate::executor::cte::exec_select_with_ctes(ctx, select, outer_ctes)
     }
 
     /// Reader ctx for view-DML evaluation (shares the read-maps snapshot
@@ -11241,141 +11174,7 @@ impl Database {
         outer_ctes: &HashMap<String, crate::types::CteMaterialization>,
         ctx: &mut ExecContext<'_>,
     ) -> Result<HashMap<String, crate::types::CteMaterialization>> {
-        let mut map: HashMap<String, crate::types::CteMaterialization> = outer_ctes.clone();
-        for cte in &with.ctes {
-            let name_lc = cte.name.to_ascii_lowercase();
-            let (rows, cols) = if with.recursive {
-                self.materialize_recursive_cte(cte, &map, ctx)?
-            } else {
-                let res = self.exec_select_with_ctes(ctx, &cte.select, &map)?;
-                (res.rows, res.columns)
-            };
-            // Apply the explicit column list (WITH name(a, b) AS ...) — the
-            // rename happens at the CTE boundary.
-            let cols: Arc<[String]> = match &cte.columns {
-                Some(list) if list.len() == cols.len() => list
-                    .iter()
-                    .map(|c| format!("{}.{}", cte.name, c))
-                    .collect::<Vec<String>>()
-                    .into(),
-                Some(list) => {
-                    return Err(Error::semantic(format!(
-                        "CTE {} declares {} columns but its SELECT produces {}",
-                        cte.name,
-                        list.len(),
-                        cols.len()
-                    )));
-                }
-                None => {
-                    // Qualify with the CTE name so `cte.col` references
-                    // resolve; unqualified refs match by suffix.
-                    cols.iter()
-                        .map(|c| {
-                            let suffix = c.rsplit('.').next().unwrap_or(c);
-                            format!("{}.{}", cte.name, suffix)
-                        })
-                        .collect::<Vec<String>>()
-                        .into()
-                }
-            };
-            map.insert(name_lc, (Arc::new(rows), cols));
-        }
-        Ok(map)
-    }
-
-    /// WITH RECURSIVE: the CTE body is `base UNION [ALL] recursive`. The
-    /// base arm executes once; the recursive arm (which references the CTE
-    /// by name) executes repeatedly, each time seeing ALL rows accumulated
-    /// so far, until it produces no new rows. UNION dedups against the
-    /// accumulated set; UNION ALL appends everything. A hard iteration cap
-    /// guards against non-terminating recursions (SQLite errors too).
-    fn materialize_recursive_cte(
-        &self,
-        cte: &Cte,
-        outer_ctes: &HashMap<String, crate::types::CteMaterialization>,
-        ctx: &mut ExecContext<'_>,
-    ) -> Result<(Vec<Row>, Arc<[String]>)> {
-        let name_lc = cte.name.to_ascii_lowercase();
-        // Split the compound body: the LAST UNION [ALL] arm is the
-        // recursive one; everything before it is the base. (SQLite's rule:
-        // exactly one recursive reference, in the arm after the UNION.)
-        let (base, recursive_op, recursive_arm) = split_compound_cte(&cte.select)?;
-        // Base: execute with the CTE visible but EMPTY (a recursive
-        // reference in the base arm is an error in SQLite; empty keeps it
-        // simple and correct for well-formed queries).
-        let mut scope = outer_ctes.clone();
-        scope.insert(
-            name_lc.clone(),
-            (
-                Arc::new(Vec::new()),
-                Arc::from(vec![format!("{}.", cte.name)]),
-            ),
-        );
-        let base_res = self.exec_select_with_ctes(ctx, &base, &scope)?;
-        let mut rows: Vec<Row> = base_res.rows;
-        let base_cols: Arc<[String]> = base_res.columns;
-        // Canonical output columns for the CTE.
-        let out_cols: Arc<[String]> = match &cte.columns {
-            Some(list) if list.len() == base_cols.len() => list
-                .iter()
-                .map(|c| format!("{}.{}", cte.name, c))
-                .collect::<Vec<String>>()
-                .into(),
-            Some(list) => {
-                return Err(Error::semantic(format!(
-                    "CTE {} declares {} columns but its SELECT produces {}",
-                    cte.name,
-                    list.len(),
-                    base_cols.len()
-                )));
-            }
-            None => base_cols
-                .iter()
-                .map(|c| {
-                    let suffix = c.rsplit('.').next().unwrap_or(c);
-                    format!("{}.{}", cte.name, suffix)
-                })
-                .collect::<Vec<String>>()
-                .into(),
-        };
-        // Dedup set for UNION semantics.
-        let mut seen: std::collections::HashSet<String> =
-            rows.iter().map(|r| format!("{:?}", r)).collect();
-        // Iterate the recursive arm with QUEUE semantics (SQLite's model):
-        // each iteration's arm sees ONLY the rows produced by the PREVIOUS
-        // iteration (the frontier), not the full accumulation — otherwise
-        // UNION ALL recursions never terminate (every iteration re-derives
-        // rows that are "new" again as duplicates).
-        let mut frontier: Vec<Row> = rows.clone();
-        const MAX_ITERS: usize = 1_000_000;
-        for _ in 0..MAX_ITERS {
-            if rows.len() > 10_000_000 {
-                return Err(Error::semantic(format!(
-                    "recursive CTE {} exceeded 10,000,000 rows",
-                    cte.name
-                )));
-            }
-            if frontier.is_empty() {
-                break;
-            }
-            let mut scope = outer_ctes.clone();
-            scope.insert(name_lc.clone(), (Arc::new(frontier), out_cols.clone()));
-            let new_res = self.exec_select_with_ctes(ctx, &recursive_arm, &scope)?;
-            let mut next_frontier: Vec<Row> = Vec::with_capacity(new_res.rows.len());
-            for r in new_res.rows {
-                if recursive_op == crate::sql::ast::SetOp::Union {
-                    let key = format!("{:?}", r);
-                    if seen.contains(&key) {
-                        continue;
-                    }
-                    seen.insert(key);
-                }
-                next_frontier.push(r.clone());
-                rows.push(r);
-            }
-            frontier = next_frontier;
-        }
-        Ok((rows, out_cols))
+        crate::executor::cte::materialize_ctes(with, outer_ctes, ctx)
     }
 
     /// EXPLAIN [QUERY PLAN] of a statement: the static plan, EXCEPT that a
@@ -12920,6 +12719,11 @@ impl Database {
                 Ok(())
             }
             Statement::Commit => {
+                // SQLite parity: COMMIT / END without an open transaction
+                // is an error (mirrors the ROLLBACK arm below).
+                if !ctx.in_transaction && !ctx.pager.concurrent_writers_active() {
+                    return Err(Error::semantic("cannot commit - no transaction is active"));
+                }
                 ctx.in_transaction = false;
                 ctx.txn_snapshot = None;
                 ctx.pager.clear_savepoints();

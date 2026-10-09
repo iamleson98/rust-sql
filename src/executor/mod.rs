@@ -11,6 +11,7 @@
 //! for shared state, but that adds complexity that doesn't pay off until you
 //! have working code in the first place.
 
+pub(crate) mod cte;
 pub mod datetime;
 pub(crate) mod explain;
 pub mod expr;
@@ -21,6 +22,7 @@ pub mod json;
 pub mod jsonb;
 pub(crate) mod parallel;
 pub(crate) mod predicate;
+pub(crate) mod printf;
 pub mod regex;
 pub(crate) mod tableval;
 pub mod trgm;
@@ -1730,6 +1732,11 @@ pub mod change_counters {
 /// "actual time" semantics) and its output row count recorded; the rows
 /// the statement produces are still returned to the caller as usual.
 pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
+    // Comparison-affinity registry frame for this subtree's base-table
+    // sources (see EvalContext::comparison_column_affinity).
+    let mut sources = Vec::new();
+    collect_affinity_sources(plan, &mut sources);
+    let _aff_scope = crate::executor::expr::AffinityScope::push(sources);
     if ctx.explain_stats.is_some() {
         let depth = ctx.explain_depth;
         ctx.explain_depth = depth + 1;
@@ -1756,8 +1763,86 @@ pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
     execute_inner(plan, ctx)
 }
 
+/// The base-table sources of a plan subtree as (qualifier, table) pairs,
+/// left to right. Derived tables / CTE rows are their own scopes (their
+/// plans push a frame when they execute).
+fn collect_affinity_sources(plan: &Plan, out: &mut Vec<(String, Arc<Table>)>) {
+    let mut add = |table: &Arc<Table>, alias: &Option<String>| {
+        let q = alias.as_deref().unwrap_or(&table.name).to_ascii_lowercase();
+        out.push((q, table.clone()));
+    };
+    match plan {
+        Plan::Scan { table, alias, .. }
+        | Plan::RowidLookup { table, alias, .. }
+        | Plan::RowidIn { table, alias, .. }
+        | Plan::RowidRange { table, alias, .. }
+        | Plan::IndexIn { table, alias, .. }
+        | Plan::IndexLookup { table, alias, .. }
+        | Plan::IndexRange { table, alias, .. }
+        | Plan::InvertedIndexScan { table, alias, .. }
+        | Plan::SpatialIndexScan { table, alias, .. }
+        | Plan::SpatialKnn { table, alias, .. } => add(table, alias),
+        Plan::Filter { input, .. }
+        | Plan::Project { input, .. }
+        | Plan::Sort { input, .. }
+        | Plan::Limit { input, .. }
+        | Plan::Aggregate { input, .. }
+        | Plan::Window { input, .. }
+        | Plan::Distinct { input } => collect_affinity_sources(input, out),
+        Plan::Join { left, right, .. } => {
+            collect_affinity_sources(left, out);
+            collect_affinity_sources(right, out);
+        }
+        Plan::IndexNestedLoopJoin {
+            outer,
+            inner_table,
+            inner_alias,
+            ..
+        } => {
+            collect_affinity_sources(outer, out);
+            let q = inner_alias
+                .as_deref()
+                .unwrap_or(&inner_table.name)
+                .to_ascii_lowercase();
+            out.push((q, inner_table.clone()));
+        }
+        // DML: the target table's columns resolve SET / WHERE / RETURNING
+        // references (the source plan pushes its own frame when it runs).
+        Plan::Insert { table, .. } | Plan::Update { table, .. } | Plan::Delete { table, .. } => {
+            out.push((table.name.to_ascii_lowercase(), table.clone()));
+        }
+        Plan::Values { .. }
+        | Plan::Subquery { .. }
+        | Plan::NestedSelect { .. }
+        | Plan::CteRows { .. }
+        | Plan::TableFunction { .. }
+        | Plan::Union { .. }
+        | Plan::Intersect { .. }
+        | Plan::Except { .. } => {}
+    }
+}
+
 fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
     match plan {
+        // A scan's pushed-down predicate is part of its meaning: the fused
+        // paths (scan+filter+project) consume it, and whenever they
+        // decline the plain scan must still apply it. It used to be
+        // DROPPED here — any predicate that did not compile came back as
+        // "every row matches".
+        Plan::Scan {
+            table,
+            alias,
+            index,
+            predicate: Some(p),
+        } => {
+            let bare = Plan::Scan {
+                table: table.clone(),
+                alias: alias.clone(),
+                index: index.clone(),
+                predicate: None,
+            };
+            exec_filter(ctx, &bare, p)
+        }
         Plan::Scan { table, alias, .. } => exec_scan(ctx, table.clone(), alias.clone()),
         Plan::Values { rows } => exec_values(ctx, rows),
         Plan::TableFunction { name, args, alias } => {
@@ -2001,6 +2086,7 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
         Plan::Intersect { left, right } => exec_intersect(ctx, left, right),
         Plan::Except { left, right } => exec_except(ctx, left, right),
         Plan::Subquery { plan } => execute(plan, ctx),
+        Plan::NestedSelect { select, view } => exec_nested_select(select, view.as_deref(), ctx),
         Plan::CteRows { rows, columns } => Ok(ExecResult {
             columns: columns.clone(),
             rows: rows.as_ref().clone(),
@@ -3730,6 +3816,8 @@ pub fn plan_has_subqueries(plan: &Plan) -> bool {
             }
             Plan::IndexNestedLoopJoin { outer, .. } => exprs_in_plan(outer, out),
             Plan::Subquery { plan } => exprs_in_plan(plan, out),
+            // Planned (and its subqueries substituted) when it runs.
+            Plan::NestedSelect { .. } => {}
             Plan::Distinct { input } => exprs_in_plan(input, out),
             Plan::Union { left, right, .. } => {
                 exprs_in_plan(left, out);
@@ -3887,13 +3975,31 @@ fn rewrite_plan_subqueries_in_place(plan: &mut Plan, ctx: &mut ExecContext<'_>) 
         Plan::Project { input, columns } => {
             rewrite_plan_subqueries_in_place(input, ctx)?;
             for c in columns.iter_mut() {
+                // Name the column after the ORIGINAL expression (SQLite:
+                // `(SELECT y FROM u)`), before the subquery is materialized
+                // into a literal (which renamed it "NULL" / "1 IN ()").
+                if c.alias.is_none() && expr_has_subquery(&c.expr) {
+                    c.alias = Some(expr_display_name(&c.expr));
+                }
                 rewrite_expr_in_place(&mut c.expr, ctx)?;
             }
         }
         Plan::Sort { input, terms } => {
             rewrite_plan_subqueries_in_place(input, ctx)?;
             for t in terms.iter_mut() {
+                let was_literal = matches!(t.expr, Expr::Literal(_));
                 rewrite_expr_in_place(&mut t.expr, ctx)?;
+                // A substituted subquery VALUE is a constant sort key, not
+                // a positional term: `ORDER BY (SELECT 2)` must not sort
+                // by the 2nd column (nor error "out of range"). Unary `+`
+                // keeps the value and stops the ordinal reading.
+                if !was_literal && matches!(t.expr, Expr::Literal(Value::Integer(_))) {
+                    let lit = std::mem::replace(&mut t.expr, Expr::Literal(Value::Null));
+                    t.expr = Expr::Unary {
+                        op: crate::sql::ast::UnaryOp::Pos,
+                        expr: Box::new(lit),
+                    };
+                }
             }
         }
         Plan::Limit {
@@ -3952,6 +4058,7 @@ fn rewrite_plan_subqueries_in_place(plan: &mut Plan, ctx: &mut ExecContext<'_>) 
         Plan::Subquery { plan } => {
             rewrite_plan_subqueries_in_place(plan, ctx)?;
         }
+        Plan::NestedSelect { .. } => {}
         Plan::Distinct { input } => {
             rewrite_plan_subqueries_in_place(input, ctx)?;
         }
@@ -3997,7 +4104,64 @@ fn rewrite_expr_in_place(expr: &mut Expr, ctx: &mut ExecContext<'_>) -> Result<(
     Ok(())
 }
 
+/// The comparison affinity of a subquery's first result column
+/// (sqlite3ExprAffinity on TK_SELECT): a bare column of one of its FROM
+/// tables carries the declared affinity, a CAST its target's; anything
+/// else (and compound / derived-table shapes) has none.
+fn select_result_affinity(
+    sel: &SelectStatement,
+    catalog: &crate::schema::Catalog,
+) -> Option<crate::types::Affinity> {
+    let SelectBody::Simple(s) = &sel.body else {
+        return None;
+    };
+    let ResultColumn::Expr { expr, .. } = s.columns.first()? else {
+        return None;
+    };
+    let mut sides: Vec<(String, Option<String>)> = Vec::new();
+    if let Some(from) = s.from.as_ref() {
+        if !crate::planner::collect_plain_table_sides(from, &mut sides) {
+            sides.clear();
+        }
+    }
+    let resolve = |e: &Expr| -> Option<crate::types::Affinity> {
+        let Expr::Column { table, name } = e else {
+            return None;
+        };
+        for (tname, alias) in &sides {
+            if let Some(q) = table {
+                let qual = alias.as_deref().unwrap_or(tname);
+                if !q.eq_ignore_ascii_case(qual) {
+                    continue;
+                }
+            }
+            let t = catalog.get_table(tname)?;
+            if let Some(i) = t.find_column(name) {
+                return t.columns.get(i).map(|c| c.affinity);
+            }
+            if crate::planner::is_rowid_spelling(name) && !t.without_rowid {
+                return Some(crate::types::Affinity::Integer);
+            }
+        }
+        None
+    };
+    crate::executor::expr::expr_affinity_with(expr, &resolve)
+}
+
 /// Bottom-up rewrite of subquery nodes in an expression.
+/// A VALUE error of an eagerly pre-run uncorrelated subquery (overflow,
+/// malformed JSON, ...): SQLite would raise it only when the subquery is
+/// actually reached, so the substitution defers instead of failing.
+/// Prepare-class errors (unknown names, column-count mismatches) still
+/// fail the statement up front.
+fn deferrable_subquery_error(e: &Error) -> bool {
+    match e {
+        Error::Runtime(_) => true,
+        Error::Semantic(m) => m == "integer overflow",
+        _ => false,
+    }
+}
+
 fn rewrite_subqueries_rec(e: &Expr, ctx: &mut ExecContext<'_>) -> Result<Expr> {
     // First, rewrite children.
     let e = map_expr_children(e, &mut |child| rewrite_subqueries_rec(child, ctx))?;
@@ -4011,13 +4175,44 @@ fn rewrite_subqueries_rec(e: &Expr, ctx: &mut ExecContext<'_>) -> Result<Expr> {
             if subquery_is_correlated(&sel, ctx.catalog(), &cte_names, &cte_cols) {
                 Ok(Expr::Subquery(Box::new(sel)))
             } else {
-                let res = exec_select_statement(&sel, ctx, None, false)?;
+                let aff = select_result_affinity(&sel, ctx.catalog());
+                let res = match exec_select_statement(&sel, ctx, None, false) {
+                    Ok(r) => r,
+                    // SQLite runs an uncorrelated subquery LAZILY (OP_Once
+                    // at its first evaluation): one in an untaken CASE
+                    // branch never runs, so its runtime error never fires.
+                    // Keep it unsubstituted — it raises if reached.
+                    Err(e) if deferrable_subquery_error(&e) => {
+                        return Ok(Expr::Subquery(Box::new(sel)))
+                    }
+                    Err(e) => return Err(e),
+                };
+                // A scalar subquery yields ONE column (SQLite rejects the
+                // statement otherwise).
+                if res.columns.len() != 1 {
+                    return Err(Error::semantic(format!(
+                        "sub-select returns {} columns - expected 1",
+                        res.columns.len()
+                    )));
+                }
                 let v = res
                     .rows
                     .first()
                     .and_then(|r| r.first().cloned())
                     .unwrap_or(Value::Null);
-                Ok(Expr::Literal(v))
+                // Keep the subquery's comparison affinity (sqlite3ExprAffinity
+                // of TK_SELECT is its first result column's): `(SELECT
+                // textcol …) = 1` compares as TEXT.
+                Ok(match aff {
+                    Some(a) => Expr::Cast {
+                        expr: Box::new(Expr::Literal(v)),
+                        type_name: crate::executor::expr::affinity_marker(
+                            crate::executor::expr::AFF_MARKER,
+                            a,
+                        ),
+                    },
+                    None => Expr::Literal(v),
+                })
             }
         }
         Expr::Exists(sel) => {
@@ -4027,7 +4222,13 @@ fn rewrite_subqueries_rec(e: &Expr, ctx: &mut ExecContext<'_>) -> Result<Expr> {
             if subquery_is_correlated(&sel, ctx.catalog(), &cte_names, &cte_cols) {
                 Ok(Expr::Exists(Box::new(sel)))
             } else {
-                let res = exec_select_statement(&sel, ctx, None, true)?;
+                let res = match exec_select_statement(&sel, ctx, None, true) {
+                    Ok(r) => r,
+                    Err(e) if deferrable_subquery_error(&e) => {
+                        return Ok(Expr::Exists(Box::new(sel)))
+                    }
+                    Err(e) => return Err(e),
+                };
                 Ok(Expr::Literal(Value::Integer(if res.rows.is_empty() {
                     0
                 } else {
@@ -4040,24 +4241,57 @@ fn rewrite_subqueries_rec(e: &Expr, ctx: &mut ExecContext<'_>) -> Result<Expr> {
             source,
             negated,
         } => {
+            let mut rhs_aff: Option<crate::types::Affinity> = None;
             let inner = match source {
                 InSource::Subquery(sel) => {
                     let mut sel = *sel;
                     rewrite_select_subqueries(&mut sel, ctx)?;
                     let (cte_names, cte_cols) = cte_scope_of(ctx);
-                    if subquery_is_correlated(&sel, ctx.catalog(), &cte_names, &cte_cols) {
-                        InSource::Subquery(Box::new(sel))
+                    // (An IN-subquery is materialized EAGERLY, errors
+                    // included — SQLite factors it out of the loop, unlike
+                    // a scalar subquery in an untaken branch.)
+                    let res = if subquery_is_correlated(&sel, ctx.catalog(), &cte_names, &cte_cols)
+                    {
+                        None
                     } else {
-                        let res = exec_select_statement(&sel, ctx, None, false)?;
-                        let list: Vec<Expr> = res
-                            .rows
-                            .iter()
-                            .map(|r| Expr::Literal(r.first().cloned().unwrap_or(Value::Null)))
-                            .collect();
-                        InSource::List(list.into())
+                        Some(exec_select_statement(&sel, ctx, None, false)?)
+                    };
+                    match res {
+                        None => InSource::Subquery(Box::new(sel)),
+                        Some(res) => {
+                            rhs_aff = select_result_affinity(&sel, ctx.catalog());
+                            let list: Vec<Expr> = res
+                                .rows
+                                .iter()
+                                .map(|r| Expr::Literal(r.first().cloned().unwrap_or(Value::Null)))
+                                .collect();
+                            InSource::List(list.into())
+                        }
                     }
                 }
                 other => other,
+            };
+            // exprINAffinity: the materialized list's column affinity joins
+            // the operand's (sqlite3CompareAffinity): `textcol IN (SELECT
+            // intcol …)` compares NUMERICALLY ('+7' matches 7). The carrier
+            // rides on the operand; the compiled IN path unwraps it
+            // whenever the column's own affinity already decides.
+            let expr = match rhs_aff {
+                Some(a)
+                    if !matches!(
+                        a,
+                        crate::types::Affinity::Blob | crate::types::Affinity::None
+                    ) =>
+                {
+                    Box::new(Expr::Cast {
+                        expr,
+                        type_name: crate::executor::expr::affinity_marker(
+                            crate::executor::expr::IN_RHS_MARKER,
+                            a,
+                        ),
+                    })
+                }
+                _ => expr,
             };
             Ok(Expr::In {
                 expr,
@@ -4090,7 +4324,14 @@ fn rewrite_body_subqueries(body: &mut SelectBody, ctx: &mut ExecContext<'_>) -> 
     match body {
         SelectBody::Simple(s) => {
             for c in s.columns.iter_mut() {
-                if let ResultColumn::Expr { expr, .. } = c {
+                if let ResultColumn::Expr { expr, alias } = c {
+                    // The output column NAME is the ORIGINAL expression's
+                    // text (SQLite names `(SELECT y FROM u)` exactly that):
+                    // capture it before the subquery becomes a literal,
+                    // which used to rename the column "NULL" / "1 IN ()".
+                    if alias.is_none() && expr_has_subquery(expr) {
+                        *alias = Some(expr_display_name(expr));
+                    }
                     rewrite_expr_in_place(expr, ctx)?;
                 }
             }
@@ -4176,6 +4417,12 @@ fn exec_select_statement(
     // populate) entries on this path. The correlated bridge passes
     // heap-stable addresses (Box'd AST nodes that survive per-row
     // re-execution) — those are the cacheable ones.
+    // A NESTED WITH clause (`(WITH c AS (…) SELECT … FROM c)` as a
+    // subquery, a FROM atom or a view body): its CTEs are materialized
+    // HERE, per evaluation, layered over the enclosing statement's scope.
+    if sel.with.is_some() {
+        return exec_select_statement_with_ctes(sel, ctx, outer, limit_one);
+    }
     let Some((outer_row_ptr, outer_names_ptr)) = outer else {
         let catalog = ctx.catalog();
         let mut planner = crate::planner::Planner::new(catalog);
@@ -4294,6 +4541,118 @@ fn exec_select_statement(
     }
 }
 
+/// `Plan::NestedSelect`: a FROM atom / view body with its own WITH
+/// clause, planned and run now. A view already being expanded on this
+/// thread is a cycle (`CREATE VIEW v AS WITH … SELECT … FROM v`) —
+/// SQLite's "circularly defined" error instead of unbounded recursion.
+fn exec_nested_select(
+    select: &SelectStatement,
+    view: Option<&str>,
+    ctx: &mut ExecContext<'_>,
+) -> Result<ExecResult> {
+    thread_local! {
+        static EXPANDING_VIEWS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    struct Pop;
+    impl Drop for Pop {
+        fn drop(&mut self) {
+            EXPANDING_VIEWS.with(|v| {
+                v.borrow_mut().pop();
+            });
+        }
+    }
+    let _pop = match view {
+        Some(name) => {
+            if EXPANDING_VIEWS.with(|v| v.borrow().iter().any(|n| n == name)) {
+                return Err(Error::semantic(format!(
+                    "view {name} is circularly defined"
+                )));
+            }
+            EXPANDING_VIEWS.with(|v| v.borrow_mut().push(name.to_string()));
+            Some(Pop)
+        }
+        None => None,
+    };
+    exec_select_statement(select, ctx, None, false)
+}
+
+/// `exec_select_statement` for a SELECT carrying its own WITH clause.
+/// Never cached: the CTE rows are baked into the plan (`Plan::CteRows`)
+/// and, under correlation, depend on the outer row. The correlated form
+/// binds the immediate outer frame's values as positional parameters
+/// first (the same rewrite as the cached path — CTE bodies included), so
+/// a CTE body may reference the outer query.
+fn exec_select_statement_with_ctes(
+    sel: &SelectStatement,
+    ctx: &mut ExecContext<'_>,
+    outer: Option<(*const [Value], *const [String])>,
+    limit_one: bool,
+) -> Result<ExecResult> {
+    // Run-time nesting guard: a view whose WITH-carrying body references
+    // the view again is planned HERE, past the planner's view-depth
+    // check — without a bound that recursion would overflow the stack.
+    thread_local! {
+        static NESTED_WITH_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    struct DepthGuard;
+    impl Drop for DepthGuard {
+        fn drop(&mut self) {
+            NESTED_WITH_DEPTH.with(|d| d.set(d.get() - 1));
+        }
+    }
+    const MAX_NESTED_WITH_DEPTH: u32 = 32;
+    if NESTED_WITH_DEPTH.with(|d| d.get()) >= MAX_NESTED_WITH_DEPTH {
+        return Err(Error::semantic(format!(
+            "subqueries with WITH clauses nested more than {MAX_NESTED_WITH_DEPTH} levels deep (or a circularly defined view)"
+        )));
+    }
+    NESTED_WITH_DEPTH.with(|d| d.set(d.get() + 1));
+    let _depth = DepthGuard;
+    let catalog = ctx.catalog();
+    let (mut stmt, bound_params) = match outer {
+        None => (sel.clone(), None),
+        Some((outer_row_ptr, outer_names_ptr)) => {
+            // SAFETY: as in exec_select_statement — the frame outlives
+            // this call.
+            let outer_names: &[String] = unsafe { &*outer_names_ptr };
+            let row: &[Value] = unsafe { &*outer_row_ptr };
+            let base = ctx.params.len();
+            let (cloned, bindings) = rewrite_outer_refs(sel, catalog, outer_names, base);
+            let params = if bindings.is_empty() {
+                None
+            } else {
+                let mut p = ctx.params.clone();
+                for (qual, name) in bindings.iter() {
+                    p.push(lookup_outer_frame_value(
+                        row,
+                        outer_names,
+                        qual.as_deref(),
+                        name,
+                    ));
+                }
+                Some(p)
+            };
+            (cloned, params)
+        }
+    };
+    if limit_one {
+        clamp_select_limit_to_one(&mut stmt);
+    }
+    let saved_params = bound_params.map(|p| std::mem::replace(&mut ctx.params, p));
+    // The per-AST-node subquery plan cache is keyed by node ADDRESS: the
+    // nodes of this transient clone (and of its transient plan) die with
+    // this call, so a later clone could reuse an address. Isolate the
+    // cache for the duration.
+    let saved_plans = std::mem::take(&mut ctx.subquery_plans);
+    let outer_ctes = ctx.ctes.clone().unwrap_or_default();
+    let res = crate::executor::cte::exec_select_with_ctes(ctx, &stmt, &outer_ctes);
+    ctx.subquery_plans = saved_plans;
+    if let Some(p) = saved_params {
+        ctx.params = p;
+    }
+    res
+}
+
 /// EXISTS short-circuit: clamp a SELECT's LIMIT so the plan stops after
 /// the first row (SQLite's co-routine model does exactly this for
 /// EXISTS). Conservative: a literal limit of 0 stays 0 (an empty
@@ -4353,6 +4712,56 @@ fn lookup_outer_frame_value(
 /// including nested sources). If any ref's qualifier isn't a local source,
 /// or any unqualified ref doesn't match a local source column, treat the
 /// subquery as correlated (outer refs present).
+/// True when a subquery inside `e` reads the row of the scan whose FROM
+/// qualifier is `qual` over `table`: a reference qualified with that
+/// qualifier (or a three-part `db.qual.col`) that no source of the
+/// subquery provides, or a bare name that is a column of `table` and of
+/// none of the subquery's own sources. Used by the planner to keep
+/// row-dependent subquery bounds out of access paths while uncorrelated
+/// (or outer-correlated) subqueries stay usable as seek values.
+pub(crate) fn subquery_reads_scan_row(
+    e: &Expr,
+    catalog: &crate::schema::Catalog,
+    qual: &str,
+    table: &Table,
+) -> bool {
+    let mut sels: Vec<&SelectStatement> = Vec::new();
+    collect_expr_selects(e, &mut sels);
+    let qual = qual.to_ascii_lowercase();
+    for sel in sels {
+        let mut sources: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut source_tables: Vec<Arc<Table>> = Vec::new();
+        collect_select_sources(sel, catalog, &mut sources, &mut source_tables);
+        for (q, name) in collect_select_refs(sel) {
+            match q {
+                Some(q) => {
+                    let ql = q.to_ascii_lowercase();
+                    let last = ql.rsplit('.').next().unwrap_or(&ql).to_string();
+                    if !sources.contains(&ql)
+                        && !sources.contains(&last)
+                        && (ql == qual || last == qual)
+                    {
+                        return true;
+                    }
+                }
+                None => {
+                    let local = source_tables.iter().any(|t| t.find_column(&name).is_some());
+                    let rowid_local =
+                        crate::planner::is_rowid_spelling(&name) && !source_tables.is_empty();
+                    if !local
+                        && !rowid_local
+                        && (table.find_column(&name).is_some()
+                            || (crate::planner::is_rowid_spelling(&name) && !table.without_rowid))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 fn subquery_is_correlated(
     sel: &SelectStatement,
     catalog: &crate::schema::Catalog,
@@ -4373,7 +4782,10 @@ fn subquery_is_correlated(
             // in scope (CTEs aren't catalog tables — without this check,
             // every ref to a CTE column was misclassified as an outer
             // reference, marking uncorrelated subqueries "correlated").
-            let known_table = source_tables.iter().any(|t| t.find_column(&name).is_some());
+            let known_table = source_tables.iter().any(|t| {
+                t.find_column(&name).is_some()
+                    || (crate::planner::is_rowid_spelling(&name) && !t.without_rowid)
+            });
             let known_cte = cte_names.iter().any(|cn| {
                 cte_cols
                     .get(cn)
@@ -4562,6 +4974,12 @@ fn collect_table_expression_refs(te: &TableExpression, out: &mut Vec<(Option<Str
 
 fn collect_expr_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
     match e {
+        // `count(*)`'s star is not a column reference: collected, it
+        // matched no source column and marked every `(SELECT count(*)
+        // FROM t ...)` CORRELATED — re-run per outer row (inside `UPDATE
+        // t` that read the half-updated table, and deadlocked against the
+        // update's own page lock).
+        Expr::Column { table: None, name } if name == "*" => {}
         Expr::Column { table, name } => {
             out.push((table.clone(), name.clone()));
         }
@@ -5952,7 +6370,15 @@ fn render_expr_canonical(e: &Expr, _nested: bool) -> String {
                     .map(|x| render_expr_canonical(x, false))
                     .collect::<Vec<_>>()
                     .join(", "),
-                crate::sql::ast::InSource::Subquery(s) => render_select_canonical(s),
+                // render_select_canonical already parenthesizes; the
+                // IN(...) wrapper below supplies the one pair SQLite shows.
+                crate::sql::ast::InSource::Subquery(s) => {
+                    let r = render_select_canonical(s);
+                    r.strip_prefix('(')
+                        .and_then(|x| x.strip_suffix(')'))
+                        .map(str::to_string)
+                        .unwrap_or(r)
+                }
                 crate::sql::ast::InSource::Table(t) => t.clone(),
             };
             format!(
@@ -6334,12 +6760,13 @@ fn exec_sort(ctx: &mut ExecContext<'_>, input: &Plan, terms: &[OrderTerm]) -> Re
     // SELECT's output width.
     let row_width = inner.rows.first().map_or(0, |r| r.len());
     if row_width > 0 {
-        for term in terms {
+        for (i, term) in terms.iter().enumerate() {
             if let Expr::Literal(Value::Integer(k)) = &term.expr {
-                if *k >= 1 && (*k as usize) > row_width {
+                if *k >= 1 && *k <= i64::from(i32::MAX) && (*k as usize) > row_width {
                     return Err(Error::semantic(format!(
-                        "{}st ORDER BY term out of range ({} output columns)",
-                        k, row_width
+                        "{} ORDER BY term out of range - should be between 1 and {}",
+                        crate::planner::sqlite_ordinal(i as i64 + 1),
+                        row_width
                     )));
                 }
             }
@@ -6366,18 +6793,33 @@ fn exec_sort(ctx: &mut ExecContext<'_>, input: &Plan, terms: &[OrderTerm]) -> Re
         }
     }
 
-    inner.rows.sort_by(|a, b| {
+    // Keys are evaluated ONCE per row, up front (decorate-sort-undecorate):
+    // a comparator that re-evaluates `random()` / a subquery per
+    // comparison is not a total order (Rust's sort PANICS on that), and
+    // an evaluation error must abort the statement as in SQLite.
+    let nt = terms.len();
+    let mut keys: Vec<Value> = Vec::with_capacity(inner.rows.len() * nt);
+    for row in &inner.rows {
         for term in terms {
-            let va = sort_key(&term.expr, a, &columns, params, named_params);
-            let vb = sort_key(&term.expr, b, &columns, params, named_params);
+            keys.push(sort_key(&term.expr, row, &columns, params, named_params)?);
+        }
+    }
+    let colls: Vec<Option<Arc<dyn crate::plugin::Collation>>> = terms
+        .iter()
+        .map(|t| match &t.expr {
+            Expr::Collate { collation, .. } => crate::plugin::lookup_collation(collation),
+            _ => None,
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..inner.rows.len()).collect();
+    order.sort_by(|&a, &b| {
+        for (t, term) in terms.iter().enumerate() {
+            let (va, vb) = (&keys[a * nt + t], &keys[b * nt + t]);
             // ORDER BY ... COLLATE name: compare text through the named
             // collation (SQL semantics: collations affect only text pairs).
-            let ord = if let Expr::Collate { collation, .. } = &term.expr {
-                crate::plugin::lookup_collation(collation)
-                    .map(|c| crate::plugin::compare_collated(&va, &vb, c.as_ref()))
-                    .unwrap_or_else(|| value_cmp_conn(&va, &vb))
-            } else {
-                value_cmp_conn(&va, &vb)
+            let ord = match &colls[t] {
+                Some(c) => crate::plugin::compare_collated(va, vb, c.as_ref()),
+                None => value_cmp_conn(va, vb),
             };
             let ord = if term.order == Order::Desc {
                 ord.reverse()
@@ -6390,6 +6832,7 @@ fn exec_sort(ctx: &mut ExecContext<'_>, input: &Plan, terms: &[OrderTerm]) -> Re
         }
         std::cmp::Ordering::Equal
     });
+    inner.rows = permute_rows(std::mem::take(&mut inner.rows), &order);
     Ok(inner)
 }
 
@@ -6567,13 +7010,23 @@ fn sort_key(
     columns: &[String],
     params: &[Value],
     named_params: &HashMap<String, Value>,
-) -> Value {
+) -> Result<Value> {
     if let Expr::Literal(Value::Integer(k)) = expr {
         if *k >= 1 {
-            return row.get(*k as usize - 1).cloned().unwrap_or(Value::Null);
+            return Ok(row.get(*k as usize - 1).cloned().unwrap_or(Value::Null));
         }
     }
-    eval_row(expr, row, columns, params, named_params).unwrap_or(Value::Null)
+    eval_row(expr, row, columns, params, named_params)
+}
+
+/// Reorder `rows` so output position `i` holds input row `order[i]`
+/// (`order` is a permutation of `0..rows.len()`).
+fn permute_rows(rows: Vec<Vec<Value>>, order: &[usize]) -> Vec<Vec<Value>> {
+    let mut slots: Vec<Option<Vec<Value>>> = rows.into_iter().map(Some).collect();
+    order
+        .iter()
+        .map(|&i| slots[i].take().expect("order is a permutation"))
+        .collect()
 }
 
 /// Bounded top-N selection for `Limit(Sort(x))` (see exec_limit's fusion).
@@ -6596,10 +7049,10 @@ fn exec_topn(
     let row_width = inner.rows.first().map_or(0, |r| r.len());
     if row_width > 0 {
         if let Expr::Literal(Value::Integer(k)) = &term.expr {
-            if *k >= 1 && (*k as usize) > row_width {
+            if *k >= 1 && *k <= i64::from(i32::MAX) && (*k as usize) > row_width {
                 return Err(Error::semantic(format!(
-                    "{}st ORDER BY term out of range ({} output columns)",
-                    k, row_width
+                    "1st ORDER BY term out of range - should be between 1 and {}",
+                    row_width
                 )));
             }
         }
@@ -6612,20 +7065,23 @@ fn exec_topn(
     if keep >= inner.rows.len() {
         // The bound covers everything: a plain sort is the same result and
         // avoids the selection machinery.
-        let rows = &mut inner.rows;
+        // Keys once per row (see exec_sort: a re-evaluating comparator
+        // is not a total order, and errors must propagate).
         let term_expr = &term.expr;
-        let cols = &inner.columns;
-        let params: &[Value] = &ctx.params;
-        let named = &ctx.named_params;
-        rows.sort_by(|a, b| {
-            let va = sort_key(term_expr, a, cols, params, named);
-            let vb = sort_key(term_expr, b, cols, params, named);
-            let ord = if let Expr::Collate { collation, .. } = term_expr {
-                crate::plugin::lookup_collation(collation)
-                    .map(|c| crate::plugin::compare_collated(&va, &vb, c.as_ref()))
-                    .unwrap_or_else(|| value_cmp_conn(&va, &vb))
-            } else {
-                value_cmp_conn(&va, &vb)
+        let keys: Vec<Value> = inner
+            .rows
+            .iter()
+            .map(|r| sort_key(term_expr, r, &inner.columns, &ctx.params, &ctx.named_params))
+            .collect::<Result<_>>()?;
+        let coll = match term_expr {
+            Expr::Collate { collation, .. } => crate::plugin::lookup_collation(collation),
+            _ => None,
+        };
+        let mut order: Vec<usize> = (0..inner.rows.len()).collect();
+        order.sort_by(|&a, &b| {
+            let ord = match &coll {
+                Some(c) => crate::plugin::compare_collated(&keys[a], &keys[b], c.as_ref()),
+                None => value_cmp_conn(&keys[a], &keys[b]),
             };
             if term.order == Order::Desc {
                 ord.reverse()
@@ -6633,6 +7089,7 @@ fn exec_topn(
                 ord
             }
         });
+        inner.rows = permute_rows(std::mem::take(&mut inner.rows), &order);
         if offset > 0 {
             let drop = offset.min(inner.rows.len());
             inner.rows.drain(..drop);
@@ -6684,7 +7141,7 @@ fn exec_topn(
             .rows
             .iter()
             .map(|r| sort_key(&term.expr, r, columns, params, named_params))
-            .collect()
+            .collect::<Result<_>>()?
     };
     let desc = term.order == Order::Desc;
     let coll = match &term.expr {
@@ -8501,7 +8958,15 @@ impl HashGrouper {
     /// sorter path — GROUP BY output order is unspecified in SQL).
     pub(crate) fn into_group_iter(self) -> GroupIter {
         let agg_ctx = self.agg_ctx.clone();
-        GroupIter::new(self, agg_ctx)
+        GroupIter::new(self, agg_ctx, true)
+    }
+
+    /// [`Self::into_group_iter`] without the key-order sort of a RAM-only
+    /// grouper (first-seen order) — for merging partial groupers into
+    /// another grouper, where emission order is irrelevant.
+    pub(crate) fn into_group_iter_unordered(self) -> GroupIter {
+        let agg_ctx = self.agg_ctx.clone();
+        GroupIter::new(self, agg_ctx, false)
     }
 }
 
@@ -8847,9 +9312,17 @@ pub(crate) struct GroupIter {
 }
 
 enum GroupIterMode {
-    /// Pure in-RAM grouper: first-seen order walk (identical to the
-    /// pre-spill behavior).
-    Ram { grouper: HashGrouper, gi: usize },
+    /// Pure in-RAM grouper, walked in KEY order (`order` = group indices
+    /// sorted by their stored — collation-folded — keys). SQLite always
+    /// groups through a sorter or an index, so its GROUP BY output comes
+    /// out key-ordered; SQL leaves the order unspecified, but code ported
+    /// from SQLite routinely depends on it. The spilled path already
+    /// merged in key order; the RAM path used to emit first-seen order.
+    Ram {
+        grouper: HashGrouper,
+        gi: usize,
+        order: Vec<u32>,
+    },
     /// Spilled: one stream per frozen chunk plus the residual RAM epoch;
     /// emitted in key order (SQLite's ephemeral-sorter output order),
     /// equal keys re-merged with `merge_agg_state`.
@@ -8993,7 +9466,7 @@ fn consolidate_spill_chunks(
 }
 
 impl GroupIter {
-    fn new(grouper: HashGrouper, agg_ctx: Vec<AggMergeCtx>) -> Self {
+    fn new(grouper: HashGrouper, agg_ctx: Vec<AggMergeCtx>, key_order: bool) -> Self {
         let n_aggs = grouper.n_aggs.max(1);
         match grouper.spill {
             Some(ef) => {
@@ -9066,7 +9539,27 @@ impl GroupIter {
                 }
             }
             None => Self {
-                mode: GroupIterMode::Ram { grouper, gi: 0 },
+                mode: {
+                    let n = grouper.group_count();
+                    let mut order: Vec<u32> = (0..n as u32).collect();
+                    match &grouper.keys_flat {
+                        _ if !key_order => {}
+                        Some(flat) => order.sort_by(|&a, &b| {
+                            value_cmp_conn(flat.get(a as usize), flat.get(b as usize))
+                        }),
+                        None => order.sort_by(|&a, &b| {
+                            cmp_keys(
+                                &grouper.keys_multi[a as usize],
+                                &grouper.keys_multi[b as usize],
+                            )
+                        }),
+                    }
+                    GroupIterMode::Ram {
+                        grouper,
+                        gi: 0,
+                        order,
+                    }
+                },
                 n_aggs,
                 agg_ctx,
                 rec_buf: Vec::new(),
@@ -9084,26 +9577,23 @@ impl GroupIter {
     /// keys across streams and emits in (key, seq) order.
     pub(crate) fn next_group(&mut self) -> Option<(Vec<Value>, Vec<AggState>)> {
         match &mut self.mode {
-            GroupIterMode::Ram { grouper, gi } => {
-                let n = grouper.group_count();
-                if *gi >= n {
-                    return None;
-                }
+            GroupIterMode::Ram { grouper, gi, order } => {
+                let g = *order.get(*gi)? as usize;
                 // Collated GROUP BY: the group's representative value is
                 // its FIRST-SEEN ORIGINAL key (SQLite's output), not the
                 // folded equality form stored in keys_*.
-                let keys = if !grouper.display_keys.is_empty() && *gi < grouper.display_keys.len() {
-                    grouper.display_keys[*gi].clone()
+                let keys = if !grouper.display_keys.is_empty() && g < grouper.display_keys.len() {
+                    grouper.display_keys[g].clone()
                 } else {
                     match &grouper.keys_flat {
-                        Some(flat) => vec![flat.get(*gi).clone()],
-                        None => grouper.keys_multi[*gi].clone(),
+                        Some(flat) => vec![flat.get(g).clone()],
+                        None => grouper.keys_multi[g].clone(),
                     }
                 };
                 let n_aggs = self.n_aggs;
                 let mut states = Vec::with_capacity(n_aggs);
                 for i in 0..n_aggs {
-                    states.push(grouper.states.get(*gi * n_aggs + i).clone());
+                    states.push(grouper.states.get(g * n_aggs + i).clone());
                 }
                 *gi += 1;
                 Some((keys, states))
@@ -9630,6 +10120,7 @@ pub(crate) fn scan_groupby_grouper(
                     arg_val,
                     aggregates[i].distinct,
                     agg_sep_at(aggregates, i),
+                    agg_coll_at(aggregates, i),
                 );
             }
             true
@@ -9744,6 +10235,9 @@ pub(crate) fn scan_groupby_grouper(
             let mut wide: Vec<Value> = vec![Value::Null; n_cols];
             let mut owned_key: Value = Value::Null;
             let pred_may_reenter = filter_predicate.is_some_and(expr_has_subquery);
+            // An evaluation error aborts the statement (SQLite raises it);
+            // it used to be swallowed as "row filtered out".
+            let mut scan_err: Option<crate::error::Error> = None;
             scan_table_maybe_range(ctx, &table, range, pred_may_reenter, |rowid, payload| {
                 if decode_row_selective_wide(
                     payload,
@@ -9763,7 +10257,10 @@ pub(crate) fn scan_groupby_grouper(
                     } else {
                         match eval_row(pred, &wide, &columns, params, named_params) {
                             Ok(v) => v.is_truthy(),
-                            Err(_) => false,
+                            Err(e) => {
+                                scan_err = Some(e);
+                                return false;
+                            }
                         }
                     };
                     if !keep {
@@ -9798,6 +10295,7 @@ pub(crate) fn scan_groupby_grouper(
                             &COUNT_STAR_ARG,
                             false,
                             agg_sep_at(aggregates, i),
+                            agg_coll_at(aggregates, i),
                         );
                         continue;
                     }
@@ -9812,15 +10310,20 @@ pub(crate) fn scan_groupby_grouper(
                         &arg_val,
                         agg.distinct,
                         agg_sep_at(aggregates, i),
+                        agg_coll_at(aggregates, i),
                     );
                 }
                 true
             })?;
+            if let Some(e) = scan_err {
+                return Err(e);
+            }
             return Ok(grouper);
         }
 
         let identity_ref: &[usize] = &identity;
         let pred_may_reenter = filter_predicate.is_some_and(expr_has_subquery);
+        let mut scan_err: Option<crate::error::Error> = None;
         scan_table_maybe_range(ctx, &table, range, pred_may_reenter, |rowid, payload| {
             row_buf.clear();
             if decode_row_into(payload, n_cols, rowid, rowid_alias, &mut row_buf).is_err() {
@@ -9833,7 +10336,10 @@ pub(crate) fn scan_groupby_grouper(
                 } else {
                     match eval_row(pred, &row_buf, &columns, params, named_params) {
                         Ok(v) => v.is_truthy(),
-                        Err(_) => false,
+                        Err(e) => {
+                            scan_err = Some(e);
+                            return false;
+                        }
                     }
                 };
                 if !keep {
@@ -9843,21 +10349,17 @@ pub(crate) fn scan_groupby_grouper(
             // Compute the group-by key: direct index when resolved, eval_row
             // otherwise (e.g. GROUP BY x+y, GROUP BY upper(name)).
             key_buf.clear();
-            let mut key_ok = true;
             for (gi_expr, kidx) in group_by.iter().zip(key_col_indices.iter()) {
                 match kidx {
                     Some(idx) => key_buf.push(row_buf[*idx].clone()),
                     None => match eval_row(gi_expr, &row_buf, &columns, params, named_params) {
                         Ok(v) => key_buf.push(v),
-                        Err(_) => {
-                            key_ok = false;
-                            break;
+                        Err(e) => {
+                            scan_err = Some(e);
+                            return false;
                         }
                     },
                 }
-            }
-            if !key_ok {
-                return true;
             }
             let gi = grouper.intern_key(&key_buf);
             for (i, agg) in aggregates.iter().enumerate() {
@@ -9866,7 +10368,10 @@ pub(crate) fn scan_groupby_grouper(
                 if let Some(f) = &agg.filter {
                     let pass = match eval_row(f, &row_buf, &columns, params, named_params) {
                         Ok(v) => v.is_truthy(),
-                        Err(_) => false,
+                        Err(e) => {
+                            scan_err = Some(e);
+                            return false;
+                        }
                     };
                     if !pass {
                         continue;
@@ -9877,7 +10382,10 @@ pub(crate) fn scan_groupby_grouper(
                     (Some(arg), None) => {
                         match eval_row(arg, &row_buf, &columns, params, named_params) {
                             Ok(v) => v,
-                            Err(_) => Value::Null,
+                            Err(e) => {
+                                scan_err = Some(e);
+                                return false;
+                            }
                         }
                     }
                     (None, _) => Value::Integer(1), // COUNT(*)
@@ -9888,10 +10396,14 @@ pub(crate) fn scan_groupby_grouper(
                     &arg_val,
                     agg.distinct,
                     agg_sep_at(aggregates, i),
+                    agg_coll_at(aggregates, i),
                 );
             }
             true
         })?;
+        if let Some(e) = scan_err {
+            return Err(e);
+        }
     }
 
     Ok(grouper)
@@ -10254,6 +10766,35 @@ pub(crate) fn kbn_step(sum: &mut f64, comp: &mut f64, x: f64) {
     *sum = t;
 }
 
+/// func.c kahanBabuskaNeumaierStepInt64: an integer of magnitude >= 2^52
+/// is added as two exactly-representable parts (the multiple of 16384,
+/// then the remainder) — a single `i as f64` rounds away up to 1 unit
+/// (summing i64::MAX gave -0.5 where SQLite gives -1.5).
+#[inline]
+pub(crate) fn kbn_step_int(sum: &mut f64, comp: &mut f64, i: i64) {
+    if i <= -4_503_599_627_370_496 || i >= 4_503_599_627_370_496 {
+        let sm = i % 16384;
+        kbn_step(sum, comp, (i - sm) as f64);
+        kbn_step(sum, comp, sm as f64);
+    } else {
+        kbn_step(sum, comp, i as f64);
+    }
+}
+
+/// func.c kahanBabuskaNeumaierInit: seed the compensated sum with the
+/// exact integer partial (large values split as in `kbn_step_int`).
+#[inline]
+pub(crate) fn kbn_init_int(sum: &mut f64, comp: &mut f64, i: i64) {
+    if i <= -4_503_599_627_370_496 || i >= 4_503_599_627_370_496 {
+        let sm = i % 16384;
+        *sum = (i - sm) as f64;
+        *comp = sm as f64;
+    } else {
+        *sum = i as f64;
+        *comp = 0.0;
+    }
+}
+
 /// Fold the KBN compensation in ONCE at finalize — SQLite's
 /// `kbnFinalize` guard, verbatim: the error term is folded only while
 /// the running sum is finite AND nonzero. When the sum has gone ±inf
@@ -10265,10 +10806,24 @@ pub(crate) fn kbn_step(sum: &mut f64, comp: &mut f64, x: f64) {
 /// `sum(-1e308 × 4)` returned NaN; SQLite returns -inf).
 #[inline]
 pub(crate) fn kbn_finalize_sum(sum: f64, comp: f64) -> f64 {
-    if comp != 0.0 && sum.is_finite() {
+    // func.c sumFinalize: `!sqlite3IsOverflow(rErr) ? rSum + rErr : rSum`
+    // — the guard is on the ERROR term (an overflowed step leaves it
+    // ±inf / NaN while the sum itself may still be finite: folding it
+    // turned `sum(… + -1e308 …)` into NaN where SQLite returns ±inf).
+    if comp != 0.0 && comp.is_finite() {
         sum + comp
     } else {
         sum
+    }
+}
+
+/// sqlite3_result_double: a NaN result IS NULL (SQLite has no NaN values).
+#[inline]
+fn real_or_null(r: f64) -> Value {
+    if r.is_nan() {
+        Value::Null
+    } else {
+        Value::Real(r)
     }
 }
 
@@ -10296,20 +10851,17 @@ fn fused_merge_acc(dst: &mut FusedAcc, src: &FusedAcc, op: FusedOp) {
                     Some(n) => dst.i_sum = n,
                     None => {
                         dst.int_overflow = true;
-                        let b = src.i_sum as f64;
-                        dst.sum = dst.i_sum as f64;
+                        kbn_init_int(&mut dst.sum, &mut dst.comp, dst.i_sum);
                         dst.sum_is_int = false;
-                        dst.comp = 0.0;
-                        kbn_step(&mut dst.sum, &mut dst.comp, b);
+                        kbn_step_int(&mut dst.sum, &mut dst.comp, src.i_sum);
                     }
                 }
             } else {
                 let src_saw_real = !src.sum_is_int && !src.int_overflow;
                 let b = src.sum_f64();
                 if dst.sum_is_int {
-                    dst.sum = dst.i_sum as f64;
+                    kbn_init_int(&mut dst.sum, &mut dst.comp, dst.i_sum);
                     dst.sum_is_int = false;
-                    dst.comp = 0.0;
                 }
                 kbn_step(&mut dst.sum, &mut dst.comp, b);
                 dst.comp += src.comp;
@@ -10334,20 +10886,17 @@ fn fused_merge_acc(dst: &mut FusedAcc, src: &FusedAcc, op: FusedOp) {
                     Some(n) => dst.i_sum = n,
                     None => {
                         dst.int_overflow = true;
-                        let b = src.i_sum as f64;
-                        dst.sum = dst.i_sum as f64;
+                        kbn_init_int(&mut dst.sum, &mut dst.comp, dst.i_sum);
                         dst.sum_is_int = false;
-                        dst.comp = 0.0;
-                        kbn_step(&mut dst.sum, &mut dst.comp, b);
+                        kbn_step_int(&mut dst.sum, &mut dst.comp, src.i_sum);
                     }
                 }
             } else {
                 let src_saw_real = !src.sum_is_int && !src.int_overflow;
                 let b = src.sum_f64();
                 if dst.sum_is_int {
-                    dst.sum = dst.i_sum as f64;
+                    kbn_init_int(&mut dst.sum, &mut dst.comp, dst.i_sum);
                     dst.sum_is_int = false;
-                    dst.comp = 0.0;
                 }
                 kbn_step(&mut dst.sum, &mut dst.comp, b);
                 dst.comp += src.comp;
@@ -10565,9 +11114,8 @@ impl FusedWalk {
                             // sumStep applies, folded at finalize.
                             NumVal::F(f) => {
                                 if acc.sum_is_int {
-                                    acc.sum = acc.i_sum as f64;
+                                    kbn_init_int(&mut acc.sum, &mut acc.comp, acc.i_sum);
                                     acc.sum_is_int = false;
-                                    acc.comp = 0.0;
                                 }
                                 acc.int_overflow = false;
                                 kbn_step(&mut acc.sum, &mut acc.comp, f);
@@ -10578,14 +11126,13 @@ impl FusedWalk {
                                         Some(n) => acc.i_sum = n,
                                         None => {
                                             acc.int_overflow = true;
-                                            acc.sum = acc.i_sum as f64;
+                                            kbn_init_int(&mut acc.sum, &mut acc.comp, acc.i_sum);
                                             acc.sum_is_int = false;
-                                            acc.comp = 0.0;
-                                            kbn_step(&mut acc.sum, &mut acc.comp, i as f64);
+                                            kbn_step_int(&mut acc.sum, &mut acc.comp, i);
                                         }
                                     }
                                 } else {
-                                    kbn_step(&mut acc.sum, &mut acc.comp, i as f64);
+                                    kbn_step_int(&mut acc.sum, &mut acc.comp, i);
                                 }
                             }
                             NumVal::Null => {}
@@ -10605,9 +11152,8 @@ impl FusedWalk {
                         match v {
                             NumVal::F(f) => {
                                 if acc.sum_is_int {
-                                    acc.sum = acc.i_sum as f64;
+                                    kbn_init_int(&mut acc.sum, &mut acc.comp, acc.i_sum);
                                     acc.sum_is_int = false;
-                                    acc.comp = 0.0;
                                 }
                                 acc.int_overflow = false;
                                 kbn_step(&mut acc.sum, &mut acc.comp, f);
@@ -10618,14 +11164,13 @@ impl FusedWalk {
                                         Some(n) => acc.i_sum = n,
                                         None => {
                                             acc.int_overflow = true;
-                                            acc.sum = acc.i_sum as f64;
+                                            kbn_init_int(&mut acc.sum, &mut acc.comp, acc.i_sum);
                                             acc.sum_is_int = false;
-                                            acc.comp = 0.0;
-                                            kbn_step(&mut acc.sum, &mut acc.comp, i as f64);
+                                            kbn_step_int(&mut acc.sum, &mut acc.comp, i);
                                         }
                                     }
                                 } else {
-                                    kbn_step(&mut acc.sum, &mut acc.comp, i as f64);
+                                    kbn_step_int(&mut acc.sum, &mut acc.comp, i);
                                 }
                             }
                             NumVal::Null => {}
@@ -11194,10 +11739,10 @@ fn fused_finalize(aggregates: &[AggExpr], accs: &[FusedAcc]) -> Result<ExecResul
                     Value::Integer(acc.i_sum)
                 } else {
                     // sumFinalize's approx arm: rSum + rErr (guarded).
-                    Value::Real(kbn_finalize_sum(acc.sum, acc.comp))
+                    real_or_null(kbn_finalize_sum(acc.sum, acc.comp))
                 }
             }
-            AggFunc::Total => Value::Real(if acc.sum_is_int {
+            AggFunc::Total => real_or_null(if acc.sum_is_int {
                 acc.i_sum as f64
             } else {
                 kbn_finalize_sum(acc.sum, acc.comp)
@@ -11216,7 +11761,7 @@ fn fused_finalize(aggregates: &[AggExpr], accs: &[FusedAcc]) -> Result<ExecResul
                     } else {
                         kbn_finalize_sum(acc.sum, acc.comp)
                     };
-                    Value::Real(r / acc.count as f64)
+                    real_or_null(r / acc.count as f64)
                 }
             }
             AggFunc::Min => match acc.min {
@@ -11472,6 +12017,7 @@ fn exec_aggregate_no_group_by(
                         arg_val,
                         aggregates[i].distinct,
                         agg_sep_at(aggregates, i),
+                        agg_coll_at(aggregates, i),
                     );
                 }
                 true
@@ -11482,6 +12028,9 @@ fn exec_aggregate_no_group_by(
 
     let params = ctx.params.clone();
     let named_params = ctx.named_params.clone();
+    // Evaluation errors abort the statement (SQLite raises them); they
+    // used to be swallowed as "row filtered out" / NULL argument.
+    let mut scan_err: Option<crate::error::Error> = None;
 
     // === Selective-decode fast path ===
     // When ALL aggregate args are bare Column refs (or COUNT(*)) AND the
@@ -11573,7 +12122,10 @@ fn exec_aggregate_no_group_by(
                             return true;
                         }
                     }
-                    Err(_) => return true,
+                    Err(e) => {
+                        scan_err = Some(e);
+                        return false;
+                    }
                 }
             }
             saw_any_row = true;
@@ -11600,7 +12152,10 @@ fn exec_aggregate_no_group_by(
                     }
                     match eval_row(arg, &full_row, cols, &params, &named_params) {
                         Ok(v) => scratch_arg[i] = v,
-                        Err(_) => scratch_arg[i] = Value::Null,
+                        Err(e) => {
+                            scan_err = Some(e);
+                            return false;
+                        }
                     }
                     &scratch_arg[i]
                 } else {
@@ -11612,6 +12167,7 @@ fn exec_aggregate_no_group_by(
                     arg_val,
                     aggregates[i].distinct,
                     agg_sep_at(aggregates, i),
+                    agg_coll_at(aggregates, i),
                 );
             }
             true
@@ -11638,7 +12194,10 @@ fn exec_aggregate_no_group_by(
                             return true;
                         }
                     }
-                    Err(_) => return true,
+                    Err(e) => {
+                        scan_err = Some(e);
+                        return false;
+                    }
                 }
             }
             saw_any_row = true;
@@ -11651,7 +12210,10 @@ fn exec_aggregate_no_group_by(
                         columns_ref.expect("columns built when per-aggregate FILTER present");
                     let pass = match eval_row(f, &row_buf, cols, &params, &named_params) {
                         Ok(v) => v.is_truthy(),
-                        Err(_) => false,
+                        Err(e) => {
+                            scan_err = Some(e);
+                            return false;
+                        }
                     };
                     if !pass {
                         continue;
@@ -11665,7 +12227,10 @@ fn exec_aggregate_no_group_by(
                     let cols = columns_ref.expect("columns were built because not all are Column");
                     match eval_row(arg, &row_buf, cols, &params, &named_params) {
                         Ok(v) => v,
-                        Err(_) => Value::Null,
+                        Err(e) => {
+                            scan_err = Some(e);
+                            return false;
+                        }
                     }
                 } else {
                     Value::Integer(1)
@@ -11676,10 +12241,14 @@ fn exec_aggregate_no_group_by(
                     &arg_val,
                     agg.distinct,
                     agg_sep_at(aggregates, i),
+                    agg_coll_at(aggregates, i),
                 );
             }
             true
         })?;
+    }
+    if let Some(e) = scan_err {
+        return Err(e);
     }
 
     finish_no_group_by(aggregates, states, saw_any_row)
@@ -12364,10 +12933,15 @@ fn exec_aggregate(
                 Some((e, inc)) => Some((fold_bound(e)?.encode_order_key(), *inc)),
                 None => None,
             };
+            // No lower bound: start PAST the NULL entries (NULL's order key is
+            // the single byte 0x00, every non-NULL key starts at >= 0x01) —
+            // `col < X` never matches NULL (SQLite OP_SeekGT on NULL). Starting
+            // at the empty key used to return the col-IS-NULL rows, and
+            // `DELETE ... WHERE col < X` deleted them.
             let scan_start: Vec<u8> = start_key
                 .as_ref()
                 .map(|(k, _)| k.clone())
-                .unwrap_or_default();
+                .unwrap_or_else(|| vec![0x01]);
             let mut n: i64 = 0;
             let index_root = ctx.index_root(&index);
             let mut index_bt = Btree::new(ctx.pager, index_root, true);
@@ -12602,21 +13176,11 @@ fn exec_aggregate(
         for row in &inner.rows {
             // Group key: direct index when resolvable, eval_row otherwise.
             key_buf.clear();
-            let mut key_ok = true;
             for (ge, kidx) in group_by.iter().zip(key_col_indices.iter()) {
                 match kidx {
                     Some(idx) => key_buf.push(row[*idx].clone()),
-                    None => match eval_row(ge, row, &inner.columns, params, named_params) {
-                        Ok(v) => key_buf.push(v),
-                        Err(_) => {
-                            key_ok = false;
-                            break;
-                        }
-                    },
+                    None => key_buf.push(eval_row(ge, row, &inner.columns, params, named_params)?),
                 }
-            }
-            if !key_ok {
-                continue;
             }
             let gi = grouper.intern_key(&key_buf);
             // Single-min/max rule (SQLite bare-column semantics): when
@@ -12656,10 +13220,7 @@ fn exec_aggregate(
             for (i, agg) in aggregates.iter().enumerate() {
                 // Per-aggregate FILTER over materialized inputs.
                 if let Some(f) = &agg.filter {
-                    let pass = match eval_row(f, row, &inner.columns, params, named_params) {
-                        Ok(v) => v.is_truthy(),
-                        Err(_) => false,
-                    };
+                    let pass = eval_row(f, row, &inner.columns, params, named_params)?.is_truthy();
                     if !pass {
                         continue;
                     }
@@ -12685,6 +13246,7 @@ fn exec_aggregate(
                     &arg_val,
                     agg.distinct,
                     agg_sep_at(aggregates, i),
+                    agg_coll_at(aggregates, i),
                 );
             }
         }
@@ -12925,6 +13487,7 @@ fn exec_plugin_aggregate(
                     &arg_val,
                     agg.distinct,
                     agg_sep_at(aggregates, i),
+                    agg_coll_at(aggregates, i),
                 ),
                 Slot::Plugin { func, state } => {
                     if !func.arity().accepts(agg.arg.is_some() as usize) {
@@ -13000,12 +13563,27 @@ fn agg_sep_at(aggregates: &[AggExpr], i: usize) -> Option<&str> {
     aggregates.get(i).and_then(|a| a.sep.as_deref())
 }
 
+/// min()/max() aggregate comparison under an optional collation name.
+fn agg_cmp(a: &Value, b: &Value, coll: Option<&str>) -> std::cmp::Ordering {
+    match coll.and_then(crate::plugin::lookup_collation) {
+        Some(c) => crate::plugin::compare_collated(a, b, c.as_ref()),
+        None => value_cmp_conn(a, b),
+    }
+}
+
+/// Aggregate `i`'s comparison collation (see `AggExpr::collation`).
+#[inline]
+fn agg_coll_at(aggregates: &[AggExpr], i: usize) -> Option<&str> {
+    aggregates.get(i).and_then(|a| a.collation.as_deref())
+}
+
 fn update_agg_state(
     state: &mut AggState,
     func: AggFunc,
     v: &Value,
     distinct: bool,
     sep: Option<&str>,
+    coll: Option<&str>,
 ) {
     // Only compute the distinct key if we're actually doing a DISTINCT
     // aggregate. For non-DISTINCT aggregates, this skips per-row hashing
@@ -13017,7 +13595,12 @@ fn update_agg_state(
             .cold_mut()
             .distinct
             .get_or_insert_with(Default::default)
-            .insert(SqlValueKey(v.clone()))
+            .insert(SqlValueKey(match coll {
+                // Values equal under the collation are ONE distinct value
+                // (the first one seen is the one aggregated).
+                Some(c) => crate::plugin::collation_fold_key(c, v),
+                None => v.clone(),
+            }))
     {
         return;
     }
@@ -13072,9 +13655,8 @@ fn update_agg_state(
                 // KBN step (comp folded at finalize, like SQLite).
                 if matches!(v, Value::Real(_)) {
                     if state.sum_is_int {
-                        state.sum = state.int_sum as f64;
+                        kbn_init_int(&mut state.sum, &mut state.comp, state.int_sum);
                         state.sum_is_int = false;
-                        state.comp = 0.0;
                     }
                     // A REAL input launders any earlier integer-mode
                     // overflow (SQLite's approx mode — sum() only raises
@@ -13086,14 +13668,14 @@ fn update_agg_state(
                         Some(n) => state.int_sum = n,
                         None => {
                             state.int_overflow = true;
-                            state.sum = state.int_sum as f64;
+                            kbn_init_int(&mut state.sum, &mut state.comp, state.int_sum);
                             state.sum_is_int = false;
-                            state.comp = 0.0;
-                            kbn_step(&mut state.sum, &mut state.comp, v.as_integer() as f64);
+                            kbn_step_int(&mut state.sum, &mut state.comp, v.as_integer());
                         }
                     }
                 } else {
-                    kbn_step(&mut state.sum, &mut state.comp, v.as_real());
+                    // Post-flip INTEGER input (Reals took the branch above).
+                    kbn_step_int(&mut state.sum, &mut state.comp, v.as_integer());
                 }
             }
         }
@@ -13122,9 +13704,8 @@ fn update_agg_state(
                 state.count += 1;
                 if matches!(v, Value::Real(_)) {
                     if state.sum_is_int {
-                        state.sum = state.int_sum as f64;
+                        kbn_init_int(&mut state.sum, &mut state.comp, state.int_sum);
                         state.sum_is_int = false;
-                        state.comp = 0.0;
                     }
                     state.int_overflow = false;
                     kbn_step(&mut state.sum, &mut state.comp, v.as_real());
@@ -13133,22 +13714,24 @@ fn update_agg_state(
                         Some(n) => state.int_sum = n,
                         None => {
                             state.int_overflow = true;
-                            state.sum = state.int_sum as f64;
+                            kbn_init_int(&mut state.sum, &mut state.comp, state.int_sum);
                             state.sum_is_int = false;
-                            state.comp = 0.0;
-                            kbn_step(&mut state.sum, &mut state.comp, v.as_integer() as f64);
+                            kbn_step_int(&mut state.sum, &mut state.comp, v.as_integer());
                         }
                     }
                 } else {
-                    kbn_step(&mut state.sum, &mut state.comp, v.as_real());
+                    // Post-flip INTEGER input (Reals took the branch above).
+                    kbn_step_int(&mut state.sum, &mut state.comp, v.as_integer());
                 }
             }
         }
+        // func.c minmaxStep: a STRICTLY better value replaces (ties keep
+        // the first), compared through the argument's collation.
         AggFunc::Min => {
             let c = state.cold_mut();
             if !v.is_null()
                 && (c.min.is_none()
-                    || value_cmp_conn(v, c.min.as_ref().unwrap()) == std::cmp::Ordering::Less)
+                    || agg_cmp(v, c.min.as_ref().unwrap(), coll) == std::cmp::Ordering::Less)
             {
                 c.min = Some(v.clone());
             }
@@ -13157,7 +13740,7 @@ fn update_agg_state(
             let c = state.cold_mut();
             if !v.is_null()
                 && (c.max.is_none()
-                    || value_cmp_conn(v, c.max.as_ref().unwrap()) == std::cmp::Ordering::Greater)
+                    || agg_cmp(v, c.max.as_ref().unwrap(), coll) == std::cmp::Ordering::Greater)
             {
                 c.max = Some(v.clone());
             }
@@ -13169,8 +13752,12 @@ fn update_agg_state(
                 .as_deref()
                 .map(|s| s.to_string())
                 .or_else(|| sep.map(|s| s.to_string()));
+            // groupConcatStep: a separator precedes every term but the
+            // FIRST — an empty-string term is still a term (`''`, `''`,
+            // `''` concatenate to ",,").
+            let first_term = c.concat.is_none();
             let buf = c.concat.get_or_insert_with(|| String::with_capacity(16));
-            if !buf.is_empty() {
+            if !first_term {
                 if let Some(s) = sep_next {
                     // Cache for the NEXT row (state is per-group).
                     c.concat_sep = Some(s.clone());
@@ -13298,10 +13885,10 @@ pub(crate) fn finalize_agg(state: &AggState, func: &str) -> Result<Value> {
             } else {
                 // sumFinalize's approx arm: rSum + rErr, with kbnFinalize's
                 // finite guard (±inf sums stay ±inf, never NaN).
-                Ok(Value::Real(kbn_finalize_sum(state.sum, state.comp)))
+                Ok(real_or_null(kbn_finalize_sum(state.sum, state.comp)))
             }
         }
-        "total" => Ok(Value::Real(if state.sum_is_int {
+        "total" => Ok(real_or_null(if state.sum_is_int {
             state.int_sum as f64
         } else {
             kbn_finalize_sum(state.sum, state.comp)
@@ -13317,7 +13904,7 @@ pub(crate) fn finalize_agg(state: &AggState, func: &str) -> Result<Value> {
                 } else {
                     kbn_finalize_sum(state.sum, state.comp)
                 };
-                Ok(Value::Real(r / state.count as f64))
+                Ok(real_or_null(r / state.count as f64))
             }
         }
         "min" => Ok(state
@@ -13328,13 +13915,13 @@ pub(crate) fn finalize_agg(state: &AggState, func: &str) -> Result<Value> {
             .cold()
             .and_then(|c| c.max.clone())
             .unwrap_or(Value::Null)),
-        "group_concat" | "string_agg" => Ok(Value::Text(
-            state
-                .cold()
-                .and_then(|c| c.concat.clone())
-                .unwrap_or_default()
-                .into(),
-        )),
+        // No (non-NULL) term at all → NULL (groupConcatFinalize never
+        // set a result), not the empty string.
+        "group_concat" | "string_agg" => Ok(state
+            .cold()
+            .and_then(|c| c.concat.clone())
+            .map(|s| Value::Text(s.into()))
+            .unwrap_or(Value::Null)),
         "json_group_array" => Ok(Value::Text(
             format!(
                 "[{}]",
@@ -13496,24 +14083,43 @@ fn exec_one_window(
 ) -> Result<()> {
     // (Rows are pre-sized by exec_window: every row gets `windows.len()`
     // NULL columns before any window computes.)
+    // Comparison collations of the PARTITION BY / ORDER BY terms: an
+    // explicit COLLATE, else a column's declared collation (SQLite).
+    let coll_ctx = crate::executor::expr::EvalContext::new(&[], columns, params, named_params);
+    let part_colls: Vec<Option<String>> = w
+        .partition_by
+        .iter()
+        .map(|e| {
+            coll_ctx
+                .expr_collation(e)
+                .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("binary"))
+        })
+        .collect();
+    let order_colls: Vec<Option<Arc<dyn crate::plugin::Collation>>> = w
+        .order_by
+        .iter()
+        .map(|t| crate::executor::expr::resolve_collation(coll_ctx.expr_collation(&t.expr)))
+        .collect::<Result<_>>()?;
+    let order_cmp = |i: usize, a: &Value, b: &Value| match &order_colls[i] {
+        Some(c) => crate::plugin::compare_collated(a, b, c.as_ref()),
+        None => value_cmp_conn(a, b),
+    };
     // ---- 1. Partition (first-appearance buckets, input order) ----
+    // Keyed by SQL equality (1 and 1.0 are ONE partition; a NOCASE term
+    // folds case) — the old `{:?}` text key split them.
     let mut partitions: Vec<(Vec<Value>, Vec<usize>)> = Vec::new();
-    let mut partition_map: HashMap<String, usize> = HashMap::new();
+    let mut partition_map: HashMap<SqlRowKey, usize> = HashMap::new();
     for (i, row) in rows.iter().enumerate() {
         let key: Vec<Value> = w
             .partition_by
             .iter()
             .map(|e| eval_row(e, row, columns, params, named_params))
             .collect::<Result<_>>()?;
-        let key_str = key
-            .iter()
-            .map(|v| format!("{:?}", v))
-            .collect::<Vec<_>>()
-            .join("|");
-        if let Some(&idx) = partition_map.get(&key_str) {
+        let hkey = collated_row_key(&key, &part_colls);
+        if let Some(&idx) = partition_map.get(&hkey) {
             partitions[idx].1.push(i);
         } else {
-            partition_map.insert(key_str, partitions.len());
+            partition_map.insert(hkey, partitions.len());
             partitions.push((key, vec![i]));
         }
     }
@@ -13535,9 +14141,11 @@ fn exec_one_window(
         // ---- 2. Sort the partition by ORDER BY (multi-key, per-term
         //         direction, SQLite value ordering; NULLs smallest). ----
         let mut sorted: Vec<usize> = indices.clone();
+        // Every order key, evaluated ONCE per row of this partition — the
+        // sort AND the peer groups below read these same values (a
+        // re-evaluation would let `random()` keys disagree).
+        let mut key_cache: HashMap<usize, Vec<Value>> = HashMap::with_capacity(np);
         if !w.order_by.is_empty() {
-            // Pre-evaluate every order key for every row in this partition.
-            let mut key_cache: HashMap<usize, Vec<Value>> = HashMap::with_capacity(np);
             for &ri in indices {
                 let vals: Vec<Value> = w
                     .order_by
@@ -13550,7 +14158,7 @@ fn exec_one_window(
                 let ka = &key_cache[&a];
                 let kb = &key_cache[&b];
                 for (i, t) in w.order_by.iter().enumerate() {
-                    let mut ord = value_cmp_conn(&ka[i], &kb[i]);
+                    let mut ord = order_cmp(i, &ka[i], &kb[i]);
                     if t.order == Order::Desc {
                         ord = ord.reverse();
                     }
@@ -13585,31 +14193,28 @@ fn exec_one_window(
 
         // ---- 4. Peer groups over the ORDER BY keys. ----
         // peer_start[p] / peer_end[p] (exclusive) in SORTED position space.
-        let order_key = |p: usize| -> Vec<Value> {
-            if w.order_by.is_empty() {
-                return Vec::new();
-            }
-            let ri = sorted[p];
-            w.order_by
-                .iter()
-                .map(|t| eval_row(&t.expr, &rows[ri], columns, params, named_params))
-                .collect::<Result<_>>()
-                .unwrap_or_default()
-        };
-        // Evaluate keys once per sorted position.
+        // Keys per sorted position (from the cache).
         let mut keys: Vec<Vec<Value>> = Vec::with_capacity(np);
         if !w.order_by.is_empty() {
-            for p in 0..np {
-                keys.push(order_key(p));
+            for ri in &sorted {
+                keys.push(key_cache.remove(ri).unwrap_or_default());
             }
         }
+        // Peers: equal on every ORDER BY term under its collation.
+        let is_peer = |a: &[Value], b: &[Value]| {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .enumerate()
+                    .all(|(i, (x, y))| order_cmp(i, x, y) == std::cmp::Ordering::Equal)
+        };
         let mut peer_start: Vec<usize> = vec![0; np];
         let mut peer_end: Vec<usize> = vec![np; np];
         if !w.order_by.is_empty() {
             let mut s = 0usize;
             while s < np {
                 let mut e = s + 1;
-                while e < np && keys[e] == keys[s] {
+                while e < np && is_peer(&keys[e], &keys[s]) {
                     e += 1;
                 }
                 for p in s..e {
@@ -13625,22 +14230,59 @@ fn exec_one_window(
         // Per-aggregate FILTER: evaluated once per partition row against
         // the INPUT row (sorted-position space), then consulted per frame
         // row inside compute_window_at.
-        let filter_pass: Option<Vec<bool>> = w.filter.as_ref().map(|f| {
-            sorted
-                .iter()
-                .map(|&ri| {
-                    eval_row(f, &rows[ri], columns, params, named_params)
-                        .map(|v| v.is_truthy())
-                        .unwrap_or(false)
-                })
-                .collect()
-        });
+        let filter_pass: Option<Vec<bool>> = match &w.filter {
+            Some(f) => Some(
+                sorted
+                    .iter()
+                    .map(|&ri| {
+                        eval_row(f, &rows[ri], columns, params, named_params).map(|v| v.is_truthy())
+                    })
+                    .collect::<Result<_>>()?,
+            ),
+            None => None,
+        };
+        // Dense rank per sorted position: one step per PEER GROUP (peers
+        // compare under the ORDER BY collations).
+        let mut dense: Vec<i64> = Vec::with_capacity(np);
+        for (p, &ps) in peer_start.iter().enumerate() {
+            let prev = dense.last().copied().unwrap_or(0);
+            dense.push(if p == 0 || ps == p { prev + 1 } else { prev });
+        }
+        // group_concat / string_agg separators, per sorted position (a
+        // NULL separator is the empty string, as in groupConcatStep).
+        let seps: Vec<String> = if matches!(w.func.as_str(), "group_concat" | "string_agg") {
+            match w.extra_args.first() {
+                Some(sep) => sorted
+                    .iter()
+                    .map(|&ri| {
+                        eval_row(sep, &rows[ri], columns, params, named_params).map(|v| match v {
+                            Value::Null => String::new(),
+                            other => other.as_text().to_string(),
+                        })
+                    })
+                    .collect::<Result<_>>()?,
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        // min()/max() compare through the argument's collation.
+        let arg_coll: Option<String> = w
+            .arg
+            .as_ref()
+            .and_then(|a| coll_ctx.expr_collation(a))
+            .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("binary"));
+        let aux = WindowAux {
+            dense: &dense,
+            seps: &seps,
+            arg_coll: arg_coll.as_deref(),
+        };
         for p in 0..np {
             let val = compute_window_at(
                 w,
                 p,
                 np,
-                &sorted,
+                &aux,
                 &arg_vals,
                 &keys,
                 (peer_start[p], peer_end[p]),
@@ -13942,11 +14584,22 @@ fn range_following_end(
 
 /// Compute the window value for one row at sorted position `p`.
 #[allow(clippy::too_many_arguments)]
+/// Per-partition data `compute_window_at` reads besides the frame.
+struct WindowAux<'a> {
+    /// Dense rank per sorted position.
+    dense: &'a [i64],
+    /// group_concat / string_agg separator per sorted position (empty =
+    /// the default ",").
+    seps: &'a [String],
+    /// The aggregate argument's non-BINARY collation (min / max).
+    arg_coll: Option<&'a str>,
+}
+
 fn compute_window_at(
     w: &WindowExpr,
     p: usize,
     np: usize,
-    _sorted: &[usize],
+    aux: &WindowAux<'_>,
     arg_vals: &[Option<Value>],
     keys: &[Vec<Value>],
     peer: (usize, usize),
@@ -13961,18 +14614,11 @@ fn compute_window_at(
     match w.func.as_str() {
         "row_number" => Ok(Value::Integer(p as i64 + 1)),
         "rank" => Ok(Value::Integer(peer.0 as i64 + 1)),
-        "dense_rank" => {
-            // Count distinct peer groups up to and including this row's.
-            let mut dn = 0i64;
-            let mut prev: Option<&Vec<Value>> = None;
-            for (_, key) in keys.iter().enumerate().take(p + 1) {
-                if prev.map(|pv| pv != key).unwrap_or(true) {
-                    dn += 1;
-                }
-                prev = Some(key);
-            }
-            Ok(Value::Integer(dn))
-        }
+        "dense_rank" => Ok(Value::Integer(if keys.is_empty() {
+            1
+        } else {
+            aux.dense[p]
+        })),
         "percent_rank" => {
             if np <= 1 {
                 Ok(Value::Real(0.0))
@@ -14054,7 +14700,14 @@ fn compute_window_at(
                 }
             }
         }
-        // Aggregates over the frame.
+        // Aggregates over the frame — stepped through the SAME
+        // update_agg_state / finalize_agg as plain aggregates, so a frame
+        // sums, averages, overflows, compares (collation, min/max ties)
+        // and concatenates (separator, value text) exactly like the
+        // grouped forms. The old hand-rolled loop printed group_concat
+        // terms with `{:?}` ("Integer(1),Integer(2)"), ignored the
+        // separator, summed TEXT through a Rust float parse and ordered
+        // min/max with Rust's Value ordering.
         "sum" | "total" | "avg" | "count" | "min" | "max" | "group_concat" | "string_agg" => {
             let (fs, fe) = resolve_frame(w, p, np, keys, peer);
             // EXCLUDE handling (subset of SQLite).
@@ -14077,19 +14730,8 @@ fn compute_window_at(
                     _ => true,
                 }
             };
-            let mut sum = 0.0f64;
-            let mut isum = 0i64;
-            let mut int_exact = true;
-            // KBN compensation for the frame's f64 running sum — the
-            // window re-aggregation runs the SAME compensated sumStep
-            // discipline SQLite's window code replays per frame
-            // (verified bit-exact against bundled SQLite 3.46).
-            let mut comp = 0.0f64;
-            let mut count = 0i64;
-            let mut total_count = 0i64;
-            let mut min: Option<Value> = None;
-            let mut max: Option<Value> = None;
-            let mut parts: Vec<String> = Vec::new();
+            let func = AggFunc::from_name(w.func.as_str());
+            let mut state = AggState::default();
             for pos in fs..=fe.max(fs) {
                 if !in_frame(pos) {
                     continue;
@@ -14101,118 +14743,17 @@ fn compute_window_at(
                         continue;
                     }
                 }
-                total_count += 1;
-                let v = val_of(pos);
-                if !matches!(v, Value::Null) {
-                    count += 1;
-                    match &v {
-                        Value::Integer(i) => {
-                            isum += i;
-                            if !int_exact {
-                                // Post-flip integers are doubles through
-                                // the KBN step (SQLite's sumStep).
-                                kbn_step(&mut sum, &mut comp, *i as f64);
-                            }
-                        }
-                        Value::Real(r) => {
-                            if int_exact {
-                                // The flip: (double)iSum folds in ONCE,
-                                // compensation starts from zero.
-                                int_exact = false;
-                                sum = isum as f64;
-                                comp = 0.0;
-                            }
-                            kbn_step(&mut sum, &mut comp, *r);
-                        }
-                        other => {
-                            if int_exact {
-                                int_exact = false;
-                                sum = isum as f64;
-                                comp = 0.0;
-                            }
-                            kbn_step(&mut sum, &mut comp, value_as_f64(other));
-                        }
-                    }
-                    match &min {
-                        None => min = Some(v.clone()),
-                        Some(m) => {
-                            if v < *m {
-                                min = Some(v.clone())
-                            }
-                        }
-                    }
-                    match &max {
-                        None => max = Some(v.clone()),
-                        Some(m) => {
-                            if v > *m {
-                                max = Some(v.clone())
-                            }
-                        }
-                    }
-                    parts.push(match &v {
-                        Value::Text(t) => t.to_string(),
-                        other => format!("{other:?}"),
-                    });
-                }
-            }
-            match w.func.as_str() {
-                "count" => Ok(Value::Integer(if w.arg.is_none() {
-                    total_count
+                let v = if w.arg.is_none() {
+                    COUNT_STAR_ARG.clone()
                 } else {
-                    count
-                })),
-                "sum" => {
-                    if count == 0 {
-                        Ok(Value::Null)
-                    } else if int_exact {
-                        Ok(Value::Integer(isum))
-                    } else {
-                        // sumFinalize's approx arm: rSum + rErr (guarded).
-                        Ok(Value::Real(kbn_finalize_sum(sum, comp)))
-                    }
-                }
-                "total" => Ok(Value::Real(if int_exact {
-                    isum as f64
-                } else {
-                    kbn_finalize_sum(sum, comp)
-                })),
-                "avg" => {
-                    if count == 0 {
-                        Ok(Value::Null)
-                    } else {
-                        // SQLite avgFinalize over the frame: the
-                        // int-exact partial converts once, else the
-                        // compensated f64 sum; raw r/cnt, no rounding.
-                        let r = if int_exact {
-                            isum as f64
-                        } else {
-                            kbn_finalize_sum(sum, comp)
-                        };
-                        Ok(Value::Real(r / count as f64))
-                    }
-                }
-                "min" => Ok(min.unwrap_or(Value::Null)),
-                "max" => Ok(max.unwrap_or(Value::Null)),
-                _ => {
-                    // group_concat / string_agg over the frame.
-                    if parts.is_empty() {
-                        Ok(Value::Null)
-                    } else {
-                        Ok(Value::Text(parts.join(",").into()))
-                    }
-                }
+                    val_of(pos)
+                };
+                let sep = aux.seps.get(pos).map(|s| s.as_str());
+                update_agg_state(&mut state, func, &v, false, sep, aux.arg_coll);
             }
+            finalize_agg(&state, w.func.as_str())
         }
         _ => Ok(Value::Null),
-    }
-}
-
-fn value_as_f64(v: &Value) -> f64 {
-    match v {
-        Value::Integer(i) => *i as f64,
-        Value::Real(r) => *r,
-        Value::Text(t) => t.to_string().parse().unwrap_or(0.0),
-        _ => 0.0,
     }
 }
 
@@ -14336,24 +14877,32 @@ impl JTerm {
                     None => apply_binary(*op, &lv, &rv),
                 }
             }
-            JTerm::And(a, b) => Value::Integer(
-                if a.eval_value(lrow, rrow, params).is_truthy()
-                    && b.eval_value(lrow, rrow, params).is_truthy()
-                {
-                    1
-                } else {
-                    0
-                },
-            ),
-            JTerm::Or(a, b) => Value::Integer(
-                if a.eval_value(lrow, rrow, params).is_truthy()
-                    || b.eval_value(lrow, rrow, params).is_truthy()
-                {
-                    1
-                } else {
-                    0
-                },
-            ),
+            // Kleene AND / OR, short-circuiting on a deciding first value
+            // (the serial evaluator's semantics): `NULL AND 1` is NULL —
+            // reducing to 0/1 by truthiness made `NOT (x AND y)` TRUE for
+            // a NULL operand.
+            JTerm::And(a, b) => {
+                let av = a.eval_value(lrow, rrow, params);
+                if !av.is_null() && !av.is_truthy() {
+                    return Value::Integer(0);
+                }
+                apply_binary(
+                    crate::sql::ast::BinaryOp::And,
+                    &av,
+                    &b.eval_value(lrow, rrow, params),
+                )
+            }
+            JTerm::Or(a, b) => {
+                let av = a.eval_value(lrow, rrow, params);
+                if !av.is_null() && av.is_truthy() {
+                    return Value::Integer(1);
+                }
+                apply_binary(
+                    crate::sql::ast::BinaryOp::Or,
+                    &av,
+                    &b.eval_value(lrow, rrow, params),
+                )
+            }
             JTerm::Not(a) => crate::executor::expr::apply_unary(
                 crate::sql::ast::UnaryOp::Not,
                 &a.eval_value(lrow, rrow, params),
@@ -14434,6 +14983,39 @@ fn compile_join_term(
                 if mixed(&l, &r) {
                     return None;
                 }
+                // A column compared with a literal / parameter takes the
+                // column's comparison affinity, which may CONVERT the
+                // other operand (`int_col > '5'` compares numerically,
+                // `text_col = 5` as text) — the compiled comparison is
+                // raw, so those shapes decline to the evaluator.
+                let col_aff = |j: &JExpr| -> Option<Option<crate::types::Affinity>> {
+                    let i = match j {
+                        JExpr::LCol(i) => *i,
+                        JExpr::RCol(i) => n_left + *i,
+                        _ => return None,
+                    };
+                    Some(affinities.and_then(|a| a.get(i).copied()))
+                };
+                let converts = |c: &JExpr, other: &JExpr| -> bool {
+                    use crate::types::Affinity as A;
+                    let Some(aff) = col_aff(c) else { return false };
+                    match other {
+                        JExpr::Literal(v) => match aff {
+                            Some(A::Integer | A::Real | A::Numeric) => matches!(v, Value::Text(_)),
+                            Some(A::Text) => matches!(v, Value::Integer(_) | Value::Real(_)),
+                            Some(_) => false,
+                            None => {
+                                matches!(v, Value::Text(_) | Value::Integer(_) | Value::Real(_))
+                            }
+                        },
+                        JExpr::Param(_) => !matches!(aff, Some(A::Blob | A::None)),
+                        JExpr::LCol(_) | JExpr::RCol(_) => false,
+                        _ => true,
+                    }
+                };
+                if converts(&l, &r) || converts(&r, &l) {
+                    return None;
+                }
                 Some(JTerm::Cmp(*op, l, r, coll))
             }
             _ => Some(JTerm::Truth(compile_join_jexpr(
@@ -14496,6 +15078,13 @@ fn compile_join_jexpr(
                     | crate::sql::ast::BinaryOp::FtsMatch
                     | crate::sql::ast::BinaryOp::Distance
             ) {
+                return None;
+            }
+            // A comparison NESTED in an expression (`1 > (a < h)`) needs
+            // comparison affinity and collation the raw value op lacks
+            // (an INTEGER column vs a TEXT column compares numerically) —
+            // decline to the evaluator.
+            if crate::executor::predicate::is_cmp_op(*op) {
                 return None;
             }
             Some(JExpr::Bin(
@@ -16774,9 +17363,12 @@ fn exec_index_nested_loop_join(
     for outer_row in &outer_res.rows {
         // Extract the join key from the outer row (borrowed — no clone;
         // the order-key encoder only reads it).
+        // A NULL join key never matches (`NULL = x` is NULL): the index
+        // DOES hold NULL-keyed entries, and probing it with the NULL key
+        // used to pair NULL outer keys with NULL inner keys.
         let key_value = match outer_row.get(outer_key_col) {
+            Some(Value::Null) | None => continue,
             Some(v) => v,
-            None => continue, // NULL join key — no matches in INNER join.
         };
 
         // Encode the key for index lookup (order-preserving form, folded
@@ -16941,7 +17533,146 @@ fn exec_index_nested_loop_join(
 // Distinct
 // ============================================================================
 
+/// Per-output-column comparison collations of a plan's rows (non-BINARY
+/// only; an empty vector or `None` entry = BINARY / not derivable).
+/// DISTINCT and the compound operators de-duplicate through them: in
+/// SQLite a result column carries its expression's collation (an
+/// explicit COLLATE, else a column's DECLARED collation), and a compound
+/// takes the leftmost arm's, falling back to later arms
+/// (multiSelectCollSeq). Rows equal under the collation are duplicates —
+/// `SELECT DISTINCT b` over a NOCASE column used to keep 'a' AND 'A'.
+fn plan_output_collations(plan: &Plan) -> Vec<Option<String>> {
+    fn scope_tables(plan: &Plan, out: &mut Vec<(String, Arc<Table>)>) {
+        match plan {
+            Plan::Scan { table, alias, .. }
+            | Plan::RowidLookup { table, alias, .. }
+            | Plan::RowidIn { table, alias, .. }
+            | Plan::RowidRange { table, alias, .. }
+            | Plan::IndexIn { table, alias, .. }
+            | Plan::IndexLookup { table, alias, .. }
+            | Plan::IndexRange { table, alias, .. } => {
+                out.push((
+                    alias.clone().unwrap_or_else(|| table.name.clone()),
+                    table.clone(),
+                ));
+            }
+            Plan::IndexNestedLoopJoin {
+                outer,
+                inner_table,
+                inner_alias,
+                ..
+            } => {
+                scope_tables(outer, out);
+                out.push((
+                    inner_alias
+                        .clone()
+                        .unwrap_or_else(|| inner_table.name.clone()),
+                    inner_table.clone(),
+                ));
+            }
+            Plan::Join { left, right, .. } => {
+                scope_tables(left, out);
+                scope_tables(right, out);
+            }
+            Plan::Filter { input, .. }
+            | Plan::Sort { input, .. }
+            | Plan::Limit { input, .. }
+            | Plan::Window { input, .. } => scope_tables(input, out),
+            // Project / Aggregate / Subquery / compound outputs are new
+            // names — not this scope's table columns.
+            _ => {}
+        }
+    }
+    fn declared(e: &Expr, tables: &[(String, Arc<Table>)]) -> Option<String> {
+        let mut p = e;
+        loop {
+            match p {
+                Expr::Cast { expr, .. }
+                | Expr::Unary {
+                    op: crate::sql::ast::UnaryOp::Pos,
+                    expr,
+                } => p = expr,
+                Expr::Column { table, name } => {
+                    let hits: Vec<&Arc<Table>> = tables
+                        .iter()
+                        .filter(|(q, _)| {
+                            table.as_deref().map_or(true, |t| t.eq_ignore_ascii_case(q))
+                        })
+                        .filter(|(_, t)| t.find_column(name).is_some())
+                        .map(|(_, t)| t)
+                        .collect();
+                    // Qualified: the named side; bare: unambiguous only.
+                    let t = if table.is_some() || hits.len() == 1 {
+                        hits.first().copied()?
+                    } else {
+                        return None;
+                    };
+                    return t.find_column(name).map(|i| t.columns[i].collation.clone());
+                }
+                _ => return None,
+            }
+        }
+    }
+    let norm = |c: Option<String>| c.filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("BINARY"));
+    match plan {
+        Plan::Project { input, columns } => {
+            if columns
+                .iter()
+                .any(|c| matches!(&c.expr, Expr::Column { name, .. } if name == "*"))
+            {
+                return Vec::new(); // star widths: positions not derivable here
+            }
+            let mut tables = Vec::new();
+            scope_tables(input, &mut tables);
+            columns
+                .iter()
+                .map(|c| {
+                    norm(crate::executor::expr::explicit_collation(&c.expr))
+                        .or_else(|| norm(declared(&c.expr, &tables)))
+                })
+                .collect()
+        }
+        Plan::Distinct { input }
+        | Plan::Sort { input, .. }
+        | Plan::Limit { input, .. }
+        | Plan::Filter { input, .. } => plan_output_collations(input),
+        Plan::Union { left, right, .. }
+        | Plan::Intersect { left, right }
+        | Plan::Except { left, right } => {
+            let l = plan_output_collations(left);
+            let r = plan_output_collations(right);
+            (0..l.len().max(r.len()))
+                .map(|i| {
+                    l.get(i)
+                        .cloned()
+                        .flatten()
+                        .or_else(|| r.get(i).cloned().flatten())
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// De-duplication key of a row under per-column collations (see
+/// `plan_output_collations`); the plain row when none applies.
+fn collated_row_key(row: &Row, colls: &[Option<String>]) -> SqlRowKey {
+    if colls.iter().all(|c| c.is_none()) {
+        return SqlRowKey(row.clone());
+    }
+    SqlRowKey(
+        row.iter()
+            .enumerate()
+            .map(|(i, v)| match colls.get(i).and_then(|c| c.as_deref()) {
+                Some(c) => crate::plugin::collation_fold_key(c, v),
+                None => v.clone(),
+            })
+            .collect(),
+    )
+}
+
 fn exec_distinct(ctx: &mut ExecContext<'_>, input: &Plan) -> Result<ExecResult> {
+    let colls = plan_output_collations(input);
     let mut inner = execute(input, ctx)?;
     // O(n) first-occurrence dedup under `Value::eq` semantics (the old
     // Vec::contains linear scan was O(n^2) — 300k rows took 132 s;
@@ -16952,7 +17683,7 @@ fn exec_distinct(ctx: &mut ExecContext<'_>, input: &Plan) -> Result<ExecResult> 
         std::collections::HashSet::with_capacity(inner.rows.len());
     let mut out: Vec<Row> = Vec::with_capacity(inner.rows.len());
     for row in inner.rows.drain(..) {
-        if seen.insert(SqlRowKey(row.clone())) {
+        if seen.insert(collated_row_key(&row, &colls)) {
             out.push(row);
         }
     }
@@ -16963,6 +17694,20 @@ fn exec_distinct(ctx: &mut ExecContext<'_>, input: &Plan) -> Result<ExecResult> 
 // ============================================================================
 // Set operations
 // ============================================================================
+
+/// A compound's per-column collations: the left arm's, else the right's.
+fn compound_collations(left: &Plan, right: &Plan) -> Vec<Option<String>> {
+    let l = plan_output_collations(left);
+    let r = plan_output_collations(right);
+    (0..l.len().max(r.len()))
+        .map(|i| {
+            l.get(i)
+                .cloned()
+                .flatten()
+                .or_else(|| r.get(i).cloned().flatten())
+        })
+        .collect()
+}
 
 fn exec_union(
     ctx: &mut ExecContext<'_>,
@@ -16977,13 +17722,14 @@ fn exec_union(
     if all {
         rows.extend(r.rows);
     } else {
+        let colls = compound_collations(left, right);
         // O(n) dedup of the concatenation, first-seen order (the old
         // Vec::contains scan was O(n^2)).
         let mut seen: std::collections::HashSet<SqlRowKey> =
             std::collections::HashSet::with_capacity(rows.len() + r.rows.len());
         let mut out: Vec<Row> = Vec::with_capacity(rows.len() + r.rows.len());
         for row in rows.into_iter().chain(r.rows) {
-            if seen.insert(SqlRowKey(row.clone())) {
+            if seen.insert(collated_row_key(&row, &colls)) {
                 out.push(row);
             }
         }
@@ -16996,14 +17742,18 @@ fn exec_intersect(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan) -> Resul
     let l = execute(left, ctx)?;
     let r = execute(right, ctx)?;
     let columns = l.columns.clone();
+    let colls = compound_collations(left, right);
     // O(n) membership + dedup (the old Vec::contains scans were O(n^2)).
-    let rseen: std::collections::HashSet<SqlRowKey> =
-        r.rows.iter().map(|row| SqlRowKey(row.clone())).collect();
+    let rseen: std::collections::HashSet<SqlRowKey> = r
+        .rows
+        .iter()
+        .map(|row| collated_row_key(row, &colls))
+        .collect();
     let mut seen: std::collections::HashSet<SqlRowKey> =
         std::collections::HashSet::with_capacity(l.rows.len());
     let mut out: Vec<Row> = Vec::with_capacity(l.rows.len());
     for row in l.rows {
-        let key = SqlRowKey(row.clone());
+        let key = collated_row_key(&row, &colls);
         if rseen.contains(&key) && seen.insert(key) {
             out.push(row);
         }
@@ -17015,14 +17765,18 @@ fn exec_except(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan) -> Result<E
     let l = execute(left, ctx)?;
     let r = execute(right, ctx)?;
     let columns = l.columns.clone();
+    let colls = compound_collations(left, right);
     // O(n) membership + dedup (the old Vec::contains scans were O(n^2)).
-    let rseen: std::collections::HashSet<SqlRowKey> =
-        r.rows.iter().map(|row| SqlRowKey(row.clone())).collect();
+    let rseen: std::collections::HashSet<SqlRowKey> = r
+        .rows
+        .iter()
+        .map(|row| collated_row_key(row, &colls))
+        .collect();
     let mut seen: std::collections::HashSet<SqlRowKey> =
         std::collections::HashSet::with_capacity(l.rows.len());
     let mut out: Vec<Row> = Vec::with_capacity(l.rows.len());
     for row in l.rows {
-        let key = SqlRowKey(row.clone());
+        let key = collated_row_key(&row, &colls);
         if !rseen.contains(&key) && seen.insert(key) {
             out.push(row);
         }
@@ -17672,6 +18426,9 @@ fn exec_rowid_range(
     residual: Option<&Expr>,
     stop_after: Option<usize>,
 ) -> Result<ExecResult> {
+    // A residual that raises aborts the statement (SQLite); the scan
+    // callbacks record it here (they cannot return it).
+    let residual_err: std::cell::Cell<Option<crate::error::Error>> = std::cell::Cell::new(None);
     // Alias-qualified output columns — see exec_index_lookup's comment
     // (the leak fix).
     let out_cols: Arc<[String]> = scan_output_columns(
@@ -17735,12 +18492,11 @@ fn exec_rowid_range(
     // below registers the legacy "rowid" name — the trailing slot
     // position is the same either way.
     let append_rowid = crate::planner::wants_rowid_slot(&table);
-    let residual = residual.filter(|_| {
-        // WITHOUT ROWID tables have no rowid; a real "rowid" column
-        // shadows the pseudo name (find_column already resolved it in
-        // the row).
-        !table.without_rowid && !has_real_rowid_col
-    });
+    // WITHOUT ROWID tables have no rowid; a real "rowid" column shadows
+    // the pseudo name (find_column already resolved it in the row). That
+    // gates the SLOT name only — the residual itself always applies (it
+    // used to be dropped here: extra conjuncts silently ignored).
+    let rowid_slot_ok = !table.without_rowid && !has_real_rowid_col;
     let eval_cols: Vec<String> = if residual.is_some() {
         // Alias-qualified names (+ the hidden rowid slot) — a residual
         // referencing `alias.col` must resolve LOCALLY, not through the
@@ -17755,7 +18511,9 @@ fn exec_rowid_range(
         // The rewrite emits the QUALIFIED slot name ("t.\0rowid");
         // bare `rowid` refs still resolve through lookup's rowid special
         // case (is_hidden_rowid matches the qualified spelling).
-        v.push(crate::planner::hidden_rowid_slot(prefix));
+        if rowid_slot_ok {
+            v.push(crate::planner::hidden_rowid_slot(prefix));
+        }
         v
     } else {
         Vec::new()
@@ -17768,7 +18526,9 @@ fn exec_rowid_range(
     // (stateful-fuzz deep-sweep).
     let eval_affs: Vec<crate::types::Affinity> = if residual.is_some() {
         let mut a: Vec<crate::types::Affinity> = table.col_affinities.iter().copied().collect();
-        a.push(crate::types::Affinity::Integer);
+        if rowid_slot_ok {
+            a.push(crate::types::Affinity::Integer);
+        }
         a
     } else {
         Vec::new()
@@ -17785,9 +18545,14 @@ fn exec_rowid_range(
                 if let Some(res) = residual_expr {
                     row.push(Value::Integer(rowid));
                     let keep =
-                        eval_row_aff(res, &row, &eval_cols, &eval_affs, params, named_params)
-                            .map(|v| v.is_truthy())
-                            .unwrap_or(false);
+                        match eval_row_aff(res, &row, &eval_cols, &eval_affs, params, named_params)
+                        {
+                            Ok(v) => v.is_truthy(),
+                            Err(e) => {
+                                residual_err.set(Some(e));
+                                false
+                            }
+                        };
                     if !keep {
                         return true;
                     }
@@ -17812,6 +18577,9 @@ fn exec_rowid_range(
     )?;
 
     let columns = out_cols;
+    if let Some(e) = residual_err.take() {
+        return Err(e);
+    }
     Ok(ExecResult { columns, rows })
 }
 
@@ -17904,6 +18672,9 @@ fn exec_rowid_range_projected_impl(
     residual: Option<&Expr>,
     stop_after: Option<usize>,
 ) -> Result<ExecResult> {
+    // A residual that raises aborts the statement (SQLite); the scan
+    // callbacks record it here (they cannot return it).
+    let residual_err: std::cell::Cell<Option<crate::error::Error>> = std::cell::Cell::new(None);
     let empty_row: Vec<Value> = Vec::new();
     let empty_cols: Vec<String> = Vec::new();
     let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
@@ -17946,14 +18717,22 @@ fn exec_rowid_range_projected_impl(
     // Residual evaluation context: the decoded row + the rowid pseudo-
     // column (see `exec_rowid_range`). Same gating: no pseudo column on
     // WITHOUT ROWID tables or tables with a real "rowid" column.
+    // The residual ALWAYS applies — it used to be dropped outright on
+    // WITHOUT ROWID tables and tables with a real "rowid" column (the
+    // gating meant only the pseudo-column, not the predicate): their
+    // extra WHERE conjuncts were silently ignored. Only the rowid slot's
+    // NAME is gated (the value is pushed / popped regardless, past the
+    // named columns, where an unnamed value is never read).
     let has_real_rowid_col = table.find_column("rowid").is_some();
-    let residual = residual.filter(|_| !table.without_rowid && !has_real_rowid_col);
+    let rowid_slot_ok = !table.without_rowid && !has_real_rowid_col;
     let eval_cols: Vec<String> = if residual.is_some() {
         let mut v: Vec<String> = table.col_names.iter().cloned().collect();
         // The rewrite emits the QUALIFIED slot name ("t.\0rowid");
         // bare `rowid` refs still resolve through lookup's rowid special
         // case (is_hidden_rowid matches the qualified spelling).
-        v.push(crate::planner::hidden_rowid_slot(&table.name));
+        if rowid_slot_ok {
+            v.push(crate::planner::hidden_rowid_slot(&table.name));
+        }
         v
     } else {
         Vec::new()
@@ -17966,7 +18745,9 @@ fn exec_rowid_range_projected_impl(
     // (stateful-fuzz deep-sweep).
     let eval_affs: Vec<crate::types::Affinity> = if residual.is_some() {
         let mut a: Vec<crate::types::Affinity> = table.col_affinities.iter().copied().collect();
-        a.push(crate::types::Affinity::Integer);
+        if rowid_slot_ok {
+            a.push(crate::types::Affinity::Integer);
+        }
         a
     } else {
         Vec::new()
@@ -17992,10 +18773,20 @@ fn exec_rowid_range_projected_impl(
                     // columns), evaluate, then project positionally.
                     if let Ok(mut full) = decode_row(payload, n_cols, rowid, rowid_alias) {
                         full.push(Value::Integer(rowid));
-                        let keep =
-                            eval_row_aff(res, &full, &eval_cols, &eval_affs, params, named_params)
-                                .map(|v| v.is_truthy())
-                                .unwrap_or(false);
+                        let keep = match eval_row_aff(
+                            res,
+                            &full,
+                            &eval_cols,
+                            &eval_affs,
+                            params,
+                            named_params,
+                        ) {
+                            Ok(v) => v.is_truthy(),
+                            Err(e) => {
+                                residual_err.set(Some(e));
+                                false
+                            }
+                        };
                         if keep {
                             full.pop();
                             let mut row = Vec::with_capacity(idxs.len());
@@ -18014,16 +18805,20 @@ fn exec_rowid_range_projected_impl(
                     if let Ok(mut row) = decode_row(payload, n_cols, rowid, rowid_alias) {
                         if let Some(res) = residual {
                             row.push(Value::Integer(rowid));
-                            let keep = eval_row_aff(
+                            let keep = match eval_row_aff(
                                 res,
                                 &row,
                                 &eval_cols,
                                 &eval_affs,
                                 params,
                                 named_params,
-                            )
-                            .map(|v| v.is_truthy())
-                            .unwrap_or(false);
+                            ) {
+                                Ok(v) => v.is_truthy(),
+                                Err(e) => {
+                                    residual_err.set(Some(e));
+                                    false
+                                }
+                            };
                             if !keep {
                                 return true;
                             }
@@ -18043,6 +18838,9 @@ fn exec_rowid_range_projected_impl(
         },
         pred_may_reenter,
     )?;
+    if let Some(e) = residual_err.take() {
+        return Err(e);
+    }
     Ok(ExecResult {
         columns: out_cols,
         rows,
@@ -18448,10 +19246,15 @@ fn exec_index_range(
     };
 
     // Scan the index from the start bound.
+    // No lower bound: start PAST the NULL entries (NULL's order key is
+    // the single byte 0x00, every non-NULL key starts at >= 0x01) —
+    // `col < X` never matches NULL (SQLite OP_SeekGT on NULL). Starting
+    // at the empty key used to return the col-IS-NULL rows, and
+    // `DELETE ... WHERE col < X` deleted them.
     let scan_start: Vec<u8> = start_key
         .as_ref()
         .map(|(k, _)| k.clone())
-        .unwrap_or_default();
+        .unwrap_or_else(|| vec![0x01]);
     let mut rowids: Vec<i64> = Vec::new();
     {
         let index_root = ctx.index_root(&index);
@@ -18557,6 +19360,7 @@ fn exec_index_range(
         };
         let mut bt = Btree::new(ctx.pager, table_root, false);
         let pred_may_reenter = residual_pred.is_some_and(expr_has_subquery);
+        let mut scan_err: Option<crate::error::Error> = None;
         bt.scan_table_borrowed_opts(
             |rowid, payload| {
                 // Advance the merge cursor.
@@ -18578,7 +19382,10 @@ fn exec_index_range(
                         Some(pred) => match eval_row(pred, &row, eval_list, &params, &named_params)
                         {
                             Ok(v) => v.is_truthy(),
-                            Err(_) => false,
+                            Err(e) => {
+                                scan_err = Some(e);
+                                return false;
+                            }
                         },
                         None => true,
                     };
@@ -18592,6 +19399,9 @@ fn exec_index_range(
             },
             pred_may_reenter,
         )?;
+        if let Some(e) = scan_err {
+            return Err(e);
+        }
         for row in placed.into_iter().flatten() {
             rows.push(row);
         }
@@ -18626,10 +19436,12 @@ fn exec_index_range(
                     if !v.is_truthy() {
                         continue;
                     }
-                    if !append_rowid {
-                        // eval-only slot: restore the table shape.
-                        row.pop();
-                    }
+                    // (The slot is pushed only when it belongs in the
+                    // OUTPUT — there is nothing to pop otherwise. A `pop()`
+                    // here for slot-less tables — INTEGER PRIMARY KEY and
+                    // WITHOUT ROWID — deleted the row's LAST REAL COLUMN:
+                    // `SELECT j, k, l FROM wr WHERE k < 5 AND l > 0`
+                    // panicked indexing the vanished column.)
                 } else if append_rowid {
                     row.push(Value::Integer(rowid));
                 }
@@ -18682,6 +19494,9 @@ fn exec_index_range_projected(
     project: Option<&[usize]>,
     out_cols: Arc<[String]>,
 ) -> Result<ExecResult> {
+    // A residual that raises aborts the statement (SQLite); the scan
+    // callbacks record it here (they cannot return it).
+    let residual_err: std::cell::Cell<Option<crate::error::Error>> = std::cell::Cell::new(None);
     // Evaluate the bound expressions (constants / parameters), folding
     // through the first index column's collation — same logic as
     // exec_index_range.
@@ -18715,10 +19530,15 @@ fn exec_index_range_projected(
         Some((e, inc)) => Some((fold_bound(e)?.encode_order_key(), *inc)),
         None => None,
     };
+    // No lower bound: start PAST the NULL entries (NULL's order key is
+    // the single byte 0x00, every non-NULL key starts at >= 0x01) —
+    // `col < X` never matches NULL (SQLite OP_SeekGT on NULL). Starting
+    // at the empty key used to return the col-IS-NULL rows, and
+    // `DELETE ... WHERE col < X` deleted them.
     let scan_start: Vec<u8> = start_key
         .as_ref()
         .map(|(k, _)| k.clone())
-        .unwrap_or_default();
+        .unwrap_or_else(|| vec![0x01]);
 
     // Phase 1: collect the matching rowids in index order.
     let mut rowids: Vec<i64> = Vec::new();
@@ -18773,14 +19593,22 @@ fn exec_index_range_projected(
     // Residual evaluation context: decoded row + rowid pseudo-column
     // (same gating as exec_rowid_range: no pseudo column on WITHOUT
     // ROWID tables or tables with a real "rowid" column).
+    // The residual ALWAYS applies — it used to be dropped outright on
+    // WITHOUT ROWID tables and tables with a real "rowid" column (the
+    // gating meant only the pseudo-column, not the predicate): their
+    // extra WHERE conjuncts were silently ignored. Only the rowid slot's
+    // NAME is gated (the value is pushed / popped regardless, past the
+    // named columns, where an unnamed value is never read).
     let has_real_rowid_col = table.find_column("rowid").is_some();
-    let residual = residual.filter(|_| !table.without_rowid && !has_real_rowid_col);
+    let rowid_slot_ok = !table.without_rowid && !has_real_rowid_col;
     let eval_cols: Vec<String> = if residual.is_some() {
         let mut v: Vec<String> = table.col_names.iter().cloned().collect();
         // The rewrite emits the QUALIFIED slot name ("t.\0rowid");
         // bare `rowid` refs still resolve through lookup's rowid special
         // case (is_hidden_rowid matches the qualified spelling).
-        v.push(crate::planner::hidden_rowid_slot(&table.name));
+        if rowid_slot_ok {
+            v.push(crate::planner::hidden_rowid_slot(&table.name));
+        }
         v
     } else {
         Vec::new()
@@ -18793,7 +19621,9 @@ fn exec_index_range_projected(
     // (stateful-fuzz deep-sweep).
     let eval_affs: Vec<crate::types::Affinity> = if residual.is_some() {
         let mut a: Vec<crate::types::Affinity> = table.col_affinities.iter().copied().collect();
-        a.push(crate::types::Affinity::Integer);
+        if rowid_slot_ok {
+            a.push(crate::types::Affinity::Integer);
+        }
         a
     } else {
         Vec::new()
@@ -18844,16 +19674,20 @@ fn exec_index_range_projected(
                 Some(res) => {
                     if let Ok(mut full) = decode_row(payload, n_cols, rowid, rowid_alias) {
                         full.push(Value::Integer(rowid));
-                        let k = eval_row_aff(
+                        let k = match eval_row_aff(
                             res,
                             &full,
                             &eval_cols,
                             &eval_affs,
                             &params,
                             &named_params,
-                        )
-                        .map(|v| v.is_truthy())
-                        .unwrap_or(false);
+                        ) {
+                            Ok(v) => v.is_truthy(),
+                            Err(e) => {
+                                residual_err.set(Some(e));
+                                false
+                            }
+                        };
                         full.pop();
                         if k {
                             placed[position.get(&rowid).copied().unwrap_or(usize::MAX)] =
@@ -18906,16 +19740,20 @@ fn exec_index_range_projected(
                     if let LookupResult::Found(payload) = table_bt.lookup_table(rowid)? {
                         if let Ok(mut full) = decode_row(&payload, n_cols, rowid, rowid_alias) {
                             full.push(Value::Integer(rowid));
-                            let keep = eval_row_aff(
+                            let keep = match eval_row_aff(
                                 res,
                                 &full,
                                 &eval_cols,
                                 &eval_affs,
                                 &params,
                                 &named_params,
-                            )
-                            .map(|v| v.is_truthy())
-                            .unwrap_or(false);
+                            ) {
+                                Ok(v) => v.is_truthy(),
+                                Err(e) => {
+                                    residual_err.set(Some(e));
+                                    false
+                                }
+                            };
                             full.pop();
                             if keep {
                                 rows.push(project_row_from_full(Some(idxs), &full, rowid));
@@ -18928,16 +19766,20 @@ fn exec_index_range_projected(
                         if let Ok(mut row) = decode_row(&payload, n_cols, rowid, rowid_alias) {
                             if let Some(res) = res {
                                 row.push(Value::Integer(rowid));
-                                let keep = eval_row_aff(
+                                let keep = match eval_row_aff(
                                     res,
                                     &row,
                                     &eval_cols,
                                     &eval_affs,
                                     &params,
                                     &named_params,
-                                )
-                                .map(|v| v.is_truthy())
-                                .unwrap_or(false);
+                                ) {
+                                    Ok(v) => v.is_truthy(),
+                                    Err(e) => {
+                                        residual_err.set(Some(e));
+                                        false
+                                    }
+                                };
                                 if !keep {
                                     continue;
                                 }
@@ -18951,6 +19793,9 @@ fn exec_index_range_projected(
         }
     }
 
+    if let Some(e) = residual_err.take() {
+        return Err(e);
+    }
     Ok(ExecResult {
         columns: out_cols,
         rows,
@@ -19647,6 +20492,21 @@ fn exec_insert_inner(
                 (states, name_lc, row, payload, cols, target)
             }
         };
+    // A REUSED scratch carries the column names its FIRST statement
+    // needed — none when that statement had no RETURNING / CHECK /
+    // generated column. Rebuild them for this statement when it needs
+    // them: an `INSERT ... RETURNING` after a same-shape plain INSERT
+    // (e.g. an UPSERT) resolved every RETURNING column against an empty
+    // name list and returned all NULLs.
+    let col_names: Vec<String> = if col_names.is_empty()
+        && (returning.is_some()
+            || !table.check_exprs.is_empty()
+            || table_has_generated_columns(&table))
+    {
+        table.columns.iter().map(|c| c.name.clone()).collect()
+    } else {
+        col_names
+    };
     let empty_row: Vec<Value> = Vec::new();
     let empty_cols: Vec<String> = Vec::new();
 
@@ -20128,14 +20988,20 @@ fn exec_insert_inner(
             }
         }
 
-        // NOT NULL + CHECK constraints (see fast path).
-        enforce_row_constraints(
+        // NOT NULL + CHECK constraints (see the VALUES path): OR IGNORE
+        // skips a violating SELECT row exactly like a VALUES row.
+        if let Err(e) = enforce_row_constraints(
             &table,
             &full_row,
             &col_names,
             &ctx.params,
             &ctx.named_params,
-        )?;
+        ) {
+            if on_conflict == crate::sql::ast::ConflictResolution::Ignore {
+                continue;
+            }
+            return Err(e);
+        }
         enforce_child_fks(ctx, &table, &full_row)?;
 
         let (outcome, landed_rowid) = exec_insert_one_row(
@@ -22819,6 +23685,10 @@ pub fn next_auto_rowid(pager: &Pager, root: u32, max_rowid: i64, autoinc: bool) 
 /// all-negative table to the empty-table behavior; SQLite reads the
 /// tree's true max for every OP_NewRowid and so must we.
 fn find_max_rowid_opt(pager: &Pager, root: u32) -> Result<Option<i64>> {
+    // Rowid ALLOCATION input, not a semantic read: in the concurrent
+    // regime sibling draws come from the disjoint reservation, and the
+    // inserted rowid's own uniqueness is enforced row-level.
+    let _structural = pager.structural_scope();
     // Fast path: the table btree's keys are rowids in ascending order —
     // the maximum is the LAST cell of the RIGHT-MOST leaf, one O(log N)
     // descent (SQLite's OP_NewRowid basis: OP_Last). The scan that used
@@ -22896,6 +23766,8 @@ fn exec_update(
     // across rows) and ONE Vec<u8> allocation for the encoded payload
     // (also reused). Cuts ~80% of the allocations on a 10k-row UPDATE,
     // closing the 23× UPDATE-range gap vs SQLite.
+    let flattened = flatten_dml_source(source);
+    let source: &Plan = flattened.as_ref().unwrap_or(source);
     if let Some(result) =
         try_streaming_update(ctx, &table, source, assignments, returning, or_conflict)?
     {
@@ -23571,17 +24443,32 @@ fn try_streaming_update(
         },
     }
     let src = match source {
-        Plan::Scan { table: t, .. } => StreamingSource::Scan {
+        // The scan's OWN predicate is the WHERE filter — it used to be
+        // dropped here (`filter: None`), which would have updated EVERY
+        // row of a table whose DML source carried a scan predicate.
+        Plan::Scan {
             table: t,
-            filter: None,
+            predicate,
+            ..
+        } => StreamingSource::Scan {
+            table: t,
+            filter: predicate.as_ref(),
         },
         Plan::Filter { input, predicate } => {
-            if let Plan::Scan { table: t, .. } = input.as_ref() {
+            if let Plan::Scan {
+                table: t,
+                predicate: None,
+                ..
+            } = input.as_ref()
+            {
                 StreamingSource::Scan {
                     table: t,
                     filter: Some(predicate),
                 }
             } else {
+                // (A Filter over a predicated scan is flattened by
+                // flatten_dml_source before it gets here; anything else
+                // takes the general path.)
                 return Ok(None);
             }
         }
@@ -23939,6 +24826,20 @@ fn try_streaming_update(
         table,
         &crate::sql::ast::TriggerEvent::Update(vec![]),
     );
+    // RE-ENTRANCY: the per-row callback evaluates SET / WHERE / RETURNING
+    // expressions and fires triggers — any subquery or trigger body may
+    // read the very table being scanned. A borrowed scan holds the leaf
+    // page's (non-reentrant) lock across the callback, so such a nested
+    // read DEADLOCKED (`UPDATE t SET g = (SELECT count(*) FROM t ...)`
+    // hung forever); those statements walk with payloads copied out.
+    let may_reenter = has_update_triggers
+        || residual_pred.is_some_and(expr_has_subquery)
+        || assignments.iter().any(|(_, e)| expr_has_subquery(e))
+        || returning.is_some_and(|r| {
+            r.iter().any(|c| {
+                matches!(c, crate::sql::ast::ResultColumn::Expr { expr, .. } if expr_has_subquery(expr))
+            })
+        });
     // Statement-atomicity: the pre-update payload is ALWAYS stashed now —
     // the undo journal (StmtUndoEntry::Updated) needs it whether or not
     // indexes/triggers do. A failed statement replays every applied row
@@ -24207,40 +25108,45 @@ fn try_streaming_update(
             }
             Ok::<(), crate::error::Error>(())
         } else {
-            bt.scan_table_range_borrowed(range_start, range_end, |rowid, payload| {
-                let old_owned = if needs_old_payload {
-                    Some(payload.to_vec())
-                } else {
-                    None
-                };
-                if let Err(e) = process_update_row(
-                    ctx,
-                    payload,
-                    n_cols,
-                    rowid,
-                    &mut row_buf,
-                    &mut new_row,
-                    &mut payload_buf,
-                    assignments,
-                    col_names,
-                    &params,
-                    &named_params,
-                    table,
-                    residual_pred,
-                    &mut updates,
-                    &mut update_arena,
-                    &mut returning_rows,
-                    returning,
-                    old_owned,
-                    compiled_ref,
-                    compiled_residual.as_ref(),
-                    patch_ctx.as_mut(),
-                ) {
-                    first_error = Some(e);
-                    return false; // stop the scan
-                }
-                true
-            })
+            bt.scan_table_range_borrowed_opts(
+                range_start,
+                range_end,
+                |rowid, payload| {
+                    let old_owned = if needs_old_payload {
+                        Some(payload.to_vec())
+                    } else {
+                        None
+                    };
+                    if let Err(e) = process_update_row(
+                        ctx,
+                        payload,
+                        n_cols,
+                        rowid,
+                        &mut row_buf,
+                        &mut new_row,
+                        &mut payload_buf,
+                        assignments,
+                        col_names,
+                        &params,
+                        &named_params,
+                        table,
+                        residual_pred,
+                        &mut updates,
+                        &mut update_arena,
+                        &mut returning_rows,
+                        returning,
+                        old_owned,
+                        compiled_ref,
+                        compiled_residual.as_ref(),
+                        patch_ctx.as_mut(),
+                    ) {
+                        first_error = Some(e);
+                        return false; // stop the scan
+                    }
+                    true
+                },
+                may_reenter,
+            )
         }
     } else if let StreamingSource::IndexRange {
         table: t,
@@ -24262,6 +25168,14 @@ fn try_streaming_update(
         let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &params, &named_params);
         // Collated index: fold bounds through the first column's collation.
         let fold_bound = |e: &Expr| eval_index_bound(e, &eval_ctx, t, index);
+        // NULL bound: EMPTY range (see the streaming delete) — it used to
+        // scan from the first entry and `UPDATE ... WHERE pk > NULL`
+        // rewrote every row.
+        let null_bound = match (start, end) {
+            (Some((e, _)), _) if evaluate(e, &eval_ctx)?.is_null() => true,
+            (_, Some((e, _))) if evaluate(e, &eval_ctx)?.is_null() => true,
+            _ => false,
+        };
         let start_key: Option<(Vec<u8>, bool)> = match start {
             Some((e, inc)) => Some((fold_bound(e)?.encode_order_key(), *inc)),
             None => None,
@@ -24270,15 +25184,23 @@ fn try_streaming_update(
             Some((e, inc)) => Some((fold_bound(e)?.encode_order_key(), *inc)),
             None => None,
         };
+        // No lower bound: start PAST the NULL entries (NULL's order key is
+        // the single byte 0x00, every non-NULL key starts at >= 0x01) —
+        // `col < X` never matches NULL (SQLite OP_SeekGT on NULL). Starting
+        // at the empty key used to return the col-IS-NULL rows, and
+        // `DELETE ... WHERE col < X` deleted them.
         let scan_start: Vec<u8> = start_key
             .as_ref()
             .map(|(k, _)| k.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|| vec![0x01]);
         let mut rowids: Vec<i64> = Vec::new();
         {
             let index_root = ctx.index_root(index);
             let mut index_bt = Btree::new(ctx.pager, index_root, true);
             index_bt.scan_index_from(&scan_start, |rowid, cell_key| {
+                if null_bound {
+                    return false; // empty range
+                }
                 // Exclusive lower bound: skip entries matching the bound key.
                 if let Some((k, false)) = &start_key {
                     if cell_key.starts_with(k) {
@@ -24454,63 +25376,68 @@ fn try_streaming_update(
                     }
                 }
             } else {
-                bt.scan_table_range_borrowed(walk_lo, walk_hi, |rowid, payload| {
-                    let is_match = if dense {
-                        let bit = (rowid - walk_lo) as u64;
-                        bitset[(bit / 64) as usize] & (1u64 << (bit % 64)) != 0
-                    } else {
-                        while ri < rowids.len() && rowids[ri] < rowid {
+                bt.scan_table_range_borrowed_opts(
+                    walk_lo,
+                    walk_hi,
+                    |rowid, payload| {
+                        let is_match = if dense {
+                            let bit = (rowid - walk_lo) as u64;
+                            bitset[(bit / 64) as usize] & (1u64 << (bit % 64)) != 0
+                        } else {
+                            while ri < rowids.len() && rowids[ri] < rowid {
+                                ri += 1;
+                            }
+                            if ri >= rowids.len() {
+                                return false; // all matches processed
+                            }
+                            rowids[ri] == rowid
+                        };
+                        if !is_match {
+                            // Past the last wanted rowid: stop the walk early (the
+                            // range may over-cover).
+                            if !dense && ri >= rowids.len() {
+                                return false;
+                            }
+                            return true;
+                        }
+                        if !dense {
                             ri += 1;
                         }
-                        if ri >= rowids.len() {
-                            return false; // all matches processed
-                        }
-                        rowids[ri] == rowid
-                    };
-                    if !is_match {
-                        // Past the last wanted rowid: stop the walk early (the
-                        // range may over-cover).
-                        if !dense && ri >= rowids.len() {
+                        let old_owned = if needs_old_payload {
+                            Some(payload.to_vec())
+                        } else {
+                            None
+                        };
+                        if let Err(e) = process_update_row(
+                            ctx,
+                            payload,
+                            n_cols,
+                            rowid,
+                            &mut row_buf,
+                            &mut new_row,
+                            &mut payload_buf,
+                            assignments,
+                            col_names,
+                            &params,
+                            &named_params,
+                            table,
+                            residual_pred,
+                            &mut updates,
+                            &mut update_arena,
+                            &mut returning_rows,
+                            returning,
+                            old_owned,
+                            compiled_ref,
+                            compiled_residual.as_ref(),
+                            patch_ctx.as_mut(),
+                        ) {
+                            err = Some(e);
                             return false;
                         }
-                        return true;
-                    }
-                    if !dense {
-                        ri += 1;
-                    }
-                    let old_owned = if needs_old_payload {
-                        Some(payload.to_vec())
-                    } else {
-                        None
-                    };
-                    if let Err(e) = process_update_row(
-                        ctx,
-                        payload,
-                        n_cols,
-                        rowid,
-                        &mut row_buf,
-                        &mut new_row,
-                        &mut payload_buf,
-                        assignments,
-                        col_names,
-                        &params,
-                        &named_params,
-                        table,
-                        residual_pred,
-                        &mut updates,
-                        &mut update_arena,
-                        &mut returning_rows,
-                        returning,
-                        old_owned,
-                        compiled_ref,
-                        compiled_residual.as_ref(),
-                        patch_ctx.as_mut(),
-                    ) {
-                        err = Some(e);
-                        return false;
-                    }
-                    true
-                })?;
+                        true
+                    },
+                    may_reenter,
+                )?;
             }
             if let Some(e) = err {
                 first_error = Some(e);
@@ -24722,7 +25649,7 @@ fn try_streaming_update(
         } else {
             // PK-ordered walk for WITHOUT ROWID tables (RETURNING order
             // and trigger firing order follow the table scan order).
-            scan_table_rows(ctx, table, false, |rowid, payload| {
+            scan_table_rows(ctx, table, may_reenter, |rowid, payload| {
                 let old_owned = if needs_old_payload {
                     Some(payload.to_vec())
                 } else {
@@ -25685,6 +26612,48 @@ fn and_predicates(a: Option<&Expr>, b: Option<&Expr>) -> Option<Expr> {
     }
 }
 
+/// Normalize a DML source's filter stack: nested `Filter`s, and a
+/// `Filter` over a predicated `Scan`, collapse into ONE predicate (the
+/// planner can stack them — a row-dependent residual over a WHERE
+/// split). The streaming UPDATE / DELETE paths match single-level shapes
+/// only, and the generic fallback cannot identify WITHOUT ROWID rows:
+/// `DELETE FROM wr WHERE (k AND '5.') AND (j BETWEEN 0 AND j)` failed
+/// with "unsupported". `None` = already flat.
+fn flatten_dml_source(source: &Plan) -> Option<Plan> {
+    let Plan::Filter { input, predicate } = source else {
+        return None;
+    };
+    let mut preds: Vec<Expr> = vec![predicate.clone()];
+    let mut bottom: &Plan = input;
+    while let Plan::Filter { input, predicate } = bottom {
+        preds.push(predicate.clone());
+        bottom = input;
+    }
+    match bottom {
+        Plan::Scan {
+            table,
+            alias,
+            index,
+            predicate: own,
+        } if own.is_some() || preds.len() > 1 => {
+            if let Some(p) = own {
+                preds.push(p.clone());
+            }
+            Some(Plan::Scan {
+                table: table.clone(),
+                alias: alias.clone(),
+                index: index.clone(),
+                predicate: Some(crate::planner::combine_and(&preds)),
+            })
+        }
+        _ if preds.len() > 1 => Some(Plan::Filter {
+            input: Box::new(bottom.clone()),
+            predicate: crate::planner::combine_and(&preds),
+        }),
+        _ => None,
+    }
+}
+
 fn try_streaming_delete(
     ctx: &mut ExecContext<'_>,
     table: &Arc<Table>,
@@ -26002,6 +26971,16 @@ fn try_streaming_delete(
         let empty_cols: Vec<String> = Vec::new();
         let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &params, &named_params);
         let fold_bound = |e: &Expr| eval_index_bound(e, &eval_ctx, table, index);
+        // A NULL bound makes the comparison NULL for every row: the range
+        // is EMPTY (exec_index_range's rule). Encoded as NULL's order key
+        // it used to scan from the very first entry — and the bound's
+        // conjunct is consumed by the range, so `DELETE ... WHERE
+        // (x = NULL) < k` deleted every row.
+        let null_bound = match (start, end) {
+            (Some((e, _)), _) if evaluate(e, &eval_ctx)?.is_null() => true,
+            (_, Some((e, _))) if evaluate(e, &eval_ctx)?.is_null() => true,
+            _ => false,
+        };
         let start_key: Option<(Vec<u8>, bool)> = match start {
             Some((e, inc)) => Some((fold_bound(e)?.encode_order_key(), *inc)),
             None => None,
@@ -26010,14 +26989,22 @@ fn try_streaming_delete(
             Some((e, inc)) => Some((fold_bound(e)?.encode_order_key(), *inc)),
             None => None,
         };
+        // No lower bound: start PAST the NULL entries (NULL's order key is
+        // the single byte 0x00, every non-NULL key starts at >= 0x01) —
+        // `col < X` never matches NULL (SQLite OP_SeekGT on NULL). Starting
+        // at the empty key used to return the col-IS-NULL rows, and
+        // `DELETE ... WHERE col < X` deleted them.
         let scan_start: Vec<u8> = start_key
             .as_ref()
             .map(|(k, _)| k.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|| vec![0x01]);
         let index_root = ctx.index_root(index);
         {
             let mut index_bt = Btree::new(ctx.pager, index_root, true);
             index_bt.scan_index_from(&scan_start, |rowid, cell_key| {
+                if null_bound {
+                    return false; // empty range
+                }
                 if let Some((k, false)) = &start_key {
                     if cell_key.starts_with(k) {
                         return true; // exclusive lower bound
@@ -26199,33 +27186,40 @@ fn try_streaming_delete(
                 true
             })?;
         } else {
-            bt.scan_table_range_borrowed(lo, hi, |rowid, payload| {
-                if let Some(pred) = residual_pred {
-                    row_buf.clear();
-                    if decode_row_into(payload, n_cols, rowid, table.rowid_alias, &mut row_buf)
-                        .is_err()
-                    {
-                        return true; // skip undecodable rows, keep walking
-                    }
-                    match eval_row_aff(
-                        pred,
-                        &row_buf,
-                        &col_names,
-                        table.col_affinities.as_ref(),
-                        &params,
-                        &named_params,
-                    ) {
-                        Ok(v) if v.is_truthy() => {}
-                        Ok(_) => return true,
-                        Err(e) => {
-                            first_error = Some(e);
-                            return false;
+            // A residual with a subquery may read this very table: copy
+            // payloads out of the page lock (see try_streaming_update).
+            bt.scan_table_range_borrowed_opts(
+                lo,
+                hi,
+                |rowid, payload| {
+                    if let Some(pred) = residual_pred {
+                        row_buf.clear();
+                        if decode_row_into(payload, n_cols, rowid, table.rowid_alias, &mut row_buf)
+                            .is_err()
+                        {
+                            return true; // skip undecodable rows, keep walking
+                        }
+                        match eval_row_aff(
+                            pred,
+                            &row_buf,
+                            &col_names,
+                            table.col_affinities.as_ref(),
+                            &params,
+                            &named_params,
+                        ) {
+                            Ok(v) if v.is_truthy() => {}
+                            Ok(_) => return true,
+                            Err(e) => {
+                                first_error = Some(e);
+                                return false;
+                            }
                         }
                     }
-                }
-                rowids.push(rowid);
-                true
-            })?;
+                    rowids.push(rowid);
+                    true
+                },
+                residual_pred.is_some_and(expr_has_subquery),
+            )?;
         }
     } else {
         // Full scan (optionally filtered): walk every cell — PK-ordered
@@ -26443,6 +27437,8 @@ fn exec_delete(
     // supports DELETE on tables without an INTEGER PRIMARY KEY (rowid
     // comes from the B+tree cell key). RowidLookup sources fall through
     // to the dedicated point-delete fast path below.
+    let flattened = flatten_dml_source(source);
+    let source: &Plan = flattened.as_ref().unwrap_or(source);
     if let Some(result) = try_streaming_delete(ctx, &table, source, returning)? {
         return Ok(result);
     }

@@ -90,7 +90,42 @@ fn substr_range(n: i64, y: i64, z: i64) -> (i64, i64) {
 /// NUMERIC keeps integral values as INTEGER (`CAST('12.0' AS NUMERIC)` is
 /// the integer 12). `CAST(x AS BOOLEAN)` is PostgreSQL-borrowed: the PG
 /// boolean literal words map to 1/0 (see the arm below).
+/// Internal "affinity carrier" type names (never produced by the parser —
+/// they start with a NUL). An uncorrelated subquery materialized into a
+/// literal at execution time keeps the comparison affinity its result
+/// column had (SQLite's sqlite3ExprAffinity(TK_SELECT)) by wrapping the
+/// literal in `CAST(v AS <marker>)`, which evaluates as the IDENTITY.
+///
+/// * `\0aff:<A>`   — the expression's own affinity is `<A>` (scalar
+///   subquery result);
+/// * `\0inrhs:<A>` — on an IN operand: the materialized `IN (SELECT …)`
+///   list's column affinity was `<A>` (exprINAffinity combines it with
+///   the operand's own via sqlite3CompareAffinity).
+pub(crate) const AFF_MARKER: &str = "\0aff:";
+pub(crate) const IN_RHS_MARKER: &str = "\0inrhs:";
+
+pub(crate) fn affinity_marker(prefix: &str, a: crate::types::Affinity) -> String {
+    use crate::types::Affinity as A;
+    let tag = match a {
+        A::Integer => "INTEGER",
+        A::Real => "REAL",
+        A::Numeric => "NUMERIC",
+        A::Text => "TEXT",
+        A::Blob | A::None => "BLOB",
+    };
+    format!("{prefix}{tag}")
+}
+
+pub(crate) fn marker_affinity(type_name: &str, prefix: &str) -> Option<crate::types::Affinity> {
+    type_name
+        .strip_prefix(prefix)
+        .map(crate::types::Affinity::from_declared_type)
+}
+
 fn cast_value(v: Value, type_name: &str) -> Value {
+    if type_name.starts_with('\0') {
+        return v; // internal affinity carrier: identity
+    }
     // PostgreSQL CAST AS BOOLEAN: 'true'/'false'/'t'/'f'/'yes'/'no'/
     // 'on'/'off'/'1'/'0' (case-insensitive, surrounding whitespace
     // allowed) map to 1/0; numbers map by truthiness. Unrecognized text
@@ -179,12 +214,28 @@ fn cast_value(v: Value, type_name: &str) -> Value {
             Value::Null => Value::Null,
             Value::Integer(i) => Value::Integer(i),
             Value::Real(f) => Value::Real(f),
+            // vdbemem.c sqlite3VdbeMemNumerify, verbatim: an integer
+            // reading (sqlite3Atoi64, trailing text allowed) when the
+            // text is not a well-formed REAL; else the REAL, squeezed to
+            // INTEGER only when sqlite3RealSameAsInt. (A float-only
+            // reading lost exact integers past 2^53:
+            // CAST('-9223372036854775807' AS NUMERIC) came back REAL.)
             Value::Text(_) | Value::Blob(_) => {
-                let f = crate::types::value::parse_real_prefix(&v.as_text());
-                if f.is_finite() && f.trunc() == f && f.abs() <= 9.007_199_254_740_992e15 {
-                    Value::Integer(f as i64)
+                let bytes: Vec<u8> = match &v {
+                    Value::Blob(b) => b.clone(),
+                    other => other.as_text().as_bytes().to_vec(),
+                };
+                let (r, rc) = crate::types::numeric::atof(&bytes);
+                let (ix, irc) = crate::types::numeric::atoi64(&bytes);
+                if (rc == 0 || rc == 1) && irc <= 1 {
+                    Value::Integer(ix)
                 } else {
-                    Value::Real(f)
+                    let ix = crate::types::numeric::real_to_i64(r);
+                    if crate::types::numeric::real_same_as_int(r, ix) {
+                        Value::Integer(ix)
+                    } else {
+                        Value::Real(r)
+                    }
                 }
             }
         },
@@ -230,54 +281,6 @@ fn parse_int_prefix(s: &str) -> i64 {
     } else {
         v
     }
-}
-
-/// SQLite's `round(X, N)`: round the EXACT binary value of X to N digits,
-/// ties away from zero. The naive `x * 10^N` scale-round-divide loses to
-/// representation error (2.675 * 100 rounds to exactly 267.5 in f64, so
-/// it would round to 2.68 — SQLite gives 2.67 because 2.675 is actually
-/// 2.67499999... in binary). The FMA error term recovers the direction of
-/// the true product when the scaled value lands exactly on a .5 boundary.
-fn sqlite_round(x: f64, n: i64) -> f64 {
-    if x.is_infinite() {
-        return x;
-    }
-    let n = n.clamp(0, 30);
-    // |x| >= 2^52 is already an exact integer; rounding to N >= 0 digits
-    // cannot change it (SQLite short-circuits the same range).
-    if x.abs() >= 4_503_599_627_370_496.0 {
-        return x;
-    }
-    if n == 0 {
-        // SQLite: (i64)(r + (r < 0 ? -0.5 : +0.5)) — half away from zero.
-        return (x + if x < 0.0 { -0.5 } else { 0.5 }).trunc();
-    }
-    let factor = 10f64.powi(n as i32);
-    let scaled = x * factor;
-    if !scaled.is_finite() {
-        return x;
-    }
-    // Exact rounding error of the multiplication (FMA is correctly
-    // rounded): true_product == scaled + err exactly.
-    let err = f64::mul_add(x, factor, -scaled);
-    let rounded = if scaled.fract().abs() == 0.5 && err != 0.0 {
-        // The scaled value sits exactly on a half boundary but the TRUE
-        // product is on one side of it: round toward the true side.
-        // err > 0 means the true product is greater than `scaled`.
-        let true_is_above = err > 0.0;
-        let scaled_is_positive = scaled > 0.0;
-        if true_is_above == scaled_is_positive {
-            // True value lies AWAY from zero relative to the boundary.
-            scaled.round()
-        } else {
-            scaled.trunc()
-        }
-    } else {
-        // Either not at a boundary (plain round is exact) or an exact
-        // mathematical tie (SQLite rounds half away from zero).
-        scaled.round()
-    };
-    rounded / factor
 }
 
 /// A row context: maps column references (table, name) to values.
@@ -396,6 +399,92 @@ impl<'a> EvalContext<'a> {
         self.column_affinities?.get(i).copied()
     }
 
+    /// Comparison-affinity resolution for a column reference: the
+    /// context's own affinity map when it has one, otherwise the
+    /// statement-scoped source registry ([`AffinityScope`]) — which is
+    /// what gives projection lists, GROUP BY / HAVING / ORDER BY
+    /// expressions, aggregate arguments and join rows the same
+    /// comparison semantics as single-table WHERE filters.
+    pub fn comparison_column_affinity(&self, e: &Expr) -> Option<crate::types::Affinity> {
+        if self.column_affinities.is_some() {
+            return self.column_expr_affinity(e);
+        }
+        let Expr::Column { table, name } = e else {
+            return None;
+        };
+        affinity_scope_lookup(
+            self.source_qualifier(table.as_deref(), name).as_deref(),
+            name,
+        )
+    }
+
+    /// The FROM qualifier a column reference binds to: its own, else the
+    /// one this row's column list resolves a bare name to (so the
+    /// registry lookup learns which source it means).
+    fn source_qualifier(&self, table: Option<&str>, name: &str) -> Option<String> {
+        match table {
+            Some(t) => Some(t.to_ascii_lowercase()),
+            None => {
+                for n in self.column_names.iter() {
+                    if n.eq_ignore_ascii_case(name) {
+                        return None;
+                    }
+                    if let Some(pos) = n.rfind('.') {
+                        if n[pos + 1..].eq_ignore_ascii_case(name) {
+                            return Some(n[..pos].to_ascii_lowercase());
+                        }
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    /// sqlite3ExprCollSeq for an operand: an explicit COLLATE (also one
+    /// nested inside the expression — SQLite's EP_Collate propagation),
+    /// else — through CAST and unary `+` — a table column's DECLARED
+    /// collation ("BINARY" when it declares none). `None`: no collation
+    /// (the comparison's other operand may supply one).
+    pub(crate) fn expr_collation(&self, e: &Expr) -> Option<String> {
+        if let Some(c) = explicit_collation(e) {
+            return Some(c);
+        }
+        // No collated column anywhere in scope: a column operand is BINARY,
+        // which is the default — nothing to resolve.
+        if COLLATED_FRAMES.with(|c| c.get()) == 0 {
+            return None;
+        }
+        let mut p = e;
+        loop {
+            match p {
+                Expr::Cast { expr, .. }
+                | Expr::Unary {
+                    op: crate::sql::ast::UnaryOp::Pos,
+                    expr,
+                } => p = expr,
+                Expr::Column { table, name } => {
+                    let q = self.source_qualifier(table.as_deref(), name);
+                    return collation_scope_lookup(q.as_deref(), name);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// sqlite3BinaryCompareCollSeq: an explicit COLLATE on the left
+    /// operand, else on the right, else the left operand's collation
+    /// (a left COLUMN decides even when it is the default BINARY), else
+    /// the right's. Comparisons in EVERY context get this — the
+    /// planner's WHERE/ON rewrite used to be the only place a column's
+    /// declared collation applied (`SELECT b = 'X'` over a NOCASE column
+    /// compared BINARY).
+    pub(crate) fn binary_comparison_collation(&self, left: &Expr, right: &Expr) -> Option<String> {
+        explicit_collation(left)
+            .or_else(|| explicit_collation(right))
+            .or_else(|| self.expr_collation(left))
+            .or_else(|| self.expr_collation(right))
+    }
+
     pub fn add_table(&mut self, alias: &str, row: &'a [Value]) {
         self.tables.insert(alias.to_ascii_lowercase(), row);
     }
@@ -504,19 +593,176 @@ impl<'a> EvalContext<'a> {
     }
 }
 
-/// An operand with NO affinity of its own: a literal, a bound parameter,
-/// or a COLLATE wrapper around one (SQLite: anything that is not a
-/// column reference or a CAST). Comparisons against an affinity-carrying
-/// column coerce these BEFORE comparing.
-fn plain_operand(e: &Expr) -> bool {
+// ---------------------------------------------------------------------------
+// Statement-scoped affinity registry
+// ---------------------------------------------------------------------------
+
+/// One frame of the affinity registry: FROM qualifier -> table schema.
+type AffinityFrame = Vec<(String, std::sync::Arc<crate::schema::Table>)>;
+
+std::thread_local! {
+    /// How many registry frames hold a column with a non-BINARY declared
+    /// collation. Zero (the common case) means every column reference
+    /// resolves to BINARY: `expr_collation` then skips the per-comparison
+    /// registry walk entirely.
+    static COLLATED_FRAMES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Stack of source frames (innermost last): each frame maps a FROM
+    /// qualifier (alias, else table name — lowercase) to its table schema.
+    static AFFINITY_SCOPES: std::cell::RefCell<Vec<AffinityFrame>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// RAII frame of the affinity registry (see
+/// [`EvalContext::comparison_column_affinity`]). Pushed by the executor
+/// around each plan subtree's execution.
+pub(crate) struct AffinityScope {
+    pushed: bool,
+    /// This frame holds a column with a non-BINARY declared collation.
+    collated: bool,
+}
+
+impl AffinityScope {
+    pub(crate) fn push(sources: Vec<(String, std::sync::Arc<crate::schema::Table>)>) -> Self {
+        if sources.is_empty() {
+            return AffinityScope {
+                pushed: false,
+                collated: false,
+            };
+        }
+        let collated = sources.iter().any(|(_, t)| {
+            t.columns
+                .iter()
+                .any(|c| !c.collation.is_empty() && !c.collation.eq_ignore_ascii_case("BINARY"))
+        });
+        if collated {
+            COLLATED_FRAMES.with(|c| c.set(c.get() + 1));
+        }
+        AFFINITY_SCOPES.with(|s| s.borrow_mut().push(sources));
+        AffinityScope {
+            pushed: true,
+            collated,
+        }
+    }
+}
+
+impl Drop for AffinityScope {
+    fn drop(&mut self) {
+        if self.pushed {
+            AFFINITY_SCOPES.with(|s| {
+                s.borrow_mut().pop();
+            });
+        }
+        if self.collated {
+            COLLATED_FRAMES.with(|c| c.set(c.get() - 1));
+        }
+    }
+}
+
+/// Resolve a column's declared affinity through the registry, innermost
+/// frame first. A bare name binds to the first source (left to right)
+/// that has such a column; rowid spellings are INTEGER.
+fn affinity_scope_lookup(qualifier: Option<&str>, name: &str) -> Option<crate::types::Affinity> {
+    AFFINITY_SCOPES.with(|s| {
+        let s = s.borrow();
+        for frame in s.iter().rev() {
+            for (q, table) in frame.iter() {
+                if let Some(want) = qualifier {
+                    if q != want {
+                        continue;
+                    }
+                }
+                if let Some(i) = table.find_column(name) {
+                    return table.columns.get(i).map(|c| c.affinity);
+                }
+                if crate::planner::is_rowid_spelling(name) && !table.without_rowid {
+                    return Some(crate::types::Affinity::Integer);
+                }
+                if qualifier.is_some() {
+                    return None;
+                }
+            }
+        }
+        None
+    })
+}
+
+/// A column's DECLARED collation through the registry (see
+/// `affinity_scope_lookup` for the binding rules): `Some("BINARY")` for
+/// a column declaring none and for the rowid; `None` when the reference
+/// is not a table column in scope.
+fn collation_scope_lookup(qualifier: Option<&str>, name: &str) -> Option<String> {
+    AFFINITY_SCOPES.with(|s| {
+        let s = s.borrow();
+        for frame in s.iter().rev() {
+            for (q, table) in frame.iter() {
+                if let Some(want) = qualifier {
+                    if q != want {
+                        continue;
+                    }
+                }
+                if let Some(i) = table.find_column(name) {
+                    return table.columns.get(i).map(|c| {
+                        if c.collation.is_empty() {
+                            "BINARY".to_string()
+                        } else {
+                            c.collation.clone()
+                        }
+                    });
+                }
+                if crate::planner::is_rowid_spelling(name) && !table.without_rowid {
+                    return Some("BINARY".to_string());
+                }
+                if qualifier.is_some() {
+                    return None;
+                }
+            }
+        }
+        None
+    })
+}
+
+/// An EXPLICIT `COLLATE` within an operand, SQLite-style: the EP_Collate
+/// flag propagates up from a COLLATE node through its ancestors, and
+/// sqlite3ExprCollSeq follows it down (left child first, then right,
+/// then list arguments). Subqueries are their own scope.
+pub(crate) fn explicit_collation(e: &Expr) -> Option<String> {
     match e {
-        Expr::Literal(_) | Expr::Parameter(_) => true,
-        Expr::Collate { expr, .. } => plain_operand(expr),
-        Expr::Unary {
-            op: crate::sql::ast::UnaryOp::Neg,
-            expr,
-        } => plain_operand(expr),
-        _ => false,
+        Expr::Collate { collation, .. } => Some(collation.clone()),
+        Expr::Cast { expr, .. } | Expr::Unary { expr, .. } => explicit_collation(expr),
+        Expr::Binary { left, right, .. } => {
+            explicit_collation(left).or_else(|| explicit_collation(right))
+        }
+        Expr::Function { args, .. } => args.iter().find_map(explicit_collation),
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => operand
+            .as_deref()
+            .and_then(explicit_collation)
+            .or_else(|| {
+                whens
+                    .iter()
+                    .find_map(|(w, t)| explicit_collation(w).or_else(|| explicit_collation(t)))
+            })
+            .or_else(|| else_.as_deref().and_then(explicit_collation)),
+        _ => None,
+    }
+}
+
+/// Resolve a collation NAME for a comparison: BINARY (the default) is
+/// `None` — the connection's ordinary order; an unknown name errors.
+pub(crate) fn resolve_collation(
+    name: Option<String>,
+) -> Result<Option<std::sync::Arc<dyn crate::plugin::Collation>>> {
+    match name {
+        None => Ok(None),
+        Some(n) if n.eq_ignore_ascii_case("binary") => Ok(None),
+        Some(n) => crate::plugin::lookup_collation(&n)
+            .map(Some)
+            .ok_or_else(|| {
+                crate::error::Error::semantic(format!("no such collation sequence: {}", n))
+            }),
     }
 }
 
@@ -548,15 +794,111 @@ pub(crate) fn apply_operand_affinity(a: crate::types::Affinity, v: &Value) -> Va
     }
 }
 
+/// `sqlite3ExprAffinity`: the affinity an expression carries into a
+/// comparison — a column's declared affinity, a CAST's target affinity,
+/// and the operand affinity seen through COLLATE. Every other expression (literals, parameters,
+/// arithmetic, `||`, most function calls) has NO affinity (`None`).
+/// `col_aff` resolves column references in the caller's context.
+pub(crate) fn expr_affinity_with(
+    e: &Expr,
+    col_aff: &dyn Fn(&Expr) -> Option<crate::types::Affinity>,
+) -> Option<crate::types::Affinity> {
+    match e {
+        Expr::Column { .. } => col_aff(e),
+        Expr::Cast { type_name, expr } => {
+            if let Some(a) = marker_affinity(type_name, AFF_MARKER) {
+                Some(a)
+            } else if type_name.starts_with(IN_RHS_MARKER) {
+                expr_affinity_with(expr, col_aff)
+            } else {
+                Some(crate::types::Affinity::from_declared_type(type_name))
+            }
+        }
+        Expr::Collate { expr, .. } => expr_affinity_with(expr, col_aff),
+        // (likely()/unlikely() do NOT pass their argument's affinity
+        // through in 3.53 — `likely(intcol) = '1'` compares raw.)
+        _ => None,
+    }
+}
+
+/// The affinity a comparison applies (`sqlite3CompareAffinity`):
+/// both sides carry an affinity → NUMERIC if either is numeric, else
+/// none; exactly one side carries an affinity → that one (BLOB = none);
+/// neither → none.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CmpAffinity {
+    None,
+    Numeric,
+    Text,
+}
+
+pub(crate) fn comparison_affinity(
+    la: Option<crate::types::Affinity>,
+    ra: Option<crate::types::Affinity>,
+) -> CmpAffinity {
+    use crate::types::Affinity as A;
+    let numeric = |x: A| matches!(x, A::Integer | A::Real | A::Numeric);
+    match (la, ra) {
+        (Some(a), Some(b)) => {
+            if numeric(a) || numeric(b) {
+                CmpAffinity::Numeric
+            } else {
+                CmpAffinity::None
+            }
+        }
+        (Some(a), None) | (None, Some(a)) => {
+            if numeric(a) {
+                CmpAffinity::Numeric
+            } else if a == A::Text {
+                CmpAffinity::Text
+            } else {
+                CmpAffinity::None
+            }
+        }
+        (None, None) => CmpAffinity::None,
+    }
+}
+
+/// Apply a comparison affinity to the operand VALUES exactly like the
+/// OP_Eq/OP_Lt family: NUMERIC converts each pure TEXT operand that
+/// looks like a number (`applyNumericAffinity(p, 0)`) when at least one
+/// operand is TEXT; TEXT renders each numeric operand as text when at
+/// least one operand is TEXT. BLOBs and NULLs never convert.
+pub(crate) fn apply_comparison_affinity(aff: CmpAffinity, l: Value, r: Value) -> (Value, Value) {
+    let any_text = matches!(l, Value::Text(_)) || matches!(r, Value::Text(_));
+    if !any_text {
+        return (l, r);
+    }
+    match aff {
+        CmpAffinity::None => (l, r),
+        CmpAffinity::Numeric => {
+            let conv = |v: Value| -> Value {
+                if matches!(v, Value::Text(_)) {
+                    numeric_value(&v).unwrap_or(v)
+                } else {
+                    v
+                }
+            };
+            (conv(l), conv(r))
+        }
+        CmpAffinity::Text => {
+            let conv = |v: Value| -> Value {
+                if matches!(v, Value::Integer(_) | Value::Real(_)) {
+                    Value::Text(v.as_text().into())
+                } else {
+                    v
+                }
+            };
+            (conv(l), conv(r))
+        }
+    }
+}
+
 /// SQLite's comparison-affinity contract for one operator application
-/// (datatype3 §4.2): when exactly one side is an affinity-carrying column
-/// reference and the other is a plain operand (literal / parameter), the
-/// column's affinity is applied to the plain operand's value. When BOTH
-/// sides are columns, a NUMERIC-family affinity (INTEGER/REAL/NUMERIC)
-/// on one side applies NUMERIC affinity to a TEXT/BLOB-affinity other
-/// side (`a.e = b.note` with e INTEGER and note TEXT compares numerically
-/// — SQLite matches 5 against '5'). Returns the (possibly coerced)
-/// operand pair.
+/// (datatype3 §4.2) in an evaluation context: the affinities of both
+/// operand EXPRESSIONS decide the comparison affinity, which is then
+/// applied to the operand VALUES. Columns the context cannot resolve to
+/// an affinity count as "no affinity" (the conservative raw compare).
 fn coerce_comparison_operands(
     ctx: &EvalContext<'_>,
     le: &Expr,
@@ -564,25 +906,15 @@ fn coerce_comparison_operands(
     re: &Expr,
     r: Value,
 ) -> (Value, Value) {
-    let la = ctx.column_expr_affinity(le);
-    let ra = ctx.column_expr_affinity(re);
-    match (la, ra) {
-        (Some(a), None) if plain_operand(re) => (l, apply_operand_affinity(a, &r)),
-        (None, Some(a)) if plain_operand(le) => (apply_operand_affinity(a, &l), r),
-        (Some(a), Some(b)) => {
-            use crate::types::Affinity::*;
-            let numeric = |x: crate::types::Affinity| matches!(x, Integer | Real | Numeric);
-            let texty = |x: crate::types::Affinity| matches!(x, Text | Blob | None);
-            if numeric(a) && texty(b) {
-                (l, apply_operand_affinity(Numeric, &r))
-            } else if numeric(b) && texty(a) {
-                (apply_operand_affinity(Numeric, &l), r)
-            } else {
-                (l, r)
-            }
-        }
-        _ => (l, r),
+    // Affinity only ever changes a comparison when a TEXT operand is
+    // involved (OP_Eq's conversions are gated on MEM_Str): skip the
+    // static resolution entirely for the numeric/NULL/BLOB common case.
+    if !matches!(l, Value::Text(_)) && !matches!(r, Value::Text(_)) {
+        return (l, r);
     }
+    let col = |e: &Expr| ctx.comparison_column_affinity(e);
+    let aff = comparison_affinity(expr_affinity_with(le, &col), expr_affinity_with(re, &col));
+    apply_comparison_affinity(aff, l, r)
 }
 
 /// Evaluate an expression in the given context.
@@ -601,6 +933,37 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
             }
         }
         Expr::Column { table, name } => Ok(ctx.lookup(table, name)),
+        // AND / OR short-circuit like SQLite's exprCodeTargetAndOr: the
+        // first operand decides alone when it is FALSE (AND) / TRUE (OR)
+        // — a NULL does not decide — and the other operand is then never
+        // evaluated (`0 AND abs(-9223372036854775808)` is 0, not an
+        // overflow error). The right operand goes first when only the
+        // left one holds a subquery (exprEvalRhsFirst).
+        Expr::Binary {
+            op: op @ (BinaryOp::And | BinaryOp::Or),
+            left,
+            right,
+        } => {
+            let (first, second) = if crate::executor::expr_has_subquery(left)
+                && !crate::executor::expr_has_subquery(right)
+            {
+                (right, left)
+            } else {
+                (left, right)
+            };
+            let a = evaluate(first, ctx)?;
+            if !a.is_null() {
+                let t = a.is_truthy();
+                if *op == BinaryOp::And && !t {
+                    return Ok(Value::Integer(0));
+                }
+                if *op == BinaryOp::Or && t {
+                    return Ok(Value::Integer(1));
+                }
+            }
+            let b = evaluate(second, ctx)?;
+            Ok(apply_binary(*op, &a, &b))
+        }
         Expr::Binary { op, left, right } => {
             let l = evaluate(left, ctx)?;
             let r = evaluate(right, ctx)?;
@@ -640,9 +1003,7 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
             // COLLATE on either comparison operand applies a collation to
             // text comparison (SQLite: `a < b COLLATE NOCASE`). Only
             // ordering / equality operators honor it.
-            if let Some(coll_name) =
-                comparison_collation(left).or_else(|| comparison_collation(right))
-            {
+            if let Some(coll_name) = ctx.binary_comparison_collation(left, right) {
                 // BINARY is the DEFAULT collation (SQLite accepts
                 // `COLLATE BINARY` everywhere) — plain apply_binary, no
                 // lookup (lookup_collation maps "binary" to None).
@@ -672,18 +1033,11 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
             let v = evaluate(expr, ctx)?;
             let lo = evaluate(low, ctx)?;
             let hi = evaluate(high, ctx)?;
-            // Comparison affinity (SQLite: BETWEEN desugars to two
-            // comparisons, each applying the column's affinity to the
-            // plain operand).
-            let (lo, hi) = match ctx.column_expr_affinity(expr) {
-                Some(a) if plain_operand(low) && plain_operand(high) => (
-                    apply_operand_affinity(a, &lo),
-                    apply_operand_affinity(a, &hi),
-                ),
-                Some(a) if plain_operand(low) => (apply_operand_affinity(a, &lo), hi),
-                Some(a) if plain_operand(high) => (lo, apply_operand_affinity(a, &hi)),
-                _ => (lo, hi),
-            };
+            // Comparison affinity (SQLite: BETWEEN desugars to `x >= lo
+            // AND x <= hi`, each comparison applying the affinity of its
+            // own operand pair). The value side is coerced per pair.
+            let (v_lo, lo) = coerce_comparison_operands(ctx, expr, v.clone(), low, lo);
+            let (v_hi, hi) = coerce_comparison_operands(ctx, expr, v.clone(), high, hi);
             // SQL three-valued logic: BETWEEN is sugar for `expr >= low
             // AND expr <= high`, and that AND is KLEENE — FALSE dominates
             // NULL. Bailing to NULL on ANY null operand is WRONG for the
@@ -701,44 +1055,30 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
             // A COLLATE on the value operand applies to both bound
             // comparisons (SQLite). Both sides evaluate as
             // Option<bool>: None = the comparison is NULL (unknown).
-            let (ge, le): (Option<bool>, Option<bool>) = if let Some(name) =
-                comparison_collation(expr)
-            {
-                let coll = crate::plugin::lookup_collation(&name).ok_or_else(|| {
-                    crate::error::Error::semantic(format!("no such collation sequence: {}", name))
-                })?;
-                let ge = if ge_null {
-                    None
-                } else {
-                    Some(
-                        crate::plugin::compare_collated(&v, &lo, coll.as_ref())
-                            != std::cmp::Ordering::Less,
-                    )
+            // Each desugared comparison takes its own pair's collation
+            // (sqlite3BinaryCompareCollSeq): the value operand's when it
+            // has one, else the bound's.
+            let coll_lo = resolve_collation(ctx.binary_comparison_collation(expr, low))?;
+            let coll_hi = resolve_collation(ctx.binary_comparison_collation(expr, high))?;
+            // Encoding-aware default: TEXT×TEXT pairs order under the
+            // connection's file encoding (same rule as the binary
+            // comparison operators — see apply_binary).
+            let cmp =
+                |a: &Value, b: &Value, c: &Option<std::sync::Arc<dyn crate::plugin::Collation>>| {
+                    match c {
+                        Some(c) => crate::plugin::compare_collated(a, b, c.as_ref()),
+                        None => crate::executor::value_cmp_conn(a, b),
+                    }
                 };
-                let le = if le_null {
-                    None
-                } else {
-                    Some(
-                        crate::plugin::compare_collated(&v, &hi, coll.as_ref())
-                            != std::cmp::Ordering::Greater,
-                    )
-                };
-                (ge, le)
+            let ge = if ge_null {
+                None
             } else {
-                // Encoding-aware bounds: TEXT×TEXT pairs order under the
-                // connection's file encoding (same rule as the binary
-                // comparison operators — see apply_binary).
-                let ge = if ge_null {
-                    None
-                } else {
-                    Some(crate::executor::value_cmp_conn(&v, &lo) != std::cmp::Ordering::Less)
-                };
-                let le = if le_null {
-                    None
-                } else {
-                    Some(crate::executor::value_cmp_conn(&v, &hi) != std::cmp::Ordering::Greater)
-                };
-                (ge, le)
+                Some(cmp(&v_lo, &lo, &coll_lo) != std::cmp::Ordering::Less)
+            };
+            let le = if le_null {
+                None
+            } else {
+                Some(cmp(&v_hi, &hi, &coll_hi) != std::cmp::Ordering::Greater)
             };
             // Kleene AND: FALSE dominates; NULL only when neither side
             // is FALSE and at least one is NULL.
@@ -779,6 +1119,13 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
             if v.is_null() || p.is_null() || esc.as_ref().map(|e| e.is_null()).unwrap_or(false) {
                 return Ok(Value::Null);
             }
+            if let Some(e) = &esc {
+                if like_escape_char(e).is_none() {
+                    return Err(Error::runtime(
+                        "ESCAPE expression must be a single character",
+                    ));
+                }
+            }
             let result = match op {
                 LikeOp::Like => like_match(&v, &p, esc.as_ref(), false),
                 LikeOp::Glob => glob_match(&v, &p),
@@ -811,13 +1158,32 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
         } => {
             let l = evaluate(left, ctx)?;
             let r = evaluate(right, ctx)?;
-            // IS treats NULL as equal to NULL.
+            // IS / IS NOT is OP_Eq / OP_Ne with SQLITE_NULLEQ: NULL equals
+            // NULL, and otherwise the comparison applies the SAME
+            // comparison affinity and collation as `=` (`realcol IS NOT
+            // textcol` compares numerically when the text is numeric).
+            let (l, r) = coerce_comparison_operands(ctx, left, l, right, r);
             let equal = if l.is_null() && r.is_null() {
                 true
             } else if l.is_null() || r.is_null() {
                 false
             } else {
-                l == r
+                match ctx
+                    .binary_comparison_collation(left, right)
+                    .filter(|n| !n.eq_ignore_ascii_case("binary"))
+                {
+                    Some(name) => {
+                        let coll = crate::plugin::lookup_collation(&name).ok_or_else(|| {
+                            crate::error::Error::semantic(format!(
+                                "no such collation sequence: {}",
+                                name
+                            ))
+                        })?;
+                        crate::plugin::compare_collated(&l, &r, coll.as_ref())
+                            == std::cmp::Ordering::Equal
+                    }
+                    None => l == r,
+                }
             };
             Ok(Value::Integer(if equal ^ negated { 1 } else { 0 }))
         }
@@ -834,8 +1200,20 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
             };
             for (cond, val) in whens {
                 if let Some(op) = &op_val {
+                    // `CASE x WHEN y` is SQLite's `x = y` (OP_Eq): NULL on
+                    // either side never matches (`CASE NULL WHEN NULL` takes
+                    // the ELSE branch).
                     let c = evaluate(cond, ctx)?;
-                    if op == &c {
+                    let base = operand.as_deref().expect("operand present");
+                    let (x, y) = coerce_comparison_operands(ctx, base, op.clone(), cond, c);
+                    // ...with that comparison's collation too (the WHEN
+                    // operand's declared one applies when the CASE operand
+                    // is not a column: `CASE trim(x) WHEN nocase_col`).
+                    let eq = match resolve_collation(ctx.binary_comparison_collation(base, cond))? {
+                        Some(coll) => apply_binary_collated(BinaryOp::Eq, &x, &y, coll.as_ref()),
+                        None => apply_binary(BinaryOp::Eq, &x, &y),
+                    };
+                    if eq.is_truthy() {
                         return evaluate(val, ctx);
                     }
                 } else {
@@ -882,15 +1260,15 @@ fn evaluate_in(
     let v = evaluate(expr, ctx)?;
     // A COLLATE on the left operand applies to every membership
     // comparison (SQLite: `v COLLATE NOCASE IN ('a', 'B')`).
-    let coll = comparison_collation(expr).and_then(|name| {
-        crate::plugin::lookup_collation(&name).or_else(|| {
-            // Unknown collation name: error later at the comparison below
-            // would abort the whole scan — mirror the binary comparison
-            // behavior and error here instead.
-            None
-        })
-    });
-    if let (Some(name), None) = (comparison_collation(expr), &coll) {
+    // BINARY is the default collation: no lookup (lookup_collation maps
+    // it to None, which must not read as "unknown collation").
+    let coll_name = comparison_collation(expr)
+        .or_else(|| ctx.expr_collation(expr))
+        .filter(|n| !n.eq_ignore_ascii_case("binary"));
+    let coll = coll_name
+        .as_deref()
+        .and_then(crate::plugin::lookup_collation);
+    if let (Some(name), None) = (coll_name, &coll) {
         return Err(crate::error::Error::semantic(format!(
             "no such collation sequence: {}",
             name
@@ -906,6 +1284,14 @@ fn evaluate_in(
     // Previously we treated Null == Null as true via our PartialEq, which
     // made `WHERE v IN (NULL)` match every NULL row — caught by the
     // differential test 'null_in_list_with_null_returns_null_only_for_null_row'.
+    // An EMPTY right-hand side decides before the NULL rule: `x IN ()` /
+    // `x IN (SELECT … no rows)` is FALSE (NOT IN: TRUE) even for a NULL
+    // x — no element exists whose comparison could be UNKNOWN.
+    if let InSource::List(list) = source {
+        if list.is_empty() {
+            return Ok(Value::Integer(i64::from(negated)));
+        }
+    }
     if v.is_null() {
         return Ok(Value::Null);
     }
@@ -913,35 +1299,67 @@ fn evaluate_in(
     // Comparison affinity (SQLite: the left operand's affinity applies to
     // every literal list member — `note IN ('x', -17.857)` compares
     // text-wise against '-17.857').
-    let lhs_aff = ctx.column_expr_affinity(expr).filter(|_| {
-        // Only when the left operand is the affinity carrier and the list
-        // is literal-shaped (subquery members carry their own values).
-        matches!(source, InSource::List(_))
-    });
+    // sqlite3ExprCodeIN with a list RHS: the comparison affinity is the
+    // LEFT operand's alone (`comparisonAffinity` with no pRight), applied
+    // OP_Eq-style to every member comparison — the members' own
+    // affinities do not participate (`1 IN (textcol)` compares raw).
+    let in_aff = match source {
+        InSource::List(_) => {
+            let col = |e: &Expr| ctx.comparison_column_affinity(e);
+            let lhs_aff = expr_affinity_with(expr, &col);
+            // A materialized `IN (SELECT …)` carries its column affinity
+            // on the operand (see IN_RHS_MARKER): exprINAffinity combines
+            // both sides like sqlite3CompareAffinity.
+            match expr {
+                Expr::Cast { type_name, .. } if type_name.starts_with(IN_RHS_MARKER) => {
+                    comparison_affinity(lhs_aff, marker_affinity(type_name, IN_RHS_MARKER))
+                }
+                _ => comparison_affinity(lhs_aff, None),
+            }
+        }
+        _ => CmpAffinity::None,
+    };
     let (found, list_has_null) = match source {
         InSource::List(list) => {
+            // sqlite3FindInIndex's two strategies: an all-CONSTANT list of
+            // more than two members is materialized up front (every member
+            // evaluates — a raising one raises even after a match), any
+            // other list compares member by member and STOPS at the first
+            // match (IN_INDEX_NOOP: `id IN (h, abs(-9223372036854775808))`
+            // never evaluates abs() for a row whose id equals h). A match
+            // decides the result alone: NULL members only matter when
+            // nothing matched.
+            let eager = list.len() > 2 && list.iter().all(is_constant_member);
+            let pre: Vec<Value> = if eager {
+                list.iter()
+                    .map(|e| evaluate(e, ctx))
+                    .collect::<Result<_>>()?
+            } else {
+                Vec::new()
+            };
             let mut found = false;
             let mut list_has_null = false;
-            for e in list.iter() {
-                let candidate = match (lhs_aff, plain_operand(e)) {
-                    (Some(a), true) => apply_operand_affinity(a, &evaluate(e, ctx)?),
-                    _ => evaluate(e, ctx)?,
+            for (i, e) in list.iter().enumerate() {
+                let candidate = if eager {
+                    pre[i].clone()
+                } else {
+                    evaluate(e, ctx)?
                 };
                 if candidate.is_null() {
                     list_has_null = true;
                     continue;
                 }
+                let (lv, candidate) = apply_comparison_affinity(in_aff, v.clone(), candidate);
                 let eq = match coll_ref {
                     Some(c) => {
-                        crate::plugin::compare_collated(&v, &candidate, c)
+                        crate::plugin::compare_collated(&lv, &candidate, c)
                             == std::cmp::Ordering::Equal
                     }
-                    None => v == candidate,
+                    None => lv == candidate,
                 };
                 if eq {
                     found = true;
-                    // Keep iterating to detect NULLs (we need list_has_null
-                    // accurate even after a match, for the negated case).
+                    break;
                 }
             }
             (found, list_has_null)
@@ -980,6 +1398,72 @@ fn evaluate_in(
     }
 }
 
+/// An IN-list member SQLite treats as constant (sqlite3ExprIsConstant):
+/// no column or rowid reference, no subquery, no non-deterministic call.
+fn is_constant_member(e: &Expr) -> bool {
+    match e {
+        Expr::Literal(_) | Expr::Parameter(_) => true,
+        Expr::Column { .. } | Expr::Subquery(_) | Expr::Exists(_) => false,
+        Expr::Function {
+            name, args, over, ..
+        } => {
+            over.is_none()
+                && !matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "random"
+                        | "randomblob"
+                        | "changes"
+                        | "total_changes"
+                        | "last_insert_rowid"
+                        | "date"
+                        | "time"
+                        | "datetime"
+                        | "julianday"
+                        | "unixepoch"
+                        | "strftime"
+                )
+                && args.iter().all(is_constant_member)
+        }
+        Expr::Binary { left, right, .. } | Expr::Is { left, right, .. } => {
+            is_constant_member(left) && is_constant_member(right)
+        }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => is_constant_member(expr),
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            operand.as_deref().map_or(true, is_constant_member)
+                && whens
+                    .iter()
+                    .all(|(c, v)| is_constant_member(c) && is_constant_member(v))
+                && else_.as_deref().map_or(true, is_constant_member)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => is_constant_member(expr) && is_constant_member(low) && is_constant_member(high),
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            is_constant_member(expr)
+                && is_constant_member(pattern)
+                && escape.as_deref().map_or(true, is_constant_member)
+        }
+        Expr::In { expr, source, .. } => {
+            is_constant_member(expr)
+                && matches!(source, InSource::List(l) if l.iter().all(is_constant_member))
+        }
+        Expr::Row(items) => items.iter().all(is_constant_member),
+        Expr::Raise { .. } => false,
+    }
+}
+
 fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext<'_>) -> Result<Value> {
     let fname = name.to_ascii_lowercase();
     // Virtual-table aux functions (FTS5's bm25 / highlight / snippet):
@@ -1008,8 +1492,65 @@ fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext<'_>) -> Result
         }
     }
     // Scalar functions only here; aggregates are handled by the Aggregate operator.
-    let argvals: Result<Vec<Value>> = args.iter().map(|e| evaluate(e, ctx)).collect();
-    let argvals = argvals?;
+    let mut argvals: Vec<Value> = Vec::with_capacity(args.len());
+    for (i, e) in args.iter().enumerate() {
+        // A json_extract() VALUE argument of a JSON constructor: its JSON
+        // subtype depends on the node it selects.
+        if crate::executor::json::is_json_extract_call(e)
+            && crate::executor::json::takes_json_value(&fname, i)
+        {
+            if let Expr::Function { args: inner, .. } = e {
+                let vals: Vec<Value> = inner
+                    .iter()
+                    .map(|x| evaluate(x, ctx))
+                    .collect::<Result<_>>()?;
+                argvals.push(crate::executor::json::json_extract_subtyped(&vals)?);
+                continue;
+            }
+        }
+        argvals.push(evaluate(e, ctx)?);
+    }
+    crate::executor::json::apply_json_subtypes(&fname, args, &mut argvals);
+    // SQLITE_FUNC_NEEDCOLL builtins (scalar min / max, nullif) compare
+    // through the collation of their FIRST argument that has one — an
+    // explicit COLLATE or a column's declared collation.
+    let needs_coll = match fname.as_str() {
+        "min" | "max" => argvals.len() > 1,
+        "nullif" => argvals.len() == 2,
+        _ => false,
+    };
+    if needs_coll {
+        if let Some(coll) = resolve_collation(args.iter().find_map(|a| ctx.expr_collation(a)))? {
+            let cmp = |a: &Value, b: &Value| crate::plugin::compare_collated(a, b, coll.as_ref());
+            if fname == "nullif" {
+                return Ok(
+                    if cmp(&argvals[0], &argvals[1]) == std::cmp::Ordering::Equal {
+                        Value::Null
+                    } else {
+                        argvals[0].clone()
+                    },
+                );
+            }
+            if argvals.iter().any(|v| v.is_null()) {
+                return Ok(Value::Null);
+            }
+            // func.c minmaxFunc: `(cmp(best, v) ^ mask) >= 0` — min moves
+            // to a later TIE, max keeps the earlier one.
+            let mut best = 0usize;
+            for i in 1..argvals.len() {
+                let c = cmp(&argvals[best], &argvals[i]);
+                let take = if fname == "min" {
+                    c != std::cmp::Ordering::Less
+                } else {
+                    c == std::cmp::Ordering::Less
+                };
+                if take {
+                    best = i;
+                }
+            }
+            return Ok(argvals[best].clone());
+        }
+    }
     call_scalar(&fname, &argvals)
 }
 
@@ -1025,14 +1566,13 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
                 return Err(Error::runtime("integer overflow"));
             }
             Some(Value::Integer(i)) => Value::Integer(i.abs()),
-            Some(Value::Real(f)) => Value::Real(f.abs()),
-            // Numeric-looking text gets coerced; everything else: SQLite returns 0.
+            // func.c absFunc's default arm: REAL, TEXT and BLOB all go
+            // through sqlite3_value_double and yield a REAL (`abs('-5')`
+            // is 5.0, `abs('abc')` is 0.0); `abs(-0.0)` keeps -0.0
+            // (`rVal<0` is false for negative zero).
             Some(other) => {
-                let i = other.as_integer();
-                if i == i64::MIN {
-                    return Err(Error::runtime("integer overflow"));
-                }
-                Value::Integer(i.abs())
+                let r = other.as_real();
+                Value::Real(if r < 0.0 { -r } else { r })
             }
         },
         "length" => match args.first() {
@@ -1069,13 +1609,18 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
             if sep.is_null() {
                 return Ok(Value::Null);
             }
+            // The separator precedes every non-NULL item but the first —
+            // an EMPTY item still counts (`concat_ws(',', '', 'a')` is
+            // ",a"; keying on "buffer non-empty" dropped it).
             let sep = sep.as_text();
             let mut buf = String::new();
+            let mut items = 0usize;
             for v in args.iter().skip(1) {
                 if !v.is_null() {
-                    if !buf.is_empty() {
+                    if items > 0 {
                         buf.push_str(&sep);
                     }
+                    items += 1;
                     buf.push_str(&v.as_text());
                 }
             }
@@ -1094,13 +1639,17 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
             // plus a source hash).
             "2026-09-08 00:00:00 48a229ceaef4985c50990b14116b6d856af09850".into(),
         ),
+        // func.c lowerFunc / upperFunc (no ICU): byte-wise
+        // sqlite3Tolower / sqlite3Toupper — ASCII letters only; every
+        // non-ASCII character passes through unchanged (`upper('é')` is
+        // 'é', `upper('ß')` is 'ß').
         "lower" => match args.first() {
             Some(Value::Null) | None => Value::Null,
-            Some(v) => Value::Text(v.as_text().to_lowercase().into()),
+            Some(v) => Value::Text(v.as_text().to_ascii_lowercase().into()),
         },
         "upper" => match args.first() {
             Some(Value::Null) | None => Value::Null,
-            Some(v) => Value::Text(v.as_text().to_uppercase().into()),
+            Some(v) => Value::Text(v.as_text().to_ascii_uppercase().into()),
         },
         // TRIM(x) / TRIM(x, chars) — strip (chars, default whitespace)
         // from both ends / left / right. The char set is UTF-8 code points.
@@ -1143,20 +1692,25 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
             Some(v) => v.clone(),
             None => Value::Null,
         },
+        // func.c replaceFunc's check ORDER: a NULL string or pattern is
+        // NULL; an EMPTY pattern returns the string unchanged — before the
+        // replacement is even looked at (`replace(x, '', NULL)` is x);
+        // only then does a NULL replacement make the result NULL.
         "replace" => {
-            if args.len() == 3 && args.iter().all(|v| !v.is_null()) {
+            if args.len() != 3 || args[0].is_null() || args[1].is_null() {
+                Value::Null
+            } else {
                 let s = args[0].as_text();
                 let from = args[1].as_text();
-                let to = args[2].as_text();
-                // Empty needle: SQLite returns the string unchanged
-                // (str::replace would insert `to` between every char).
-                if from.is_empty() {
+                // `zPattern[0]==0`: a pattern whose text STARTS with a NUL
+                // byte (x'00...') reads as empty in C.
+                if from.is_empty() || from.starts_with('\0') {
                     Value::Text(s.into())
+                } else if args[2].is_null() {
+                    Value::Null
                 } else {
-                    Value::Text(s.replace(&from, &to).into())
+                    Value::Text(s.replace(&from, &args[2].as_text()).into())
                 }
-            } else {
-                Value::Null
             }
         }
         "substr" | "substring" => {
@@ -1167,22 +1721,35 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
                 // Blob operands are byte-indexed and yield a blob
                 // (mirrors SQLite: substr(x'00ff', 2, 1) = x'ff').
                 if let Some(Value::Blob(b)) = args.first() {
+                    // func.c substrFunc: sqlite3_value_blob() of a
+                    // zero-length BLOB is a NULL pointer, and the function
+                    // returns early — substr(x'', ...) is NULL (an empty
+                    // TEXT still yields '').
+                    if b.is_empty() {
+                        return Ok(Value::Null);
+                    }
                     let (begin, end) = substr_range(
                         b.len() as i64,
                         args[1].as_integer(),
                         if args.len() == 3 {
                             args[2].as_integer()
                         } else {
-                            i64::MAX / 4
+                            1_000_000_000 /* SQLITE_LIMIT_LENGTH: func.c substrFunc's default length (a far-negative start drives it below zero: empty result) */
                         },
                     );
                     return Ok(Value::Blob(b[begin as usize..end as usize].to_vec()));
                 }
                 let s = args[0].as_text();
+                // func.c substrFunc walks sqlite3_value_text() as a C
+                // string: TEXT ends at its first NUL byte.
+                let s = match s.find('\0') {
+                    Some(nul) => &s[..nul],
+                    None => &s[..],
+                };
                 let z = if args.len() == 3 {
                     args[2].as_integer()
                 } else {
-                    i64::MAX / 4
+                    1_000_000_000 /* SQLITE_LIMIT_LENGTH: func.c substrFunc's default length (a far-negative start drives it below zero: empty result) */
                 };
                 if s.is_ascii() {
                     // Fast path: byte index == char index for ASCII.
@@ -1222,39 +1789,69 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
                 Value::Null
             }
         }
-        "iif" => {
-            if args.len() == 3 {
-                if args[0].is_truthy() {
-                    args[1].clone()
-                } else {
-                    args[2].clone()
+        // iif(C1, V1 [, C2, V2 ...] [, ELSE]) / if(...) — SQLite 3.48+:
+        // the first true condition's value, else the trailing ELSE
+        // argument (odd count), else NULL.
+        "iif" | "if" => {
+            let mut k = 0;
+            while k + 1 < args.len() {
+                if args[k].is_truthy() {
+                    return Ok(args[k + 1].clone());
                 }
+                k += 2;
+            }
+            if args.len() % 2 == 1 && args.len() >= 3 {
+                args[args.len() - 1].clone()
             } else {
                 Value::Null
             }
         }
+        // func.c roundFunc, verbatim: a NULL digit count is NULL, the
+        // count clamps to [0, 30]; |X| > 2^52 has no fraction to round;
+        // N == 0 rounds half away from zero through an i64; otherwise
+        // the value is printed with "%!.*f" and parsed back.
         "round" => {
-            if args.is_empty() || args[0].is_null() {
-                Value::Null
-            } else {
-                let x = args[0].as_real();
-                if x.is_nan() {
-                    // SQLite: round(NaN) is NULL.
+            let mut n: i64 = 0;
+            if let Some(d) = args.get(1) {
+                if d.is_null() {
                     return Ok(Value::Null);
                 }
-                let n = args.get(1).map(|v| v.as_integer()).unwrap_or(0);
-                Value::Real(sqlite_round(x, n))
+                n = d.as_integer().clamp(0, 30);
+            }
+            match args.first() {
+                None | Some(Value::Null) => Value::Null,
+                Some(v) => {
+                    let mut r = v.as_real();
+                    if (-4503599627370496.0..=4503599627370496.0).contains(&r) {
+                        if n == 0 {
+                            r = ((r + if r < 0.0 { -0.5 } else { 0.5 }) as i64) as f64;
+                        } else {
+                            let txt = crate::executor::printf::sql_printf(
+                                b"%!.*f",
+                                &[Value::Integer(n), Value::Real(r)],
+                            );
+                            r = crate::types::numeric::atof(txt.as_text().as_bytes()).0;
+                        }
+                    }
+                    real_result(r)
+                }
             }
         }
         "random" => Value::Integer(rand_i64()),
+        // randomblob(N): N < 1 yields one byte (func.c).
         "randomblob" => {
-            let n = args.first().map(|v| v.as_integer()).unwrap_or(0).max(0) as usize;
-            Value::Blob(
-                (0..n)
-                    .map(|i| (i.wrapping_mul(2654435761) & 0xFF) as u8)
-                    .collect(),
-            )
+            let n = args.first().map(|v| v.as_integer()).unwrap_or(0).max(1);
+            if n > SQLITE_MAX_LENGTH {
+                return Err(Error::runtime("string or blob too big"));
+            }
+            let mut out = vec![0u8; n as usize];
+            fill_random(&mut out);
+            Value::Blob(out)
         }
+        // __JSON_EXTRACT_SUBTYPED(X, P...) — hidden scalar: json_extract
+        // with SQLite's JSON subtype applied (see json_extract_subtyped);
+        // feeds json_group_array.
+        "__json_extract_subtyped" => crate::executor::json::json_extract_subtyped(args)?,
         // __JSON_OBJECT_FRAG(k, v) — hidden scalar feeding
         // json_group_object's accumulator: `"k":v` (JSON-quoted).
         // NULL values are INCLUDED as null (SQLite); NULL keys skip the
@@ -1348,168 +1945,55 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
             if args.len() != 2 || args[0].is_null() || args[1].is_null() {
                 return Ok(Value::Null);
             }
-            let s = args[0].as_text();
-            let sub = args[1].as_text();
-            if sub.is_empty() {
+            // func.c instrFunc: BLOB×BLOB searches bytes and counts
+            // bytes; every other pairing searches the TEXT forms and
+            // counts CHARACTERS (`instr('héllo','l')` is 3). An empty
+            // needle is found at 1.
+            if let (Value::Blob(h), Value::Blob(n)) = (&args[0], &args[1]) {
+                if n.is_empty() {
+                    return Ok(Value::Integer(1));
+                }
+                return Ok(Value::Integer(
+                    h.windows(n.len())
+                        .position(|w| w == n.as_slice())
+                        .map_or(0, |p| p as i64 + 1),
+                ));
+            }
+            let hay: Vec<u8> = match &args[0] {
+                Value::Blob(b) => b.clone(),
+                v => v.as_text().into_bytes(),
+            };
+            let needle: Vec<u8> = match &args[1] {
+                Value::Blob(b) => b.clone(),
+                v => v.as_text().into_bytes(),
+            };
+            if needle.is_empty() {
                 return Ok(Value::Integer(1));
             }
-            match s.find(&sub) {
-                Some(pos) => Value::Integer((pos + 1) as i64),
+            match hay
+                .windows(needle.len())
+                .position(|w| w == needle.as_slice())
+            {
+                Some(pos) => Value::Integer(
+                    hay[..pos].iter().filter(|&&b| b & 0xc0 != 0x80).count() as i64 + 1,
+                ),
                 None => Value::Integer(0),
             }
         }
         // PRINTF — minimal SQLite printf implementation. Supports %d, %s,
         // %f, %x, %c, %% substitutions. NULL format returns NULL.
-        "printf" | "format" => {
-            if args.is_empty() || args[0].is_null() {
-                return Ok(Value::Null);
-            }
-            let fmt = args[0].as_text();
-            let mut out = String::with_capacity(fmt.len());
-            let mut chars = fmt.chars().peekable();
-            let mut arg_idx = 1;
-            while let Some(c) = chars.next() {
-                if c != '%' {
-                    out.push(c);
-                    continue;
-                }
-                // ---- parse: % [flags] [width] [.prec] conv ----
-                let mut minus = false;
-                let mut plus = false;
-                let mut space = false;
-                let mut alt = false;
-                let mut zero = false;
-                loop {
-                    match chars.peek() {
-                        Some('-') => {
-                            minus = true;
-                            chars.next();
-                        }
-                        Some('+') => {
-                            plus = true;
-                            chars.next();
-                        }
-                        Some(' ') => {
-                            space = true;
-                            chars.next();
-                        }
-                        Some('#') => {
-                            alt = true;
-                            chars.next();
-                        }
-                        Some('0') => {
-                            zero = true;
-                            chars.next();
-                        }
-                        _ => break,
-                    }
-                }
-                let mut width = 0usize;
-                while let Some(&d) = chars.peek() {
-                    if d.is_ascii_digit() {
-                        width = width
-                            .saturating_mul(10)
-                            .saturating_add(d as usize - '0' as usize);
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-                let mut prec: Option<usize> = None;
-                if chars.peek() == Some(&'.') {
-                    chars.next();
-                    let mut p = 0usize;
-                    while let Some(&d) = chars.peek() {
-                        if d.is_ascii_digit() {
-                            p = p
-                                .saturating_mul(10)
-                                .saturating_add(d as usize - '0' as usize);
-                            chars.next();
-                        } else {
-                            break;
-                        }
-                    }
-                    prec = Some(p);
-                }
-                let conv = match chars.next() {
-                    Some(ch) => ch,
-                    None => {
-                        out.push('%');
-                        break;
-                    }
+        // printf.c sqlite3_str_vappendf in SQL-function mode — see
+        // executor/printf.rs. A NULL (or absent) format yields NULL.
+        "printf" | "format" => match args.first() {
+            None | Some(Value::Null) => Value::Null,
+            Some(f) => {
+                let fmt: Vec<u8> = match f {
+                    Value::Blob(b) => b.clone(),
+                    v => v.as_text().into_bytes(),
                 };
-                if conv == '%' {
-                    out.push('%');
-                    continue;
-                }
-                let arg = args.get(arg_idx).cloned().unwrap_or(Value::Null);
-                arg_idx += 1;
-                // Raw conversion (no width yet).
-                let (raw, numeric): (String, bool) = match conv {
-                    'd' | 'i' => {
-                        let i = arg.as_integer();
-                        let mut s = i.abs().to_string();
-                        if i < 0 {
-                            s.insert(0, '-');
-                        } else if plus {
-                            s.insert(0, '+');
-                        } else if space {
-                            s.insert(0, ' ');
-                        }
-                        (s, true)
-                    }
-                    'u' => (format!("{}", arg.as_integer() as u64), true),
-                    'x' => (format!("{:x}", arg.as_integer() as u64), true),
-                    'X' => (format!("{:X}", arg.as_integer() as u64), true),
-                    'o' => (format!("{:o}", arg.as_integer() as u64), true),
-                    'f' | 'F' => {
-                        let p = prec.unwrap_or(6);
-                        (format!("{:.*}", p, arg.as_real()), true)
-                    }
-                    'e' => {
-                        let p = prec.unwrap_or(6);
-                        (format!("{:.*e}", p, arg.as_real()), true)
-                    }
-                    'E' => {
-                        let p = prec.unwrap_or(6);
-                        (format!("{:.*e}", p, arg.as_real()).to_uppercase(), true)
-                    }
-                    'g' | 'G' => {
-                        let r = arg.as_real();
-                        let s = match prec {
-                            Some(p) => format!("{:.*}", p, r),
-                            None => format!("{r}"),
-                        };
-                        (s, true)
-                    }
-                    's' => {
-                        let s = arg.as_text();
-                        let s: String = match prec {
-                            Some(p) => s.chars().take(p).collect(),
-                            None => s.to_string(),
-                        };
-                        (s, false)
-                    }
-                    'c' => {
-                        let ch = if let Value::Integer(n) = &arg {
-                            char::from_u32(*n as u32)
-                        } else {
-                            arg.as_text().chars().next()
-                        };
-                        (ch.map(|c| c.to_string()).unwrap_or_default(), false)
-                    }
-                    _ => {
-                        // Unknown conversion: emit verbatim.
-                        out.push('%');
-                        out.push(conv);
-                        continue;
-                    }
-                };
-                let _ = alt;
-                out.push_str(&apply_printf_width(raw, minus, zero && numeric, width));
+                crate::executor::printf::sql_printf(&fmt, &args[1..])
             }
-            Value::Text(out.into())
-        }
+        },
         // MIN(a, b, c, ...) — scalar form (not the aggregate form).
         // Returns the smallest argument. SQLite semantics: if ANY arg is
         // NULL, the result is NULL (the comparison short-circuits).
@@ -1517,11 +2001,14 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
             if args.iter().any(|v| v.is_null()) {
                 return Ok(Value::Null);
             }
+            // func.c minmaxFunc: `(cmp(best, v) ^ mask) >= 0` with mask 0
+            // for min — a TIE moves to the LATER argument (`min(1, 1.0)`
+            // is 1.0); max keeps the earlier one.
             let mut best: Option<Value> = None;
             for v in args {
                 if best.is_none()
                     || crate::executor::value_cmp_conn(v, best.as_ref().unwrap())
-                        == std::cmp::Ordering::Less
+                        != std::cmp::Ordering::Greater
                 {
                     best = Some(v.clone());
                 }
@@ -1547,46 +2034,45 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
         }
         // SIGN(x) — returns -1, 0, or +1 depending on the sign of x.
         // NULL input returns NULL.
-        "sign" => match args.first() {
-            Some(Value::Null) | None => Value::Null,
+        // func.c signFunc: only arguments whose sqlite3_value_numeric_type
+        // is INTEGER or REAL have a sign — non-numeric TEXT and every
+        // BLOB yield NULL (`sign('abc')`, `sign(x'01')`).
+        "sign" => match args.first().and_then(numeric_value) {
+            None => Value::Null,
             Some(v) => {
                 let r = v.as_real();
-                if r > 0.0 {
-                    Value::Integer(1)
-                } else if r < 0.0 {
-                    Value::Integer(-1)
+                Value::Integer(if r < 0.0 {
+                    -1
+                } else if r > 0.0 {
+                    1
                 } else {
-                    Value::Integer(0)
-                }
+                    0
+                })
             }
         },
         // POWER(x, y) / POW(x, y) — x^y.
-        "power" | "pow" => {
-            if args.len() == 2 && !args[0].is_null() && !args[1].is_null() {
-                Value::Real(args[0].as_real().powf(args[1].as_real()))
-            } else {
-                Value::Null
-            }
-        }
+        "power" | "pow" => match (
+            args.first().and_then(numeric_value),
+            args.get(1).and_then(numeric_value),
+        ) {
+            (Some(a), Some(b)) => real_result(a.as_real().powf(b.as_real())),
+            _ => Value::Null,
+        },
         // MOD(x, y) — remainder (integer flavor preserved).
-        "mod" => {
-            if args.len() == 2 && !args[0].is_null() && !args[1].is_null() {
-                let y = args[1].as_real();
-                if y == 0.0 {
-                    Value::Null
-                } else if let (Value::Integer(a), Value::Integer(b)) = (&args[0], &args[1]) {
-                    Value::Integer(a.wrapping_rem(*b))
-                } else {
-                    Value::Real(args[0].as_real() % y)
-                }
-            } else {
-                Value::Null
-            }
-        }
+        // func.c math2Func(fmod): both operands must be numeric
+        // (sqlite3_value_numeric_type), the result is always REAL, and a
+        // NaN result (`mod(x, 0)`) is NULL.
+        "mod" => match (
+            args.first().and_then(numeric_value),
+            args.get(1).and_then(numeric_value),
+        ) {
+            (Some(a), Some(b)) => real_result(a.as_real() % b.as_real()),
+            _ => Value::Null,
+        },
         // Trigonometry (SQLite's MATH functions extension — always on here).
         "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh"
-        | "acosh" | "atanh" => match args.first() {
-            Some(Value::Null) | None => Value::Null,
+        | "acosh" | "atanh" => match args.first().and_then(numeric_value) {
+            None => Value::Null,
             Some(v) => {
                 let x = v.as_real();
                 let r = match fname.as_str() {
@@ -1603,24 +2089,24 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
                     "acosh" => x.acosh(),
                     _ => x.atanh(),
                 };
-                Value::Real(r)
+                real_result(r)
             }
         },
-        "atan2" => {
-            if args.len() == 2 && !args[0].is_null() && !args[1].is_null() {
-                Value::Real(args[0].as_real().atan2(args[1].as_real()))
-            } else {
-                Value::Null
-            }
-        }
+        "atan2" => match (
+            args.first().and_then(numeric_value),
+            args.get(1).and_then(numeric_value),
+        ) {
+            (Some(a), Some(b)) => real_result(a.as_real().atan2(b.as_real())),
+            _ => Value::Null,
+        },
         // DEGREES(x) / RADIANS(x).
-        "degrees" => match args.first() {
-            Some(Value::Null) | None => Value::Null,
-            Some(v) => Value::Real(v.as_real().to_degrees()),
+        "degrees" => match args.first().and_then(numeric_value) {
+            None => Value::Null,
+            Some(v) => real_result(v.as_real() * (180.0 / std::f64::consts::PI)),
         },
-        "radians" => match args.first() {
-            Some(Value::Null) | None => Value::Null,
-            Some(v) => Value::Real(v.as_real().to_radians()),
+        "radians" => match args.first().and_then(numeric_value) {
+            None => Value::Null,
+            Some(v) => real_result(v.as_real() * (std::f64::consts::PI / 180.0)),
         },
         // Cotangent / secant / cosecant (SQLite math extension).
         "cot" => match args.first() {
@@ -1649,106 +2135,106 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
                 }
             }
         },
-        "log2" => match args.first() {
-            Some(Value::Null) | None => Value::Null,
+        "log2" => match args.first().and_then(numeric_value) {
+            None => Value::Null,
             Some(v) => {
                 let x = v.as_real();
                 if x <= 0.0 {
                     Value::Null
                 } else {
-                    Value::Real(x.log2())
+                    real_result(x.log2())
                 }
             }
         },
-        // SQRT(x).
-        "sqrt" => match args.first() {
-            Some(Value::Null) | None => Value::Null,
+        // SQRT(x) — math1Func: a negative argument's NaN is NULL.
+        "sqrt" => match args.first().and_then(numeric_value) {
+            None => Value::Null,
+            Some(v) => real_result(v.as_real().sqrt()),
+        },
+        // FLOOR / CEIL / CEILING / TRUNC — func.c ceilingFunc: an INTEGER
+        // (after numeric affinity) passes through unchanged, a REAL is
+        // rounded as REAL, anything non-numeric is NULL.
+        "floor" | "ceil" | "ceiling" | "trunc" => match args.first().and_then(numeric_value) {
+            None => Value::Null,
+            Some(Value::Integer(i)) => Value::Integer(i),
             Some(v) => {
                 let x = v.as_real();
-                if x < 0.0 {
-                    Value::Null
-                } else {
-                    Value::Real(x.sqrt())
-                }
+                real_result(match fname.as_str() {
+                    "floor" => x.floor(),
+                    "trunc" => x.trunc(),
+                    _ => x.ceil(),
+                })
             }
-        },
-        // FLOOR / CEIL / CEILING.
-        "floor" => match args.first() {
-            Some(Value::Null) | None => Value::Null,
-            Some(v) => Value::Real(v.as_real().floor()),
-        },
-        "ceil" | "ceiling" => match args.first() {
-            Some(Value::Null) | None => Value::Null,
-            Some(v) => Value::Real(v.as_real().ceil()),
-        },
-        // TRUNC(x) — truncate toward zero.
-        "trunc" => match args.first() {
-            Some(Value::Null) | None => Value::Null,
-            Some(v) => Value::Real(v.as_real().trunc()),
         },
         // PI() — 3.141592653589793.
         "pi" => Value::Real(std::f64::consts::PI),
         // EXP(x) — e^x.
-        "exp" => match args.first() {
-            Some(Value::Null) | None => Value::Null,
-            Some(v) => Value::Real(std::f64::consts::E.powf(v.as_real())),
+        "exp" => match args.first().and_then(numeric_value) {
+            None => Value::Null,
+            Some(v) => real_result(v.as_real().exp()),
         },
         // LN(x) — natural log.
-        "ln" => match args.first() {
-            Some(Value::Null) | None => Value::Null,
-            Some(v) => {
-                let x = v.as_real();
-                if x <= 0.0 {
-                    Value::Null
-                } else {
-                    Value::Real(x.ln())
-                }
-            }
-        },
-        // LOG(x) / LOG10(x) — base-10 log. With two args, LOG(b, x) is base-b.
-        "log" | "log10" => {
-            if args.is_empty() || args[0].is_null() {
+        // func.c logFunc: the (first) argument must be numeric and > 0.
+        // LN = natural log; LOG(X)/LOG10(X) = base 10; LOG(B, X) =
+        // ln(X)/ln(B), NULL unless ln(B) > 0 (so bases <= 1 are NULL)
+        // and X > 0.
+        "ln" | "log" | "log10" => {
+            let Some(x0) = args.first().and_then(numeric_value) else {
+                return Ok(Value::Null);
+            };
+            let x0 = x0.as_real();
+            if x0 <= 0.0 {
                 return Ok(Value::Null);
             }
-            if args.len() == 2 && !args[1].is_null() {
-                let b = args[0].as_real();
-                let x = args[1].as_real();
-                if b <= 0.0 || b == 1.0 || x <= 0.0 {
+            if args.len() == 2 && fname != "ln" {
+                let b = x0.ln();
+                if b <= 0.0 {
                     return Ok(Value::Null);
                 }
-                return Ok(Value::Real(x.log(b)));
+                let x = args[1].as_real();
+                if x <= 0.0 {
+                    return Ok(Value::Null);
+                }
+                return Ok(real_result(x.ln() / b));
             }
-            let x = args[0].as_real();
-            if x <= 0.0 {
-                Value::Null
-            } else {
-                Value::Real(x.log10())
-            }
+            real_result(if fname == "ln" { x0.ln() } else { x0.log10() })
         }
         // ABS already defined above.
         // ZEROBLOB(n) — n zero bytes.
         "zeroblob" => {
-            let n = args.first().map(|v| v.as_integer()).unwrap_or(0).max(0) as usize;
-            Value::Blob(vec![0u8; n])
+            let n = args.first().map(|v| v.as_integer()).unwrap_or(0).max(0);
+            if n > SQLITE_MAX_LENGTH {
+                return Err(Error::runtime("string or blob too big"));
+            }
+            Value::Blob(vec![0u8; n as usize])
         }
         // CHAR(c1, c2, ...) — construct a string from code points.
+        // func.c charFunc: each argument's int64; anything outside
+        // [0, 0x10FFFF] becomes U+FFFD (as do lone surrogates, which a
+        // Rust string cannot carry).
         "char" => {
             let mut s = String::new();
             for v in args {
-                if let Some(ch) = char::from_u32(v.as_integer() as u32) {
-                    s.push(ch);
-                }
+                let x = v.as_integer();
+                let ch = if (0..=0x10ffff).contains(&x) {
+                    char::from_u32(x as u32).unwrap_or('\u{fffd}')
+                } else {
+                    '\u{fffd}'
+                };
+                s.push(ch);
             }
             Value::Text(s.into())
         }
         // UNICODE(s) — code point of the first character of s.
+        // func.c unicodeFunc: the C string's first character — an empty
+        // string, or one that STARTS with NUL, has none (NULL).
         "unicode" => match args.first() {
             Some(Value::Null) | None => Value::Null,
             Some(v) => {
                 let s = v.as_text();
                 match s.chars().next() {
-                    Some(c) => Value::Integer(c as i64),
-                    None => Value::Null,
+                    Some(c) if c != '\0' => Value::Integer(c as i64),
+                    _ => Value::Null,
                 }
             }
         },
@@ -1840,7 +2326,14 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
         "like" => match (args.first(), args.get(1), args.get(2)) {
             (Some(p), Some(v), esc) if !p.is_null() && !v.is_null() => {
                 let esc_val = match esc {
-                    Some(e) if !e.is_null() => Some(e.clone()),
+                    Some(e) if !e.is_null() => {
+                        if like_escape_char(e).is_none() {
+                            return Err(Error::runtime(
+                                "ESCAPE expression must be a single character",
+                            ));
+                        }
+                        Some(e.clone())
+                    }
                     Some(_) => return Ok(Value::Null),
                     None => None,
                 };
@@ -1974,6 +2467,7 @@ pub(crate) fn is_builtin_scalar(name: &str) -> bool {
         "glob",
         "group_concat",
         "hex",
+        "if",
         "ifnull",
         "iif",
         "instr",
@@ -2127,8 +2621,22 @@ fn quote_value(v: &Value) -> String {
     match v {
         Value::Null => "NULL".to_string(),
         Value::Integer(i) => i.to_string(),
+        // quoteFunc renders REALs with the zero-pad flag, whose infinity
+        // spelling is the re-parseable 9.0e+999 (not "Inf").
+        Value::Real(f) if f.is_infinite() => {
+            if *f < 0.0 {
+                "-9.0e+999".to_string()
+            } else {
+                "9.0e+999".to_string()
+            }
+        }
         Value::Real(f) => crate::types::format_real(*f),
-        Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
+        // quoteFunc renders TEXT through `%Q`, which stops at the first
+        // NUL (C string): quote('a' || char(0) || 'b') is 'a'.
+        Value::Text(s) => {
+            let s = s.split('\0').next().unwrap_or("");
+            format!("'{}'", s.replace('\'', "''"))
+        }
         Value::Blob(b) => format!(
             "X'{}'",
             b.iter().map(|x| format!("{:02X}", x)).collect::<String>()
@@ -2136,23 +2644,122 @@ fn quote_value(v: &Value) -> String {
     }
 }
 
+/// SQLITE_MAX_LENGTH: the default cap on any string or BLOB a function
+/// may materialize ("string or blob too big") — without it
+/// `zeroblob(1e18)` would abort the process on allocation.
+pub(crate) const SQLITE_MAX_LENGTH: i64 = 1_000_000_000;
+
+/// `sqlite3_value_numeric_type` as a value: INTEGER and REAL pass, TEXT
+/// takes numeric affinity WITHOUT the integer squeeze (`'5'` → 5, `'1.0'`
+/// → 1.0, `'abc'` / `'5x'` → not numeric), NULL and BLOB are not numeric.
+pub(crate) fn numeric_value(v: &Value) -> Option<Value> {
+    match v {
+        Value::Integer(_) | Value::Real(_) => Some(v.clone()),
+        Value::Text(t) => {
+            let z = t.as_bytes();
+            let (r, rc) = crate::types::numeric::atof(z);
+            if rc <= 0 {
+                return None;
+            }
+            if rc == 1 {
+                let ix = crate::types::numeric::real_to_i64(r);
+                if crate::types::numeric::real_same_as_int(r, ix) {
+                    return Some(Value::Integer(ix));
+                }
+                let (i, irc) = crate::types::numeric::atoi64(z);
+                if irc == 0 {
+                    return Some(Value::Integer(i));
+                }
+            }
+            Some(Value::Real(r))
+        }
+        _ => None,
+    }
+}
+
+/// `sqlite3_result_double`: a NaN result is stored as NULL.
+#[inline]
+pub(crate) fn real_result(r: f64) -> Value {
+    if r.is_nan() {
+        Value::Null
+    } else {
+        Value::Real(r)
+    }
+}
+
+/// Process-wide pseudo-random generator for random() / randomblob():
+/// xoshiro256** per thread, seeded from the OS-keyed SipHash state
+/// (`RandomState` draws its keys from the OS RNG), the clock and the
+/// thread identity. The previous generator was a fixed LCG over the
+/// wall clock (two calls in one nanosecond collided) and randomblob()
+/// emitted a CONSTANT byte pattern — `hex(randomblob(16))` ids collided
+/// on every call.
+fn with_rng<R>(f: impl FnOnce(&mut [u64; 4]) -> R) -> R {
+    use std::cell::RefCell;
+    use std::hash::{BuildHasher, Hasher};
+    thread_local! {
+        static STATE: RefCell<Option<[u64; 4]>> = const { RefCell::new(None) };
+    }
+    STATE.with(|cell| {
+        let mut st = cell.borrow_mut();
+        let s = st.get_or_insert_with(|| {
+            let mut seed = [0u64; 4];
+            for (k, slot) in seed.iter_mut().enumerate() {
+                let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+                h.write_usize(k);
+                h.write_u128(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0),
+                );
+                h.write(format!("{:?}", std::thread::current().id()).as_bytes());
+                *slot = h.finish() | 1;
+            }
+            seed
+        });
+        f(s)
+    })
+}
+
+fn next_random(s: &mut [u64; 4]) -> u64 {
+    let result = s[1].wrapping_mul(5).rotate_left(7).wrapping_mul(9);
+    let t = s[1] << 17;
+    s[2] ^= s[0];
+    s[3] ^= s[1];
+    s[1] ^= s[2];
+    s[0] ^= s[3];
+    s[2] ^= t;
+    s[3] = s[3].rotate_left(45);
+    result
+}
+
 fn rand_i64() -> i64 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0);
-    now.wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407)
+    with_rng(|s| next_random(s) as i64)
+}
+
+fn fill_random(out: &mut [u8]) {
+    with_rng(|s| {
+        for chunk in out.chunks_mut(8) {
+            let v = next_random(s).to_le_bytes();
+            chunk.copy_from_slice(&v[..chunk.len()]);
+        }
+    })
 }
 
 /// Extract a COLLATE name from one side of a comparison (SQLite allows
 /// `a COLLATE X < b` and `a < b COLLATE X`; the RHS wins when both sides
 /// specify one).
 pub(crate) fn comparison_collation(e: &Expr) -> Option<String> {
-    if let Expr::Collate { collation, .. } = e {
-        return Some(collation.clone());
+    match e {
+        Expr::Collate { collation, .. } => Some(collation.clone()),
+        // The IN-subquery affinity carrier wraps the operand (and any
+        // COLLATE on it) — see IN_RHS_MARKER.
+        Expr::Cast { expr, type_name } if type_name.starts_with(IN_RHS_MARKER) => {
+            comparison_collation(expr)
+        }
+        _ => None,
     }
-    None
 }
 
 /// Comparison through a collation (text-text pairs only; other types keep
@@ -2206,34 +2813,9 @@ pub fn apply_binary(op: BinaryOp, l: &Value, r: &Value) -> Value {
         Arrow | ArrowText | FtsMatch | Distance => Value::Null,
         // Integer overflow PROMOTES TO REAL (SQLite: 9223372036854775807 + 1
         // is 9.223372036854776e18, never a wrapped i64).
-        Add => arith_checked(l, r, i64::checked_add, |a, b| a + b),
-        Sub => arith_checked(l, r, i64::checked_sub, |a, b| a - b),
-        Mul => arith_checked(l, r, i64::checked_mul, |a, b| a * b),
-        Div => {
-            if r.as_integer() == 0 || r.as_real() == 0.0 {
-                Value::Null
-            } else {
-                // i64::MIN / -1 overflows; checked_div promotes to REAL.
-                arith_checked(l, r, i64::checked_div, |a, b| a / b)
-            }
-        }
-        Mod => {
-            let b = r.as_integer();
-            if b == 0 {
-                Value::Null
-            } else if b == -1 {
-                // i64::MIN % -1 overflows in Rust; mathematically 0.
-                Value::Integer(0)
-            } else {
-                Value::Integer(l.as_integer() % b)
-            }
-        }
+        Add | Sub | Mul | Div | Mod => sqlite_arith(op, l, r),
         Concat => l.concat(r),
-        BitAnd => Value::Integer(l.as_integer() & r.as_integer()),
-        BitOr => Value::Integer(l.as_integer() | r.as_integer()),
-        BitXor => Value::Integer(l.as_integer() ^ r.as_integer()),
-        ShiftLeft => Value::Integer(l.as_integer() << (r.as_integer() & 63)),
-        ShiftRight => Value::Integer(l.as_integer() >> (r.as_integer() & 63)),
+        BitAnd | BitOr | BitXor | ShiftLeft | ShiftRight => sqlite_bitop(op, l, r),
         // SQL three-valued logic: any comparison with NULL on either side
         // produces NULL (UNKNOWN), which is filtered out by WHERE.
         // Previously we did `if l == r { 1 } else { 0 }`, which — combined
@@ -2343,54 +2925,153 @@ pub fn apply_binary(op: BinaryOp, l: &Value, r: &Value) -> Value {
     }
 }
 
-fn arith_checked<F, I>(l: &Value, r: &Value, fi: F, ff: I) -> Value
-where
-    F: Fn(i64, i64) -> Option<i64>,
-    I: Fn(f64, f64) -> f64,
-{
+/// vdbe.c OP_Add / OP_Subtract / OP_Multiply / OP_Divide / OP_Remainder,
+/// verbatim semantics:
+///
+/// * two INTEGER operands use checked i64 math; overflow (and
+///   `i64::MIN / -1`) falls over to REAL math;
+/// * NULL anywhere → NULL;
+/// * TEXT / BLOB operands read through `numericType` (`'12abc'` → 12,
+///   `'1.5'` → 1.5, `x'3132'` → 12); if both then read as INTEGER the
+///   integer path runs, otherwise REAL math;
+/// * division / remainder by zero → NULL (REAL division checks the REAL
+///   divisor: `1 / 0.5` is 2.0, not a "zero" integer divisor);
+/// * REAL remainder truncates both operands to INTEGER and yields a REAL
+///   (`5.5 % 2` → 1.0);
+/// * a NaN result (`inf - inf`) → NULL.
+pub(crate) fn sqlite_arith(op: BinaryOp, l: &Value, r: &Value) -> Value {
+    use BinaryOp::*;
+    fn int_math(op: BinaryOp, a: i64, b: i64) -> Option<Value> {
+        // a = left, b = right. `None` = overflow → REAL math.
+        Some(match op {
+            Add => Value::Integer(a.checked_add(b)?),
+            Sub => Value::Integer(a.checked_sub(b)?),
+            Mul => Value::Integer(a.checked_mul(b)?),
+            Div => {
+                if b == 0 {
+                    return Some(Value::Null);
+                }
+                if b == -1 && a == i64::MIN {
+                    return None;
+                }
+                Value::Integer(a / b)
+            }
+            _ => {
+                if b == 0 {
+                    return Some(Value::Null);
+                }
+                let b = if b == -1 { 1 } else { b };
+                Value::Integer(a % b)
+            }
+        })
+    }
+    // `l`/`r` are the ORIGINAL operands: REAL math reads them through
+    // sqlite3VdbeRealValue / sqlite3VdbeIntValue on the un-converted
+    // memory cells (OP_Remainder's `iA = sqlite3VdbeIntValue(pIn1)` takes
+    // the TEXT's integer PREFIX: `-21 % '9.2e18'` is -21 % 9 = -3.0).
+    fn fp_math(op: BinaryOp, l: &Value, r: &Value) -> Value {
+        let (a, b) = (l.as_real(), r.as_real());
+        let out = match op {
+            Add => a + b,
+            Sub => a - b,
+            Mul => a * b,
+            Div => {
+                if b == 0.0 {
+                    return Value::Null;
+                }
+                a / b
+            }
+            _ => {
+                let ia = l.as_integer();
+                let ib = r.as_integer();
+                if ib == 0 {
+                    return Value::Null;
+                }
+                let ib = if ib == -1 { 1 } else { ib };
+                (ia % ib) as f64
+            }
+        };
+        if out.is_nan() {
+            Value::Null
+        } else {
+            Value::Real(out)
+        }
+    }
+    if let (Value::Integer(a), Value::Integer(b)) = (l, r) {
+        return int_math(op, *a, *b).unwrap_or_else(|| fp_math(op, l, r));
+    }
     if l.is_null() || r.is_null() {
         return Value::Null;
     }
-    if matches!(l, Value::Real(_)) || matches!(r, Value::Real(_)) {
-        Value::Real(ff(l.as_real(), r.as_real()))
-    } else {
-        let (a, b) = (l.as_integer(), r.as_integer());
-        match fi(a, b) {
-            Some(v) => Value::Integer(v),
-            // Integer overflow: SQLite promotes the whole expression to
-            // REAL instead of wrapping (`9223372036854775807 + 1` is
-            // 9.223372036854776e18, never i64::MIN).
-            None => Value::Real(ff(a as f64, b as f64)),
-        }
+    let ln = l.to_numeric();
+    let rn = r.to_numeric();
+    if let (Value::Integer(a), Value::Integer(b)) = (&ln, &rn) {
+        return int_math(op, *a, *b).unwrap_or_else(|| fp_math(op, l, r));
     }
+    fp_math(op, l, r)
+}
+
+/// vdbe.c OP_BitAnd / OP_BitOr / OP_ShiftLeft / OP_ShiftRight: operands
+/// read through `sqlite3VdbeIntValue` (prefix integer parse for TEXT and
+/// BLOB, clamping truncation for REAL); a negative shift count shifts
+/// the other way; a count >= 64 yields 0 (or -1 for a right shift of a
+/// negative value); right shifts sign-extend.
+pub(crate) fn sqlite_bitop(op: BinaryOp, l: &Value, r: &Value) -> Value {
+    use BinaryOp::*;
+    if l.is_null() || r.is_null() {
+        return Value::Null;
+    }
+    let a = l.as_integer();
+    let b = r.as_integer();
+    Value::Integer(match op {
+        BitAnd => a & b,
+        BitOr => a | b,
+        BitXor => a ^ b,
+        _ => {
+            if b == 0 {
+                a
+            } else {
+                let mut left = matches!(op, ShiftLeft);
+                let mut n = b;
+                if n < 0 {
+                    left = !left;
+                    n = if n > -64 { -n } else { 64 };
+                }
+                if n >= 64 {
+                    if a >= 0 || left {
+                        0
+                    } else {
+                        -1
+                    }
+                } else if left {
+                    ((a as u64) << n) as i64
+                } else {
+                    a >> n
+                }
+            }
+        }
+    })
 }
 
 pub fn apply_unary(op: UnaryOp, v: &Value) -> Value {
     match op {
-        UnaryOp::Neg => {
-            if v.is_null() {
-                Value::Null
-            } else if matches!(v, Value::Real(_)) {
-                Value::Real(-v.as_real())
-            } else {
-                let i = v.as_integer();
-                match i.checked_neg() {
-                    Some(n) => Value::Integer(n),
-                    // -i64::MIN overflows: promote to REAL (SQLite).
-                    None => Value::Real(-(i as f64)),
-                }
-            }
-        }
+        // SQLite codes a non-literal unary minus as `0 - x` (OP_Subtract),
+        // so TEXT/BLOB operands go through numericType: -'5' is -5,
+        // -'1.5' is -1.5, -'abc' is 0, -x'35' is -5, and -i64::MIN
+        // promotes to REAL. (Negative literals never reach here as text.)
+        UnaryOp::Neg => match v {
+            Value::Null => Value::Null,
+            _ => sqlite_arith(BinaryOp::Sub, &Value::Integer(0), v),
+        },
         UnaryOp::Pos => v.clone(),
-        // SQLite three-valued logic: NOT NULL is NULL (the row is
-        // filtered — the old Integer(1) included rows SQLite excludes,
-        // e.g. `WHERE NOT (x >= 5)` with NULL x). Every other value
-        // flips under the SAME truthiness rule WHERE uses (probed:
-        // NOT x'31' is 0 — a non-empty blob is truthy under NOT too).
+        // SQLite three-valued logic: NOT NULL is NULL; every other value
+        // flips under the SAME truthiness rule WHERE uses
+        // (`sqlite3VdbeBooleanValue`: NOT x'31' is 0, NOT x'41' is 1).
         UnaryOp::Not => match v {
             Value::Null => Value::Null,
             v => Value::Integer(if v.is_truthy() { 0 } else { 1 }),
         },
+        // OP_BitNot: `~sqlite3VdbeIntValue(x)` (~x'31' is -2).
         UnaryOp::BitNot => {
             if v.is_null() {
                 Value::Null
@@ -2419,11 +3100,13 @@ pub fn like_match(
     if escape.is_none() {
         if let (Value::Text(sv), Value::Text(pv)) = (value, pattern) {
             if pv.is_ascii() {
-                if let Some(hit) = like_match_bytes(
-                    sv.as_str().as_bytes(),
-                    pv.as_str().as_bytes(),
-                    case_sensitive,
-                ) {
+                // C-string operands: both end at their first NUL byte.
+                let cstr =
+                    |b: &'_ [u8]| -> usize { b.iter().position(|&c| c == 0).unwrap_or(b.len()) };
+                let (sb, pb) = (sv.as_str().as_bytes(), pv.as_str().as_bytes());
+                if let Some(hit) =
+                    like_match_bytes(&sb[..cstr(sb)], &pb[..cstr(pb)], case_sensitive)
+                {
                     return hit;
                 }
                 // None = general wildcard shape on a NON-ASCII subject
@@ -2433,11 +3116,244 @@ pub fn like_match(
         }
     }
     // General path: ESCAPE support, non-TEXT operands (numeric LIKE casts
-    // to text), non-ASCII patterns, Unicode folding.
-    let s = value.as_text();
-    let p = pattern.as_text();
-    let esc = escape.map(|v| v.as_text().chars().next().unwrap_or('\\'));
-    like_match_str(&s, &p, esc, case_sensitive)
+    // to text), non-ASCII patterns — func.c likeFunc + patternCompare.
+    let s = like_operand_bytes(value);
+    let p = like_operand_bytes(pattern);
+    let mut info = PatternInfo {
+        match_all: u32::from(b'%'),
+        match_one: u32::from(b'_'),
+        match_set: 0,
+        no_case: !case_sensitive,
+    };
+    let mut esc = 0u32;
+    if let Some(e) = escape {
+        // Callers validate the single-character rule (see
+        // `like_escape_char`); a bad value here degrades to "no escape".
+        if let Some(c) = like_escape_char(e) {
+            esc = c;
+            if esc == info.match_all {
+                info.match_all = 0;
+            }
+            if esc == info.match_one {
+                info.match_one = 0;
+            }
+        }
+    }
+    pattern_compare(&p, &s, &info, esc) == PATTERN_MATCH
+}
+
+/// The bytes LIKE/GLOB see for an operand (`sqlite3_value_text`): TEXT
+/// as-is, BLOB bytes raw, numbers rendered; truncated at the first NUL
+/// (the C string walk).
+fn like_operand_bytes(v: &Value) -> Vec<u8> {
+    let mut b = match v {
+        Value::Text(t) => t.as_bytes().to_vec(),
+        Value::Blob(b) => b.clone(),
+        other => other.as_text().into_bytes(),
+    };
+    if let Some(z) = b.iter().position(|&c| c == 0) {
+        b.truncate(z);
+    }
+    b
+}
+
+/// The LIKE ESCAPE character: `Some(cp)` iff the value's text is exactly
+/// one UTF-8 character (SQLite: "ESCAPE expression must be a single
+/// character" otherwise).
+pub(crate) fn like_escape_char(v: &Value) -> Option<u32> {
+    let t = v.as_text();
+    let mut it = t.chars();
+    match (it.next(), it.next()) {
+        (Some(c), None) => Some(c as u32),
+        _ => None,
+    }
+}
+
+struct PatternInfo {
+    match_all: u32,
+    match_one: u32,
+    match_set: u32,
+    no_case: bool,
+}
+
+const PATTERN_MATCH: i32 = 0;
+const PATTERN_NOMATCH: i32 = 1;
+const PATTERN_NOWILDCARDMATCH: i32 = 2;
+
+/// sqlite3Utf8Read: decode one (leniently validated) UTF-8 character
+/// starting at `*i`; 0 at the end of the input.
+fn utf8_read(z: &[u8], i: &mut usize) -> u32 {
+    if *i >= z.len() {
+        return 0;
+    }
+    let mut c = u32::from(z[*i]);
+    *i += 1;
+    if c >= 0xc0 {
+        const TRANS: [u8; 64] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+            0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x00, 0x01, 0x02, 0x03, 0x00, 0x01, 0x00, 0x00,
+        ];
+        c = u32::from(TRANS[(c - 0xc0) as usize]);
+        while *i < z.len() && (z[*i] & 0xc0) == 0x80 {
+            c = (c << 6) + u32::from(0x3f & z[*i]);
+            *i += 1;
+        }
+        if c < 0x80 || (c & 0xFFFF_F800) == 0xD800 || (c & 0xFFFF_FFFE) == 0xFFFE {
+            c = 0xFFFD;
+        }
+    }
+    c
+}
+
+#[inline]
+fn ascii_lower(c: u32) -> u32 {
+    if (u32::from(b'A')..=u32::from(b'Z')).contains(&c) {
+        c + 32
+    } else {
+        c
+    }
+}
+
+/// func.c `patternCompare`, verbatim semantics (LIKE and GLOB): `%`/`*`
+/// runs collapse, the NOWILDCARDMATCH return prunes the search to
+/// polynomial time (the old recursive matcher was exponential on
+/// `'%a%a%a%a%b'` shapes), case folding is ASCII-only, `[...]` sets for
+/// GLOB, and an escaped character is always literal.
+fn pattern_compare(pat: &[u8], s: &[u8], info: &PatternInfo, match_other: u32) -> i32 {
+    let mut pi = 0usize;
+    let mut si = 0usize;
+    let mut escaped_at: Option<usize> = None;
+    loop {
+        let mut c = utf8_read(pat, &mut pi);
+        if c == 0 {
+            break;
+        }
+        if c == info.match_all && info.match_all != 0 {
+            loop {
+                c = utf8_read(pat, &mut pi);
+                if c == info.match_all && info.match_all != 0 {
+                    continue;
+                }
+                if c == info.match_one && info.match_one != 0 {
+                    if utf8_read(s, &mut si) == 0 {
+                        return PATTERN_NOWILDCARDMATCH;
+                    }
+                    continue;
+                }
+                break;
+            }
+            if c == 0 {
+                return PATTERN_MATCH;
+            } else if c == match_other && match_other != 0 {
+                if info.match_set == 0 {
+                    c = utf8_read(pat, &mut pi);
+                    if c == 0 {
+                        return PATTERN_NOWILDCARDMATCH;
+                    }
+                } else {
+                    // "[...]" right after "*": slow recursive search.
+                    let rest = &pat[pi - 1..];
+                    let mut k = si;
+                    while k < s.len() {
+                        let b = pattern_compare(rest, &s[k..], info, match_other);
+                        if b != PATTERN_NOMATCH {
+                            return b;
+                        }
+                        let mut kk = k;
+                        utf8_read(s, &mut kk);
+                        k = kk;
+                    }
+                    return PATTERN_NOWILDCARDMATCH;
+                }
+            }
+            // Search the subject for the first char after the wildcard and
+            // recursively continue from each candidate.
+            loop {
+                let c2 = utf8_read(s, &mut si);
+                if c2 == 0 {
+                    break;
+                }
+                let hit = c2 == c
+                    || (info.no_case && c < 0x80 && c2 < 0x80 && ascii_lower(c) == ascii_lower(c2));
+                if !hit {
+                    continue;
+                }
+                let b = pattern_compare(&pat[pi..], &s[si..], info, match_other);
+                if b != PATTERN_NOMATCH {
+                    return b;
+                }
+            }
+            return PATTERN_NOWILDCARDMATCH;
+        }
+        if c == match_other && match_other != 0 {
+            if info.match_set == 0 {
+                c = utf8_read(pat, &mut pi);
+                if c == 0 {
+                    return PATTERN_NOMATCH;
+                }
+                escaped_at = Some(pi);
+            } else {
+                // GLOB character set.
+                let mut prior_c: u32 = 0;
+                let mut seen = false;
+                let mut invert = false;
+                let cs = utf8_read(s, &mut si);
+                if cs == 0 {
+                    return PATTERN_NOMATCH;
+                }
+                let mut c2 = utf8_read(pat, &mut pi);
+                if c2 == u32::from(b'^') {
+                    invert = true;
+                    c2 = utf8_read(pat, &mut pi);
+                }
+                if c2 == u32::from(b']') {
+                    if cs == u32::from(b']') {
+                        seen = true;
+                    }
+                    c2 = utf8_read(pat, &mut pi);
+                }
+                while c2 != 0 && c2 != u32::from(b']') {
+                    let next = pat.get(pi).copied().unwrap_or(0);
+                    if c2 == u32::from(b'-') && next != b']' && next != 0 && prior_c > 0 {
+                        c2 = utf8_read(pat, &mut pi);
+                        if cs >= prior_c && cs <= c2 {
+                            seen = true;
+                        }
+                        prior_c = 0;
+                    } else {
+                        if cs == c2 {
+                            seen = true;
+                        }
+                        prior_c = c2;
+                    }
+                    c2 = utf8_read(pat, &mut pi);
+                }
+                if c2 == 0 || !(seen ^ invert) {
+                    return PATTERN_NOMATCH;
+                }
+                continue;
+            }
+        }
+        let c2 = utf8_read(s, &mut si);
+        if c == c2 {
+            continue;
+        }
+        if info.no_case && c < 0x80 && c2 < 0x80 && ascii_lower(c) == ascii_lower(c2) {
+            continue;
+        }
+        if c == info.match_one && info.match_one != 0 && escaped_at != Some(pi) && c2 != 0 {
+            continue;
+        }
+        return PATTERN_NOMATCH;
+    }
+    if si >= s.len() {
+        PATTERN_MATCH
+    } else {
+        PATTERN_NOMATCH
+    }
 }
 
 /// ASCII case folding helper (SQLite LIKE folds ASCII letters only).
@@ -2641,154 +3557,18 @@ fn like_general_bytes(s: &[u8], p: &[u8], case_sensitive: bool) -> bool {
     pi == p.len()
 }
 
-fn like_match_str(s: &str, p: &str, esc: Option<char>, case_sensitive: bool) -> bool {
-    let s_chars: Vec<char> = if case_sensitive {
-        s.chars().collect()
-    } else {
-        s.to_lowercase().chars().collect()
-    };
-    let p_chars: Vec<char> = if case_sensitive {
-        p.chars().collect()
-    } else {
-        p.to_lowercase().chars().collect()
-    };
-    let esc_char = esc.unwrap_or('\0');
-    like_match_chars(&s_chars, 0, &p_chars, 0, esc_char)
-}
-
-fn like_match_chars(s: &[char], si: usize, p: &[char], pi: usize, esc: char) -> bool {
-    if pi >= p.len() {
-        return si >= s.len();
-    }
-    let pc = p[pi];
-    if pc == esc && pi + 1 < p.len() {
-        let next = p[pi + 1];
-        if si < s.len() && s[si] == next {
-            return like_match_chars(s, si + 1, p, pi + 2, esc);
-        }
-        return false;
-    }
-    match pc {
-        '%' => {
-            // Match zero or more characters.
-            for i in si..=s.len() {
-                if like_match_chars(s, i, p, pi + 1, esc) {
-                    return true;
-                }
-            }
-            false
-        }
-        '_' => {
-            if si < s.len() {
-                like_match_chars(s, si + 1, p, pi + 1, esc)
-            } else {
-                false
-            }
-        }
-        c => {
-            if si < s.len() && s[si] == c {
-                like_match_chars(s, si + 1, p, pi + 1, esc)
-            } else {
-                false
-            }
-        }
-    }
-}
-
-/// GLOB matching: case-sensitive, * and ? wildcards, [abc] character classes.
+/// GLOB matching (func.c globInfo + patternCompare): case-sensitive,
+/// `*` / `?` wildcards, `[...]` / `[^...]` sets with ranges.
 pub fn glob_match(value: &Value, pattern: &Value) -> bool {
-    let s: Vec<char> = value.as_text().chars().collect();
-    let p: Vec<char> = pattern.as_text().chars().collect();
-    glob_match_chars(&s, 0, &p, 0)
-}
-
-fn glob_match_chars(s: &[char], si: usize, p: &[char], pi: usize) -> bool {
-    if pi >= p.len() {
-        return si >= s.len();
-    }
-    match p[pi] {
-        '*' => {
-            for i in si..=s.len() {
-                if glob_match_chars(s, i, p, pi + 1) {
-                    return true;
-                }
-            }
-            false
-        }
-        '?' => {
-            if si < s.len() {
-                glob_match_chars(s, si + 1, p, pi + 1)
-            } else {
-                false
-            }
-        }
-        '[' => {
-            // Character class
-            if si >= s.len() {
-                return false;
-            }
-            let mut end = pi + 1;
-            let mut negate = false;
-            if end < p.len() && (p[end] == '!' || p[end] == '^') {
-                negate = true;
-                end += 1;
-            }
-            let mut matched = false;
-            let class_start = end;
-            while end < p.len() && p[end] != ']' {
-                end += 1;
-            }
-            let mut i = class_start;
-            while i < end {
-                if i + 2 < end && p[i + 1] == '-' {
-                    if s[si] >= p[i] && s[si] <= p[i + 2] {
-                        matched = true;
-                    }
-                    i += 3;
-                } else {
-                    if s[si] == p[i] {
-                        matched = true;
-                    }
-                    i += 1;
-                }
-            }
-            if matched ^ negate {
-                glob_match_chars(s, si + 1, p, end + 1)
-            } else {
-                false
-            }
-        }
-        c => {
-            if si < s.len() && s[si] == c {
-                glob_match_chars(s, si + 1, p, pi + 1)
-            } else {
-                false
-            }
-        }
-    }
-}
-
-/// printf width/padding: left-align with spaces, or zero-pad numerics
-/// (sign before the zeros, C semantics).
-fn apply_printf_width(raw: String, minus: bool, zero: bool, width: usize) -> String {
-    let len = raw.chars().count();
-    if len >= width || width == 0 {
-        return raw;
-    }
-    let pad = " ".repeat(width - len);
-    if minus {
-        format!("{raw}{pad}")
-    } else if zero {
-        // Zero-pad after a leading sign.
-        let (sign, digits) = match raw.strip_prefix('-') {
-            Some(d) => ("-", d.to_string()),
-            None => ("", raw.clone()),
-        };
-        let zeros = "0".repeat(width - len);
-        format!("{sign}{zeros}{digits}")
-    } else {
-        format!("{pad}{raw}")
-    }
+    let s = like_operand_bytes(value);
+    let p = like_operand_bytes(pattern);
+    let info = PatternInfo {
+        match_all: u32::from(b'*'),
+        match_one: u32::from(b'?'),
+        match_set: u32::from(b'['),
+        no_case: false,
+    };
+    pattern_compare(&p, &s, &info, u32::from(b'[')) == PATTERN_MATCH
 }
 
 // ---------------------------------------------------------------------------

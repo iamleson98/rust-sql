@@ -231,6 +231,42 @@ pub struct ConcurrentTxn {
     /// high-water, so the ids exist in the committed file), and a full
     /// ROLLBACK recycles them alongside `allocated`.
     pub(crate) discarded: Vec<PageId>,
+    /// SEMANTIC READ SET, page granularity: leaf / overflow pages whose
+    /// content was returned to the statement layer (scans, index probes,
+    /// UNIQUE checks) — as opposed to the STRUCTURAL fetches the B-tree
+    /// write paths make (see [`StructuralScope`]). Validated at COMMIT
+    /// (and whenever the transaction's view advances): a page whose
+    /// committed stamp moved since this transaction materialized it means
+    /// a sibling commit changed data this transaction READ — committing
+    /// would admit write skew / stale-read anomalies (SQLite's
+    /// begin-concurrent rejects any transaction whose read pages were
+    /// modified), so the commit fails with SQLITE_BUSY_SNAPSHOT.
+    pub(crate) sem_pages: HashSet<PageId>,
+    /// SEMANTIC READ SET, row granularity: rowid point lookups record
+    /// (canonical tree root, rowid) with the epoch of the shadow they
+    /// read from — a sibling's write to a DIFFERENT row of the same hot
+    /// leaf is not a conflict (row-level MERGE stays available), a write
+    /// to the row itself (or an insert of the probed-but-absent rowid) is.
+    pub(crate) sem_rows: HashMap<(PageId, i64), u64>,
+    /// SEMANTIC READ SET, index-key granularity: equality probes of an
+    /// index (`WHERE indexed_col = ?`, UNIQUE checks) record (canonical
+    /// index root, probe key prefix) with the read epoch. A sibling's
+    /// commit of an entry under that prefix (insert or delete — the
+    /// phantom case included) is a conflict; entries under OTHER keys of
+    /// the same hot leaf are not.
+    pub(crate) sem_keys: HashMap<(PageId, Vec<u8>), u64>,
+    /// Commit epoch observed when each shadow was materialized (the
+    /// "as of" point of every read served from it).
+    pub(crate) shadow_epoch: HashMap<PageId, u64>,
+    /// B-tree page-type byte of each materialized shadow (interior pages
+    /// are navigation, never part of the semantic read set).
+    pub(crate) page_kind: HashMap<PageId, u8>,
+    /// True once a LATE touch (a page a sibling committed after BEGIN)
+    /// was served at its newest bytes: the view advanced past the BEGIN
+    /// snapshot, so every further read must be checked against the
+    /// pages/rows already read (opacity — no mixed snapshot is ever
+    /// returned to the statement layer).
+    pub(crate) view_advanced: bool,
 }
 
 impl ConcurrentTxn {
@@ -250,6 +286,12 @@ impl ConcurrentTxn {
             root_lineage: HashMap::new(),
             savepoints: Vec::new(),
             discarded: Vec::new(),
+            sem_pages: HashSet::new(),
+            sem_rows: HashMap::new(),
+            sem_keys: HashMap::new(),
+            shadow_epoch: HashMap::new(),
+            page_kind: HashMap::new(),
+            view_advanced: false,
         }
     }
 
@@ -322,6 +364,10 @@ pub struct ConcurrentManager {
     /// key by (index root, rowid): entries of one row collide (any key),
     /// entries of different rows do not.
     row_stamps: RwLock<HashMap<(PageId, i64), u64>>,
+    /// Index-key write stamps: (ORIGIN index root, encoded key) → epoch of
+    /// the commit that last inserted/deleted an entry with that key —
+    /// ordered so a probe PREFIX can range-scan its keys.
+    key_stamps: RwLock<std::collections::BTreeMap<(PageId, Vec<u8>), u64>>,
     /// Origin root → CURRENT committed root for that tree. Updated at
     /// every concurrent commit that moved a root (splits fold into the
     /// origin's entry). Absent = the origin root is still current. The
@@ -419,6 +465,7 @@ impl ConcurrentManager {
             txns: std::array::from_fn(|_| TxnShard(Mutex::new(HashMap::new()))),
             stamps: RwLock::new(HashMap::new()),
             row_stamps: RwLock::new(HashMap::new()),
+            key_stamps: RwLock::new(std::collections::BTreeMap::new()),
             live_roots: RwLock::new(HashMap::new()),
             root_origin: RwLock::new(HashMap::new()),
             commit_epoch: AtomicU64::new(1),
@@ -537,6 +584,55 @@ impl ConcurrentManager {
         }
     }
 
+    /// Stamp the index KEYS a committing transaction's journal wrote.
+    fn stamp_keys<'a>(&self, ops: impl Iterator<Item = &'a JournalOp>, epoch: u64) {
+        let mut keys = self.key_stamps.write();
+        for op in ops {
+            if op.is_index {
+                let origin = self.origin_of(op.root);
+                keys.insert((origin, op.key.clone()), epoch);
+            }
+        }
+    }
+
+    /// Newest commit epoch that wrote an index entry whose key starts
+    /// with `prefix` in the tree with ORIGIN-folded root `root` (0 when
+    /// none).
+    pub(crate) fn key_prefix_stamp(&self, root: PageId, prefix: &[u8]) -> u64 {
+        let origin = self.origin_of(root);
+        let keys = self.key_stamps.read();
+        let mut newest = 0;
+        for ((r, k), e) in keys.range((origin, prefix.to_vec())..) {
+            if *r != origin || !k.starts_with(prefix) {
+                break;
+            }
+            newest = newest.max(*e);
+        }
+        newest
+    }
+
+    /// Drop every version stamp once NO concurrent transaction is open
+    /// (and none is mid-commit): each future transaction's BEGIN epoch is
+    /// at least every existing stamp, so an absent stamp (0) answers every
+    /// "moved since?" question identically. Without this the maps grew
+    /// by one entry per page / row / index key ever written under the
+    /// regime, for the life of the process. The emptiness check runs
+    /// under the stamp write locks, so a transaction registering
+    /// concurrently either is seen (no prune) or reads the pruned maps.
+    pub(crate) fn prune_stamps_if_idle(&self) {
+        let mut stamps = self.stamps.write();
+        let mut rows = self.row_stamps.write();
+        let mut keys = self.key_stamps.write();
+        if self.active.load(Ordering::Acquire) == 0 && self.committing.load(Ordering::Acquire) == 0
+        {
+            stamps.clear();
+            stamps.shrink_to_fit();
+            rows.clear();
+            rows.shrink_to_fit();
+            keys.clear();
+        }
+    }
+
     /// Committed row stamp of (ORIGIN root, rowid). 0 = never written
     /// by a concurrent commit. The origin fold applies on BOTH sides
     /// (stamp and lookup), so views that straddle a split agree.
@@ -634,6 +730,110 @@ thread_local! {
 /// Current armed scope (instance, txn) — `None` when not armed.
 pub(crate) fn writer_scope() -> Option<(u64, u64)> {
     WRITER_SCOPE.with(|c| c.get())
+}
+
+thread_local! {
+    /// Depth of B-tree WRITE entry points on this thread (see
+    /// [`StructuralScope`]). Page fetches made at depth 0 are semantic
+    /// reads of the armed concurrent transaction.
+    static STRUCTURAL_DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// The (tree root, rowid) of the rowid point lookup in progress, if
+    /// any: its leaf fetch records a ROW-level read instead of a page one.
+    static POINT_READ: Cell<Option<(PageId, i64)>> = const { Cell::new(None) };
+    /// The (index root, probe key) of the equality index probe in
+    /// progress, if any (see `sem_keys`).
+    static KEY_PROBE: std::cell::RefCell<Option<(PageId, Vec<u8>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// RAII marker for an equality index probe (restores the previous one).
+pub(crate) struct KeyProbeScope {
+    prev: Option<(PageId, Vec<u8>)>,
+    armed: bool,
+}
+
+impl KeyProbeScope {
+    #[inline]
+    pub(crate) fn enter(armed: bool, root: PageId, key: &[u8]) -> Self {
+        if !armed {
+            return KeyProbeScope {
+                prev: None,
+                armed: false,
+            };
+        }
+        let prev = KEY_PROBE.with(|p| p.replace(Some((root, key.to_vec()))));
+        KeyProbeScope { prev, armed: true }
+    }
+}
+
+impl Drop for KeyProbeScope {
+    fn drop(&mut self) {
+        if self.armed {
+            let prev = self.prev.take();
+            KEY_PROBE.with(|p| *p.borrow_mut() = prev);
+        }
+    }
+}
+
+/// RAII marker for a B-tree write entry point (insert / update / delete /
+/// max-rowid probes): the pages it fetches steer placement only — they
+/// are validated by the write-set / decision-read machinery, not as
+/// semantic reads. Only armed while a concurrent writer scope exists.
+pub(crate) struct StructuralScope {
+    armed: bool,
+}
+
+impl StructuralScope {
+    #[inline]
+    pub(crate) fn enter(armed: bool) -> Self {
+        if armed {
+            STRUCTURAL_DEPTH.with(|d| d.set(d.get() + 1));
+        }
+        StructuralScope { armed }
+    }
+}
+
+impl Drop for StructuralScope {
+    #[inline]
+    fn drop(&mut self) {
+        if self.armed {
+            STRUCTURAL_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        }
+    }
+}
+
+#[inline]
+fn structural_active() -> bool {
+    STRUCTURAL_DEPTH.with(|d| d.get() > 0)
+}
+
+/// RAII marker for a rowid point lookup (restores the previous value, so
+/// nested lookups — overflow assembly, triggers — stay correct).
+pub(crate) struct PointReadScope {
+    prev: Option<(PageId, i64)>,
+    armed: bool,
+}
+
+impl PointReadScope {
+    #[inline]
+    pub(crate) fn enter(armed: bool, root: PageId, rowid: i64) -> Self {
+        if !armed {
+            return PointReadScope {
+                prev: None,
+                armed: false,
+            };
+        }
+        let prev = POINT_READ.with(|p| p.replace(Some((root, rowid))));
+        PointReadScope { prev, armed: true }
+    }
+}
+
+impl Drop for PointReadScope {
+    #[inline]
+    fn drop(&mut self) {
+        if self.armed {
+            POINT_READ.with(|p| p.set(self.prev));
+        }
+    }
 }
 
 /// SAVEPOINT undo capture for a shadow-page fetch (the mirror of the
@@ -1013,6 +1213,7 @@ impl Pager {
             self.commit_concurrent_body(txn_id)
         };
         self.refresh_concurrent_gate();
+        self.concurrent.prune_stamps_if_idle();
         out
     }
 
@@ -1029,6 +1230,30 @@ impl Pager {
         // `concurrent_writers_active` check wedges every plain writer on
         // BUSY forever.
         self.refresh_concurrent_gate();
+
+        // ---- READ-SET validation (SQLite begin-concurrent semantics):
+        // a WRITING transaction whose semantic reads were invalidated by
+        // a sibling commit cannot commit — its writes may be derived from
+        // stale data (write skew, read-dependency anomalies). This runs
+        // BEFORE the write-set checks because no MERGE can repair it: the
+        // merge replays row operations, not the reads that chose them.
+        // Read-only transactions skip it (their reads were consistent by
+        // construction — see the opacity checks in writer_shadow_fetch).
+        let wrote = !txn.dirtied.is_empty()
+            || !txn.row_journal.is_empty()
+            || !txn.allocated.is_empty()
+            || !txn.freed.is_empty();
+        if wrote {
+            if let Some(what) = self.read_set_stale(&txn) {
+                let mut recycle = txn.allocated.clone();
+                recycle.extend_from_slice(&txn.discarded);
+                self.splice_txn_freed(&recycle)?;
+                return Err(Error::SnapshotConflict(format!(
+                    "data read by this transaction ({what}) was changed by a concurrent \
+                     commit since it was read; the transaction was rolled back — retry it"
+                )));
+            }
+        }
 
         // ---- validation: first-committer-wins on the WRITE set.
         //
@@ -1169,7 +1394,7 @@ impl Pager {
         // middle.
         let mut freed_now = txn.freed.clone();
         freed_now.extend_from_slice(&txn.discarded);
-        let installed = {
+        let ticket = {
             let _ig = self.concurrent.install_gate.write();
             // Publish the root moves BEFORE the install lands: the
             // moment the install's pages become visible, plain readers
@@ -1180,6 +1405,13 @@ impl Pager {
             // one-leaf torn reads).
             self.concurrent.install_lineage(&txn.root_lineage);
             let installed = self.install_txn_shadows(&txn);
+            // Version stamps publish INSIDE the install gate: a reader can
+            // never observe these bytes with the pre-commit stamps (see
+            // `writer_shadow_fetch`'s atomic materialization).
+            let epoch = self.concurrent.stamp_installed(installed.iter().copied());
+            self.concurrent
+                .stamp_rows(txn.row_journal.iter().map(|o| (o.root, o.rowid)), epoch);
+            self.concurrent.stamp_keys(txn.row_journal.iter(), epoch);
             self.splice_txn_freed(&freed_now)?;
             // The durable schema row's single writer-of-record (see
             // `reconcile_catalog_rootpages`): AFTER install_lineage
@@ -1196,16 +1428,9 @@ impl Pager {
             // so the gated window is only the in-memory install + the
             // WAL frame append.
             self.reconcile_catalog_rootpages()?;
-            let ticket = self.flush_wal_deferred_concurrent()?;
-            (installed, ticket)
+            self.flush_wal_deferred_concurrent()?
         };
-        let (installed, ticket) = installed;
-
-        // ---- publish version stamps for the installed pages + rows.
-        let epoch = self.concurrent.stamp_installed(installed.into_iter());
-        self.concurrent
-            .stamp_rows(txn.row_journal.iter().map(|o| (o.root, o.rowid)), epoch);
-        // (install_lineage already ran INSIDE the install gate above.)
+        // (stamps + install_lineage already ran INSIDE the install gate.)
 
         // Advisory caches (leaf hints, memos, chains) must re-derive
         // against the new committed state — one epoch bump covers all.
@@ -1430,7 +1655,7 @@ impl Pager {
         // ---- install the replayed state through the standard path
         // (under the install gate: same plain-reader exclusion contract
         // as the fast path above).
-        let (installed, ticket) = {
+        let ticket = {
             let _ig = self.concurrent.install_gate.write();
             // Publish the replay's root moves BEFORE the install lands
             // (same rationale as the fast path: plain readers resolve
@@ -1438,6 +1663,14 @@ impl Pager {
             // already be published).
             self.concurrent.install_lineage(&fresh.root_lineage);
             let installed = self.install_txn_shadows(&fresh);
+            // Stamps publish inside the gate (fast-path rationale). The
+            // fresh transaction's journal re-recorded the replayed ops
+            // (keys canonicalized against ITS lineage) — exactly the rows
+            // the merged commit wrote.
+            let epoch = self.concurrent.stamp_installed(installed.iter().copied());
+            self.concurrent
+                .stamp_rows(fresh.row_journal.iter().map(|o| (o.root, o.rowid)), epoch);
+            self.concurrent.stamp_keys(fresh.row_journal.iter(), epoch);
             self.splice_txn_freed(&fresh.freed)?;
             // The durable schema row's single writer-of-record — AFTER
             // the replay's own lineage is published (the pre-install
@@ -1446,16 +1679,9 @@ impl Pager {
             // rationale: the tail's get_page/cache traffic must not
             // interleave with owner statements / reader walks).
             self.reconcile_catalog_rootpages()?;
-            let ticket = self.flush_wal_deferred_concurrent()?;
-            (installed, ticket)
+            self.flush_wal_deferred_concurrent()?
         };
-        let epoch = self.concurrent.stamp_installed(installed.into_iter());
-        // The fresh transaction's journal re-recorded the replayed ops
-        // (with keys canonicalized against ITS lineage) — stamping those
-        // keys publishes exactly the rows the merged commit wrote.
-        self.concurrent
-            .stamp_rows(fresh.row_journal.iter().map(|o| (o.root, o.rowid)), epoch);
-        // (install_lineage already ran INSIDE the install gate above.)
+        // (stamps + install_lineage already ran INSIDE the install gate.)
 
         // ---- engine bookkeeping fixups: the merged trees may be rooted
         // elsewhere than the transaction's private view (replayed splits).
@@ -1896,6 +2122,7 @@ impl Pager {
             self.rollback_concurrent_body(txn_id)
         };
         self.refresh_concurrent_gate();
+        self.concurrent.prune_stamps_if_idle();
         out
     }
 
@@ -2267,6 +2494,119 @@ impl Pager {
     /// did. With a savepoint open the strict abort remains: a savepoint
     /// undo image must be byte-stable, and post-sibling bytes could
     /// leak a later commit into a ROLLBACK TO SAVEPOINT view.
+    /// The first stale entry of `txn`'s semantic read set, if any: a read
+    /// page whose committed stamp moved since it was materialized, or a
+    /// read row a sibling commit wrote after the read.
+    fn read_set_stale(&self, txn: &ConcurrentTxn) -> Option<String> {
+        {
+            let stamps = self.concurrent.stamps.read();
+            for id in &txn.sem_pages {
+                let rec = txn.read_stamps.get(id).copied().unwrap_or(0);
+                let now = stamps.get(id).copied().unwrap_or(0);
+                if now != rec {
+                    return Some(format!("page {id}"));
+                }
+            }
+        }
+        for (&(root, rowid), &e) in &txn.sem_rows {
+            if self.concurrent.row_stamp(root, rowid) > e {
+                return Some(format!("row {rowid}"));
+            }
+        }
+        for ((root, key), &e) in &txn.sem_keys {
+            if self.concurrent.key_prefix_stamp(*root, key) > e {
+                return Some("index key".to_string());
+            }
+        }
+        None
+    }
+
+    /// Record a semantic read of shadow `id` (called for fetches outside
+    /// any [`StructuralScope`]). Once the view has advanced, the read is
+    /// also validated on the spot: serving a stale shadow next to a newer
+    /// late-touched page would hand the statement a mixed snapshot.
+    fn note_semantic_read(&self, txn: &mut ConcurrentTxn, id: PageId) -> Result<()> {
+        // Fresh allocations (no kind recorded) are private — nothing a
+        // sibling can change. Interior pages are navigation only.
+        let Some(kind) = txn.page_kind.get(&id).copied() else {
+            return Ok(());
+        };
+        if kind == 0x05 || kind == 0x02 {
+            return Ok(());
+        }
+        let stale = || {
+            Error::SnapshotConflict(format!(
+                "data read by this transaction (page {id}) was changed by a concurrent \
+                 commit; the transaction must be retried"
+            ))
+        };
+        if let Some((root, rowid)) = POINT_READ.with(|p| p.get()) {
+            if kind == 0x0D {
+                let key = (txn.canonical_root(root), rowid);
+                let e = txn
+                    .shadow_epoch
+                    .get(&id)
+                    .copied()
+                    .unwrap_or(txn.begin_epoch);
+                let ent = txn.sem_rows.entry(key).or_insert(e);
+                if e < *ent {
+                    *ent = e;
+                }
+                let read_at = *ent;
+                if txn.view_advanced && self.concurrent.row_stamp(key.0, key.1) > read_at {
+                    return Err(stale());
+                }
+                return Ok(());
+            }
+            if kind != 0x0A {
+                // Overflow pages of the point-read row: covered by the
+                // row-level entry.
+                return Ok(());
+            }
+        }
+        if kind == 0x0A {
+            let probe = KEY_PROBE.with(|p| p.borrow().clone());
+            if let Some((root, key)) = probe {
+                let canonical = txn.canonical_root(root);
+                let e = txn
+                    .shadow_epoch
+                    .get(&id)
+                    .copied()
+                    .unwrap_or(txn.begin_epoch);
+                let ent = txn.sem_keys.entry((canonical, key)).or_insert(e);
+                if e < *ent {
+                    *ent = e;
+                }
+                let read_at = *ent;
+                if txn.view_advanced {
+                    let key = KEY_PROBE
+                        .with(|p| p.borrow().as_ref().map(|(_, k)| k.clone()))
+                        .unwrap_or_default();
+                    if self.concurrent.key_prefix_stamp(canonical, &key) > read_at {
+                        return Err(stale());
+                    }
+                }
+                return Ok(());
+            }
+        }
+        if txn.sem_pages.insert(id) && std::env::var_os("RSQL_DBG_SEMREAD").is_some() {
+            eprintln!(
+                "[SEMREAD] txn {} page {} kind {:#x}\n{}",
+                txn.id,
+                id,
+                kind,
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+        if txn.view_advanced {
+            let rec = txn.read_stamps.get(&id).copied().unwrap_or(0);
+            if self.concurrent.stamp_of(id) != rec {
+                return Err(stale());
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn writer_shadow_fetch(&self, txn_id: u64, id: PageId) -> Result<PageRef> {
         let mut guard = match self.concurrent.get(txn_id) {
             Some(g) => g,
@@ -2293,6 +2633,12 @@ impl Pager {
             if !txn.savepoints.is_empty() {
                 capture_shadow_undo(txn, id, &pr);
             }
+            if id != 0 && !structural_active() {
+                if let Err(e) = self.note_semantic_read(txn, id) {
+                    drop(guard);
+                    return Err(e);
+                }
+            }
             return Ok(pr);
         }
         // ── LATE-TOUCH GATE ──────────────────────────────────────────
@@ -2302,28 +2648,39 @@ impl Pager {
         // is a late touch once the first committer lands — the strict
         // gate used to abort all of them, making the parallel regime a
         // retry storm). Materialization then serves the newest committed
-        // bytes (see the method doc); with a savepoint open, keep the
-        // strict abort (undo images must be byte-stable).
+        // bytes; with a savepoint open, keep the strict abort (undo
+        // images must be byte-stable).
         //
         // PAGE 0 is exempt (its header region is rewritten by every
         // commit, and its schema rows only move with root moves — a
         // page-0 reader has always served the newest committed bytes;
         // a read-committed page 0).
+        let begin_epoch = txn.begin_epoch;
+        let snapshot_n_pages = txn.begin_n_pages;
+        let savepoints_open = !txn.savepoints.is_empty();
+        // The registry guard is never held across the install gate (lock
+        // order: install gate → registry shard, below).
+        drop(guard);
+
+        // ATOMIC (stamp, epoch, bytes) under the install gate's READ side.
+        // Commits publish their version stamps INSIDE the install gate's
+        // write side (see `commit_concurrent_body`), so bytes a commit
+        // installed are only ever observed together with that commit's
+        // stamp. The old order — stamp read first, bytes later, stamps
+        // published after the gate — let a fetch pair POST-commit bytes
+        // with a PRE-commit stamp, classify the page as in-snapshot and
+        // skip the opacity check: a read-only transaction summing two
+        // halves of a table saw one leg of a transfer (3999 / 4001).
+        // The gate also spans whole multi-page installs, so a freshly
+        // published root is never walked into a half-installed tree.
+        let _ig = self.concurrent.install_gate.read();
         let stamp = self.concurrent.stamp_of(id);
+        let epoch_f = self.concurrent.current_epoch();
         // A page beyond the BEGIN-time committed count did not exist in
-        // this snapshot — it can ONLY be a sibling commit's install
-        // (allocation bumps n_pages ahead of the install). Treat it as a
-        // LATE touch even when the installer's stamp has not been
-        // published yet: stamp_installed runs AFTER the install gate, so
-        // in that window stamp_of lags the live pages and the strict
-        // `stamp > begin_epoch` test would misclassify the fetch as
-        // in-snapshot and reject a page the tree's CURRENT root points
-        // at ("page 5 out of range (concurrent snapshot n_pages=2)" —
-        // the parallel-writers re-rooting race).
-        let beyond = id >= txn.begin_n_pages && id != 0;
-        let late = (stamp > txn.begin_epoch && id != 0) || beyond;
-        if late && !txn.savepoints.is_empty() {
-            drop(guard);
+        // this snapshot — it can ONLY be a sibling commit's install.
+        let beyond = id >= snapshot_n_pages && id != 0;
+        let late = (stamp > begin_epoch && id != 0) || beyond;
+        if late && savepoints_open {
             return Err(Error::SnapshotConflict(format!(
                 "page {} was committed by another connection after this \
                  transaction began; the transaction must be retried",
@@ -2332,54 +2689,31 @@ impl Pager {
         }
         // Bounds: pages beyond the BEGIN committed count did not exist
         // in this snapshot — EXCEPT for a late touch, where a sibling
-        // commit may have grown the tree (splits): the descent through a
-        // newest-bytes internal shadow can reach pages the sibling
-        // created, which exist in the CURRENT committed state. Bound a
-        // late fetch by the current committed page count instead; a
-        // beyond-snapshot fetch is additionally bounded by the live
-        // `n_pages` (the committed count publishes at the installer's
-        // flush, which trails the install) — uncommitted sibling
-        // allocations are unreachable from any published root (their
-        // trees only become visible at install_lineage), and the
-        // install-gate read side around the materialization below
-        // spans whole installs, so the fetch can never observe a torn
-        // multi-page install.
-        let begin_n_pages = if beyond {
+        // commit may have grown the tree (splits). Bound a late fetch by
+        // the current committed page count; a beyond-snapshot fetch is
+        // additionally bounded by the live `n_pages` (the committed count
+        // publishes at the installer's flush) — uncommitted sibling
+        // allocations are unreachable from any published root.
+        let bound = if beyond {
             self.committed_n_pages
                 .load(Ordering::Acquire)
                 .max(self.n_pages.load(Ordering::Acquire))
         } else if late {
             self.committed_n_pages
                 .load(Ordering::Acquire)
-                .max(txn.begin_n_pages)
+                .max(snapshot_n_pages)
         } else {
-            txn.begin_n_pages
+            snapshot_n_pages
         };
-        if id >= begin_n_pages {
+        if id >= bound {
             return Err(Error::corruption(format!(
                 "page {} out of range (concurrent snapshot n_pages={})",
-                id, begin_n_pages
+                id, bound
             )));
         }
-        // Materialize the committed bytes WITHOUT the registry guard
-        // held (the plain get_page path takes cache/WAL locks), under
-        // the install gate's READ side: a concurrent commit installs a
-        // multi-page tree ONE PAGE AT A TIME, and an armed statement
-        // fetching a freshly-published root mid-install would otherwise
-        // walk into a half-installed tree (children not yet in cache,
-        // WAL, or file). Plain readers already hold this gate for their
-        // whole walk; armed fetches join the same exclusion for this
-        // one materialization.
-        drop(guard);
-
-        // Read the committed bytes: the live path (no scope armed here —
-        // we are inside get_page's writer branch, the committed-view TLS
-        // is not set for the writer thread) serves exactly the
+        // The live path (no scope armed here) serves exactly the
         // committed state in this regime.
-        let live = {
-            let _ig = self.concurrent.install_gate.read();
-            self.fetch_committed_bytes(id, begin_n_pages)?
-        };
+        let live = self.fetch_committed_bytes(id, bound)?;
         let psz = self.page_size();
         let mut page = crate::storage::page::Page::new(id, psz);
         page.data.copy_from_slice(&live);
@@ -2405,8 +2739,29 @@ impl Pager {
         if let Some(existing) = txn.shadows.get(&id) {
             return Ok(existing.clone());
         }
+        // OPACITY: serving the newest bytes advances this transaction's
+        // view past its BEGIN snapshot. That is only sound while
+        // everything it already read is still current — otherwise the
+        // statement would combine pre- and post-commit state (read skew:
+        // one transfer leg visible, the other not). Fail fast instead.
+        // (Still under the install gate: no commit can move a stamp
+        // between this validation and the materialization above.)
+        if late {
+            if let Some(what) = self.read_set_stale(txn) {
+                drop(guard);
+                return Err(Error::SnapshotConflict(format!(
+                    "data read by this transaction ({what}) was changed by a concurrent \
+                     commit; the transaction must be retried"
+                )));
+            }
+            txn.view_advanced = true;
+        }
         txn.read_stamps.insert(id, stamp);
         txn.shadows.insert(id, pr.clone());
+        txn.shadow_epoch.insert(id, epoch_f);
+        if id != 0 {
+            txn.page_kind.insert(id, live[0]);
+        }
         // SAVEPOINT undo capture for the freshly materialized page: the
         // bytes are the committed state, which for every page except the
         // read-committed page 0 is byte-stable since BEGIN (the stamp gate
@@ -2414,6 +2769,12 @@ impl Pager {
         // for this first post-savepoint fetch.
         if !txn.savepoints.is_empty() {
             capture_shadow_undo(txn, id, &pr);
+        }
+        if id != 0 && !structural_active() {
+            if let Err(e) = self.note_semantic_read(txn, id) {
+                drop(guard);
+                return Err(e);
+            }
         }
         Ok(pr)
     }
