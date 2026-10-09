@@ -2672,22 +2672,14 @@ impl Parser {
                 self.expect_keyword("FROM")?;
                 negated = !negated;
                 let right = self.parse_binary(PREC_IS + 1)?;
-                return Ok(Expr::Is {
-                    left: Box::new(left),
-                    right: Box::new(right),
-                    negated,
-                });
+                return Ok(is_expr(left, right, negated));
             }
             if self.peek().is_keyword("NULL") {
                 self.advance();
                 Ok(is_null_expr(left, negated))
             } else {
                 let right = self.parse_binary(PREC_IS + 1)?;
-                Ok(Expr::Is {
-                    left: Box::new(left),
-                    right: Box::new(right),
-                    negated,
-                })
+                Ok(is_expr(left, right, negated))
             }
         } else if self.peek().is_keyword("ISNULL") {
             self.advance();
@@ -3943,16 +3935,10 @@ fn contains_function_call(e: &Expr) -> bool {
             contains_function_call(expr)
                 || matches!(source, InSource::List(l) if l.iter().any(contains_function_call))
         }
-        Expr::Like {
-            expr,
-            pattern,
-            escape,
-            ..
-        } => {
-            contains_function_call(expr)
-                || contains_function_call(pattern)
-                || escape.as_deref().is_some_and(contains_function_call)
-        }
+        // LIKE / GLOB / REGEXP / MATCH parse to a FUNCTION call in SQLite
+        // (sqlite3ExprFunction: like(pattern, expr[, escape])) — EP_HasFunc,
+        // so `0 AND x LIKE y` is not folded to 0.
+        Expr::Like { .. } => true,
         Expr::Case {
             operand,
             whens,
@@ -3966,6 +3952,20 @@ fn contains_function_call(e: &Expr) -> bool {
         }
         Expr::Row(items) => items.iter().any(contains_function_call),
         _ => false,
+    }
+}
+
+/// `X IS [NOT] Y` / `X IS [NOT] DISTINCT FROM Y` (sqlite3PExprIs): a Y
+/// that parsed to NULL — `(NULL)` included — becomes the IS [NOT] NULL
+/// test, which then folds over a literal X like any other.
+fn is_expr(left: Expr, right: Expr, negated: bool) -> Expr {
+    if matches!(right, Expr::Literal(Value::Null)) {
+        return is_null_expr(left, negated);
+    }
+    Expr::Is {
+        left: Box::new(left),
+        right: Box::new(right),
+        negated,
     }
 }
 

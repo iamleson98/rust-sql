@@ -87,8 +87,31 @@ fn sqlite_rows(rc: &Connection, sql: &str) -> Vec<rustqlite::Value> {
 }
 
 fn q_both(db: &rustqlite::Database, rc: &Connection, sql: &str) {
-    let r1 = engine_rows(db, sql);
-    let r2 = sqlite_rows(rc, sql);
+    if sql.to_ascii_uppercase().contains("ORDER BY") {
+        let r1 = engine_rows(db, sql);
+        let r2 = sqlite_rows(rc, sql);
+        assert_eq!(r1, r2, "engine/SQLite rows disagree on: {sql}");
+        return;
+    }
+    // No ORDER BY: SQL leaves the row order unspecified (SQLite's own
+    // order follows whichever index its planner picked) — compare the
+    // rows as a multiset. Values stay exact (storage class included).
+    let mut r1: Vec<Vec<rustqlite::Value>> = db
+        .query(sql, ())
+        .unwrap_or_else(|e| panic!("engine query failed: {sql}: {e}"));
+    let mut r2: Vec<Vec<rustqlite::Value>> = {
+        let mut out = Vec::new();
+        let mut stmt = rc.prepare(sql).expect("sqlite prepare");
+        let n = stmt.column_count();
+        let mut rows = stmt.query([]).unwrap();
+        while let Ok(Some(r)) = rows.next() {
+            out.push((0..n).map(|i| sv(r.get_ref(i).unwrap())).collect());
+        }
+        out
+    };
+    let key = |r: &Vec<rustqlite::Value>| format!("{r:?}");
+    r1.sort_by_key(key);
+    r2.sort_by_key(key);
     assert_eq!(r1, r2, "engine/SQLite rows disagree on: {sql}");
 }
 

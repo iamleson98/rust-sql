@@ -746,6 +746,30 @@ pub(crate) fn explicit_collation(e: &Expr) -> Option<String> {
                     .find_map(|(w, t)| explicit_collation(w).or_else(|| explicit_collation(t)))
             })
             .or_else(|| else_.as_deref().and_then(explicit_collation)),
+        // TK_BETWEEN / TK_IN: the left operand, then the x.pList members.
+        Expr::Between {
+            expr, low, high, ..
+        } => explicit_collation(expr)
+            .or_else(|| explicit_collation(low))
+            .or_else(|| explicit_collation(high)),
+        Expr::In { expr, source, .. } => explicit_collation(expr).or_else(|| match source {
+            crate::sql::ast::InSource::List(items) => items.iter().find_map(explicit_collation),
+            _ => None,
+        }),
+        // LIKE / GLOB are the function like(pattern, expr [, escape]):
+        // the pattern is the FIRST argument searched.
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => explicit_collation(pattern)
+            .or_else(|| explicit_collation(expr))
+            .or_else(|| escape.as_deref().and_then(explicit_collation)),
+        Expr::Is { left, right, .. } => {
+            explicit_collation(left).or_else(|| explicit_collation(right))
+        }
+        Expr::IsNull { expr, .. } => explicit_collation(expr),
         _ => None,
     }
 }
@@ -1511,6 +1535,36 @@ fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext<'_>) -> Result
         return Ok(Value::Integer(1));
     }
     let fname = name.to_ascii_lowercase();
+    // coalesce / ifnull / iif / if: SQLite codes these INLINE and lazily
+    // (iif compiles as CASE) — arguments past the deciding one are never
+    // evaluated, so they cannot raise: `iif(0, abs(-9223372036854775808),
+    // 1)` is 1, `coalesce(1, abs(-9223372036854775808))` is 1.
+    match fname.as_str() {
+        "coalesce" | "ifnull" if args.len() >= 2 => {
+            for a in args {
+                let v = evaluate(a, ctx)?;
+                if !v.is_null() {
+                    return Ok(v);
+                }
+            }
+            return Ok(Value::Null);
+        }
+        "iif" | "if" if args.len() >= 2 => {
+            let mut k = 0;
+            while k + 1 < args.len() {
+                if evaluate(&args[k], ctx)?.is_truthy() {
+                    return evaluate(&args[k + 1], ctx);
+                }
+                k += 2;
+            }
+            return if args.len() % 2 == 1 && args.len() >= 3 {
+                evaluate(&args[args.len() - 1], ctx)
+            } else {
+                Ok(Value::Null)
+            };
+        }
+        _ => {}
+    }
     // Virtual-table aux functions (FTS5's bm25 / highlight / snippet):
     // the call resolves against the statement's driving vtab scan when
     // one is installed. The first argument is the table reference — it

@@ -6997,7 +6997,7 @@ impl<'a> Btree<'a> {
                     return Ok(false); // only child — keep the empty leaf
                 }
                 let last_idx = n_cells as usize - 1;
-                let new_rightmost = {
+                let (new_rightmost, dead_chain) = {
                     let parent_ref = self.pager.get_page(parent_id)?;
                     let borrowed = parent_ref.lock();
                     let cell_ptr = borrowed.cell_pointer(last_idx as u16) as usize;
@@ -7006,14 +7006,21 @@ impl<'a> Btree<'a> {
                         pt,
                         borrowed.page_size(),
                     )?;
-                    c.left_child()
+                    // The dropped cell is a separator: an overflow key's
+                    // chain dies with it (the other branch frees it too).
+                    (c.left_child(), c.index_overflow())
                 };
-                let parent_ref = self.pager.get_page(parent_id)?;
-                let mut borrowed = parent_ref.lock();
-                borrowed.set_right_most_pointer(new_rightmost);
-                // Remove the last cell slot (no shift needed — it's the tail).
-                borrowed.set_n_cells(n_cells - 1);
-                borrowed.touch();
+                {
+                    let parent_ref = self.pager.get_page(parent_id)?;
+                    let mut borrowed = parent_ref.lock();
+                    borrowed.set_right_most_pointer(new_rightmost);
+                    // Remove the last cell slot (no shift needed — it's the tail).
+                    borrowed.set_n_cells(n_cells - 1);
+                    borrowed.touch();
+                }
+                if dead_chain != 0 {
+                    self.free_overflow_chain(dead_chain)?;
+                }
             }
         }
         self.pager.note_dirty(parent_id);
