@@ -1144,7 +1144,8 @@ fn run_seed(seed: u64, stmts_per_case: usize) -> Vec<Divergence> {
                 // leaves i64 — whether it does depends on the summation
                 // order, i.e. on the plan (SQLite may walk an index).
                 (Ok(_), Err(e)) | (Err(e), Ok(_))
-                    if e.contains("integer overflow") && q.sql.to_ascii_uppercase().contains("SUM(") =>
+                    if e.contains("integer overflow")
+                        && q.sql.to_ascii_uppercase().contains("SUM(") =>
                 {
                     UNSPECIFIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     true
