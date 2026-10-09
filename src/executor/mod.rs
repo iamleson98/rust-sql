@@ -7352,6 +7352,20 @@ fn sort_key(
             return Ok(row.get(*k as usize - 1).cloned().unwrap_or(Value::Null));
         }
     }
+    // The NULLS FIRST / LAST key of an ORDINAL term (the plan's fold pass
+    // pairs `ORDER BY k NULLS LAST` with `k IS NULL`): column k's NULLness.
+    if let Expr::IsNull {
+        expr: inner,
+        negated: false,
+    } = expr
+    {
+        if let Expr::Literal(Value::Integer(k)) = inner.as_ref() {
+            if *k >= 1 {
+                let null = row.get(*k as usize - 1).map_or(true, Value::is_null);
+                return Ok(Value::Integer(i64::from(null)));
+            }
+        }
+    }
     eval_row(expr, row, columns, params, named_params)
 }
 
@@ -8106,6 +8120,339 @@ fn exec_const_where(ctx: &mut ExecContext<'_>, input: &Plan, terms: &[Expr]) -> 
     execute(&empty, ctx)
 }
 
+/// The index an `ORDER BY` can be read from, in order: its leading
+/// columns are the terms (plain ASC column keys, the term's collation),
+/// optionally followed by the rowid (index entries tie by rowid). All
+/// terms share one direction and their NULL placement is the natural one
+/// (NULLs sort lowest). Partial, expression and non-B-tree indexes never
+/// qualify. Returns whether the walk runs backwards.
+fn index_order_matches(
+    table: &Table,
+    alias: Option<&str>,
+    index: &crate::schema::Index,
+    terms: &[OrderTerm],
+) -> Option<bool> {
+    if index.partial_expr.is_some()
+        || !matches!(index.kind, crate::schema::IndexKind::Btree)
+        || terms.is_empty()
+    {
+        return None;
+    }
+    let desc = terms[0].order == Order::Desc;
+    let norm = |c: &str| -> String {
+        if c.is_empty() {
+            "BINARY".to_string()
+        } else {
+            c.to_ascii_uppercase()
+        }
+    };
+    for (k, term) in terms.iter().enumerate() {
+        if (term.order == Order::Desc) != desc {
+            return None;
+        }
+        match term.nulls {
+            NullsOrder::Default => {}
+            NullsOrder::First if !desc => {}
+            NullsOrder::Last if desc => {}
+            _ => return None,
+        }
+        let (col, explicit) = match &term.expr {
+            Expr::Collate { expr, collation } => (expr.as_ref(), Some(collation.as_str())),
+            e => (e, None),
+        };
+        let Expr::Column { table: q, name } = col else {
+            return None;
+        };
+        if let Some(q) = q {
+            let ok = q.eq_ignore_ascii_case(&table.name)
+                || alias.is_some_and(|a| q.eq_ignore_ascii_case(a));
+            if !ok {
+                return None;
+            }
+        }
+        let lower = name.to_ascii_lowercase();
+        let is_rowid = matches!(lower.as_str(), "rowid" | "_rowid_" | "oid")
+            || table
+                .rowid_alias
+                .is_some_and(|a| table.columns[a].name.eq_ignore_ascii_case(name));
+        if k == index.columns.len() {
+            // One trailing rowid term: index entries tie by rowid.
+            return (is_rowid && explicit.is_none() && k + 1 == terms.len()).then_some(desc);
+        }
+        if k > index.columns.len() {
+            return None;
+        }
+        let ic = &index.columns[k];
+        let pos = table.find_column(name)?;
+        if ic.expr.is_some()
+            || ic.order != Order::Asc
+            || !ic.name.eq_ignore_ascii_case(&table.columns[pos].name)
+            || norm(&ic.collation) != norm(explicit.unwrap_or(&table.columns[pos].collation))
+        {
+            return None;
+        }
+    }
+    Some(desc)
+}
+
+/// `min(c)` / `max(c)` (no GROUP BY, no DISTINCT / FILTER) read from an
+/// index whose leading key is `c` under the aggregate's collation — the
+/// first (min) or last (max) non-NULL entry of the input's range whose
+/// row passes the range's residual: one descent instead of a full scan.
+/// The value is the row's stored value (index keys encode `5` and `5.0`
+/// alike); among equal values the walk returns the entry SQLite's
+/// optimization reaches first — lowest rowid for min, highest for max.
+fn try_index_min_max(
+    ctx: &mut ExecContext<'_>,
+    input: &Plan,
+    agg: &AggExpr,
+) -> Result<Option<ExecResult>> {
+    let desc = match agg.func.as_str() {
+        "min" => false,
+        "max" => true,
+        _ => return Ok(None),
+    };
+    if agg.distinct || agg.filter.is_some() {
+        return Ok(None);
+    }
+    let Some(arg) = agg.arg.as_ref() else {
+        return Ok(None);
+    };
+    let term = OrderTerm {
+        expr: arg.clone(),
+        order: if desc { Order::Desc } else { Order::Asc },
+        nulls: NullsOrder::Default,
+    };
+    let col = match arg {
+        Expr::Collate { expr, .. } => expr.as_ref(),
+        e => e,
+    };
+    let Expr::Column { name, .. } = col else {
+        return Ok(None);
+    };
+    // The aggregate reads the input's rows: an unfiltered scan, or an
+    // index range (the walk is the range, the residual filters it).
+    let sort_input = match input {
+        Plan::Scan {
+            index: None,
+            predicate: None,
+            ..
+        }
+        | Plan::IndexRange { .. } => input,
+        _ => return Ok(None),
+    };
+    let table = match sort_input {
+        Plan::Scan { table, .. } | Plan::IndexRange { table, .. } => Arc::clone(table),
+        _ => unreachable!(),
+    };
+    let Some(pos) = table.find_column(name) else {
+        return Ok(None);
+    };
+    // min/max skip NULLs: walk from the first non-NULL key (a range
+    // already starts past them; an unfiltered scan does not).
+    let res = match sort_input {
+        Plan::Scan { table, alias, .. } => {
+            let range = Plan::IndexRange {
+                table: Arc::clone(table),
+                alias: alias.clone(),
+                index: match ctx
+                    .catalog()
+                    .indexes_on_table(&table.name)
+                    .into_iter()
+                    .find(|ix| {
+                        index_order_matches(
+                            table,
+                            alias.as_deref(),
+                            ix,
+                            std::slice::from_ref(&term),
+                        )
+                        .is_some()
+                    }) {
+                    Some(ix) => ix,
+                    None => return Ok(None),
+                },
+                start: None,
+                end: None,
+                residual: None,
+            };
+            try_index_order_limit(ctx, &range, std::slice::from_ref(&term), 1)?
+        }
+        _ => try_index_order_limit(ctx, sort_input, std::slice::from_ref(&term), 1)?,
+    };
+    let Some(res) = res else {
+        return Ok(None);
+    };
+    let v = res
+        .rows
+        .first()
+        .and_then(|r| r.get(pos).cloned())
+        .unwrap_or(Value::Null);
+    Ok(Some(ExecResult {
+        columns: Arc::from(vec!["__agg_0".to_string()]),
+        rows: vec![vec![v]],
+    }))
+}
+
+/// `ORDER BY <an index's leading columns> LIMIT k [OFFSET o]` over that
+/// index's range — or over an unfiltered scan of a table with such an
+/// index: SQLite's index-order plan. The index is walked in order
+/// (backwards for DESC) between the range bounds; each entry's row is
+/// fetched and filtered by the residual, and the walk STOPS once `need`
+/// rows qualify — no sort and no full read of the range (`WHERE ts > ?
+/// ORDER BY ts LIMIT 10` used to read the whole range and top-N sort it,
+/// ~6000x SQLite at 1M rows). Ties come out in index order, (key, rowid),
+/// as SQLite's walk returns them. `None` = the shape does not apply.
+fn try_index_order_limit(
+    ctx: &mut ExecContext<'_>,
+    sort_input: &Plan,
+    terms: &[OrderTerm],
+    need: usize,
+) -> Result<Option<ExecResult>> {
+    type Range<'a> = (
+        Option<&'a (Expr, bool)>,
+        Option<&'a (Expr, bool)>,
+        Option<&'a Expr>,
+    );
+    let (table, alias, index, desc, range): (
+        &Arc<Table>,
+        &Option<String>,
+        Arc<crate::schema::Index>,
+        bool,
+        Option<Range<'_>>,
+    ) = match sort_input {
+        Plan::IndexRange {
+            table,
+            alias,
+            index,
+            start,
+            end,
+            residual,
+        } => {
+            let Some(desc) = index_order_matches(table, alias.as_deref(), index, terms) else {
+                return Ok(None);
+            };
+            (
+                table,
+                alias,
+                Arc::clone(index),
+                desc,
+                Some((start.as_ref(), end.as_ref(), residual.as_ref())),
+            )
+        }
+        Plan::Scan {
+            table,
+            alias,
+            index: None,
+            predicate: None,
+        } => {
+            let found = ctx
+                .catalog()
+                .indexes_on_table(&table.name)
+                .into_iter()
+                .find_map(|ix| {
+                    index_order_matches(table, alias.as_deref(), &ix, terms).map(|d| (ix, d))
+                });
+            let Some((index, desc)) = found else {
+                return Ok(None);
+            };
+            (table, alias, index, desc, None)
+        }
+        _ => return Ok(None),
+    };
+    if table.vtab.is_some() || table.without_rowid {
+        return Ok(None);
+    }
+    // Output layout of exec_index_range: qualified columns, plus the
+    // hidden rowid slot for alias-less rowid tables.
+    let append_rowid = crate::planner::wants_rowid_slot(table);
+    let mut columns: Vec<String> = if alias.as_deref().unwrap_or(&table.name) == table.name {
+        table.qualified_col_names.iter().cloned().collect()
+    } else {
+        let prefix = alias.as_deref().unwrap_or(&table.name);
+        table
+            .columns
+            .iter()
+            .map(|c| format!("{}.{}", prefix, c.name))
+            .collect()
+    };
+    if append_rowid {
+        columns.push(crate::planner::hidden_rowid_slot(&table.name));
+    }
+    let columns: Arc<[String]> = columns.into();
+    // Bounds: a NULL bound makes the range empty (SQL 3VL); otherwise the
+    // byte bounds of the walk — `lo` inclusive, `hi` exclusive. A bound
+    // covers the leading column only, so an inclusive upper / exclusive
+    // lower bound steps past every key sharing its prefix (no key
+    // component starts with 0xFF). A range always excludes NULL keys.
+    let (mut lo, mut hi): (Option<Vec<u8>>, Option<Vec<u8>>) = (None, None);
+    let mut residual: Option<&Expr> = None;
+    if let Some((start, end, res)) = range {
+        residual = res;
+        let empty_row: Vec<Value> = Vec::new();
+        let empty_cols: Vec<String> = Vec::new();
+        let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+        let key_of = |b: &(Expr, bool)| -> Result<Option<(Vec<u8>, bool)>> {
+            if evaluate(&b.0, &eval_ctx)?.is_null() {
+                return Ok(None);
+            }
+            Ok(Some((
+                eval_index_bound(&b.0, &eval_ctx, table, &index)?.encode_order_key(),
+                b.1,
+            )))
+        };
+        lo = Some(vec![0x01]);
+        for (bound, is_start) in [(start, true), (end, false)] {
+            let Some(b) = bound else { continue };
+            let Some((mut k, inclusive)) = key_of(b)? else {
+                return Ok(Some(ExecResult {
+                    columns,
+                    rows: Vec::new(),
+                }));
+            };
+            if inclusive != is_start {
+                k.push(0xFF);
+            }
+            if is_start {
+                lo = Some(k);
+            } else {
+                hi = Some(k);
+            }
+        }
+    }
+    let eval_names: Vec<String> = if append_rowid {
+        let mut v: Vec<String> = table.col_names.iter().cloned().collect();
+        v.push(crate::planner::hidden_rowid_slot(&table.name));
+        v
+    } else {
+        table.col_names.iter().cloned().collect()
+    };
+    let n_cols = table.n_columns();
+    let rowid_alias = table.rowid_alias;
+    let mut rows: Vec<Row> = Vec::with_capacity(need.min(4096));
+    if need > 0 {
+        let mut table_bt = Btree::new(ctx.pager, ctx.table_root(table), false);
+        let mut index_bt = Btree::new(ctx.pager, ctx.index_root(&index), true);
+        let (params, named) = (&ctx.params, &ctx.named_params);
+        index_bt.walk_index_ordered(lo.as_deref(), hi.as_deref(), desc, |rowid, _key| {
+            let LookupResult::Found(payload) = table_bt.lookup_table(rowid)? else {
+                return Ok(true);
+            };
+            let mut row = decode_row(&payload, n_cols, rowid, rowid_alias)?;
+            if append_rowid {
+                row.push(Value::Integer(rowid));
+            }
+            if let Some(pred) = residual {
+                if !eval_row_where(pred, &row, &eval_names, params, named)? {
+                    return Ok(true);
+                }
+            }
+            rows.push(row);
+            Ok(rows.len() < need)
+        })?;
+    }
+    Ok(Some(ExecResult { columns, rows }))
+}
+
 fn exec_limit(
     ctx: &mut ExecContext<'_>,
     input: &Plan,
@@ -8134,6 +8481,33 @@ fn exec_limit(
         Expr::Literal(Value::Integer(offset_i)),
     );
     let (count, offset) = (&count_lit, &offset_lit);
+    // ORDER BY over an index's leading columns + LIMIT: walk the index in
+    // order and stop after OFFSET + LIMIT qualifying rows.
+    if count_i >= 0 && (0..=(1 << 16)).contains(&offset_i) && count_i <= (1 << 16) {
+        let order_target = match input {
+            Plan::Sort { input, terms } => Some((input.as_ref(), terms, None)),
+            Plan::Project {
+                input: inner,
+                columns,
+            } => match inner.as_ref() {
+                Plan::Sort { input, terms } => Some((input.as_ref(), terms, Some(columns))),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((sort_input, terms, projection)) = order_target {
+            let need = (count_i + offset_i) as usize;
+            if let Some(mut res) = try_index_order_limit(ctx, sort_input, terms, need)? {
+                let skip = (offset_i as usize).min(res.rows.len());
+                res.rows.drain(..skip);
+                res.rows.truncate(count_i as usize);
+                return match projection {
+                    Some(columns) => apply_projection(res, columns, ctx),
+                    None => Ok(res),
+                };
+            }
+        }
+    }
     // Constant-WHERE marker under the LIMIT: decide it here and limit the
     // chosen plan directly, so the top-N fusions below see their
     // `Limit(Sort(…))` / `Limit(Project(Sort(…)))` shapes.
@@ -13122,6 +13496,34 @@ fn exec_aggregate(
                     });
                 }
             }
+        }
+    }
+    // Index min/max (SQLite's min/max optimization): `SELECT min(c)` /
+    // `max(c)` with no GROUP BY, over an unfiltered scan or a range of an
+    // index whose leading key is `c` — read from the index's first / last
+    // non-NULL entry instead of scanning every row.
+    // Repeated identical calls (`SELECT max(x), typeof(max(x))` plans two)
+    // are one aggregate, as in SQLite's AggInfo: computed once, the value
+    // fills every slot.
+    if group_by.is_empty()
+        && !aggregates.is_empty()
+        && aggregates.iter().all(|a| {
+            a.func == aggregates[0].func
+                && a.distinct == aggregates[0].distinct
+                && a.filter.is_none()
+                && format!("{:?}", a.arg) == format!("{:?}", aggregates[0].arg)
+        })
+    {
+        if let Some(mut res) = try_index_min_max(ctx, input, &aggregates[0])? {
+            if aggregates.len() > 1 {
+                let v = res.rows[0][0].clone();
+                res.columns = (0..aggregates.len())
+                    .map(|i| format!("__agg_{}", i))
+                    .collect::<Vec<_>>()
+                    .into();
+                res.rows = vec![vec![v; aggregates.len()]];
+            }
+            return Ok(res);
         }
     }
     // Fast path #1: input is a bare Scan.

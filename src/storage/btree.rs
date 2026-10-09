@@ -10717,6 +10717,148 @@ impl<'a> Btree<'a> {
         Ok(())
     }
 
+    /// Walk index entries in (key, rowid) order — ascending, or
+    /// descending when `desc` — over the keys `lo <= key < hi` (`None` =
+    /// unbounded). Calls `f(rowid, key)` and stops when it returns false.
+    /// Unlike `scan_index_from`, `f` runs with NO page latch held: each
+    /// leaf's in-range cells are copied out first, so the callback may
+    /// read other trees (the index-order `ORDER BY … LIMIT` path fetches
+    /// each row from inside the walk). Children outside the bounds are
+    /// pruned through the interior separators — a child's entries are
+    /// bounded by its neighbouring separators, the invariant
+    /// `scan_index_from` already descends by.
+    pub fn walk_index_ordered<F: FnMut(i64, &[u8]) -> Result<bool>>(
+        &mut self,
+        lo: Option<&[u8]>,
+        hi: Option<&[u8]>,
+        desc: bool,
+        mut f: F,
+    ) -> Result<()> {
+        // Pure-read walk: suspend savepoint undo pre-image capture.
+        let _undo_scan = crate::storage::pager::suspend_undo_capture();
+        self.walk_index_ordered_rec(self.root, lo, hi, desc, &mut f)?;
+        Ok(())
+    }
+
+    /// Index of the first cell of `pg` whose key (leaf) / separator
+    /// (interior) is `>= bound` — `n_cells` when none is. Overflow keys
+    /// compare by their reassembled full key.
+    fn index_first_ge(&mut self, pg: &Page, interior: bool, bound: &[u8]) -> Result<u16> {
+        let psz = pg.page_size();
+        let (mut lo, mut hi) = (0u16, pg.n_cells());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let ptr = pg.cell_pointer(mid) as usize;
+            let Some(v) = decode_index_cell(pg.cell_slice_checked(ptr)?, interior, psz) else {
+                return Err(Error::corruption("truncated index cell in ordered walk"));
+            };
+            let less = if v.overflow != 0 {
+                self.index_view_key(&v)?.as_slice() < bound
+            } else {
+                v.key < bound
+            };
+            if less {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(lo)
+    }
+
+    fn walk_index_ordered_rec<F: FnMut(i64, &[u8]) -> Result<bool>>(
+        &mut self,
+        page_id: PageId,
+        lo: Option<&[u8]>,
+        hi: Option<&[u8]>,
+        desc: bool,
+        f: &mut F,
+    ) -> Result<bool> {
+        let page = self.pager.get_page(page_id)?;
+        let guard = page.lock();
+        let pg: &Page = &guard;
+        let n = pg.n_cells();
+        let interior = match pg.page_type()? {
+            PageType::LeafIndex => false,
+            PageType::InteriorIndex => true,
+            other => {
+                return Err(Error::corruption(format!(
+                    "index walk reached a {:?} page",
+                    other
+                )))
+            }
+        };
+        let begin = match lo {
+            Some(b) => self.index_first_ge(pg, interior, b)?,
+            None => 0,
+        };
+        let end = match hi {
+            Some(b) => self.index_first_ge(pg, interior, b)?,
+            None => n,
+        };
+        if !interior {
+            // Copy the in-range cells, then release the latch.
+            let psz = pg.page_size();
+            let mut cells: Vec<(i64, Vec<u8>)> =
+                Vec::with_capacity(end.saturating_sub(begin) as usize);
+            for i in begin..end {
+                let ptr = pg.cell_pointer(i) as usize;
+                let Some(v) = decode_index_cell(pg.cell_slice_checked(ptr)?, false, psz) else {
+                    return Err(Error::corruption(
+                        "truncated index leaf cell in ordered walk",
+                    ));
+                };
+                let key = self.index_view_key(&v)?;
+                cells.push((v.rowid, key));
+            }
+            drop(guard);
+            drop(page);
+            if desc {
+                for (rowid, key) in cells.iter().rev() {
+                    if !f(*rowid, key)? {
+                        return Ok(false);
+                    }
+                }
+            } else {
+                for (rowid, key) in &cells {
+                    if !f(*rowid, key)? {
+                        return Ok(false);
+                    }
+                }
+            }
+            return Ok(true);
+        }
+        // Interior: children `begin ..= end` (index n = right-most) can
+        // hold in-range keys — those before `begin` end below `lo` (their
+        // separators are < lo), those after `end` start at or above `hi`.
+        let psz = pg.page_size();
+        let mut children: Vec<PageId> = Vec::with_capacity((end - begin) as usize + 1);
+        for i in begin..=end.min(n) {
+            if i == n {
+                children.push(pg.right_most_pointer());
+            } else {
+                let ptr = pg.cell_pointer(i) as usize;
+                let Some(v) = decode_index_cell(pg.cell_slice_checked(ptr)?, true, psz) else {
+                    return Err(Error::corruption(
+                        "truncated index interior cell in ordered walk",
+                    ));
+                };
+                children.push(v.left_child);
+            }
+        }
+        drop(guard);
+        drop(page);
+        if desc {
+            children.reverse();
+        }
+        for child in children {
+            if child != 0 && !self.walk_index_ordered_rec(child, lo, hi, desc, f)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Recursive range scan. `started` tracks whether we've passed the start
     /// key yet (once true, every entry is visited).
     ///
@@ -11921,6 +12063,77 @@ mod tests {
                 assert!(matches.is_empty(), "value {} should be deleted", i);
             } else {
                 assert_eq!(matches, vec![i], "value {} should remain", i);
+            }
+        }
+    }
+
+    /// walk_index_ordered visits exactly the entries in [lo, hi) — in
+    /// (key, rowid) order, or its reverse — across a multi-level tree with
+    /// duplicate keys and overflow-length keys, and honors early stop.
+    #[test]
+    fn index_ordered_walk_matches_naive_scan() {
+        let pager = open_pager();
+        let mut bt = Btree::create(&pager, true).unwrap();
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed >> 33
+        };
+        let mut entries: Vec<(Vec<u8>, i64)> = Vec::new();
+        for rowid in 1..=3000i64 {
+            let v = (next() % 400) as i64; // ~7 duplicates per key
+            let key = if rowid % 97 == 0 {
+                // Overflow-length TEXT key (sorts with the text family).
+                Value::Text(format!("{:05}{}", v, "x".repeat(5000)).into()).encode_order_key()
+            } else {
+                Value::Integer(v).encode_order_key()
+            };
+            bt.insert_index(&key, rowid).unwrap();
+            entries.push((key, rowid));
+        }
+        entries.sort();
+        let bound = |v: i64| Value::Integer(v).encode_order_key();
+        type Bounds = (Option<Vec<u8>>, Option<Vec<u8>>);
+        let cases: Vec<Bounds> = vec![
+            (None, None),
+            (Some(bound(17)), None),
+            (None, Some(bound(250))),
+            (Some(bound(100)), Some(bound(101))),
+            (Some(bound(399)), Some(bound(399))),
+            (Some(bound(-5)), Some(bound(1000))),
+            (Some(Value::Text("00200".into()).encode_order_key()), None),
+        ];
+        for (lo, hi) in &cases {
+            let want: Vec<i64> = entries
+                .iter()
+                .filter(|(k, _)| {
+                    lo.as_ref().map_or(true, |l| k.as_slice() >= l.as_slice())
+                        && hi.as_ref().map_or(true, |h| k.as_slice() < h.as_slice())
+                })
+                .map(|(_, r)| *r)
+                .collect();
+            for desc in [false, true] {
+                let mut got = Vec::new();
+                bt.walk_index_ordered(lo.as_deref(), hi.as_deref(), desc, |rowid, _| {
+                    got.push(rowid);
+                    Ok(true)
+                })
+                .unwrap();
+                let mut want = want.clone();
+                if desc {
+                    want.reverse();
+                }
+                assert_eq!(got, want, "lo={lo:?} hi={hi:?} desc={desc}");
+                // Early stop after 5 entries.
+                let mut first5 = Vec::new();
+                bt.walk_index_ordered(lo.as_deref(), hi.as_deref(), desc, |rowid, _| {
+                    first5.push(rowid);
+                    Ok(first5.len() < 5)
+                })
+                .unwrap();
+                assert_eq!(first5, want.iter().copied().take(5).collect::<Vec<_>>());
             }
         }
     }

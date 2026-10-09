@@ -32,8 +32,58 @@
 
 use crate::executor::apply_binary;
 use crate::planner::plan::Plan;
-use crate::sql::ast::{BinaryOp, Expr, UnaryOp};
+use crate::sql::ast::{BinaryOp, Expr, NullsOrder, Order, OrderTerm, UnaryOp};
 use crate::types::Value;
+
+/// NULLS FIRST / LAST against the direction's natural placement (NULL
+/// sorts lowest: first under ASC, last under DESC) leads with an `x IS
+/// NULL` key in the same direction — `x NULLS LAST` sorts as `x IS NULL,
+/// x`. Every sort / top-N / merge / window path then honors it (the
+/// clause used to be parsed and ignored). An ORDINAL term `k` pairs with
+/// `k IS NULL`, which the executor's sort key reads as output column k's
+/// NULLness. The extra key never changes which rows tie (two rows tie on
+/// `x IS NULL, x` exactly when they tie on `x`).
+fn expand_nulls_order(terms: &mut Vec<OrderTerm>) {
+    let flips = |t: &OrderTerm| {
+        matches!(
+            (t.order, t.nulls),
+            (Order::Asc, NullsOrder::Last) | (Order::Desc, NullsOrder::First)
+        ) && is_sort_key_term(&t.expr)
+    };
+    if !terms.iter().any(flips) {
+        return;
+    }
+    let mut expanded = Vec::with_capacity(terms.len() + 1);
+    for t in terms.drain(..) {
+        if flips(&t) {
+            expanded.push(OrderTerm {
+                expr: Expr::IsNull {
+                    expr: Box::new(t.expr.clone()),
+                    negated: false,
+                },
+                order: t.order,
+                nulls: NullsOrder::Default,
+            });
+            expanded.push(OrderTerm {
+                nulls: NullsOrder::Default,
+                ..t
+            });
+        } else {
+            expanded.push(t);
+        }
+    }
+    *terms = expanded;
+}
+
+/// A sort term that orders rows: an ordinal (positive integer literal) or
+/// any non-literal expression — a constant term orders nothing.
+fn is_sort_key_term(e: &Expr) -> bool {
+    match e {
+        Expr::Literal(Value::Integer(k)) => *k >= 1,
+        Expr::Literal(_) => false,
+        _ => true,
+    }
+}
 
 /// True when the expression has no observable side effects and no
 /// execution cost that a fold could duplicate or skip: no function
@@ -504,6 +554,7 @@ pub(crate) fn fold_constants_in_plan(plan: &mut Plan) {
                     t.expr = folded;
                 }
             }
+            expand_nulls_order(terms);
             Vec::new()
         }
         Plan::Limit {
@@ -532,6 +583,24 @@ pub(crate) fn fold_constants_in_plan(plan: &mut Plan) {
             fold_constants_in_plan(input);
             let mut out: Vec<&mut Expr> = Vec::new();
             for w in windows.iter_mut() {
+                // A RANGE frame with an offset bound needs its single
+                // ORDER BY key as is.
+                let offset_range = w.frame.as_ref().is_some_and(|f| {
+                    f.kind == crate::sql::ast::FrameKind::Range
+                        && [Some(&*f.start), f.end.as_deref()]
+                            .into_iter()
+                            .flatten()
+                            .any(|b| {
+                                matches!(
+                                    b,
+                                    crate::sql::ast::FrameBound::Preceding(_)
+                                        | crate::sql::ast::FrameBound::Following(_)
+                                )
+                            })
+                });
+                if !offset_range {
+                    expand_nulls_order(&mut w.order_by);
+                }
                 if let Some(a) = w.arg.as_mut() {
                     out.push(a);
                 }
