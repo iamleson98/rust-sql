@@ -700,7 +700,15 @@ fn collation_scope_lookup(qualifier: Option<&str>, name: &str) -> Option<String>
                         continue;
                     }
                 }
+                // The rowid — an INTEGER PRIMARY KEY column or a rowid
+                // spelling — defines NO collation: SQLite resolves both to
+                // iColumn -1 and sqlite3ExprCollSeq skips them, so the next
+                // operand decides (`max('NULL', id, h)` over a NOCASE `h`
+                // compares NOCASE; `id = h` takes h's collation).
                 if let Some(i) = table.find_column(name) {
+                    if table.rowid_alias == Some(i) {
+                        return None;
+                    }
                     return table.columns.get(i).map(|c| {
                         if c.collation.is_empty() {
                             "BINARY".to_string()
@@ -710,7 +718,7 @@ fn collation_scope_lookup(qualifier: Option<&str>, name: &str) -> Option<String>
                     });
                 }
                 if crate::planner::is_rowid_spelling(name) && !table.without_rowid {
-                    return Some("BINARY".to_string());
+                    return None;
                 }
                 if qualifier.is_some() {
                     return None;

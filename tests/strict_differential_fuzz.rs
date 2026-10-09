@@ -479,11 +479,18 @@ fn agg_call(rng: &mut Rng, ctx: &Ctx, d: u32) -> String {
 
 // --------------------------------------------------------------- queries --
 
+#[derive(Default)]
 struct Query {
     sql: String,
     /// True when the ORDER BY is total over the output, so row SEQUENCE is
     /// part of the contract.
     ordered: bool,
+    /// Output columns that are a top-level `min(x)` / `max(x)` aggregate:
+    /// among several EQUAL candidates (`0` / `0.0`, `'a'` / `'A'` under
+    /// NOCASE) SQLite returns the first its plan reads — and it reads a
+    /// table through a covering index whenever one exists — so only the
+    /// equality class is a contract there (see `unspecified_only`).
+    minmax_cols: Vec<usize>,
 }
 
 fn table_for(rng: &mut Rng) -> (&'static str, &'static [&'static str]) {
@@ -531,7 +538,11 @@ fn gen_query(rng: &mut Rng) -> Query {
                     ));
                 }
             }
-            Query { sql, ordered }
+            Query {
+                sql,
+                ordered,
+                ..Default::default()
+            }
         }
         // Aggregate, optionally grouped.
         4..=5 => {
@@ -553,6 +564,14 @@ fn gen_query(rng: &mut Rng) -> Query {
             if grouped {
                 proj.insert(0, key.clone());
             }
+            let minmax_cols: Vec<usize> = proj
+                .iter()
+                .enumerate()
+                .filter(|(i, p)| {
+                    (!grouped || *i > 0) && (p.starts_with("min(") || p.starts_with("max("))
+                })
+                .map(|(i, _)| i)
+                .collect();
             let mut sql = format!("SELECT {} FROM {}", proj.join(", "), t);
             if rng.chance(50) {
                 sql.push_str(&format!(" WHERE {}", expr(rng, &plain, 2)));
@@ -580,6 +599,7 @@ fn gen_query(rng: &mut Rng) -> Query {
             Query {
                 sql,
                 ordered: false,
+                minmax_cols,
             }
         }
         // Join.
@@ -614,6 +634,7 @@ fn gen_query(rng: &mut Rng) -> Query {
             Query {
                 sql,
                 ordered: false,
+                ..Default::default()
             }
         }
         // Compound select.
@@ -642,6 +663,7 @@ fn gen_query(rng: &mut Rng) -> Query {
             Query {
                 sql,
                 ordered: false,
+                ..Default::default()
             }
         }
         // Constant expression (no table): the evaluator in isolation.
@@ -656,6 +678,7 @@ fn gen_query(rng: &mut Rng) -> Query {
             Query {
                 sql: format!("SELECT {}", proj.join(", ")),
                 ordered: true,
+                ..Default::default()
             }
         }
         // Typeof probe: storage class of a projected expression.
@@ -670,6 +693,7 @@ fn gen_query(rng: &mut Rng) -> Query {
             Query {
                 sql: format!("SELECT typeof({e}), quote({e}) FROM {t}"),
                 ordered: false,
+                ..Default::default()
             }
         }
     }
@@ -923,7 +947,13 @@ fn eq_class(v: &V, nocase: bool) -> V {
 /// storage class that is not one of the tied candidates, an order that
 /// differs on non-tied keys — is still a divergence. Every acceptance is
 /// COUNTED and reported (strict_differential_vs_sqlite prints the total).
-fn unspecified_only(sql: &str, ordered: bool, ours: &Rows, theirs: &Rows) -> bool {
+fn unspecified_only(
+    sql: &str,
+    ordered: bool,
+    minmax_cols: &[usize],
+    ours: &Rows,
+    theirs: &Rows,
+) -> bool {
     if ours.len() != theirs.len() {
         return false;
     }
@@ -934,7 +964,7 @@ fn unspecified_only(sql: &str, ordered: bool, ours: &Rows, theirs: &Rows) -> boo
     let dedups = ["DISTINCT", "UNION", "INTERSECT", "EXCEPT", "GROUP BY"]
         .iter()
         .any(|k| up.contains(k));
-    if !dedups && !ordered {
+    if !dedups && !ordered && minmax_cols.is_empty() {
         return false;
     }
     let nocase = up.contains("NOCASE")
@@ -956,7 +986,7 @@ fn unspecified_only(sql: &str, ordered: bool, ours: &Rows, theirs: &Rows) -> boo
                 r.iter()
                     .enumerate()
                     .map(|(i, v)| {
-                        if all_cols || i == 0 {
+                        if all_cols || (dedups && i == 0) || minmax_cols.contains(&i) {
                             eq_class(v, nocase)
                         } else {
                             v.clone()
@@ -1135,7 +1165,7 @@ fn run_seed(seed: u64, stmts_per_case: usize) -> Vec<Divergence> {
             let b = sqlite_rows(&theirs, &q.sql).map(|r| normalize(r, q.ordered));
             let same = match (&a, &b) {
                 (Ok(x), Ok(y)) if x == y => true,
-                (Ok(x), Ok(y)) if unspecified_only(&q.sql, q.ordered, x, y) => {
+                (Ok(x), Ok(y)) if unspecified_only(&q.sql, q.ordered, &q.minmax_cols, x, y) => {
                     UNSPECIFIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     true
                 }

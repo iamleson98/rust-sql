@@ -13,11 +13,16 @@ log="$(mktemp)"
 rc=${PIPESTATUS[0]}
 if [ "$rc" -ne 0 ]; then
   # Prefer the diagnostic lines (panics, assertion messages, compiler and
-  # linker errors); fall back to the raw tail. GitHub keeps at most 10
-  # error annotations per step.
-  lines="$(grep -E 'panicked|assertion|left:|right:|^error|error\[|Error:|FAILED|failed|undefined reference|cannot find' "$log" | tail -n 8)"
+  # linker errors, each with the line after it); fall back to the raw
+  # tail. Colour codes are stripped first (cargo colours "error" under
+  # CI, so an anchored match on the raw text missed every compiler
+  # error). GitHub keeps at most 10 error annotations per step.
+  plain="$(sed -e $'s/\x1b\\[[0-9;]*[A-Za-z]//g' "$log")"
+  lines="$(printf '%s\n' "$plain" \
+    | grep -E -A1 'panicked|assertion|left:|right:|^error|error\[|Error:|FAILED|undefined reference|cannot find|could not' \
+    | grep -v -E '^--$|build failed, waiting' | head -n 9)"
   if [ -z "$lines" ]; then
-    lines="$(tail -n 8 "$log")"
+    lines="$(printf '%s\n' "$plain" | tail -n 8)"
   fi
   while IFS= read -r line; do
     line="${line//'%'/'%25'}"
