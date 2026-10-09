@@ -1406,11 +1406,64 @@ impl Parser {
     fn parse_set_clause(&mut self) -> Result<Vec<(String, Expr)>> {
         let mut out = Vec::new();
         loop {
-            let name = self.parse_ident()?;
-            // Optional `=` after column name. SQLite also allows `(a, b) = (expr1, expr2)`.
-            self.expect_op("=")?;
-            let e = self.parse_expr()?;
-            out.push((name, e));
+            // `(a, b) = (e1, e2)` / `(a, b) = (SELECT x, y …)` (SQLite
+            // 3.15+ row-value assignment): one assignment per column — a
+            // row's items pair up; a subquery's first row is read once per
+            // column through the ROW_COL_FN pick.
+            if self.peek().is_punct('(') {
+                let t = self.peek().clone();
+                self.advance();
+                let mut names = vec![self.parse_ident()?];
+                while self.peek().is_punct(',') {
+                    self.advance();
+                    names.push(self.parse_ident()?);
+                }
+                self.expect_punct(')')?;
+                self.expect_op("=")?;
+                let e = self.parse_expr()?;
+                let n = names.len();
+                match e {
+                    Expr::Row(items) if items.len() == n => {
+                        out.extend(names.into_iter().zip(items));
+                    }
+                    Expr::Row(items) => {
+                        return Err(Error::parse(
+                            t.line,
+                            t.col,
+                            format!("{} columns assigned {} values", n, items.len()),
+                        ));
+                    }
+                    Expr::Subquery(sel) => {
+                        for (k, name) in names.into_iter().enumerate() {
+                            let pick = Expr::Function {
+                                name: ROW_COL_FN.to_string(),
+                                distinct: false,
+                                args: vec![
+                                    Expr::Literal(Value::Integer(k as i64)),
+                                    Expr::Literal(Value::Integer(n as i64)),
+                                    Expr::Subquery(sel.clone()),
+                                ],
+                                filter: None,
+                                over: None,
+                            };
+                            out.push((name, pick));
+                        }
+                    }
+                    _ if n == 1 => out.push((names.pop().expect("one name"), e)),
+                    _ => {
+                        return Err(Error::parse(
+                            t.line,
+                            t.col,
+                            format!("{} columns assigned 1 values", n),
+                        ));
+                    }
+                }
+            } else {
+                let name = self.parse_ident()?;
+                self.expect_op("=")?;
+                let e = self.parse_expr()?;
+                out.push((name, e));
+            }
             if self.peek().is_punct(',') {
                 self.advance();
             } else {
@@ -3092,8 +3145,22 @@ impl Parser {
                 Ok(InSource::List(list.into()))
             }
         } else {
-            let name = self.parse_ident()?;
-            Ok(InSource::Table(name))
+            // `x IN [schema.]name` is SQLite's shorthand for `x IN (SELECT
+            // * FROM [schema.]name)` — a table, view or CTE of exactly one
+            // column. It is planned as that subquery (the bare form used
+            // to fail: "IN table via evaluator", or "no such table" for a
+            // CTE name).
+            let first = self.parse_ident()?;
+            let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+            let from = if self.peek().is_punct('.') {
+                self.advance();
+                let second = self.parse_ident()?;
+                format!("{}.{}", quote(&first), quote(&second))
+            } else {
+                quote(&first)
+            };
+            let mut sub = Parser::new(&format!("SELECT * FROM {from}"))?;
+            Ok(InSource::Subquery(Box::new(sub.parse_select()?)))
         }
     }
 
@@ -3706,9 +3773,26 @@ pub fn parse(src: &str) -> Result<Statement> {
 /// trigger body does NOT split; the statement ends at the block's END.
 /// Empty parts (trailing/duplicated semicolons) are dropped.
 pub fn split_script(src: &str) -> Vec<String> {
-    let b = src.as_bytes();
     let mut out: Vec<String> = Vec::new();
-    let mut start = 0usize;
+    let mut pos = 0usize;
+    while pos < src.len() {
+        let end = pos + statement_end(&src[pos..]);
+        let part = &src[pos..end];
+        let part = part.strip_suffix(';').unwrap_or(part).trim();
+        if !part.is_empty() {
+            out.push(part.to_string());
+        }
+        pos = end;
+    }
+    out
+}
+
+/// Byte offset just past the FIRST statement of `src` — past its
+/// terminating `;`, or `src.len()` when none — under `split_script`'s
+/// rules (literals, quoted identifiers, comments, and `CREATE TRIGGER …
+/// BEGIN …; …; END` bodies, whose inner `;` does not end the statement).
+pub fn statement_end(src: &str) -> usize {
+    let b = src.as_bytes();
     let mut i = 0usize;
     let n = b.len();
     // Word-level state for trigger-body detection: `CREATE` followed
@@ -3811,25 +3895,14 @@ pub fn split_script(src: &str) -> Vec<String> {
             }
             b';' => {
                 if !in_trigger_block && block_depth == 0 {
-                    let part = &src[start..i];
-                    let trimmed = part.trim();
-                    if !trimmed.is_empty() {
-                        out.push(trimmed.to_string());
-                    }
-                    start = i + 1;
+                    return i + 1;
                 }
                 i += 1;
             }
             _ => i += 1,
         }
     }
-    if start < n {
-        let part = src[start..].trim();
-        if !part.is_empty() {
-            out.push(part.to_string());
-        }
-    }
-    out
+    n
 }
 
 /// Pragma-value keywords: bare words accepted where an expression is
@@ -3982,6 +4055,11 @@ fn contains_function_call(e: &Expr) -> bool {
         _ => false,
     }
 }
+
+/// Column `k` (of `n`) of a row subquery's first row — the parser's
+/// expansion of `SET (a, b) = (SELECT x, y …)` (SQLite's TK_SELECT_COLUMN).
+/// Arguments: `[k, n, (subquery)]`; an empty subquery yields NULL.
+pub const ROW_COL_FN: &str = "__rowcol";
 
 /// `X IS [NOT] Y` / `X IS [NOT] DISTINCT FROM Y` (sqlite3PExprIs): a Y
 /// that parsed to NULL — `(NULL)` included — becomes the IS [NOT] NULL

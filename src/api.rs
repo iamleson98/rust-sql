@@ -8024,7 +8024,18 @@ impl Database {
             let rows = self.run_fast_path(fp, &params_v)?;
             return Ok((fp.output_columns().to_vec(), rows));
         }
-        if let Some(plan) = cached.plan.clone() {
+        // WITH-clause DML is never planned at cache time (its CTE rows are
+        // recomputed per call): it runs below through the same execution
+        // + DML epilogue as a planned statement. It used to fall to the
+        // final arm — a SILENT no-op (no write, no RETURNING rows).
+        let cte_dml = match cached.stmt.as_ref() {
+            Statement::Insert(i) => i.with.is_some(),
+            Statement::Update(u) => u.with.is_some(),
+            Statement::Delete(d) => d.with.is_some(),
+            _ => false,
+        };
+        let plan_opt = cached.plan.clone();
+        if plan_opt.is_some() || cte_dml {
             let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
             let in_txn = self.in_transaction.load(Ordering::Acquire);
             // Skip the txn-snapshot Mutex entirely when not inside a
@@ -8049,24 +8060,33 @@ impl Database {
             let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
             // Substitute uncorrelated subqueries before execution (flag
             // precomputed at plan time — no per-query plan walk).
-            let plan_local;
-            let plan_ref: &crate::planner::plan::Plan = if cached.has_subqueries {
-                plan_local = crate::executor::rewrite_plan_subqueries(&plan, &mut ctx)?;
-                &plan_local
-            } else {
-                &plan
+            let res = match &plan_opt {
+                Some(plan) => {
+                    let plan_local;
+                    let plan_ref: &crate::planner::plan::Plan = if cached.has_subqueries {
+                        plan_local = crate::executor::rewrite_plan_subqueries(plan, &mut ctx)?;
+                        &plan_local
+                    } else {
+                        plan
+                    };
+                    execute(plan_ref, &mut ctx)?
+                }
+                None => self.exec_dml_with_ctes_stmt(&mut ctx, cached.stmt.as_ref())?,
             };
-            let res = execute(plan_ref, &mut ctx)?;
             // For SELECT, root_overrides/max_rowids don't change. For DML
             // with RETURNING (INSERT..RETURNING etc. via the query path),
             // the root pages may have moved due to B+tree splits — write
             // them back so subsequent statements see the new roots.
-            if matches!(
-                plan.as_ref(),
-                crate::planner::plan::Plan::Insert { .. }
-                    | crate::planner::plan::Plan::Update { .. }
-                    | crate::planner::plan::Plan::Delete { .. }
-            ) {
+            if cte_dml
+                || matches!(
+                    plan_opt.as_deref(),
+                    Some(
+                        crate::planner::plan::Plan::Insert { .. }
+                            | crate::planner::plan::Plan::Update { .. }
+                            | crate::planner::plan::Plan::Delete { .. }
+                    )
+                )
+            {
                 // Change accounting (mirrors execute's epilogue): DML via
                 // the query path must feed changes()/total_changes() and
                 // the engine-wide observability aggregates too.
@@ -8118,9 +8138,51 @@ impl Database {
             }
             Ok((res.columns.to_vec(), res.rows))
         } else {
-            Ok((Vec::new(), Vec::new()))
+            Self::query_path_unsupported(cached)
         }
     }
+    /// The `&self` query paths run row-returning statements and TABLE
+    /// DML only. Everything else — DDL, transaction control, write
+    /// pragmas, ATTACH, VACUUM, DML against a VIEW (INSTEAD OF triggers)
+    /// — needs the mutable [`Database::execute`] path; it is reported
+    /// here instead of the silent "success" it used to return (no table
+    /// created, no transaction begun, `PRAGMA foreign_keys=ON` not
+    /// applied).
+    fn query_path_unsupported(cached: &CachedStmt) -> Result<(Vec<String>, Vec<Row>)> {
+        match cached.stmt.as_ref() {
+            Statement::NoOp => Ok((Vec::new(), Vec::new())),
+            // A READ pragma the reader did not answer — an unknown pragma,
+            // or an introspection pragma over a missing object — returns
+            // no rows, as in SQLite. Only a WRITE (a value outside the
+            // argument-taking read family) needs the mutable path.
+            Statement::Pragma(p)
+                if p.value.is_none()
+                    || matches!(
+                        p.name.to_ascii_lowercase().as_str(),
+                        "table_info"
+                            | "table_xinfo"
+                            | "index_list"
+                            | "index_info"
+                            | "index_xinfo"
+                            | "foreign_key_list"
+                            | "foreign_key_check"
+                            | "table_list"
+                            | "integrity_check"
+                            | "quick_check"
+                    ) =>
+            {
+                Ok((Vec::new(), Vec::new()))
+            }
+            _ if cached.view_target.is_some() => Err(Error::Unsupported(
+                "DML on a view (INSTEAD OF triggers) must run through Database::execute",
+            )),
+            _ => Err(Error::Unsupported(
+                "this statement must run through Database::execute (query runs SELECT, \
+                 DML and read PRAGMAs)",
+            )),
+        }
+    }
+
     /// Alias for `query()` — for use when callers want to emphasize that
     /// they're sharing a `&Database` reference across threads.
     pub fn query_shared<P: Params>(&self, sql: &str, params: P) -> Result<Vec<Row>> {
@@ -8417,7 +8479,16 @@ impl Database {
                 return Ok((res.columns.to_vec(), res.rows));
             }
         }
-        if let Some(plan) = cached.plan.clone() {
+        // WITH-clause DML: never planned at cache time — run below with
+        // its CTEs materialized (see query_cached_stmt_with_cols).
+        let cte_dml = match cached.stmt.as_ref() {
+            Statement::Insert(i) => i.with.is_some(),
+            Statement::Update(u) => u.with.is_some(),
+            Statement::Delete(d) => d.with.is_some(),
+            _ => false,
+        };
+        let plan_opt = cached.plan.clone();
+        if plan_opt.is_some() || cte_dml {
             // Pre-compiled point-lookup fast path (see query()). Works
             // under committed-view reads too: run_fast_path resolves
             // BEGIN-time roots under an armed scope.
@@ -8445,20 +8516,29 @@ impl Database {
             let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
             // Substitute uncorrelated subqueries before execution (flag
             // precomputed at plan time — no per-query plan walk).
-            let plan_local;
-            let plan_ref: &crate::planner::plan::Plan = if cached.has_subqueries {
-                plan_local = crate::executor::rewrite_plan_subqueries(&plan, &mut ctx)?;
-                &plan_local
-            } else {
-                &plan
+            let res = match &plan_opt {
+                Some(plan) => {
+                    let plan_local;
+                    let plan_ref: &crate::planner::plan::Plan = if cached.has_subqueries {
+                        plan_local = crate::executor::rewrite_plan_subqueries(plan, &mut ctx)?;
+                        &plan_local
+                    } else {
+                        plan
+                    };
+                    execute(plan_ref, &mut ctx)?
+                }
+                None => self.exec_dml_with_ctes_stmt(&mut ctx, cached.stmt.as_ref())?,
             };
-            let res = execute(plan_ref, &mut ctx)?;
-            if matches!(
-                plan.as_ref(),
-                crate::planner::plan::Plan::Insert { .. }
-                    | crate::planner::plan::Plan::Update { .. }
-                    | crate::planner::plan::Plan::Delete { .. }
-            ) {
+            if cte_dml
+                || matches!(
+                    plan_opt.as_deref(),
+                    Some(
+                        crate::planner::plan::Plan::Insert { .. }
+                            | crate::planner::plan::Plan::Update { .. }
+                            | crate::planner::plan::Plan::Delete { .. }
+                    )
+                )
+            {
                 if ctx.roots_changed || ctx.max_rowids_changed || ctx.index_roots_changed {
                     let mut m = self.maps.write();
                     let bk = Arc::make_mut(&mut *m);
@@ -8494,7 +8574,7 @@ impl Database {
             }
             Ok((res.columns.to_vec(), res.rows))
         } else {
-            Ok((Vec::new(), Vec::new()))
+            Self::query_path_unsupported(&cached)
         }
     }
 
@@ -10214,12 +10294,30 @@ impl Database {
     /// uncorrelated subqueries, execute. Mirrors exec_select_with_ctes
     /// for the DML planners (which take no CTE map — the planner is
     /// seeded directly, and ctx.ctes covers subquery planning).
+    /// WITH-clause DML through the statement / query paths (the statement
+    /// carries its own WITH clause): materialize the CTEs and run it,
+    /// returning the executor's result (RETURNING rows).
+    pub(crate) fn exec_dml_with_ctes_stmt(
+        &self,
+        ctx: &mut ExecContext<'_>,
+        stmt: &Statement,
+    ) -> Result<crate::executor::ExecResult> {
+        let with = match stmt {
+            Statement::Insert(i) => i.with.clone(),
+            Statement::Update(u) => u.with.clone(),
+            Statement::Delete(d) => d.with.clone(),
+            _ => None,
+        }
+        .ok_or_else(|| Error::semantic("WITH-clause DML expected"))?;
+        self.exec_dml_with_ctes(ctx, stmt, &with)
+    }
+
     fn exec_dml_with_ctes(
         &self,
         ctx: &mut ExecContext<'_>,
         stmt: &Statement,
         with: &WithClause,
-    ) -> Result<()> {
+    ) -> Result<crate::executor::ExecResult> {
         let cte_map = self.materialize_ctes(with, &HashMap::new(), ctx)?;
         let mut planner = Planner::new(&self.catalog);
         planner.set_ctes(cte_map.clone());
@@ -10262,7 +10360,7 @@ impl Database {
         }
         let res = crate::executor::execute(&plan, ctx);
         ctx.ctes = None;
-        res.map(|_| ())
+        res
     }
 
     // ------------------------------------------------------------------

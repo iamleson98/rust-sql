@@ -4565,16 +4565,54 @@ pub fn split_and_chain(predicate: &Expr) -> Vec<Expr> {
 }
 
 fn split_and_chain_rec(expr: &Expr, out: &mut Vec<Expr>) {
-    if let Expr::Binary {
-        op: BinaryOp::And,
-        left,
-        right,
-    } = expr
-    {
-        split_and_chain_rec(left, out);
-        split_and_chain_rec(right, out);
-    } else {
-        out.push(expr.clone());
+    match expr {
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            split_and_chain_rec(left, out);
+            split_and_chain_rec(right, out);
+        }
+        // Row values: `(a, b) = (x, y)` IS `a = x AND b = y` (the Kleene
+        // AND of the pairs, each with its own affinity / collation) — the
+        // pairs become ordinary, indexable terms. A lexicographic
+        // `(a, b) > (x, y)` keeps its own term and adds the bound it
+        // implies on its first pair (`a >= x`; `<` / `<=`: `a <= x`) —
+        // never stricter than the original (a NULL pair filters both), and
+        // it lets an index on `a` range-scan keyset pagination.
+        Expr::Binary { op, left, right } => match (left.as_ref(), right.as_ref()) {
+            (Expr::Row(l), Expr::Row(r)) if l.len() == r.len() && !l.is_empty() => {
+                if *op == BinaryOp::Eq {
+                    for (a, b) in l.iter().zip(r.iter()) {
+                        split_and_chain_rec(
+                            &Expr::Binary {
+                                op: BinaryOp::Eq,
+                                left: Box::new(a.clone()),
+                                right: Box::new(b.clone()),
+                            },
+                            out,
+                        );
+                    }
+                    return;
+                }
+                out.push(expr.clone());
+                let implied = match op {
+                    BinaryOp::Gt | BinaryOp::GtEq => Some(BinaryOp::GtEq),
+                    BinaryOp::Lt | BinaryOp::LtEq => Some(BinaryOp::LtEq),
+                    _ => None,
+                };
+                if let (Some(op), true) = (implied, l.len() > 1) {
+                    out.push(Expr::Binary {
+                        op,
+                        left: Box::new(l[0].clone()),
+                        right: Box::new(r[0].clone()),
+                    });
+                }
+            }
+            _ => out.push(expr.clone()),
+        },
+        _ => out.push(expr.clone()),
     }
 }
 

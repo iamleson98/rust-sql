@@ -2707,7 +2707,18 @@ fn execute_sql(
                 print_rows(out, &pcols, &prows, state);
             }
         }
-        let (cols, rows) = runner.query(sql)?;
+        let (cols, rows) = match runner.query(sql) {
+            Ok(r) => r,
+            // A query-shaped statement the read path cannot run — a
+            // write PRAGMA (`PRAGMA user_version = 5`) — applies through
+            // the execute path instead (it used to be silently ignored).
+            Err(e) if e.contains("must run through Database::execute") => {
+                runner.execute(sql)?;
+                writeln!(out, "OK").unwrap();
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
         print_rows(out, &cols, &rows, state);
     } else {
         runner.execute(sql)?;

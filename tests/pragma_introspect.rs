@@ -300,15 +300,27 @@ fn journal_mode_call_form_writes() {
 }
 
 #[test]
-fn write_pragmas_still_return_no_rows() {
-    // Non-journal_mode write pragmas return zero rows (SQLite behavior
-    // for most write forms; sqlx sends these at connect time).
+fn write_pragmas_apply_through_execute_and_are_refused_by_query() {
+    // Write pragmas apply through `execute` (the drivers route them
+    // there; sqlx sends them at connect time). The `&self` query path
+    // cannot apply them and says so — it used to return zero rows and
+    // silently leave the setting unchanged (`foreign_keys` stayed OFF).
     let mut db = Database::open_in_memory().unwrap();
     db.execute("CREATE TABLE t (a INT)", []).unwrap();
-    let res = db.query("PRAGMA foreign_keys=ON", []).unwrap();
-    assert!(res.is_empty());
-    let res = db.query("PRAGMA cache_size=-2000", []).unwrap();
-    assert!(res.is_empty());
+    for sql in ["PRAGMA foreign_keys=ON", "PRAGMA cache_size=-2000"] {
+        let err = db.query(sql, []).unwrap_err().to_string();
+        assert!(err.contains("Database::execute"), "{sql}: {err}");
+    }
+    db.execute("PRAGMA foreign_keys=ON", []).unwrap();
+    db.execute("PRAGMA cache_size=-1234", []).unwrap();
+    assert_eq!(
+        db.query("PRAGMA foreign_keys", []).unwrap()[0][0].as_integer(),
+        1
+    );
+    assert_eq!(
+        db.query("PRAGMA cache_size", []).unwrap()[0][0].as_integer(),
+        -1234
+    );
 }
 
 #[test]
@@ -463,7 +475,14 @@ fn begin_modes_parse_and_commit() {
 
 #[test]
 fn synchronous_pragma_round_trip() {
-    diff_query(&[], "PRAGMA synchronous = OFF");
+    // The write applies through `execute` (diff_query's setup path); the
+    // `&self` query path refuses a write instead of ignoring it.
+    let db = Database::open_in_memory().unwrap();
+    let err = db
+        .query("PRAGMA synchronous = OFF", [])
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("Database::execute"), "{err}");
     diff_query(&["PRAGMA synchronous = OFF"], "PRAGMA synchronous");
     diff_query(&["PRAGMA synchronous = 1"], "PRAGMA synchronous");
 }

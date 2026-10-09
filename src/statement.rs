@@ -120,6 +120,9 @@ pub struct Statement<'a> {
     plan: Option<Arc<Plan>>,
     has_subqueries: bool,
     fast_path: Option<Arc<FastPath>>,
+    /// DML whose target is a VIEW: it runs INSTEAD OF triggers, which
+    /// need the mutable `Database::execute` path (see `targets_view`).
+    view_target: bool,
     params: Vec<Value>,
     named: HashMap<String, Value>,
     /// Positional parameter count discovered at prepare time.
@@ -273,6 +276,7 @@ impl<'a> Statement<'a> {
             sql: sql.to_string(),
             fast_path: cached.fast_path.clone(),
             has_subqueries: cached.has_subqueries,
+            view_target: cached.view_target.is_some(),
             stmt,
             plan,
             params: vec![Value::Null; param_count],
@@ -419,6 +423,25 @@ impl<'a> Statement<'a> {
             .exec_with_ctx(|ctx| crate::executor::execute(&empty, ctx))
             .ok()?;
         Some(res.columns.to_vec())
+    }
+
+    /// True for INSERT / UPDATE / DELETE against a VIEW: such a statement
+    /// runs the view's INSTEAD OF triggers, which only
+    /// [`Database::execute`] can do — stepping it fails (it used to step
+    /// to DONE without running anything). Drivers route these to
+    /// `execute`.
+    pub fn targets_view(&self) -> bool {
+        self.view_target
+    }
+
+    /// True for INSERT / UPDATE / DELETE … RETURNING.
+    pub fn has_returning(&self) -> bool {
+        match self.stmt.as_ref() {
+            AstStatement::Insert(i) => i.returning.is_some(),
+            AstStatement::Update(u) => u.returning.is_some(),
+            AstStatement::Delete(d) => d.returning.is_some(),
+            _ => false,
+        }
     }
 
     /// Number of output columns (valid after the first step).
@@ -912,10 +935,28 @@ impl<'a> Statement<'a> {
         // materialized path below rewrites uncorrelated subqueries into
         // literals and evaluates correlated ones with the guard
         // installed, which is the only correct route for them.
-        if let Some(plan) = self.plan.clone() {
-            if !self.has_subqueries {
+        // WITH-clause DML is never planned at prepare (its CTE rows are
+        // recomputed per execution): it runs below through the same DML
+        // machinery as a planned statement — gate, implicit concurrent
+        // join, map merge, durability — with the CTEs materialized per
+        // execution (Database::execute's route). Stepping it used to be
+        // a SILENT no-op: no row written, no RETURNING rows, no error.
+        let cte_dml: Option<Arc<AstStatement>> = match self.stmt.as_ref() {
+            AstStatement::Insert(i) if i.with.is_some() => Some(Arc::clone(&self.stmt)),
+            AstStatement::Update(u) if u.with.is_some() => Some(Arc::clone(&self.stmt)),
+            AstStatement::Delete(d) if d.with.is_some() => Some(Arc::clone(&self.stmt)),
+            _ => None,
+        };
+        if self.view_target {
+            return Err(Error::Unsupported(
+                "DML on a view (INSTEAD OF triggers) must run through Database::execute",
+            ));
+        }
+        let plan_opt = self.plan.clone();
+        if plan_opt.is_some() || cte_dml.is_some() {
+            if let (Some(plan), false) = (plan_opt.as_ref(), self.has_subqueries) {
                 // Streaming driver?
-                if let Some(drv) = try_build_driver(&plan) {
+                if let Some(drv) = try_build_driver(plan) {
                     self.columns = Some(drv.columns());
                     self.stream = StreamState::Driver(drv);
                     return Ok(());
@@ -944,10 +985,11 @@ impl<'a> Statement<'a> {
                 AstStatement::Delete(d) => d.returning.is_some(),
                 _ => false,
             };
-            let is_dml = matches!(
-                plan.as_ref(),
-                Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. }
-            );
+            let is_dml = cte_dml.is_some()
+                || matches!(
+                    plan_opt.as_deref(),
+                    Some(Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. })
+                );
             // ── SHARED-DATABASE DML SAFETY GATE ─────────────────────────
             // Plain DML mutates the LIVE page cache; two threads running
             // it simultaneously on one `Arc<Database>` (no outer write
@@ -995,8 +1037,13 @@ impl<'a> Statement<'a> {
                 None
             };
             let has_subq = self.has_subqueries;
-            let plan2 = plan.clone();
+            let plan2 = plan_opt.clone();
+            let db = self.db;
             let exec_res = self.exec_with_ctx(move |ctx| {
+                let Some(plan2) = plan2 else {
+                    let stmt = cte_dml.expect("an unplanned statement here is WITH-clause DML");
+                    return db.exec_dml_with_ctes_stmt(ctx, &stmt);
+                };
                 let plan_local;
                 let plan_ref: &Plan = if has_subq {
                     plan_local = crate::executor::rewrite_plan_subqueries(&plan2, ctx)?;
@@ -1495,20 +1542,90 @@ fn collect_parameters(stmt: &AstStatement, positional: &mut usize, named: &mut V
                 }
             }
         }
+        // UPDATE / DELETE: every clause binds on this statement — the WITH
+        // CTEs, UPDATE's FROM, RETURNING, ORDER BY and LIMIT used to be
+        // missed (`DELETE … LIMIT ?` reported 0 parameters and the bind
+        // failed "parameter index 1 out of range").
         AstStatement::Update(u) => {
+            if let Some(w) = &u.with {
+                for cte in &w.ctes {
+                    walk_select(
+                        &cte.select,
+                        &mut max_pos,
+                        &mut saw_numeric,
+                        named,
+                        &mut counter,
+                    );
+                }
+            }
             for (_, e) in &u.set {
                 walk_expr(e, &mut max_pos, &mut saw_numeric, named, &mut counter);
+            }
+            if let Some(f) = &u.from {
+                walk_table(f, &mut max_pos, &mut saw_numeric, named, &mut counter);
             }
             if let Some(w) = &u.where_clause {
                 walk_expr(w, &mut max_pos, &mut saw_numeric, named, &mut counter);
             }
+            dml_tail(
+                u.returning.as_deref(),
+                &u.order_by,
+                u.limit.as_ref(),
+                &mut max_pos,
+                &mut saw_numeric,
+                named,
+                &mut counter,
+            );
         }
         AstStatement::Delete(d) => {
+            if let Some(w) = &d.with {
+                for cte in &w.ctes {
+                    walk_select(
+                        &cte.select,
+                        &mut max_pos,
+                        &mut saw_numeric,
+                        named,
+                        &mut counter,
+                    );
+                }
+            }
             if let Some(w) = &d.where_clause {
                 walk_expr(w, &mut max_pos, &mut saw_numeric, named, &mut counter);
             }
+            dml_tail(
+                d.returning.as_deref(),
+                &d.order_by,
+                d.limit.as_ref(),
+                &mut max_pos,
+                &mut saw_numeric,
+                named,
+                &mut counter,
+            );
         }
         _ => {}
+    }
+
+    /// RETURNING, ORDER BY and LIMIT of an UPDATE / DELETE.
+    fn dml_tail(
+        returning: Option<&[crate::sql::ast::ResultColumn]>,
+        order_by: &[crate::sql::ast::OrderTerm],
+        limit: Option<&Expr>,
+        max_pos: &mut usize,
+        saw_numeric: &mut bool,
+        named: &mut Vec<String>,
+        counter: &mut usize,
+    ) {
+        for rc in returning.unwrap_or(&[]) {
+            if let crate::sql::ast::ResultColumn::Expr { expr, .. } = rc {
+                walk_expr(expr, max_pos, saw_numeric, named, counter);
+            }
+        }
+        for o in order_by {
+            walk_expr(&o.expr, max_pos, saw_numeric, named, counter);
+        }
+        if let Some(l) = limit {
+            walk_expr(l, max_pos, saw_numeric, named, counter);
+        }
     }
     *positional = if saw_numeric { max_pos + 1 } else { 0 };
 }

@@ -3016,6 +3016,11 @@ pub(crate) fn try_parallel_sort(
     }
 
     let mut out: Vec<Row> = Vec::with_capacity(total);
+    // Move a value out only at its LAST use in the map; earlier uses
+    // clone (`SELECT x, x` must not read NULL for the second x).
+    let last_use: Vec<bool> = (0..project_map.len())
+        .map(|k| !project_map[k + 1..].contains(&project_map[k]))
+        .collect();
     while let Some(&c) = heap.first() {
         let pos = cursors[c];
         cursors[c] += 1;
@@ -3023,7 +3028,14 @@ pub(crate) fn try_parallel_sort(
         if project.is_some() {
             let projected: Vec<Value> = project_map
                 .iter()
-                .map(|&p| std::mem::replace(&mut row[p], Value::Null))
+                .zip(&last_use)
+                .map(|(&p, &last)| {
+                    if last {
+                        std::mem::replace(&mut row[p], Value::Null)
+                    } else {
+                        row[p].clone()
+                    }
+                })
                 .collect();
             out.push(projected);
         } else {

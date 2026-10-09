@@ -449,8 +449,7 @@ pub(crate) fn compiled_columns(p: &CompiledPredicate, out: &mut Vec<usize>) {
 impl CompiledPredicate {
     /// Would this predicate's VALUE be NULL for the row? (Three-valued
     /// logic for `NOT` — NOT NULL is NULL, and the row is filtered.)
-    /// AND/OR flatten to 0/1 integers in the evaluator; IS NULL is
-    /// always 0/1.
+    /// AND / OR follow Kleene logic; IS NULL is always 0/1.
     #[inline]
     fn eval_null(&self, row: &[Value], positions: &[usize], params: &[Value]) -> bool {
         match self {
@@ -462,7 +461,27 @@ impl CompiledPredicate {
                 let r = rhs.eval(row, positions, params);
                 matches!(&*r, Value::Null)
             }
-            CompiledPredicate::And(..) | CompiledPredicate::Or(..) => false,
+            // Kleene AND / OR: NULL when no operand decides (FALSE for
+            // AND, TRUE for OR) and at least one operand is NULL.
+            // Flattening them to 0/1 made `NOT (x IN (…, NULL) OR …)`
+            // TRUE for rows whose operands were all NULL.
+            CompiledPredicate::And(a, b) => {
+                let a_null = a.eval_null(row, positions, params);
+                if !a_null && !a.eval(row, positions, params) {
+                    return false; // a is FALSE: the AND is FALSE
+                }
+                let b_null = b.eval_null(row, positions, params);
+                if !b_null && !b.eval(row, positions, params) {
+                    return false;
+                }
+                a_null || b_null
+            }
+            CompiledPredicate::Or(a, b) => {
+                if a.eval(row, positions, params) || b.eval(row, positions, params) {
+                    return false; // an operand is TRUE: the OR is TRUE
+                }
+                a.eval_null(row, positions, params) || b.eval_null(row, positions, params)
+            }
             CompiledPredicate::Not(a) => a.eval_null(row, positions, params),
             CompiledPredicate::IsNull { .. } => false,
             CompiledPredicate::Between { col, lo, hi, .. } => between_kleene(

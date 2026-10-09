@@ -1981,3 +1981,89 @@ fn abi_rowid_pseudo_column_names() {
         .into_owned();
     assert_eq!(s, "k", "real column value, not the integer rowid");
 }
+
+/// Count rows through a fresh statement (helper for the DML tests below).
+fn count_rows(db: &Db, sql: &str) -> Vec<Vec<String>> {
+    let (mut st, _) = prepare(db, sql);
+    step_all_text(&mut st)
+}
+
+/// DML against a VIEW runs its INSTEAD OF trigger through prepare/step —
+/// with bound parameters, re-executed after reset. It used to step to
+/// SQLITE_DONE without running the trigger at all (every sqlx / sea-orm
+/// write into a trigger-backed view was silently dropped).
+#[test]
+fn abi_view_dml_runs_instead_of_triggers() {
+    let db = open_memory();
+    exec(&db, "CREATE TABLE b (a INTEGER)");
+    exec(&db, "CREATE VIEW v AS SELECT a FROM b");
+    exec(
+        &db,
+        "CREATE TRIGGER vi INSTEAD OF INSERT ON v BEGIN INSERT INTO b VALUES (new.a * 10); END",
+    );
+    exec(
+        &db,
+        "CREATE TRIGGER vu INSTEAD OF UPDATE ON v BEGIN UPDATE b SET a = new.a WHERE a = old.a; END",
+    );
+    exec(
+        &db,
+        "CREATE TRIGGER vd INSTEAD OF DELETE ON v BEGIN DELETE FROM b WHERE a = old.a; END",
+    );
+    let (stmt, _) = prepare(&db, "INSERT INTO v VALUES (?)");
+    for k in [4i64, 5] {
+        unsafe {
+            assert_eq!(sqlite3_reset(stmt.0), SQLITE_OK);
+            assert_eq!(sqlite3_bind_int64(stmt.0, 1, k), SQLITE_OK);
+            assert_eq!(sqlite3_step(stmt.0), SQLITE_DONE);
+        }
+    }
+    assert_eq!(
+        count_rows(&db, "SELECT a FROM b ORDER BY a"),
+        vec![vec!["40"], vec!["50"]]
+    );
+    let (upd, _) = prepare(&db, "UPDATE v SET a = ? WHERE a = ?");
+    unsafe {
+        sqlite3_bind_int64(upd.0, 1, 41);
+        sqlite3_bind_int64(upd.0, 2, 40);
+        assert_eq!(sqlite3_step(upd.0), SQLITE_DONE);
+    }
+    let (del, _) = prepare(&db, "DELETE FROM v WHERE a = 50");
+    assert_eq!(unsafe { sqlite3_step(del.0) }, SQLITE_DONE);
+    assert_eq!(count_rows(&db, "SELECT a FROM b"), vec![vec!["41"]]);
+}
+
+/// WITH-prefixed INSERT / UPDATE / DELETE through prepare/step: they used
+/// to step to SQLITE_DONE without writing anything (the CTE route was
+/// only wired into Database::execute) — RETURNING rows included.
+#[test]
+fn abi_cte_prefixed_dml_executes() {
+    let db = open_memory();
+    exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
+    let (ins, _) = prepare(
+        &db,
+        "WITH x(n) AS (SELECT ?) INSERT INTO t(v) SELECT n FROM x",
+    );
+    unsafe {
+        // The CTE's `?` is this statement's parameter (it used to be
+        // missed: count 0, the bind failed with SQLITE_RANGE).
+        assert_eq!(sqlite3_bind_parameter_count(ins.0), 1);
+        assert_eq!(sqlite3_bind_int64(ins.0, 1, 7), SQLITE_OK);
+        assert_eq!(sqlite3_step(ins.0), SQLITE_DONE);
+    }
+    let (mut ret, _) = prepare(
+        &db,
+        "WITH x(n) AS (SELECT 8) INSERT INTO t(v) SELECT n FROM x RETURNING id, v",
+    );
+    assert_eq!(step_all_text(&mut ret), vec![vec!["2", "8"]]);
+    let (upd, _) = prepare(
+        &db,
+        "WITH x(n) AS (SELECT 7) UPDATE t SET v = v * 10 WHERE v IN x",
+    );
+    assert_eq!(unsafe { sqlite3_step(upd.0) }, SQLITE_DONE);
+    let (del, _) = prepare(&db, "WITH x(n) AS (SELECT 8) DELETE FROM t WHERE v IN x");
+    assert_eq!(unsafe { sqlite3_step(del.0) }, SQLITE_DONE);
+    assert_eq!(
+        count_rows(&db, "SELECT id, v FROM t"),
+        vec![vec!["1", "70"]]
+    );
+}

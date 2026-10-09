@@ -855,8 +855,15 @@ enum Exec {
     /// owning engine (behind the shared Arc) outlives the connection, and
     /// `sqlite3_close` refuses while statements are live.
     Rows(Box<EngineStatement<'static>>),
-    /// Executed once on first step via the mutable path.
-    Once { sql: String },
+    /// Executed once on first step via the mutable path. `binds` holds
+    /// the positional values bound to it (DML against a VIEW routes here
+    /// and binds like any DML); a NAMED bind is rejected at step — the
+    /// mutable path takes positional values only.
+    Once {
+        sql: String,
+        binds: Vec<Value>,
+        named_bound: bool,
+    },
     /// Read-pragma / query form: run `Database::query_with_columns` on the
     /// first step and serve the buffered rows.
     Query {
@@ -1904,6 +1911,21 @@ impl ParamCollector {
 fn collect_param_slots(stmt: &rustqlite::sql::ast::Statement) -> Vec<ParamSlot> {
     use rustqlite::sql::ast::Statement as S;
     let mut c = ParamCollector::default();
+    // A DML statement's WITH clause leads the text: its CTE bodies'
+    // parameters bind on this statement first (they used to be missed —
+    // `WITH x AS (SELECT ?) INSERT …` reported 0 parameters and the bind
+    // failed with SQLITE_RANGE, inserting NULL).
+    let dml_with = match stmt {
+        S::Insert(i) => i.with.as_ref(),
+        S::Update(u) => u.with.as_ref(),
+        S::Delete(d) => d.with.as_ref(),
+        _ => None,
+    };
+    if let Some(w) = dml_with {
+        for cte in &w.ctes {
+            collect_select(&cte.select, &mut c);
+        }
+    }
     match stmt {
         S::Select(s) => collect_select(s, &mut c),
         S::Insert(i) => {
@@ -1948,11 +1970,21 @@ fn collect_param_slots(stmt: &rustqlite::sql::ast::Statement) -> Vec<ParamSlot> 
             for (_, e) in &u.set {
                 walk_expr(e, &mut c);
             }
+            // UPDATE … FROM (derived tables, JOIN ON, table functions).
+            if let Some(f) = &u.from {
+                collect_table(f, &mut c);
+            }
             if let Some(w) = &u.where_clause {
                 walk_expr(w, &mut c);
             }
             if let Some(rcs) = &u.returning {
                 collect_result_columns(rcs, &mut c);
+            }
+            for o in &u.order_by {
+                walk_expr(&o.expr, &mut c);
+            }
+            if let Some(l) = &u.limit {
+                walk_expr(l, &mut c);
             }
         }
         S::Delete(d) => {
@@ -1961,6 +1993,12 @@ fn collect_param_slots(stmt: &rustqlite::sql::ast::Statement) -> Vec<ParamSlot> 
             }
             if let Some(rcs) = &d.returning {
                 collect_result_columns(rcs, &mut c);
+            }
+            for o in &d.order_by {
+                walk_expr(&o.expr, &mut c);
+            }
+            if let Some(l) = &d.limit {
+                walk_expr(l, &mut c);
             }
         }
         S::Pragma(rustqlite::sql::ast::PragmaStatement {
@@ -2285,6 +2323,32 @@ unsafe fn prepare_impl(
                 };
                 erased
             };
+            // DML against a VIEW runs its INSTEAD OF triggers, which only
+            // the mutable execute path can do — run it once under the
+            // write lock (stepping the engine statement fails: it used to
+            // step to DONE without running the trigger at all). A
+            // RETURNING form keeps the Rows route, where the engine
+            // reports it as unsupported rather than dropping the rows.
+            if matches!(kind, StmtKind::Dml { returning: false }) && eng_stmt.targets_view() {
+                drop(eng_stmt);
+                let rc = finish_prepare(
+                    conn,
+                    engine,
+                    stmt_text.clone(),
+                    kind,
+                    is_write,
+                    tx_kind,
+                    Exec::Once {
+                        sql: stmt_text.clone(),
+                        binds: Vec::new(),
+                        named_bound: false,
+                    },
+                    params,
+                    static_columns,
+                    pp_stmt,
+                );
+                return rc;
+            }
             // Prepare-time column names (sqlx reads column_count /
             // column_name BEFORE the first step):
             //  1. the engine knows them when a streaming driver covers the
@@ -2468,6 +2532,8 @@ unsafe fn prepare_impl(
         }
         StmtKind::PragmaWrite { .. } | StmtKind::Once => Exec::Once {
             sql: stmt_text.clone(),
+            binds: Vec::new(),
+            named_bound: false,
         },
     };
     let rc = finish_prepare(
@@ -2602,8 +2668,16 @@ fn free_value_pool(stmt: &mut Stmt) {
 fn run_once(stmt: &mut Stmt) -> c_int {
     let engine = stmt.engine.clone().expect("engine");
     let conn = stmt.conn.clone();
-    let sql = match &stmt.exec {
-        Exec::Once { sql } => sql.clone(),
+    let (sql, binds) = match &stmt.exec {
+        Exec::Once {
+            named_bound: true, ..
+        } => {
+            return conn.set_err(
+                SQLITE_ERROR,
+                "named parameters are not supported for this statement",
+            );
+        }
+        Exec::Once { sql, binds, .. } => (sql.clone(), binds.clone()),
         _ => unreachable!(),
     };
 
@@ -2739,7 +2813,7 @@ fn run_once(stmt: &mut Stmt) -> c_int {
         let result = {
             let _id = rustqlite::ConnIdentityGuard::arm(conn.id as u64);
             let mut w = engine.db.write();
-            w.execute(&sql, [])
+            w.execute(&sql, binds)
         };
         match result {
             Ok(()) => {
@@ -3201,8 +3275,15 @@ pub unsafe extern "C" fn sqlite3_clear_bindings(stmt: *mut sqlite3_stmt) -> c_in
     let Some(s) = (stmt as *mut Stmt).as_mut() else {
         return SQLITE_MISUSE;
     };
-    if let Exec::Rows(eng) = &mut s.exec {
-        eng.clear_bindings();
+    match &mut s.exec {
+        Exec::Rows(eng) => eng.clear_bindings(),
+        Exec::Once {
+            binds, named_bound, ..
+        } => {
+            binds.clear();
+            *named_bound = false;
+        }
+        Exec::Query { .. } => {}
     }
     SQLITE_OK
 }
@@ -3240,16 +3321,30 @@ unsafe fn bind_value(stmt: *mut sqlite3_stmt, idx: c_int, v: Value) -> c_int {
         return s.conn.set_err(SQLITE_RANGE, "parameter index out of range");
     }
     let slot = &s.params[idx as usize - 1];
-    let r = if let Exec::Rows(eng) = &mut s.exec {
-        match slot {
+    let r = match &mut s.exec {
+        Exec::Rows(eng) => match slot {
             ParamSlot::Positional(pidx) => eng.bind(pidx + 1, v),
             ParamSlot::Named(name) => eng.bind_named(name, v),
             // A number the SQL never references: accept and discard, like
             // SQLite binding an unallocated parameter slot.
             ParamSlot::Unused => Ok(()),
+        },
+        Exec::Once {
+            binds, named_bound, ..
+        } => {
+            match slot {
+                ParamSlot::Positional(pidx) => {
+                    if binds.len() <= *pidx {
+                        binds.resize(*pidx + 1, Value::Null);
+                    }
+                    binds[*pidx] = v;
+                }
+                ParamSlot::Named(_) => *named_bound = true,
+                ParamSlot::Unused => {}
+            }
+            Ok(())
         }
-    } else {
-        Ok(())
+        Exec::Query { .. } => Ok(()),
     };
     let _ = n;
     match r {

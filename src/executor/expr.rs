@@ -1117,6 +1117,23 @@ fn between_jump(
     else {
         unreachable!("between_jump on a non-BETWEEN");
     };
+    if is_row(expr) || is_row(low) || is_row(high) {
+        // Row values: the same jump over the two row comparisons.
+        let truth = |v: Value| -> Option<bool> {
+            if v.is_null() {
+                None
+            } else {
+                Some(v.is_truthy())
+            }
+        };
+        let ge = truth(row_binary(BinaryOp::GtEq, expr, low, ctx, false)?);
+        let first_jump_null = if if_true { !jump_if_null } else { jump_if_null };
+        if ge.map_or(first_jump_null, |b| !b) {
+            return Ok(!if_true);
+        }
+        let le = truth(row_binary(BinaryOp::LtEq, expr, high, ctx, false)?);
+        return Ok(le.map_or(jump_if_null, |b| b == if_true));
+    }
     let v = evaluate(expr, ctx)?;
     let ge = between_bound(ctx, expr, &v, low, true)?;
     // The AND's first comparison, under the jump flags of its position.
@@ -1162,6 +1179,269 @@ fn between_bound(
     } else {
         ord != std::cmp::Ordering::Greater
     }))
+}
+
+/// SQLite's error for a row value outside a row context, or rows of
+/// different sizes.
+fn row_value_misused() -> Error {
+    Error::semantic("row value misused")
+}
+
+fn is_row(e: &Expr) -> bool {
+    matches!(e, Expr::Row(_))
+}
+
+/// One side of a row-value comparison: a `(a, b, …)` row whose items are
+/// evaluated as the comparison reaches them (an earlier deciding pair
+/// skips the rest, as in codeVectorCompare), or already-materialized
+/// values (a correlated subquery's row, an IN operand computed once).
+enum RowSide<'e> {
+    Items(&'e [Expr]),
+    Values(Option<&'e [Expr]>, Vec<Value>),
+}
+
+impl RowSide<'_> {
+    fn len(&self) -> usize {
+        match self {
+            RowSide::Items(items) => items.len(),
+            RowSide::Values(_, vals) => vals.len(),
+        }
+    }
+
+    /// Item `i`: its expression (for comparison affinity / collation)
+    /// and value.
+    fn item(&self, i: usize, ctx: &EvalContext<'_>) -> Result<(Option<&Expr>, Value)> {
+        match self {
+            RowSide::Items(items) => Ok((Some(&items[i]), evaluate(&items[i], ctx)?)),
+            RowSide::Values(exprs, vals) => Ok((exprs.map(|e| &e[i]), vals[i].clone())),
+        }
+    }
+}
+
+/// The row side of `e`, sized against the other side's `width`: a row
+/// constructor, or a (correlated) subquery's first row — all NULL when it
+/// returns no row. `None` = not a row-shaped operand.
+fn row_side<'e>(e: &'e Expr, width: usize, ctx: &EvalContext<'_>) -> Result<Option<RowSide<'e>>> {
+    match e {
+        Expr::Row(items) => Ok(Some(RowSide::Items(items))),
+        Expr::Subquery(sel) => {
+            let res = crate::executor::corr_exec_rows(sel, ctx, true)?;
+            if res.columns.len() != width {
+                return Err(Error::semantic(format!(
+                    "sub-select returns {} columns - expected {}",
+                    res.columns.len(),
+                    width
+                )));
+            }
+            let row = res
+                .rows
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| vec![Value::Null; width]);
+            Ok(Some(RowSide::Values(None, row)))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// One pair of a row-value comparison under the scalar rules: the pair's
+/// comparison affinity and collation, then SQLite's value order. `None`
+/// when either side is NULL — unless `null_eq` (IS / IS NOT), where
+/// NULL equals only NULL.
+fn row_pair_cmp(
+    ctx: &EvalContext<'_>,
+    le: Option<&Expr>,
+    l: Value,
+    re: Option<&Expr>,
+    r: Value,
+    null_eq: bool,
+) -> Result<Option<std::cmp::Ordering>> {
+    use std::cmp::Ordering;
+    if l.is_null() || r.is_null() {
+        if null_eq {
+            return Ok(Some(if l.is_null() && r.is_null() {
+                Ordering::Equal
+            } else {
+                Ordering::Less
+            }));
+        }
+        return Ok(None);
+    }
+    let none = Expr::Literal(Value::Null);
+    let (le, re) = (le.unwrap_or(&none), re.unwrap_or(&none));
+    let (l, r) = coerce_comparison_operands(ctx, le, l, re, r);
+    let coll = resolve_collation(ctx.binary_comparison_collation(le, re))?;
+    Ok(Some(match coll {
+        Some(c) => crate::plugin::compare_collated(&l, &r, c.as_ref()),
+        None => crate::executor::value_cmp_conn(&l, &r),
+    }))
+}
+
+/// A row-value comparison (codeVectorCompare): `=` is the Kleene AND of
+/// the pairs' equalities, stopping at the first definite FALSE; `<>` its
+/// negation; `<` `<=` `>` `>=` compare lexicographically — an earlier
+/// pair decides when it is unequal, a NULL there makes the whole result
+/// NULL, the last pair applies the operator itself. `null_eq` is IS /
+/// IS NOT (NULL equals NULL; never NULL).
+fn row_compare(
+    op: BinaryOp,
+    l: &RowSide<'_>,
+    r: &RowSide<'_>,
+    ctx: &EvalContext<'_>,
+    null_eq: bool,
+) -> Result<Value> {
+    use std::cmp::Ordering;
+    if l.len() != r.len() {
+        return Err(row_value_misused());
+    }
+    let eq_mode = matches!(op, BinaryOp::Eq | BinaryOp::NotEq);
+    if !eq_mode
+        && !matches!(
+            op,
+            BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq
+        )
+    {
+        return Err(row_value_misused());
+    }
+    let n = l.len();
+    let mut result = Some(true);
+    for i in 0..n {
+        let last = i + 1 == n;
+        let (le, lv) = l.item(i, ctx)?;
+        let (re, rv) = r.item(i, ctx)?;
+        let ord = row_pair_cmp(ctx, le, lv, re, rv, null_eq)?;
+        if eq_mode {
+            match ord {
+                Some(Ordering::Equal) => {}
+                Some(_) => {
+                    result = Some(false);
+                    break;
+                }
+                None => result = None,
+            }
+            continue;
+        }
+        let Some(o) = ord else {
+            result = None;
+            break;
+        };
+        // Earlier pairs use the STRICT operator; ties move on.
+        let pass = match (op, last) {
+            (BinaryOp::Lt, _) | (BinaryOp::LtEq, false) => o == Ordering::Less,
+            (BinaryOp::LtEq, true) => o != Ordering::Greater,
+            (BinaryOp::Gt, _) | (BinaryOp::GtEq, false) => o == Ordering::Greater,
+            _ => o != Ordering::Less,
+        };
+        if pass {
+            break;
+        }
+        if !last && o == Ordering::Equal {
+            continue;
+        }
+        result = Some(false);
+        break;
+    }
+    let result = if op == BinaryOp::NotEq {
+        result.map(|b| !b)
+    } else {
+        result
+    };
+    Ok(match result {
+        Some(b) => Value::Integer(i64::from(b)),
+        None => Value::Null,
+    })
+}
+
+/// `left op right` where a side is a row value.
+fn row_binary(
+    op: BinaryOp,
+    left: &Expr,
+    right: &Expr,
+    ctx: &EvalContext<'_>,
+    null_eq: bool,
+) -> Result<Value> {
+    let width = match (left, right) {
+        (Expr::Row(items), _) | (_, Expr::Row(items)) => items.len(),
+        _ => return Err(row_value_misused()),
+    };
+    let (Some(l), Some(r)) = (row_side(left, width, ctx)?, row_side(right, width, ctx)?) else {
+        return Err(row_value_misused());
+    };
+    row_compare(op, &l, &r, ctx, null_eq)
+}
+
+/// `(a, b, …) [NOT] IN (…)`: the Kleene OR of the row's equality with
+/// each right-hand row — a `((…), (…))` list of rows, or a subquery's
+/// rows (uncorrelated ones arrive materialized as a list); an empty right
+/// side is FALSE. The left row is computed once.
+fn evaluate_in_row(
+    items: &[Expr],
+    source: &InSource,
+    negated: bool,
+    ctx: &EvalContext<'_>,
+) -> Result<Value> {
+    let width = items.len();
+    let lhs_vals = items
+        .iter()
+        .map(|e| evaluate(e, ctx))
+        .collect::<Result<Vec<_>>>()?;
+    let lhs = RowSide::Values(Some(items), lhs_vals);
+    let mut saw_null = false;
+    let mut any = false;
+    let mut probe = |rhs: RowSide<'_>| -> Result<bool> {
+        any = true;
+        match row_compare(BinaryOp::Eq, &lhs, &rhs, ctx, false)? {
+            Value::Integer(1) => Ok(true),
+            Value::Null => {
+                saw_null = true;
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
+    };
+    let found = match source {
+        InSource::List(list) => {
+            let mut found = false;
+            for e in list.iter() {
+                let Expr::Row(r) = e else {
+                    return Err(row_value_misused());
+                };
+                if probe(RowSide::Items(r))? {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        }
+        InSource::Subquery(sel) => {
+            let res = crate::executor::corr_exec_rows(sel, ctx, false)?;
+            if res.columns.len() != width {
+                return Err(Error::semantic(format!(
+                    "sub-select returns {} columns - expected {}",
+                    res.columns.len(),
+                    width
+                )));
+            }
+            let mut found = false;
+            for row in res.rows {
+                if probe(RowSide::Values(None, row))? {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        }
+        InSource::Table(_) => return Err(row_value_misused()),
+    };
+    Ok(if found {
+        Value::Integer(i64::from(!negated))
+    } else if !any {
+        Value::Integer(i64::from(negated))
+    } else if saw_null {
+        Value::Null
+    } else {
+        Value::Integer(i64::from(negated))
+    })
 }
 
 pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
@@ -1213,6 +1493,9 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
             }
             let b = evaluate(second, ctx)?;
             Ok(apply_binary(*op, &a, &b))
+        }
+        Expr::Binary { op, left, right } if is_row(left) || is_row(right) => {
+            row_binary(*op, left, right, ctx, false)
         }
         Expr::Binary { op, left, right } => {
             let l = evaluate(left, ctx)?;
@@ -1273,6 +1556,23 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
         Expr::Unary { op, expr } => {
             let v = evaluate(expr, ctx)?;
             Ok(apply_unary(*op, &v))
+        }
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } if is_row(expr) || is_row(low) || is_row(high) => {
+            // `x >= lo AND x <= hi` over rows, both computed (value
+            // context), Kleene AND.
+            let ge = row_binary(BinaryOp::GtEq, expr, low, ctx, false)?;
+            let le = row_binary(BinaryOp::LtEq, expr, high, ctx, false)?;
+            let v = apply_binary(BinaryOp::And, &ge, &le);
+            Ok(if *negated {
+                apply_unary(UnaryOp::Not, &v)
+            } else {
+                v
+            })
         }
         Expr::Between {
             expr,
@@ -1405,6 +1705,18 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
             left,
             right,
             negated,
+        } if is_row(left) || is_row(right) => {
+            let v = row_binary(BinaryOp::Eq, left, right, ctx, true)?;
+            Ok(if *negated {
+                apply_unary(UnaryOp::Not, &v)
+            } else {
+                v
+            })
+        }
+        Expr::Is {
+            left,
+            right,
+            negated,
         } => {
             let l = evaluate(left, ctx)?;
             let r = evaluate(right, ctx)?;
@@ -1478,7 +1790,7 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
                 Ok(Value::Null)
             }
         }
-        Expr::Row(_) => Err(Error::Unsupported("row value expressions in this context")),
+        Expr::Row(_) => Err(row_value_misused()),
         Expr::Subquery(sel) => {
             // Correlated subqueries execute per-row through the statement
             // bridge (see executor::corr). Uncorrelated ones were already
@@ -1506,6 +1818,9 @@ fn evaluate_in(
     negated: bool,
     ctx: &EvalContext<'_>,
 ) -> Result<Value> {
+    if let Expr::Row(items) = expr {
+        return evaluate_in_row(items, source, negated, ctx);
+    }
     let v = evaluate(expr, ctx)?;
     // A COLLATE on the left operand applies to every membership
     // comparison (SQLite: `v COLLATE NOCASE IN ('a', 'B')`).
@@ -1724,6 +2039,21 @@ fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext<'_>) -> Result
             }
         }
         return Ok(Value::Integer(1));
+    }
+    // `SET (a, b) = (SELECT …)` column pick over a CORRELATED subquery
+    // (uncorrelated ones were materialized by the subquery rewrite).
+    if name == crate::sql::parser::ROW_COL_FN {
+        if let [Expr::Literal(Value::Integer(k)), Expr::Literal(Value::Integer(n)), sub] = args {
+            let width = *n as usize;
+            return match row_side(sub, width, ctx)? {
+                Some(RowSide::Values(_, row)) => {
+                    Ok(row.get(*k as usize).cloned().unwrap_or(Value::Null))
+                }
+                Some(RowSide::Items(items)) => evaluate(&items[*k as usize], ctx),
+                None => Err(row_value_misused()),
+            };
+        }
+        return Err(row_value_misused());
     }
     let fname = name.to_ascii_lowercase();
     // coalesce / ifnull / iif / if: SQLite codes these INLINE and lazily

@@ -2158,3 +2158,59 @@ async fn conc_tx_url_param_parses() {
     let plain = RustqliteConnectOptions::shared_memory("x");
     assert!(!plain.is_concurrent_transactions());
 }
+
+/// DML against a VIEW runs its INSTEAD OF triggers through the driver
+/// (bound parameters included), and a WITH-prefixed INSERT / UPDATE /
+/// DELETE writes — both used to step to DONE without doing anything.
+#[tokio::test]
+async fn view_dml_and_cte_dml_execute() {
+    let pool = mem_pool().await;
+    raw_sql(
+        "CREATE TABLE b (a INTEGER);
+         CREATE VIEW v AS SELECT a FROM b;
+         CREATE TRIGGER vi INSTEAD OF INSERT ON v BEGIN INSERT INTO b VALUES (new.a * 10); END;
+         CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for k in [4i64, 5] {
+        let r = sqlx::query("INSERT INTO v VALUES (?)")
+            .bind(k)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(r.rows_affected(), 1);
+    }
+    let got: Vec<i64> = sqlx::query_scalar("SELECT a FROM b ORDER BY a")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(got, vec![40, 50]);
+
+    sqlx::query("WITH x(n) AS (SELECT ?) INSERT INTO t(v) SELECT n FROM x")
+        .bind(7i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let id: i64 =
+        sqlx::query_scalar("WITH x(n) AS (SELECT 8) INSERT INTO t(v) SELECT n FROM x RETURNING id")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(id, 2);
+    sqlx::query("WITH x(n) AS (SELECT ?) UPDATE t SET v = v * 10 WHERE v IN x")
+        .bind(7i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("WITH x(n) AS (SELECT 8) DELETE FROM t WHERE v IN x")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let rows: Vec<(i64, i64)> = sqlx::query_as("SELECT id, v FROM t")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, 70)]);
+}

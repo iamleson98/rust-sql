@@ -478,7 +478,33 @@ pub(crate) fn fold_constants_in_plan(plan: &mut Plan) {
         }
         Plan::Sort { input, terms } => {
             fold_constants_in_plan(input);
-            terms.iter_mut().map(|t| &mut t.expr).collect()
+            // A sort term the planner RESOLVED (an ordinal or alias
+            // replaced by its result expression) must not fold into an
+            // integer literal: the executor reads a bare integer term as
+            // an ORDINAL (`ORDER BY 3` over `x'3132' - x'00410042'` became
+            // "ORDER BY 12" — "term out of range"). Such a term is a
+            // constant sort key, a no-op; it stays unfolded.
+            // (An ordinal-SHAPED term — an integer literal under unary
+            // `+` / `-`, sqlite3ExprIsInteger's forms — still folds: the
+            // executor resolves those against star projections.)
+            for t in terms.iter_mut() {
+                let mut core = &t.expr;
+                while let Expr::Unary {
+                    op: UnaryOp::Pos | UnaryOp::Neg,
+                    expr,
+                } = core
+                {
+                    core = expr;
+                }
+                let mut folded = t.expr.clone();
+                fold_expr(&mut folded);
+                if matches!(core, Expr::Literal(_))
+                    || !matches!(folded, Expr::Literal(Value::Integer(_)))
+                {
+                    t.expr = folded;
+                }
+            }
+            Vec::new()
         }
         Plan::Limit {
             input,

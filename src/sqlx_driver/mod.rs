@@ -629,10 +629,16 @@ fn step_dml_stmt(
     limit_one: bool,
     logger: &mut QueryLogger,
     out: &mut Vec<Either<RustqliteQueryResult, RustqliteRow>>,
-) -> Result<(u64, i64), SqlxError> {
+) -> Result<Option<(u64, i64)>, SqlxError> {
     let mut stmt = db
         .prepare(stmt_sql)
         .map_err(crate::sqlx_driver::error::engine_err)?;
+    // DML against a VIEW (INSTEAD OF triggers) needs the mutable execute
+    // path: hand it back to the caller. A RETURNING form would lose its
+    // rows there, so it stays on the statement path, which reports it.
+    if stmt.targets_view() && !stmt.has_returning() {
+        return Ok(None);
+    }
     stmt.bind_all(values)
         .map_err(crate::sqlx_driver::error::engine_err)?;
     let (mut columns, mut names): (Option<Columns>, Option<NameMap>) = (None, None);
@@ -662,7 +668,7 @@ fn step_dml_stmt(
     }
     let rows_affected = stmt.changes().max(0) as u64;
     let last_rowid = db.last_insert_rowid();
-    Ok((rows_affected, last_rowid))
+    Ok(Some((rows_affected, last_rowid)))
 }
 
 impl RustqliteConnection {
@@ -1076,8 +1082,17 @@ impl RustqliteConnection {
                 }
                 if self.concurrent_tx {
                     let db = self.acquire_read()?;
+                    // A view target inside a concurrent transaction has no
+                    // mutable path here: report it (never a silent DONE).
                     let (ra, rid) =
-                        step_dml_stmt(&db, stmt_sql, values, limit_one, &mut logger, &mut out)?;
+                        step_dml_stmt(&db, stmt_sql, values, limit_one, &mut logger, &mut out)?
+                            .ok_or_else(|| {
+                                crate::sqlx_driver::error::engine_err(
+                                    crate::error::Error::Unsupported(
+                                        "DML on a view inside a BEGIN CONCURRENT transaction",
+                                    ),
+                                )
+                            })?;
                     rows_affected = ra;
                     last_rowid = rid;
                 } else {
@@ -1104,10 +1119,22 @@ impl RustqliteConnection {
                     // observing uncommitted rows. (Harmless in autocommit: with
                     // no transaction owner, readers ignore the dirty flag.)
                     self.shared.tx_dirty.store(true, Ordering::Release);
-                    let (ra, rid) =
-                        step_dml_stmt(&db, stmt_sql, values, limit_one, &mut logger, &mut out)?;
-                    rows_affected = ra;
-                    last_rowid = rid;
+                    match step_dml_stmt(&db, stmt_sql, values, limit_one, &mut logger, &mut out)? {
+                        Some((ra, rid)) => {
+                            rows_affected = ra;
+                            last_rowid = rid;
+                        }
+                        None => {
+                            // DML against a VIEW runs its INSTEAD OF
+                            // triggers — only the mutable execute path
+                            // can (stepping it used to reach DONE without
+                            // running the trigger at all).
+                            db.execute(stmt_sql, values)
+                                .map_err(crate::sqlx_driver::error::engine_err)?;
+                            rows_affected = db.changes().max(0) as u64;
+                            last_rowid = db.last_insert_rowid();
+                        }
+                    }
                 }
             }
             Kind::Once => {
@@ -2207,45 +2234,6 @@ fn acquire_shared(options: &RustqliteConnectOptions) -> Result<Arc<SharedDb>, Sq
 // C-ABI compat layer.
 // ---------------------------------------------------------------------------
 
-fn scan_stmt_end(sql: &[u8]) -> usize {
-    let mut i = 0usize;
-    while i < sql.len() {
-        let c = sql[i];
-        match c {
-            b'\'' | b'"' => {
-                let quote = c;
-                i += 1;
-                while i < sql.len() {
-                    if sql[i] == quote {
-                        if i + 1 < sql.len() && sql[i + 1] == quote {
-                            i += 2; // escaped quote ('' or "")
-                            continue;
-                        }
-                        break;
-                    }
-                    i += 1;
-                }
-                i += 1;
-            }
-            b'-' if i + 1 < sql.len() && sql[i + 1] == b'-' => {
-                while i < sql.len() && sql[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if i + 1 < sql.len() && sql[i + 1] == b'*' => {
-                i += 2;
-                while i + 1 < sql.len() && !(sql[i] == b'*' && sql[i + 1] == b'/') {
-                    i += 1;
-                }
-                i += 2.min(sql.len() - i);
-            }
-            b';' => return i + 1,
-            _ => i += 1,
-        }
-    }
-    sql.len()
-}
-
 fn is_blank_chunk(s: &str) -> bool {
     // True when the chunk contains no executable SQL: only whitespace,
     // semicolons, and comments (`-- ...` / `/* ... */`). A trailing
@@ -2276,10 +2264,12 @@ fn is_blank_chunk(s: &str) -> bool {
 
 /// Find the first non-blank statement: returns (statement_text, tail_offset).
 fn split_first_stmt(sql: &str) -> (Option<String>, usize) {
-    let bytes = sql.as_bytes();
     let mut pos = 0usize;
     loop {
-        let end = scan_stmt_end(&bytes[pos..]) + pos;
+        // The engine's scanner: trigger bodies (`BEGIN …; …; END`) are
+        // one statement (the old byte scanner split them at the first
+        // inner `;`, so a raw_sql script creating a trigger failed).
+        let end = crate::sql::parser::statement_end(&sql[pos..]) + pos;
         let chunk = &sql[pos..end];
         if is_blank_chunk(chunk.trim_end_matches(';')) {
             if end >= sql.len() {

@@ -310,6 +310,25 @@ mod corr {
             .collect())
     }
 
+    /// Execute a correlated subquery for its ROWS (all columns) — a row
+    /// value's right side (`(a, b) = (SELECT …)`, `(a, b) IN (SELECT …)`).
+    pub(crate) fn exec_rows(
+        sel: &SelectStatement,
+        outer_row: *const [Value],
+        outer_names: *const [String],
+        limit_one: bool,
+    ) -> Result<ExecResult> {
+        let ctx_ptr = CORR.with(|c| c.borrow().ctx);
+        if ctx_ptr.is_null() {
+            return Err(crate::error::Error::Unsupported(
+                "row subqueries via evaluator (use executor)",
+            ));
+        }
+        let _frame = push_outer(outer_row, outer_names);
+        // SAFETY: as in exec_scalar.
+        unsafe { exec_select(sel, ctx_ptr, Some((outer_row, outer_names)), limit_one) }
+    }
+
     /// SAFETY: caller must guarantee `ctx` is alive and not mutably
     /// aliased outside this call.
     unsafe fn exec_select(
@@ -461,6 +480,20 @@ pub(crate) fn corr_exec_in_list(
         sel,
         eval_ctx.row as *const [Value],
         eval_ctx.column_names as *const [String],
+    )
+}
+
+/// Evaluator-facing wrapper: a correlated subquery's rows, every column.
+pub(crate) fn corr_exec_rows(
+    sel: &SelectStatement,
+    eval_ctx: &EvalContext<'_>,
+    limit_one: bool,
+) -> Result<ExecResult> {
+    corr::exec_rows(
+        sel,
+        eval_ctx.row as *const [Value],
+        eval_ctx.column_names as *const [String],
+        limit_one,
     )
 }
 
@@ -4181,7 +4214,111 @@ fn deferrable_subquery_error(e: &Error) -> bool {
     }
 }
 
+/// An uncorrelated subquery used as a ROW value — compared with a row
+/// (`(a, b) = (SELECT x, y …)`), or read by an UPDATE's `SET (a, b) =
+/// (SELECT …)` picks — materializes to its FIRST row as a row of
+/// literals (all NULL when it returns none); its column count must match
+/// the row's. A correlated one stays for per-row evaluation.
+fn materialize_row_subquery(
+    sel: &SelectStatement,
+    width: usize,
+    ctx: &mut ExecContext<'_>,
+) -> Result<Expr> {
+    let mut sel = sel.clone();
+    rewrite_select_subqueries(&mut sel, ctx)?;
+    let (cte_names, cte_cols) = cte_scope_of(ctx);
+    if subquery_is_correlated(&sel, ctx.catalog(), &cte_names, &cte_cols) {
+        return Ok(Expr::Subquery(Box::new(sel)));
+    }
+    let res = exec_select_statement(&sel, ctx, None, true)?;
+    if res.columns.len() != width {
+        return Err(Error::semantic(format!(
+            "sub-select returns {} columns - expected {}",
+            res.columns.len(),
+            width
+        )));
+    }
+    let row = res
+        .rows
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| vec![Value::Null; width]);
+    Ok(Expr::Row(row.into_iter().map(Expr::Literal).collect()))
+}
+
+/// Row-value contexts of the subquery rewrite (see
+/// `materialize_row_subquery`); `None` = not one — the generic rewrite,
+/// which reads a subquery as a SCALAR, applies.
+fn rewrite_row_context(e: &Expr, ctx: &mut ExecContext<'_>) -> Result<Option<Expr>> {
+    let rows = |items: &[Expr], ctx: &mut ExecContext<'_>| -> Result<Expr> {
+        Ok(Expr::Row(
+            items
+                .iter()
+                .map(|i| rewrite_subqueries_rec(i, ctx))
+                .collect::<Result<_>>()?,
+        ))
+    };
+    match e {
+        Expr::Binary { op, left, right } => match (left.as_ref(), right.as_ref()) {
+            (Expr::Row(items), Expr::Subquery(sel)) => Ok(Some(Expr::Binary {
+                op: *op,
+                left: Box::new(rows(items, ctx)?),
+                right: Box::new(materialize_row_subquery(sel, items.len(), ctx)?),
+            })),
+            (Expr::Subquery(sel), Expr::Row(items)) => Ok(Some(Expr::Binary {
+                op: *op,
+                left: Box::new(materialize_row_subquery(sel, items.len(), ctx)?),
+                right: Box::new(rows(items, ctx)?),
+            })),
+            _ => Ok(None),
+        },
+        Expr::Is {
+            left,
+            right,
+            negated,
+        } => match (left.as_ref(), right.as_ref()) {
+            (Expr::Row(items), Expr::Subquery(sel)) => Ok(Some(Expr::Is {
+                left: Box::new(rows(items, ctx)?),
+                right: Box::new(materialize_row_subquery(sel, items.len(), ctx)?),
+                negated: *negated,
+            })),
+            (Expr::Subquery(sel), Expr::Row(items)) => Ok(Some(Expr::Is {
+                left: Box::new(materialize_row_subquery(sel, items.len(), ctx)?),
+                right: Box::new(rows(items, ctx)?),
+                negated: *negated,
+            })),
+            _ => Ok(None),
+        },
+        Expr::Function { name, args, .. } if name == crate::sql::parser::ROW_COL_FN => {
+            let [Expr::Literal(Value::Integer(k)), n @ Expr::Literal(Value::Integer(w)), Expr::Subquery(sel)] =
+                args.as_slice()
+            else {
+                return Ok(None);
+            };
+            Ok(Some(
+                match materialize_row_subquery(sel, *w as usize, ctx)? {
+                    Expr::Row(items) => items
+                        .into_iter()
+                        .nth(*k as usize)
+                        .unwrap_or(Expr::Literal(Value::Null)),
+                    correlated => {
+                        let mut pick = e.clone();
+                        if let Expr::Function { args, .. } = &mut pick {
+                            *args = vec![Expr::Literal(Value::Integer(*k)), n.clone(), correlated];
+                        }
+                        pick
+                    }
+                },
+            ))
+        }
+        _ => Ok(None),
+    }
+}
+
 fn rewrite_subqueries_rec(e: &Expr, ctx: &mut ExecContext<'_>) -> Result<Expr> {
+    if let Some(rewritten) = rewrite_row_context(e, ctx)? {
+        return Ok(rewritten);
+    }
     // First, rewrite children.
     let e = map_expr_children(e, &mut |child| rewrite_subqueries_rec(child, ctx))?;
     // Then, handle this node if it is a subquery node.
@@ -4279,6 +4416,36 @@ fn rewrite_subqueries_rec(e: &Expr, ctx: &mut ExecContext<'_>) -> Result<Expr> {
                     };
                     match res {
                         None => InSource::Subquery(Box::new(sel)),
+                        // A ROW operand: the subquery's rows, as a list of
+                        // rows of the same width.
+                        Some(res) if matches!(*expr, Expr::Row(_)) => {
+                            let width = match &*expr {
+                                Expr::Row(items) => items.len(),
+                                _ => unreachable!(),
+                            };
+                            if res.columns.len() != width {
+                                return Err(Error::semantic(format!(
+                                    "sub-select returns {} columns - expected {}",
+                                    res.columns.len(),
+                                    width
+                                )));
+                            }
+                            let list: Vec<Expr> = res
+                                .rows
+                                .into_iter()
+                                .map(|r| Expr::Row(r.into_iter().map(Expr::Literal).collect()))
+                                .collect();
+                            InSource::List(list.into())
+                        }
+                        // A scalar operand needs a ONE-column subquery
+                        // (SQLite rejects the statement otherwise; the
+                        // extra columns used to be ignored silently).
+                        Some(res) if res.columns.len() != 1 && !matches!(*expr, Expr::Row(_)) => {
+                            return Err(Error::semantic(format!(
+                                "sub-select returns {} columns - expected 1",
+                                res.columns.len()
+                            )));
+                        }
                         Some(res) => {
                             rhs_aff = select_result_affinity(&sel, ctx.catalog());
                             let list: Vec<Expr> = res
@@ -7548,6 +7715,11 @@ fn exec_topn_scan(
     };
     if table.without_rowid {
         let mut decode_err: Option<Error> = None;
+        // The tie serial is the PK-order SCAN POSITION: the internal
+        // rowid follows insertion order, not the PK, so using it undid
+        // the PK walk (`ORDER BY k LIMIT 1` over equal k returned the
+        // first-inserted row, not the PK-first one SQLite returns).
+        let mut pos: i64 = 0;
         scan_table_rows(ctx, table, false, |rowid, payload| {
             let mut row: Vec<Value> = Vec::with_capacity(wanted.len());
             if let Err(e) =
@@ -7556,7 +7728,8 @@ fn exec_topn_scan(
                 decode_err = Some(e);
                 return false;
             }
-            offer(rowid, row);
+            offer(pos, row);
+            pos += 1;
             true
         })?;
         if let Some(e) = decode_err {
@@ -7637,7 +7810,12 @@ fn exec_topn_scan_expr(
     let mut wide: Vec<Value> = Vec::with_capacity(n_cols + 1);
     // An undecodable record fails the statement (never skipped).
     let mut decode_err: Option<Error> = None;
+    // Ties break by SCAN POSITION — rowid order for rowid tables, PK
+    // order for WITHOUT ROWID ones (whose internal rowid follows
+    // insertion, not the PK walk SQLite's tie order comes from).
+    let mut pos: i64 = -1;
     scan_table_maybe_range(ctx, table, range, false, |rowid, payload| {
+        pos += 1;
         if let Err(e) = crate::storage::row_codec::decode_row_selective_wide(
             payload,
             n_cols,
@@ -7670,16 +7848,16 @@ fn exec_topn_scan_expr(
             let idx = sel.len();
             sel.push(TopnSel {
                 key,
-                serial: rowid,
+                serial: pos,
                 row,
             });
             topn_sift_up(&mut sel, idx, desc, coll);
-        } else if topn_total_cmp(&key, rowid, &sel[0].key, sel[0].serial, desc, coll)
+        } else if topn_total_cmp(&key, pos, &sel[0].key, sel[0].serial, desc, coll)
             == std::cmp::Ordering::Less
         {
             sel[0] = TopnSel {
                 key,
-                serial: rowid,
+                serial: pos,
                 row,
             };
             topn_sift_down(&mut sel, 0, desc, coll);
@@ -17790,22 +17968,35 @@ fn exec_index_nested_loop_join(
     // per-row `wanted.binary_search` (up to 2 searches per output row —
     // a 50-row join paid 100 binary searches per query) collapses to a
     // table lookup.
-    let fused_slots: Option<Vec<(bool, usize)>> = fused.as_ref().map(|(indices, _)| {
+    let fused_slots: Option<Vec<(bool, usize, bool)>> = fused.as_ref().map(|(indices, _)| {
         indices
             .iter()
             .map(|&i| {
                 if i < outer_width {
-                    (true, i)
+                    (true, i, false)
                 } else {
                     let inner_col = i - outer_width;
                     let slot = fused_inner_cols
                         .as_ref()
                         .and_then(|w| w.binary_search(&inner_col).ok())
                         .unwrap_or(usize::MAX);
-                    (false, slot)
+                    (false, slot, false)
                 }
             })
             .collect()
+    });
+    // A decoded inner value is MOVED into the output only at its LAST
+    // use; earlier uses clone it — `SELECT i, i` used to move the value
+    // out at the first `i` and emit NULL for the second.
+    let fused_slots: Option<Vec<(bool, usize, bool)>> = fused_slots.map(|mut slots| {
+        for k in 0..slots.len() {
+            let (is_outer, idx, _) = slots[k];
+            if !is_outer {
+                let reused = slots[k + 1..].iter().any(|&(o, j, _)| !o && j == idx);
+                slots[k].2 = !reused;
+            }
+        }
+        slots
     });
     // Reused rowid batch + decode buffer across outer rows (one malloc per
     // STATEMENT instead of one per outer row / per matched row).
@@ -17868,7 +18059,7 @@ fn exec_index_nested_loop_join(
                 match &fused_slots {
                     Some(slots) => {
                         let mut out: Row = Vec::with_capacity(slots.len());
-                        for &(is_outer, idx) in slots {
+                        for &(is_outer, idx, _) in slots {
                             if is_outer {
                                 out.push(outer_row[idx].clone());
                             } else if Some(idx) == covering_alias_slot {
@@ -17915,15 +18106,20 @@ fn exec_index_nested_loop_join(
                         let sel = &mut inner_vals;
                         let slots = fused_slots.as_ref().unwrap();
                         let mut out: Row = Vec::with_capacity(slots.len());
-                        for &(is_outer, idx) in slots {
+                        for &(is_outer, idx, last_use) in slots {
                             if is_outer {
                                 // Outer row values are shared across all
                                 // matching inner rows — clone (the source
                                 // row outlives this iteration).
                                 out.push(outer_row[idx].clone());
                             } else if idx != usize::MAX && idx < sel.len() {
-                                // Move out of the decoded row.
-                                out.push(std::mem::replace(&mut sel[idx], Value::Null));
+                                // Move out of the decoded row at the last
+                                // use of the slot; clone before that.
+                                if last_use {
+                                    out.push(std::mem::replace(&mut sel[idx], Value::Null));
+                                } else {
+                                    out.push(sel[idx].clone());
+                                }
                             } else {
                                 out.push(Value::Null);
                             }

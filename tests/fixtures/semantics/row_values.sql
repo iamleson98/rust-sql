@@ -1,0 +1,60 @@
+-- Row values (SQLite 3.15+): lexicographic comparisons with SQLite's NULL
+-- rules (codeVectorCompare), IS / IS NOT, BETWEEN, IN over subqueries /
+-- VALUES / row lists (correlated too), scalar row subqueries, UPDATE /
+-- upsert SET (a, b) = (…) | (SELECT …), keyset pagination, and SQLite's
+-- errors for misused rows and width mismatches.
+CREATE TABLE two (a, b);
+INSERT INTO two VALUES (1, 2), (1, 3), (2, 1), (NULL, 5);
+SELECT a, b FROM two WHERE (a, b) = (1, 2);
+SELECT a, b FROM two WHERE (a, b) <> (1, 2);
+SELECT a, b FROM two WHERE (a, b) > (1, 2);
+SELECT a, b FROM two WHERE (a, b) <= (1, 3);
+SELECT a, b FROM two WHERE (a, b) IS (1, 2);
+SELECT a, b FROM two WHERE (a, b) IS NOT (NULL, 5);
+SELECT a, b FROM two WHERE (a, b) BETWEEN (1, 2) AND (2, 0);
+SELECT a, b FROM two WHERE (a, b) NOT BETWEEN (1, 2) AND (2, 0);
+SELECT (1, 2) = (1, 2), (1, NULL) = (1, 2), (1, NULL) = (2, 2), (1, 2) < (1, 3), (NULL, 1) < (2, 2), (1, NULL) < (2, 0), (1, NULL) <= (1, 3);
+SELECT a, b, (a, b) > (1, 2), (a, b) >= (1, 3), (a, b) < (2, NULL), (a, b) IS NOT (1, 3) FROM two;
+SELECT a, b FROM two WHERE (a, b) IN (SELECT a, b FROM two WHERE b > 2);
+SELECT a, b FROM two WHERE (a, b) NOT IN (SELECT a, b FROM two WHERE b > 2);
+SELECT a, b FROM two WHERE (a, b) IN (VALUES (1, 2), (2, 1));
+SELECT a, b FROM two WHERE (a, b) IN ((1, 3), (2, 1));
+SELECT (1, 2) IN (SELECT a, b FROM two), (1, NULL) IN (SELECT 1, 2), (2, NULL) IN (SELECT 1, 2), (1, 2) IN (SELECT 1, NULL), (1, 2) NOT IN (SELECT 1, NULL), (1, 2) IN (SELECT 1, 2 WHERE 0);
+SELECT a FROM two WHERE (a, b) = (SELECT 1, 3);
+SELECT (1, 2) = (SELECT 1, 2 WHERE 0);
+SELECT (1, 2) IN (SELECT 1);
+SELECT (1, 2) = (1, 2, 3);
+SELECT (1, 2);
+SELECT (1, 2) + 1;
+SELECT x.a, x.b FROM two x WHERE (x.a, x.b) IN (SELECT y.a, y.b + 0 FROM two y WHERE y.a = x.a AND y.b > 2);
+SELECT x.a FROM two x WHERE (x.a, x.b) = (SELECT y.a, max(y.b) FROM two y WHERE y.a = x.a);
+UPDATE two SET (a, b) = (b, a) WHERE a = 2;
+SELECT * FROM two;
+UPDATE two SET (a, b) = (SELECT 9, 8) WHERE a IS NULL;
+SELECT * FROM two;
+UPDATE two SET (a, b) = (SELECT y.b, y.a FROM two y WHERE y.a = 1 AND y.b = two.b) WHERE a = 1;
+SELECT * FROM two;
+UPDATE two SET (a, b) = (1, 2, 3);
+UPDATE two SET (a, b) = (SELECT 1);
+CREATE TABLE ks (id INTEGER PRIMARY KEY, ts INTEGER);
+INSERT INTO ks(ts) VALUES (5), (5), (6), (7), (7), (8);
+/*ordered*/ SELECT id, ts FROM ks WHERE (ts, id) > (5, 2) ORDER BY ts, id LIMIT 3;
+/*ordered*/ SELECT id, ts FROM ks WHERE (ts, id) < (7, 5) ORDER BY ts DESC, id DESC LIMIT 2;
+CREATE INDEX ks_ts_id ON ks(ts, id);
+/*ordered*/ SELECT id, ts FROM ks WHERE (ts, id) > (5, 2) ORDER BY ts, id LIMIT 3;
+/*ordered*/ SELECT id, ts FROM ks WHERE (ts, id) >= (7, 4) ORDER BY ts, id;
+SELECT id FROM ks WHERE (ts, id) IN ((5, 1), (7, 5), (9, 9));
+SELECT id FROM ks WHERE (ts, id) = (6, 3);
+SELECT id FROM ks WHERE (ts, id) IN (SELECT ts, id FROM ks WHERE ts > 6);
+CREATE TABLE wr (p TEXT, q INTEGER, v, PRIMARY KEY (p, q)) WITHOUT ROWID;
+INSERT INTO wr VALUES ('a', 1, 10), ('a', 2, 20), ('b', 1, 30);
+SELECT v FROM wr WHERE (p, q) = ('a', 2);
+SELECT v FROM wr WHERE (p, q) > ('a', 1);
+SELECT v FROM wr WHERE (p, q) IN (('b', 1), ('a', 1));
+SELECT k.id, w.v FROM ks k JOIN wr w ON (w.q, w.v) = (k.id, k.ts * 2);
+SELECT count(*) FROM ks WHERE (ts, id) BETWEEN (5, 2) AND (7, 4);
+CREATE TABLE up (id INTEGER PRIMARY KEY, x, y);
+INSERT INTO up VALUES (1, 1, 1);
+INSERT INTO up VALUES (1, 5, 5) ON CONFLICT(id) DO UPDATE SET (x, y) = (excluded.y * 2, excluded.x + 1);
+SELECT * FROM up;
+SELECT CASE WHEN (1, 2) < (1, 3) THEN 'lt' END, iif((2, 2) > (1, 9), 'gt', 'no');
