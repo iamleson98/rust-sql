@@ -252,9 +252,11 @@ mod corr {
         // subqueries resolve through it) AND travels as the binding
         // tuple for the correlated-parameter rewrite.
         let _frame = push_outer(outer_row, outer_names);
-        // SAFETY: as in exec_scalar.
+        // SAFETY: as in exec_scalar. limit-one: a scalar subquery reads
+        // one row (sqlite3CodeSubselect's LIMIT rewrite, shared with
+        // EXISTS — see clamp_select_limit_to_one).
         let res: ExecResult =
-            unsafe { exec_select(sel, ctx_ptr, Some((outer_row, outer_names)), false)? };
+            unsafe { exec_select(sel, ctx_ptr, Some((outer_row, outer_names)), true)? };
         Ok(res
             .rows
             .first()
@@ -4176,7 +4178,9 @@ fn rewrite_subqueries_rec(e: &Expr, ctx: &mut ExecContext<'_>) -> Result<Expr> {
                 Ok(Expr::Subquery(Box::new(sel)))
             } else {
                 let aff = select_result_affinity(&sel, ctx.catalog());
-                let res = match exec_select_statement(&sel, ctx, None, false) {
+                // limit-one: the scalar reads one row (see
+                // clamp_select_limit_to_one).
+                let res = match exec_select_statement(&sel, ctx, None, true) {
                     Ok(r) => r,
                     // SQLite runs an uncorrelated subquery LAZILY (OP_Once
                     // at its first evaluation): one in an untaken CASE
@@ -4661,12 +4665,23 @@ fn exec_select_statement_with_ctes(
 /// left untouched since their runtime value decides. OFFSET survives:
 /// `LIMIT 1 OFFSET k` still yields "row k+1 exists".
 fn clamp_select_limit_to_one(sel: &mut SelectStatement) {
+    // sqlite3CodeSubselect (scalar and EXISTS alike): no LIMIT becomes
+    // LIMIT 1, and `LIMIT X` becomes `LIMIT (X <> 0)` with the 0 carrying
+    // NUMERIC affinity — so `LIMIT 'abc'` reads one row, `LIMIT 0` none,
+    // and a NULL limit still fails OP_MustBeInt.
     let one = || Expr::Literal(Value::Integer(1));
     sel.limit = Some(match sel.limit.take() {
         None => one(),
         Some(Expr::Literal(Value::Integer(0))) => Expr::Literal(Value::Integer(0)),
         Some(Expr::Literal(Value::Integer(_))) => one(),
-        Some(other) => other,
+        Some(other) => Expr::Binary {
+            op: crate::sql::ast::BinaryOp::NotEq,
+            left: Box::new(other),
+            right: Box::new(Expr::Cast {
+                expr: Box::new(Expr::Literal(Value::Integer(0))),
+                type_name: "NUMERIC".to_string(),
+            }),
+        },
     });
 }
 
@@ -5596,6 +5611,9 @@ fn exec_values(ctx: &mut ExecContext<'_>, rows: &[Vec<Expr>]) -> Result<ExecResu
 // ============================================================================
 
 fn exec_filter(ctx: &mut ExecContext<'_>, input: &Plan, predicate: &Expr) -> Result<ExecResult> {
+    if let Some(terms) = crate::planner::const_where_terms(predicate) {
+        return exec_const_where(ctx, input, terms);
+    }
     // FUSED PATH: Filter over a condition-less CROSS/INNER join (the
     // implicit-join shape `FROM a, b WHERE a.y < b.y` after the planner's
     // equi fusion took what it could). Evaluating the predicate as the
@@ -5697,6 +5715,60 @@ fn exec_filter(ctx: &mut ExecContext<'_>, input: &Plan, predicate: &Expr) -> Res
     })
 }
 
+/// [`scan_filter_limit`]'s evaluated variant: the predicate runs through
+/// the general evaluator (column affinities applied, as the unfused
+/// Filter does) and the scan ends once `stop` rows have passed. The walk
+/// copies each row out (`may_reenter`) — a user function inside the
+/// predicate may query the database.
+fn scan_eval_filter_limit(
+    ctx: &ExecContext<'_>,
+    table: &Arc<Table>,
+    alias: &Option<String>,
+    predicate: &Expr,
+    stop: usize,
+) -> Result<ExecResult> {
+    let append_rowid = crate::planner::wants_rowid_slot(table);
+    let columns = scan_output_columns(table, alias, append_rowid);
+    let n_cols = table.n_columns();
+    let rowid_alias = table.rowid_alias;
+    let mut rows: Vec<Row> = Vec::new();
+    let mut err: Option<Error> = None;
+    if stop > 0 {
+        scan_table_rows(ctx, table, true, |rowid, payload| {
+            let mut row = match decode_row(payload, n_cols, rowid, rowid_alias) {
+                Ok(r) => r,
+                Err(e) => {
+                    err = Some(e);
+                    return false;
+                }
+            };
+            if append_rowid {
+                row.push(Value::Integer(rowid));
+            }
+            match eval_row_aff(
+                predicate,
+                &row,
+                &columns,
+                &table.col_affinities,
+                &ctx.params,
+                &ctx.named_params,
+            ) {
+                Ok(v) if v.is_truthy() => rows.push(row),
+                Ok(_) => {}
+                Err(e) => {
+                    err = Some(e);
+                    return false;
+                }
+            }
+            rows.len() < stop
+        })?;
+    }
+    if let Some(e) = err {
+        return Err(e);
+    }
+    Ok(ExecResult { columns, rows })
+}
+
 /// FUSED Scan+Filter(+Limit) path: scan the table with a compiled
 /// predicate, selectively decoding ONLY the predicate's columns for
 /// non-matching rows, and — when `stop_after` is set — terminating the
@@ -5708,7 +5780,9 @@ fn exec_filter(ctx: &mut ExecContext<'_>, input: &Plan, predicate: &Expr) -> Res
 /// * `predicate` — the filter to apply (from the enclosing Filter node,
 ///   or the Scan's own pushed-down predicate). `None` accepts every row.
 /// * Returns `Ok(None)` when the shape is unsupported (virtual table,
-///   non-compilable predicate, index scan) so the caller falls back.
+///   index scan, or a non-compilable predicate without a LIMIT — with
+///   one, [`scan_eval_filter_limit`] takes over) so the caller falls
+///   back.
 /// * `stop_after` — include offset: stop once this many rows PASS
 ///   (the caller then applies offset/truncation).
 fn scan_filter_limit(
@@ -5747,7 +5821,18 @@ fn scan_filter_limit(
     let pred = match predicate {
         Some(p) => match crate::executor::predicate::compile_predicate(p, table, prefix) {
             Some(c) => Some(c),
-            None => return Ok(None),
+            None => {
+                // A LIMIT still stops the scan for a predicate that does
+                // not compile (function calls, CASE, …): rows past the
+                // k-th match are never read — nor evaluated, so they
+                // cannot raise (SQLite's loop ends at the LIMIT).
+                return match stop_after {
+                    Some(stop) if !expr_has_subquery(p) => {
+                        scan_eval_filter_limit(ctx, table, alias, p, stop).map(Some)
+                    }
+                    _ => Ok(None),
+                };
+            }
         },
         None => None, // accept every row
     };
@@ -7551,12 +7636,252 @@ fn limit_window(mut res: ExecResult, offset: usize, count: i64) -> ExecResult {
     res
 }
 
+/// A LIMIT / OFFSET operand under OP_MustBeInt: an INTEGER, or a REAL /
+/// numeric TEXT that converts losslessly to one (`2.0`, `'1e1'` = 10);
+/// anything else — `1.5`, `'abc'`, NULL, a BLOB — fails with SQLite's
+/// "datatype mismatch".
+fn limit_operand(ctx: &ExecContext<'_>, e: &Expr) -> Result<i64> {
+    let empty_row: Vec<Value> = Vec::new();
+    let empty_cols: Vec<String> = Vec::new();
+    let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+    rowid_from_value(&evaluate(e, &eval_ctx)?)?
+        .ok_or_else(|| Error::constraint("datatype mismatch"))
+}
+
+/// The plan's result COLUMNS without reading a row: every access leaf
+/// becomes an empty row source carrying the executor's own column names,
+/// and an Aggregate's single over-empty-input row is cut before anything
+/// above it (HAVING, the projection) evaluates it. Nothing in the
+/// rewritten plan evaluates an expression. `None` for shapes whose names
+/// are not statically known (virtual tables, table functions, nested
+/// selects planned at execution) — the caller then runs the plan as is.
+fn empty_input_plan(plan: &Plan) -> Option<Plan> {
+    let empty = |columns: Arc<[String]>| Plan::CteRows {
+        rows: Arc::new(Vec::new()),
+        columns,
+    };
+    let sub = |p: &Plan| empty_input_plan(p).map(Box::new);
+    Some(match plan {
+        Plan::Scan { table, .. } if table.vtab.is_some() => return None,
+        Plan::Scan { .. }
+        | Plan::RowidLookup { .. }
+        | Plan::RowidIn { .. }
+        | Plan::RowidRange { .. }
+        | Plan::IndexIn { .. }
+        | Plan::IndexLookup { .. }
+        | Plan::IndexRange { .. }
+        | Plan::CteRows { .. } => empty(crate::planner::atom_out_cols(plan)?.into()),
+        Plan::Values { rows } => empty(
+            (0..rows.first().map_or(0, |r| r.len()))
+                .map(|i| format!("column{}", i + 1))
+                .collect::<Vec<String>>()
+                .into(),
+        ),
+        // The constant-WHERE marker evaluates up front, not per row: over
+        // no rows it must not run at all (LIMIT 0 precedes the WHERE).
+        Plan::Filter { input, predicate }
+            if crate::planner::const_where_terms(predicate).is_some() =>
+        {
+            empty_input_plan(input)?
+        }
+        Plan::Filter { input, predicate } => Plan::Filter {
+            input: sub(input)?,
+            predicate: predicate.clone(),
+        },
+        Plan::Project { input, columns } => Plan::Project {
+            input: sub(input)?,
+            columns: columns.clone(),
+        },
+        Plan::Sort { input, terms } => Plan::Sort {
+            input: sub(input)?,
+            terms: terms.clone(),
+        },
+        // A nested LIMIT over no rows is no rows; dropping it also skips
+        // evaluating its bounds.
+        Plan::Limit { input, .. } => empty_input_plan(input)?,
+        Plan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => Plan::Filter {
+            input: Box::new(Plan::Aggregate {
+                input: sub(input)?,
+                group_by: group_by.clone(),
+                aggregates: aggregates.clone(),
+            }),
+            predicate: Expr::Literal(Value::Integer(0)),
+        },
+        Plan::Window { input, windows } => Plan::Window {
+            input: sub(input)?,
+            windows: windows.clone(),
+        },
+        Plan::Join {
+            left,
+            right,
+            join_type,
+            condition,
+            algorithm,
+        } => Plan::Join {
+            left: sub(left)?,
+            right: sub(right)?,
+            join_type: *join_type,
+            condition: condition.clone(),
+            algorithm: *algorithm,
+        },
+        Plan::IndexNestedLoopJoin {
+            outer,
+            inner_table,
+            inner_alias,
+            inner_index,
+            outer_key_col,
+            covering,
+        } => Plan::IndexNestedLoopJoin {
+            outer: sub(outer)?,
+            inner_table: inner_table.clone(),
+            inner_alias: inner_alias.clone(),
+            inner_index: inner_index.clone(),
+            outer_key_col: *outer_key_col,
+            covering: *covering,
+        },
+        Plan::Subquery { plan: inner } => Plan::Subquery { plan: sub(inner)? },
+        Plan::Distinct { input } => Plan::Distinct { input: sub(input)? },
+        Plan::Union { left, right, all } => Plan::Union {
+            left: sub(left)?,
+            right: sub(right)?,
+            all: *all,
+        },
+        Plan::Intersect { left, right } => Plan::Intersect {
+            left: sub(left)?,
+            right: sub(right)?,
+        },
+        Plan::Except { left, right } => Plan::Except {
+            left: sub(left)?,
+            right: sub(right)?,
+        },
+        _ => return None,
+    })
+}
+
+/// A simple SELECT's plan with its FROM clause producing NO rows: the
+/// select's own operators (projection, window, aggregate + HAVING, the
+/// planner's ORDER BY sort) stay, the FROM/WHERE subtree below them
+/// becomes [`empty_input_plan`]. An aggregate without GROUP BY still
+/// yields its one row (`SELECT count(*) … WHERE 0` is 0). `None` when
+/// the FROM side's names are not statically known.
+pub(crate) fn empty_from_plan(plan: &Plan) -> Option<Plan> {
+    let sub = |p: &Plan| empty_from_plan(p).map(Box::new);
+    Some(match plan {
+        Plan::Distinct { input } => Plan::Distinct { input: sub(input)? },
+        Plan::Project { input, columns } => Plan::Project {
+            input: sub(input)?,
+            columns: columns.clone(),
+        },
+        Plan::Window { input, windows } => Plan::Window {
+            input: sub(input)?,
+            windows: windows.clone(),
+        },
+        Plan::Sort { input, terms } => Plan::Sort {
+            input: sub(input)?,
+            terms: terms.clone(),
+        },
+        // HAVING sits above the Aggregate; any other Filter is WHERE.
+        Plan::Filter { input, predicate } if matches!(input.as_ref(), Plan::Aggregate { .. }) => {
+            Plan::Filter {
+                input: sub(input)?,
+                predicate: predicate.clone(),
+            }
+        }
+        Plan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => Plan::Aggregate {
+            input: Box::new(empty_input_plan(input)?),
+            group_by: group_by.clone(),
+            aggregates: aggregates.clone(),
+        },
+        from => empty_input_plan(from)?,
+    })
+}
+
+/// The constant-WHERE marker (see `planner::CONST_WHERE_FN`): evaluate
+/// the terms once, in order, before anything reads a row — a FALSE/NULL
+/// term ends evaluation (sqlite3ExprIfFalse with JUMPIFNULL), an error
+/// raises even when the FROM clause is empty. `Some(true)` = run the
+/// plan, `Some(false)` = the FROM clause yields nothing.
+fn const_where_holds(ctx: &ExecContext<'_>, terms: &[Expr]) -> Result<bool> {
+    let empty_row: Vec<Value> = Vec::new();
+    let empty_cols: Vec<String> = Vec::new();
+    let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+    for t in terms {
+        if !evaluate(t, &eval_ctx)?.is_truthy() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn exec_const_where(ctx: &mut ExecContext<'_>, input: &Plan, terms: &[Expr]) -> Result<ExecResult> {
+    if const_where_holds(ctx, terms)? {
+        return execute(input, ctx);
+    }
+    // The planner only emits the marker over plans whose empty-FROM form
+    // exists (and nothing later in planning changes that), so `None` is
+    // an engine bug — reported, never answered with guessed rows.
+    let empty = empty_from_plan(input).ok_or_else(|| {
+        Error::runtime("internal error: constant WHERE over a plan without an empty-FROM form")
+    })?;
+    execute(&empty, ctx)
+}
+
 fn exec_limit(
     ctx: &mut ExecContext<'_>,
     input: &Plan,
     count: &Expr,
     offset: &Expr,
 ) -> Result<ExecResult> {
+    // computeLimitRegisters: the LIMIT is evaluated before anything else
+    // in the statement (OP_MustBeInt — a non-integer raises "datatype
+    // mismatch"), and a LIMIT of 0 jumps straight to the end (`n==0 →
+    // goto iBreak`, OP_IfNot for a computed limit): no row is read and no
+    // WHERE / projection / OFFSET expression is evaluated, so none can
+    // raise. Also makes the `SELECT … LIMIT 0` metadata probe free on
+    // joins and aggregates. The OFFSET is evaluated next, the same way.
+    let count_i = limit_operand(ctx, count)?;
+    if count_i == 0 {
+        if let Some(empty) = empty_input_plan(input) {
+            let mut res = execute(&empty, ctx)?;
+            res.rows.clear();
+            return Ok(res);
+        }
+    }
+    let offset_i = limit_operand(ctx, offset)?;
+    // Every path below re-reads the bounds: hand it the converted values.
+    let (count_lit, offset_lit) = (
+        Expr::Literal(Value::Integer(count_i)),
+        Expr::Literal(Value::Integer(offset_i)),
+    );
+    let (count, offset) = (&count_lit, &offset_lit);
+    // Constant-WHERE marker under the LIMIT: decide it here and limit the
+    // chosen plan directly, so the top-N fusions below see their
+    // `Limit(Sort(…))` / `Limit(Project(Sort(…)))` shapes.
+    if let Plan::Filter {
+        input: inner,
+        predicate,
+    } = input
+    {
+        if let Some(terms) = crate::planner::const_where_terms(predicate) {
+            if const_where_holds(ctx, terms)? {
+                return exec_limit(ctx, inner, count, offset);
+            }
+            let empty = empty_from_plan(inner).ok_or_else(|| {
+                Error::runtime(
+                    "internal error: constant WHERE over a plan without an empty-FROM form",
+                )
+            })?;
+            return exec_limit(ctx, &empty, count, offset);
+        }
+    }
     // TOP-N FUSION: `Limit(Sort(x))` with literal bounds and a SINGLE sort
     // term keeps only the top (offset + count) rows via bounded partial
     // selection — O(n) key extraction + O(n) selection + O(k log k) sort —
@@ -17740,6 +18065,13 @@ fn exec_union(
 
 fn exec_intersect(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan) -> Result<ExecResult> {
     let l = execute(left, ctx)?;
+    // SQLite runs every non-ALL compound as a merge of two co-routines
+    // (multiSelectByMerge): the left arm is pulled first, and when it is
+    // empty the merge ends without ever starting the right arm — whose
+    // expressions therefore never evaluate (or raise).
+    if l.rows.is_empty() {
+        return Ok(l);
+    }
     let r = execute(right, ctx)?;
     let columns = l.columns.clone();
     let colls = compound_collations(left, right);
@@ -17763,6 +18095,13 @@ fn exec_intersect(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan) -> Resul
 
 fn exec_except(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan) -> Result<ExecResult> {
     let l = execute(left, ctx)?;
+    // SQLite runs every non-ALL compound as a merge of two co-routines
+    // (multiSelectByMerge): the left arm is pulled first, and when it is
+    // empty the merge ends without ever starting the right arm — whose
+    // expressions therefore never evaluate (or raise).
+    if l.rows.is_empty() {
+        return Ok(l);
+    }
     let r = execute(right, ctx)?;
     let columns = l.columns.clone();
     let colls = compound_collations(left, right);

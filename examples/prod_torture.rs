@@ -2657,8 +2657,20 @@ fn main() {
 
     println!("\n== SUMMARY ==");
     println!("gate failures: {}", failures.len());
+    // On GitHub Actions each failure also becomes an `::error` workflow
+    // annotation: annotations are readable without the authenticated
+    // log download, so a red torture job says WHICH gate fired (and by
+    // how much) to anyone looking at the run.
+    let annotate = std::env::var("GITHUB_ACTIONS").is_ok_and(|v| v == "true");
     for f in &failures {
         println!("  FAIL {f}");
+        if annotate {
+            let msg = f
+                .replace('%', "%25")
+                .replace('\r', "%0D")
+                .replace('\n', "%0A");
+            println!("::error title=torture gate::{msg}");
+        }
     }
     println!("perf losses vs sqlite (tracked): {}", losses.len());
     for l in &losses {

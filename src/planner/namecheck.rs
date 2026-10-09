@@ -646,9 +646,11 @@ fn validate_select(
                     validate_expr(ctx, &t.expr, scope, &full)?;
                 }
                 if let Some(l) = &stmt.limit {
+                    reject_limit_columns(l)?;
                     validate_expr(ctx, l, scope, &full)?;
                 }
                 if let Some(o) = &stmt.offset {
+                    reject_limit_columns(o)?;
                     validate_expr(ctx, o, scope, &full)?;
                 }
                 Ok(())
@@ -668,9 +670,11 @@ fn validate_select(
                     validate_expr(ctx, &t.expr, scope, &full)?;
                 }
                 if let Some(l) = &stmt.limit {
+                    reject_limit_columns(l)?;
                     validate_expr(ctx, l, scope, &full)?;
                 }
                 if let Some(o) = &stmt.offset {
+                    reject_limit_columns(o)?;
                     validate_expr(ctx, o, scope, &full)?;
                 }
                 Ok(())
@@ -678,6 +682,17 @@ fn validate_select(
             scope.pop_level();
             r
         }
+    }
+}
+
+/// LIMIT / OFFSET resolve against NO table — neither the FROM clause nor
+/// an enclosing query: any column reference outside a subquery fails at
+/// prepare with SQLite's "no such column: <ref as written>".
+fn reject_limit_columns(e: &Expr) -> Result<()> {
+    match crate::planner::first_bare_column_ref(e) {
+        Some((Some(t), name)) => Err(Error::NotFound(format!("no such column: {}.{}", t, name))),
+        Some((None, name)) => Err(Error::NotFound(format!("no such column: {}", name))),
+        None => Ok(()),
     }
 }
 

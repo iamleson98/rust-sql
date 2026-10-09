@@ -1313,11 +1313,21 @@ pub(crate) fn compile_predicate(
             for v in vals.iter() {
                 bound.push(bind_leaf(v, table, prefix)?);
             }
-            // Every member takes the column's affinity (SQLite: the left
-            // operand's affinity applies to literal list members).
+            // Every member takes the column's affinity: a list IN compares
+            // with the LEFT operand's affinity alone (exprINAffinity — no
+            // pairwise sqlite3CompareAffinity), so a COLUMN member is
+            // converted too (`int_col IN (text_col)` compares numerically,
+            // `text_col IN (int_col)` as text), unlike `=` where a column
+            // operand keeps its own affinity.
             if let Some(a) = table.columns.get(col).map(|c| c.affinity) {
                 for b in bound.iter_mut() {
-                    *b = coerce_operand(b.clone(), a);
+                    *b = match b {
+                        PredValue::Col(_) => PredValue::Coerce {
+                            inner: Box::new(b.clone()),
+                            affinity: a,
+                        },
+                        _ => coerce_operand(b.clone(), a),
+                    };
                 }
             }
             // All-integer-literal members: prebuilt membership set (the

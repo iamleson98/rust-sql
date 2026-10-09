@@ -87,7 +87,7 @@ pub(crate) fn expr_is_pure(e: &Expr) -> bool {
     }
 }
 
-fn literal_truthy(v: &Value) -> bool {
+pub(crate) fn literal_truthy(v: &Value) -> bool {
     match v {
         Value::Null => false,
         other => other.is_truthy(),

@@ -651,3 +651,169 @@ fn concurrent_readers_never_see_partial_transfers() {
         "no reader transaction completed"
     );
 }
+
+/// PHANTOM double booking: both transactions check that a slot is FREE
+/// (an absent-row read through a non-unique index), both insert a booking
+/// for it. No constraint stops the duplicate — only read-set validation
+/// can: the second committer's "no booking" read was invalidated by the
+/// first commit's insert into the very index range it probed.
+#[test]
+fn phantom_double_booking_is_rejected() {
+    let (mut db, path) = waldb("phantom_book");
+    db.execute(
+        "CREATE TABLE booking (id INTEGER PRIMARY KEY, room INTEGER, slot INTEGER, who TEXT)",
+        [],
+    )
+    .unwrap();
+    db.execute("CREATE INDEX booking_room_slot ON booking(room, slot)", [])
+        .unwrap();
+    // Unrelated rows, so the probe lands in a populated index.
+    for r in 1..=50 {
+        db.execute(
+            "INSERT INTO booking(room, slot, who) VALUES (?, 9, 'x')",
+            [Value::Integer(r)],
+        )
+        .unwrap();
+    }
+    let free = "SELECT count(*) FROM booking WHERE room = 7 AND slot = 10";
+
+    Database::set_conn_identity(1);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    let f1 = int(&db, free);
+    Database::set_conn_identity(2);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    let f2 = int(&db, free);
+    assert_eq!((f1, f2), (0, 0));
+
+    Database::set_conn_identity(1);
+    db.execute(
+        "INSERT INTO booking(room, slot, who) VALUES (7, 10, 'alice')",
+        [],
+    )
+    .unwrap();
+    Database::set_conn_identity(2);
+    db.execute(
+        "INSERT INTO booking(room, slot, who) VALUES (7, 10, 'bob')",
+        [],
+    )
+    .unwrap();
+
+    Database::set_conn_identity(1);
+    db.execute("COMMIT", []).unwrap();
+    Database::set_conn_identity(2);
+    let second = db.execute("COMMIT", []);
+    if second.is_err() {
+        let _ = db.execute("ROLLBACK", []);
+    }
+    Database::set_conn_identity(0);
+    let n = int(&db, free);
+    drop(db);
+    cleanup(&path);
+    if let Err(e) = &second {
+        assert!(is_busy_snapshot(e), "unexpected error: {e}");
+    }
+    assert!(
+        second.is_err(),
+        "phantom: both 'slot is free' transactions committed ({n} bookings for one slot)"
+    );
+    assert_eq!(n, 1);
+}
+
+/// PHANTOM through a range aggregate: a transaction derives a summary row
+/// from `count(*)` over a key range while a sibling commits an insert INTO
+/// that range; committing the stale summary must fail.
+#[test]
+fn phantom_range_summary_is_rejected() {
+    let (mut db, path) = waldb("phantom_range");
+    db.execute("CREATE TABLE ev (id INTEGER PRIMARY KEY, day INTEGER)", [])
+        .unwrap();
+    db.execute("CREATE INDEX ev_day ON ev(day)", []).unwrap();
+    db.execute(
+        "CREATE TABLE daily (day INTEGER PRIMARY KEY, n INTEGER)",
+        [],
+    )
+    .unwrap();
+    for i in 0..300 {
+        db.execute("INSERT INTO ev(day) VALUES (?)", [Value::Integer(i % 30)])
+            .unwrap();
+    }
+
+    Database::set_conn_identity(1);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    let n = int(&db, "SELECT count(*) FROM ev WHERE day BETWEEN 10 AND 12");
+    assert_eq!(n, 30);
+
+    // The sibling inserts into the counted range and commits first (an
+    // autocommit statement joining the concurrent regime).
+    Database::set_conn_identity(2);
+    db.execute("INSERT INTO ev(day) VALUES (11)", []).unwrap();
+
+    Database::set_conn_identity(1);
+    db.execute("INSERT INTO daily VALUES (10, ?)", [Value::Integer(n)])
+        .unwrap();
+    let commit = db.execute("COMMIT", []);
+    if commit.is_err() {
+        let _ = db.execute("ROLLBACK", []);
+    }
+    Database::set_conn_identity(0);
+    let summaries = int(&db, "SELECT count(*) FROM daily");
+    let actual = int(&db, "SELECT count(*) FROM ev WHERE day BETWEEN 10 AND 12");
+    drop(db);
+    cleanup(&path);
+    if let Err(e) = &commit {
+        assert!(is_busy_snapshot(e), "unexpected error: {e}");
+    }
+    assert!(
+        commit.is_err(),
+        "phantom: a summary computed before a committed insert into its range committed \
+         (summary {n}, actual {actual})"
+    );
+    assert_eq!((summaries, actual), (0, 31));
+}
+
+/// Absence of a ROWID is a read too: a transaction that saw `id = 500`
+/// missing and acts on it must not commit after a sibling created it.
+#[test]
+fn absent_rowid_read_is_validated() {
+    let (mut db, path) = waldb("absent_rowid");
+    db.execute("CREATE TABLE item (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
+    db.execute("CREATE TABLE log (id INTEGER PRIMARY KEY, note TEXT)", [])
+        .unwrap();
+    for i in 1..=200 {
+        db.execute("INSERT INTO item VALUES (?, 'v')", [Value::Integer(i)])
+            .unwrap();
+    }
+
+    Database::set_conn_identity(1);
+    db.execute("BEGIN CONCURRENT", []).unwrap();
+    let seen = db
+        .query("SELECT v FROM item WHERE id = 500", [])
+        .unwrap()
+        .len();
+    assert_eq!(seen, 0);
+
+    Database::set_conn_identity(2);
+    db.execute("INSERT INTO item VALUES (500, 'new')", [])
+        .unwrap();
+
+    Database::set_conn_identity(1);
+    db.execute("INSERT INTO log(note) VALUES ('500 was missing')", [])
+        .unwrap();
+    let commit = db.execute("COMMIT", []);
+    if commit.is_err() {
+        let _ = db.execute("ROLLBACK", []);
+    }
+    Database::set_conn_identity(0);
+    let logs = int(&db, "SELECT count(*) FROM log");
+    drop(db);
+    cleanup(&path);
+    if let Err(e) = &commit {
+        assert!(is_busy_snapshot(e), "unexpected error: {e}");
+    }
+    assert!(
+        commit.is_err(),
+        "a commit acting on 'id 500 is missing' succeeded after id 500 was committed"
+    );
+    assert_eq!(logs, 0);
+}

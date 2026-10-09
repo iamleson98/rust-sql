@@ -1465,6 +1465,17 @@ fn is_constant_member(e: &Expr) -> bool {
 }
 
 fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext<'_>) -> Result<Value> {
+    // The constant-WHERE marker evaluated as an ordinary predicate (a
+    // path that filters row by row instead of deciding it up front): the
+    // conjunction, term by term, stopping at the first FALSE/NULL.
+    if name == crate::planner::CONST_WHERE_FN {
+        for a in args {
+            if !evaluate(a, ctx)?.is_truthy() {
+                return Ok(Value::Integer(0));
+            }
+        }
+        return Ok(Value::Integer(1));
+    }
     let fname = name.to_ascii_lowercase();
     // Virtual-table aux functions (FTS5's bm25 / highlight / snippet):
     // the call resolves against the statement's driving vtab scan when

@@ -132,6 +132,18 @@ impl<'a> Planner<'a> {
             plan
         };
 
+        // LIMIT / OFFSET resolve against NO table (not even an enclosing
+        // query's): any column reference fails at prepare, as in SQLite
+        // ("no such column: s.k"). Subqueries inside them have their own
+        // scope.
+        for e in stmt.limit.iter().chain(stmt.offset.iter()) {
+            if let Some((table, name)) = first_bare_column_ref(e) {
+                return Err(Error::NotFound(match table {
+                    Some(t) => format!("no such column: {}.{}", t, name),
+                    None => format!("no such column: {}", name),
+                }));
+            }
+        }
         let plan = if stmt.limit.is_some() || stmt.offset.is_some() {
             Plan::Limit {
                 input: Box::new(plan),
@@ -294,18 +306,25 @@ impl<'a> Planner<'a> {
                         // exec_sort turns the literal into `row[k-1]`.
                     }
                 }
-                // 1. Alias resolution.
-                if let Expr::Column { table: None, name } = &expr {
-                    for c in &s.columns {
-                        if let ResultColumn::Expr {
-                            expr: ce,
-                            alias: Some(a),
-                        } = c
-                        {
-                            if a.eq_ignore_ascii_case(name) {
-                                expr = guard_ordinal_literal(ce.clone());
-                                break;
-                            }
+                // 1. Alias resolution — through COLLATE wrappers too
+                //    (resolveOrderGroupBy matches the alias on
+                //    sqlite3ExprSkipCollate(term); `ORDER BY c COLLATE
+                //    NOCASE` sorts the aliased expression under NOCASE).
+                {
+                    let mut target = &mut expr;
+                    while let Expr::Collate { expr: inner, .. } = target {
+                        target = inner.as_mut();
+                    }
+                    if let Expr::Column { table: None, name } = &*target {
+                        let hit = s.columns.iter().find_map(|c| match c {
+                            ResultColumn::Expr {
+                                expr: ce,
+                                alias: Some(a),
+                            } if a.eq_ignore_ascii_case(name) => Some(ce.clone()),
+                            _ => None,
+                        });
+                        if let Some(ce) = hit {
+                            *target = guard_ordinal_literal(ce);
                         }
                     }
                 }
@@ -327,15 +346,33 @@ impl<'a> Planner<'a> {
                 //    (serial exec_sort, top-N, and the parallel path's
                 //    Collate declination) honors the wrapper.
                 if !matches!(&expr, Expr::Collate { .. }) {
+                    // sqlite3ExprCollSeq on the (resolved) term: an
+                    // explicit COLLATE anywhere inside it (EP_Collate
+                    // propagation — `CASE x WHEN (l COLLATE NOCASE) ...`
+                    // sorts NOCASE), else the declared collation of a
+                    // column reached through CAST / unary `+`.
                     let term_coll = if let Expr::Collate { collation, .. } = &t.expr {
                         Some(collation.clone())
-                    } else if let Expr::Column { .. } = &expr {
-                        s.from.as_ref().and_then(|from| {
-                            let scope = collect_collation_scope(self.catalog, from);
-                            column_declared_collation(self.catalog, &expr, &scope)
-                        })
+                    } else if let Some(c) = crate::executor::expr::explicit_collation(&expr) {
+                        Some(c)
                     } else {
-                        None
+                        let mut base = &expr;
+                        while let Expr::Cast { expr: inner, .. }
+                        | Expr::Unary {
+                            op: UnaryOp::Pos,
+                            expr: inner,
+                        } = base
+                        {
+                            base = inner;
+                        }
+                        if let Expr::Column { .. } = base {
+                            s.from.as_ref().and_then(|from| {
+                                let scope = collect_collation_scope(self.catalog, from);
+                                column_declared_collation(self.catalog, base, &scope)
+                            })
+                        } else {
+                            None
+                        }
                     };
                     if let Some(coll) =
                         term_coll.filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("BINARY"))
@@ -393,6 +430,40 @@ impl<'a> Planner<'a> {
     }
 
     fn plan_simple_select(&mut self, s: &SimpleSelect, order_terms: &[OrderTerm]) -> Result<Plan> {
+        // CONSTANT WHERE TERMS (sqlite3WhereBegin): a deterministic term
+        // with no column reference is evaluated ONCE, before the loop,
+        // in term order — an error raises even over an empty table, and
+        // a FALSE/NULL term ends the scan before any later term (or row)
+        // is evaluated. The terms ride a marker Filter on TOP of the
+        // select's plan, so every fused path below keeps its shape; the
+        // marker is only used when the executor can form the plan's
+        // empty-FROM variant (otherwise the terms stay per-row).
+        if let Some((body, consts)) = split_constant_where(s) {
+            let plan = self.plan_simple_select_body(&body, order_terms)?;
+            if consts.is_empty() {
+                return Ok(plan);
+            }
+            if crate::executor::empty_from_plan(&plan).is_some() {
+                return Ok(Plan::Filter {
+                    input: Box::new(plan),
+                    predicate: Expr::Function {
+                        name: CONST_WHERE_FN.to_string(),
+                        distinct: false,
+                        args: consts,
+                        filter: None,
+                        over: None,
+                    },
+                });
+            }
+        }
+        self.plan_simple_select_body(s, order_terms)
+    }
+
+    fn plan_simple_select_body(
+        &mut self,
+        s: &SimpleSelect,
+        order_terms: &[OrderTerm],
+    ) -> Result<Plan> {
         // Positional GROUP BY for bodies planned outside plan_select
         // (compound arms, subqueries): see resolve_group_by_ordinals.
         let resolved_owned;
@@ -4490,6 +4561,279 @@ fn split_and_chain_rec(expr: &Expr, out: &mut Vec<Expr>) {
     }
 }
 
+/// Marker predicate of the CONSTANT-WHERE Filter a simple SELECT carries
+/// on top of its plan: `Filter { input, predicate: __const_where(t1, …) }`.
+/// The executor evaluates the terms once, before running `input` (see
+/// `exec_const_where`); evaluated per row it is the plain conjunction.
+pub(crate) const CONST_WHERE_FN: &str = "__const_where";
+
+/// Built-in functions SQLite treats as constant for one statement
+/// (SQLITE_FUNC_CONSTANT, plus the SLOCHNG date/time family) — the set a
+/// constant WHERE term may call. Anything else (random(), changes(),
+/// user functions, aggregates) keeps the term per-row.
+const CONSTANT_FUNCTIONS: &[&str] = &[
+    "abs",
+    "acos",
+    "acosh",
+    "asin",
+    "asinh",
+    "atan",
+    "atan2",
+    "atanh",
+    "ceil",
+    "ceiling",
+    "char",
+    "coalesce",
+    "concat",
+    "concat_ws",
+    "cos",
+    "cosh",
+    "date",
+    "datetime",
+    "degrees",
+    "exp",
+    "floor",
+    "format",
+    "glob",
+    "hex",
+    "ifnull",
+    "iif",
+    "instr",
+    "json",
+    "json_array",
+    "json_array_length",
+    "json_extract",
+    "json_insert",
+    "json_object",
+    "json_patch",
+    "json_quote",
+    "json_remove",
+    "json_replace",
+    "json_set",
+    "json_type",
+    "json_valid",
+    "julianday",
+    "length",
+    "like",
+    "likelihood",
+    "likely",
+    "ln",
+    "log",
+    "log10",
+    "log2",
+    "lower",
+    "ltrim",
+    "mod",
+    "nullif",
+    "octet_length",
+    "pi",
+    "pow",
+    "power",
+    "printf",
+    "quote",
+    "radians",
+    "replace",
+    "round",
+    "rtrim",
+    "sign",
+    "sin",
+    "sinh",
+    "sqrt",
+    "strftime",
+    "substr",
+    "substring",
+    "tan",
+    "tanh",
+    "time",
+    "timediff",
+    "trim",
+    "trunc",
+    "typeof",
+    "unhex",
+    "unicode",
+    "unixepoch",
+    "unlikely",
+    "upper",
+    "zeroblob",
+];
+
+/// sqlite3WhereBegin's constant-term rule: a WHERE term whose
+/// prerequisites are empty (no column, rowid or correlated reference)
+/// and that is deterministic is evaluated ONCE, before the loop.
+/// Subqueries are left per-row (their own lazy/eager machinery applies).
+fn is_constant_where_term(e: &Expr) -> bool {
+    match e {
+        Expr::Literal(_) | Expr::Parameter(_) => true,
+        Expr::Column { .. } | Expr::Subquery(_) | Expr::Exists(_) | Expr::Raise { .. } => false,
+        Expr::Binary { left, right, .. } | Expr::Is { left, right, .. } => {
+            is_constant_where_term(left) && is_constant_where_term(right)
+        }
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. } => is_constant_where_term(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            is_constant_where_term(expr)
+                && is_constant_where_term(low)
+                && is_constant_where_term(high)
+        }
+        Expr::In { expr, source, .. } => {
+            is_constant_where_term(expr)
+                && matches!(source, InSource::List(l) if l.iter().all(is_constant_where_term))
+        }
+        Expr::Like {
+            op,
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            matches!(op, LikeOp::Like | LikeOp::Glob)
+                && is_constant_where_term(expr)
+                && is_constant_where_term(pattern)
+                && escape.as_deref().map_or(true, is_constant_where_term)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            operand.as_deref().map_or(true, is_constant_where_term)
+                && whens
+                    .iter()
+                    .all(|(w, t)| is_constant_where_term(w) && is_constant_where_term(t))
+                && else_.as_deref().map_or(true, is_constant_where_term)
+        }
+        Expr::Row(items) => items.iter().all(is_constant_where_term),
+        Expr::Function {
+            name,
+            distinct,
+            args,
+            filter,
+            over,
+        } => {
+            !*distinct
+                && filter.is_none()
+                && over.is_none()
+                && CONSTANT_FUNCTIONS.contains(&name.to_ascii_lowercase().as_str())
+                && args.iter().all(is_constant_where_term)
+        }
+    }
+}
+
+/// Split the constant terms out of a simple SELECT's WHERE (and, with a
+/// GROUP BY, its HAVING — SQLite's havingToWhere moves non-aggregate
+/// HAVING terms into WHERE). Terms built only from literals and
+/// operators fold at plan time — they cannot raise — and a TRUE one
+/// drops (`WHERE 1=1 AND …` query-builder prefixes cost nothing).
+/// Returns the remaining select and the constant terms in order, or
+/// `None` when nothing constant is left to evaluate.
+fn split_constant_where(s: &SimpleSelect) -> Option<(SimpleSelect, Vec<Expr>)> {
+    s.from.as_ref()?;
+    let mut consts: Vec<Expr> = Vec::new();
+    let mut changed = false;
+    let mut split = |clause: &Option<Expr>| -> Option<Expr> {
+        let w = clause.as_ref()?;
+        let mut rest = Vec::new();
+        for term in split_and_chain(w) {
+            if !is_constant_where_term(&term) {
+                rest.push(term);
+                continue;
+            }
+            changed = true;
+            let mut folded = term.clone();
+            fold::fold_expr(&mut folded);
+            match &folded {
+                Expr::Literal(v) if fold::literal_truthy(v) => {}
+                _ => consts.push(term),
+            }
+        }
+        if rest.is_empty() {
+            None
+        } else {
+            Some(combine_and(&rest))
+        }
+    };
+    let where_clause = split(&s.where_clause);
+    let having = if s.group_by.is_empty() {
+        s.having.clone()
+    } else {
+        split(&s.having)
+    };
+    if !changed {
+        return None;
+    }
+    let mut out = s.clone();
+    out.where_clause = where_clause;
+    out.having = having;
+    Some((out, consts))
+}
+
+/// The first column reference in `e` outside any subquery (subqueries
+/// are their own name scope), as written: `(qualifier, name)`.
+pub(crate) fn first_bare_column_ref(e: &Expr) -> Option<(Option<String>, String)> {
+    fn any<'a>(items: impl IntoIterator<Item = &'a Expr>) -> Option<(Option<String>, String)> {
+        items.into_iter().find_map(first_bare_column_ref)
+    }
+    match e {
+        Expr::Column { table, name } => Some((table.clone(), name.clone())),
+        Expr::Literal(_)
+        | Expr::Parameter(_)
+        | Expr::Subquery(_)
+        | Expr::Exists(_)
+        | Expr::Raise { .. } => None,
+        Expr::Binary { left, right, .. } | Expr::Is { left, right, .. } => {
+            first_bare_column_ref(left).or_else(|| first_bare_column_ref(right))
+        }
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. } => first_bare_column_ref(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => any([expr.as_ref(), low.as_ref(), high.as_ref()]),
+        Expr::In { expr, source, .. } => first_bare_column_ref(expr).or_else(|| match source {
+            InSource::List(l) => any(l.iter()),
+            InSource::Subquery(_) | InSource::Table(_) => None,
+        }),
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => first_bare_column_ref(expr)
+            .or_else(|| first_bare_column_ref(pattern))
+            .or_else(|| escape.as_deref().and_then(first_bare_column_ref)),
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => operand
+            .as_deref()
+            .and_then(first_bare_column_ref)
+            .or_else(|| {
+                whens.iter().find_map(|(w, t)| {
+                    first_bare_column_ref(w).or_else(|| first_bare_column_ref(t))
+                })
+            })
+            .or_else(|| else_.as_deref().and_then(first_bare_column_ref)),
+        Expr::Row(items) => any(items),
+        Expr::Function { args, filter, .. } => {
+            any(args).or_else(|| filter.as_deref().and_then(first_bare_column_ref))
+        }
+    }
+}
+
+/// Is `e` the constant-WHERE marker predicate?
+pub(crate) fn const_where_terms(e: &Expr) -> Option<&[Expr]> {
+    match e {
+        Expr::Function { name, args, .. } if name == CONST_WHERE_FN => Some(args),
+        _ => None,
+    }
+}
+
 /// Combine a list of conjuncts back into a single Expr with AND nodes.
 /// Empty list returns a literal TRUE (so it's a no-op when wrapped in a Filter).
 pub fn combine_and(conjuncts: &[Expr]) -> Expr {
@@ -6441,7 +6785,7 @@ fn reorder_spine_child(catalog: &Catalog, plan: Plan) -> Plan {
 /// subtrees). `None` for plans whose names aren't statically computable
 /// (Subquery, TableFunction, Project-wrapped views) — the caller aborts
 /// the reorder.
-fn atom_out_cols(plan: &Plan) -> Option<Vec<String>> {
+pub(crate) fn atom_out_cols(plan: &Plan) -> Option<Vec<String>> {
     let cols = match plan {
         Plan::Scan { table, alias, .. } => {
             let mut v = scan_qualified_cols(table, alias);
@@ -9544,6 +9888,14 @@ fn scan_table_of(input: &Plan) -> Option<(std::sync::Arc<Table>, Option<String>)
 /// ORDER BY may reference any column in the FROM clause or any projection alias.
 pub fn insert_sort_below_top(plan: Plan, terms: Vec<OrderTerm>) -> Plan {
     match plan {
+        // The constant-WHERE marker stays on top; the Sort goes where it
+        // would go without it.
+        Plan::Filter { input, predicate } if const_where_terms(&predicate).is_some() => {
+            Plan::Filter {
+                input: Box::new(insert_sort_below_top(*input, terms)),
+                predicate,
+            }
+        }
         Plan::Project { input, columns } => {
             let sorted = Plan::Sort { input, terms };
             Plan::Project {
