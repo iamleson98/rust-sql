@@ -701,6 +701,10 @@ pub enum Expr {
         args: Vec<Expr>,
         filter: Option<Box<Expr>>,
         over: Option<Box<WindowSpec>>,
+        /// `agg(args ORDER BY terms)` (SQLite 3.44): the order an
+        /// aggregate consumes its group's rows in. Empty for every other
+        /// call.
+        order_by: Vec<OrderTerm>,
     },
     /// `CASE WHEN ... THEN ... ELSE ... END` or `CASE expr WHEN ... THEN ... END`
     Case {

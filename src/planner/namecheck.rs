@@ -1218,10 +1218,27 @@ fn validate_expr(ctx: &Ctx<'_>, e: &Expr, scope: &mut Scope, visible: &CteList) 
             args,
             filter,
             over,
+            order_by,
             ..
         } => {
             if let Some(msg) = builtin_arity_error(name, args.len()) {
                 return Err(Error::semantic(msg));
+            }
+            // `f(x ORDER BY y)` (SQLite 3.44) orders an AGGREGATE's input;
+            // a scalar call or a window function cannot take it.
+            if !order_by.is_empty() {
+                let lower = name.to_ascii_lowercase();
+                let aggregate = crate::planner::is_aggregate_call(&lower, args.len())
+                    || crate::plugin::lookup_aggregate(&lower).is_some();
+                if over.is_some() || !aggregate {
+                    return Err(Error::semantic(format!(
+                        "ORDER BY may not be used with non-aggregate {}()",
+                        name
+                    )));
+                }
+                for t in order_by {
+                    validate_expr(ctx, &t.expr, scope, visible)?;
+                }
             }
             for a in args {
                 if let Expr::Column { name, .. } = a {

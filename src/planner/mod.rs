@@ -452,6 +452,7 @@ impl<'a> Planner<'a> {
                         args: consts,
                         filter: None,
                         over: None,
+                        order_by: Vec::new(),
                     },
                 });
             }
@@ -1358,6 +1359,8 @@ impl<'a> Planner<'a> {
             };
             aggregates.push(AggExpr {
                 func: "bare".into(),
+                order_by: Vec::new(),
+                order_coll: Vec::new(),
                 arg: Some(e),
                 sep: None,
                 distinct: false,
@@ -1379,6 +1382,19 @@ impl<'a> Planner<'a> {
             if a.func == "bare" {
                 continue;
             }
+            // `agg(x ORDER BY c)`: each key sorts under its explicit
+            // COLLATE, else its column's declared collation — like a
+            // statement-level ORDER BY term. (Kept beside the terms, which
+            // stay as written: the call → slot matcher compares them.)
+            a.order_coll = a
+                .order_by
+                .iter()
+                .map(|t| {
+                    crate::executor::expr::explicit_collation(&t.expr)
+                        .or_else(|| column_declared_collation(self.catalog, &t.expr, &coll_scope))
+                        .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("BINARY"))
+                })
+                .collect();
             let Some(arg) = &a.arg else { continue };
             a.collation = crate::executor::expr::explicit_collation(arg)
                 .or_else(|| column_declared_collation(self.catalog, arg, &coll_scope))
@@ -1856,12 +1872,14 @@ fn resolve_having_aliases(having: &Expr, columns: &[ResultColumn]) -> Expr {
                 args,
                 filter,
                 over,
+                order_by,
             } => Expr::Function {
                 name: name.clone(),
                 distinct: *distinct,
                 args: args.iter().map(|a| subst(a, aliases)).collect(),
                 filter: filter.as_ref().map(|f| Box::new(subst(f, aliases))),
                 over: over.clone(),
+                order_by: order_by.clone(),
             },
             Expr::Case {
                 operand,
@@ -1959,6 +1977,7 @@ pub fn rewrite_aggregates_and_groups(
             args,
             over,
             filter,
+            order_by,
         } => {
             // Use is_aggregate_call so the polymorphic scalar forms
             // (MIN(a,b), MAX(a,b,c)) are NOT rewritten to aggregate
@@ -1993,6 +2012,7 @@ pub fn rewrite_aggregates_and_groups(
                         args: args.clone(),
                         over: None,
                         filter: None,
+                        order_by: Vec::new(),
                     });
                     synthesized.as_ref()
                 } else if let Some(wrapped) =
@@ -2017,6 +2037,11 @@ pub fn rewrite_aggregates_and_groups(
                         _ => false,
                     };
                     if !filter_match {
+                        continue;
+                    }
+                    // ...and in ORDER BY (`group_concat(x)` vs
+                    // `group_concat(x ORDER BY y)` read rows differently).
+                    if format!("{:?}", agg.order_by) != format!("{:?}", order_by) {
                         continue;
                     }
                     // Match on the argument expression as well: two calls
@@ -2053,6 +2078,7 @@ pub fn rewrite_aggregates_and_groups(
                     args: new_args,
                     filter: filter.clone(),
                     over: over.clone(),
+                    order_by: order_by.clone(),
                 }
             }
         }
@@ -2306,6 +2332,7 @@ pub(crate) fn rewrite_window_refs(e: &Expr, windows: &[WindowExpr]) -> Expr {
             args,
             over,
             filter,
+            order_by,
         } => {
             // The whole call with `over` matched above (or not); rewrite
             // the ARGUMENTS of non-window calls only.
@@ -2321,6 +2348,7 @@ pub(crate) fn rewrite_window_refs(e: &Expr, windows: &[WindowExpr]) -> Expr {
                         .collect(),
                     over: None,
                     filter: filter.clone(),
+                    order_by: order_by.clone(),
                 }
             }
         }
@@ -2545,6 +2573,7 @@ fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExp
             args,
             over,
             filter,
+            order_by,
         } => {
             // Use is_aggregate_call (not is_aggregate_fn) so that the
             // polymorphic min/max distinction is respected: MAX(col) is
@@ -2569,6 +2598,8 @@ fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExp
                     };
                     out.push(AggExpr {
                         func: fname,
+                        order_by: order_by.clone(),
+                        order_coll: Vec::new(),
                         arg: Some(args[0].clone()),
                         sep,
                         distinct: *distinct,
@@ -2615,6 +2646,8 @@ fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExp
                     };
                     out.push(AggExpr {
                         func: fname,
+                        order_by: order_by.clone(),
+                        order_coll: Vec::new(),
                         arg: Some(args[0].clone()),
                         sep: pct,
                         distinct: *distinct,
@@ -2641,6 +2674,7 @@ fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExp
                         args: args.clone(),
                         over: None,
                         filter: None,
+                        order_by: Vec::new(),
                     })
                 } else if let Some(wrapped) = json_group_array_input(&fname, args) {
                     Some(wrapped)
@@ -2652,6 +2686,8 @@ fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExp
                 };
                 out.push(AggExpr {
                     func: fname,
+                    order_by: order_by.clone(),
+                    order_coll: Vec::new(),
                     arg,
                     sep: None,
                     distinct: *distinct,
@@ -2756,6 +2792,7 @@ fn json_group_array_input(fname: &str, args: &[Expr]) -> Option<Expr> {
             args: inner.clone(),
             over: None,
             filter: None,
+            order_by: Vec::new(),
         });
     }
     Some(Expr::Function {
@@ -2764,6 +2801,7 @@ fn json_group_array_input(fname: &str, args: &[Expr]) -> Option<Expr> {
         args: vec![a.clone()],
         over: None,
         filter: None,
+        order_by: Vec::new(),
     })
 }
 
@@ -2839,6 +2877,7 @@ fn collect_windows_rec(
             args,
             over,
             filter,
+            order_by: _,
         } => {
             if let Some(spec) = over {
                 let r = match spec.as_ref() {
@@ -4768,10 +4807,12 @@ fn is_constant_where_term(e: &Expr) -> bool {
             args,
             filter,
             over,
+            order_by,
         } => {
             !*distinct
                 && filter.is_none()
                 && over.is_none()
+                && order_by.is_empty()
                 && CONSTANT_FUNCTIONS.contains(&name.to_ascii_lowercase().as_str())
                 && args.iter().all(is_constant_where_term)
         }

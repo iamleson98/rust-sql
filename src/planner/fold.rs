@@ -721,6 +721,7 @@ mod tests {
             args: Vec::new(),
             filter: None,
             over: None,
+            order_by: Vec::new(),
         }
     }
 
@@ -861,6 +862,7 @@ mod tests {
             args: vec![Expr::Literal(Value::Null), Expr::Literal(Value::Null)],
             filter: None,
             over: None,
+            order_by: Vec::new(),
         };
         fold_expr(&mut e);
         assert_eq!(lit(&e), Some(Value::Null));
@@ -872,6 +874,7 @@ mod tests {
             args: vec![Expr::Literal(Value::Null), int(7), col("x")],
             filter: None,
             over: None,
+            order_by: Vec::new(),
         };
         fold_expr(&mut e);
         assert_eq!(lit(&e), Some(Value::Integer(7)));
@@ -883,6 +886,7 @@ mod tests {
             args: vec![Expr::Literal(Value::Null), Expr::Literal(Value::Null)],
             filter: None,
             over: None,
+            order_by: Vec::new(),
         };
         fold_expr(&mut e);
         assert_eq!(lit(&e), Some(Value::Null));

@@ -986,6 +986,16 @@ pub(crate) fn merge_agg_state(
     distinct: bool,
     sep: Option<&str>,
 ) {
+    // `agg(x ORDER BY …)` states carry their group's buffered inputs,
+    // replayed in order at finalize: merging (a spill's chunk merge)
+    // concatenates the buffers, earlier side first.
+    if let Some(buf) = src.cold().and_then(|c| c.ordered.as_ref()) {
+        dst.cold_mut()
+            .ordered
+            .get_or_insert_with(Vec::new)
+            .extend(buf.iter().cloned());
+        return;
+    }
     if distinct {
         if let Some(set) = src.cold().and_then(|c| c.distinct.as_ref()) {
             for v in set.iter() {

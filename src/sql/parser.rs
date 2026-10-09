@@ -1445,6 +1445,7 @@ impl Parser {
                                 ],
                                 filter: None,
                                 over: None,
+                                order_by: Vec::new(),
                             };
                             out.push((name, pick));
                         }
@@ -3005,6 +3006,7 @@ impl Parser {
                     distinct,
                     args,
                     over,
+                    order_by,
                     ..
                 } = e
                 {
@@ -3014,6 +3016,7 @@ impl Parser {
                         args,
                         filter: Some(Box::new(f)),
                         over,
+                        order_by,
                     };
                 } else {
                     let t = self.peek();
@@ -3038,6 +3041,7 @@ impl Parser {
                     distinct,
                     args,
                     filter,
+                    order_by,
                     ..
                 } = e
                 {
@@ -3047,6 +3051,7 @@ impl Parser {
                         args,
                         filter,
                         over: Some(Box::new(over)),
+                        order_by,
                     };
                 } else {
                     let t = self.peek();
@@ -3223,6 +3228,7 @@ impl Parser {
                         args: Vec::new(),
                         filter: None,
                         over: None,
+                        order_by: Vec::new(),
                     })
                 }
                 "CASE" => self.parse_case(),
@@ -3383,9 +3389,11 @@ impl Parser {
             let _ = self.consume_keyword("ALL");
         }
         let mut args = Vec::new();
+        let mut star = false;
         if self.peek().is_op("*") {
             // COUNT(*) special case
             self.advance();
+            star = true;
             args.push(Expr::Column {
                 table: None,
                 name: "*".to_string(),
@@ -3400,6 +3408,16 @@ impl Parser {
                 }
             }
         }
+        // `agg(args ORDER BY terms)` (SQLite 3.44): the order the
+        // aggregate reads its group's rows in.
+        let order_by =
+            if !star && self.peek().is_keyword("ORDER") && self.peek_n(1).is_keyword("BY") {
+                self.advance();
+                self.advance();
+                self.parse_order_terms()?
+            } else {
+                Vec::new()
+            };
         self.expect_punct(')')?;
         Ok(Expr::Function {
             name,
@@ -3407,6 +3425,7 @@ impl Parser {
             args,
             filter: None,
             over: None,
+            order_by,
         })
     }
 

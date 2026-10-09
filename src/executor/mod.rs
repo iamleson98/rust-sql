@@ -3605,6 +3605,7 @@ fn map_expr_children(e: &Expr, f: &mut dyn FnMut(&Expr) -> Result<Expr>) -> Resu
             args,
             filter,
             over,
+            order_by,
         } => {
             let mut new_args = Vec::with_capacity(args.len());
             for a in args {
@@ -3620,6 +3621,7 @@ fn map_expr_children(e: &Expr, f: &mut dyn FnMut(&Expr) -> Result<Expr>) -> Resu
                 args: new_args,
                 filter: new_filter,
                 over: over.clone(),
+                order_by: order_by.clone(),
             }
         }
         Expr::Case {
@@ -6765,6 +6767,7 @@ fn render_expr_canonical(e: &Expr, _nested: bool) -> String {
             args,
             filter,
             over,
+            order_by,
         } => {
             let rendered: Vec<String> = args
                 .iter()
@@ -6773,12 +6776,24 @@ fn render_expr_canonical(e: &Expr, _nested: bool) -> String {
                     _ => render_expr_canonical(a, false),
                 })
                 .collect();
-            let mut out = if rendered.is_empty() {
-                format!("{}()", name)
-            } else if *distinct {
-                format!("{}(DISTINCT {})", name, rendered.join(", "))
+            let order = if order_by.is_empty() {
+                String::new()
             } else {
-                format!("{}({})", name, rendered.join(", "))
+                let terms: Vec<String> = order_by
+                    .iter()
+                    .map(|t| {
+                        let dir = if t.order == Order::Desc { " DESC" } else { "" };
+                        format!("{}{}", render_expr_canonical(&t.expr, false), dir)
+                    })
+                    .collect();
+                format!(" ORDER BY {}", terms.join(", "))
+            };
+            let mut out = if rendered.is_empty() {
+                format!("{}({})", name, order.trim_start())
+            } else if *distinct {
+                format!("{}(DISTINCT {}{})", name, rendered.join(", "), order)
+            } else {
+                format!("{}({}{})", name, rendered.join(", "), order)
             };
             if let Some(f) = filter {
                 out = format!("{} FILTER (WHERE {})", out, render_expr_canonical(f, false));
@@ -9041,6 +9056,10 @@ struct AggCold {
     /// row's value — or the min/max row's value under the single-min/max
     /// rule (updated by the serial loop's extreme tracking).
     bare: Option<Value>,
+    /// `agg(x ORDER BY …)`: the group's (ORDER BY keys, input value)
+    /// pairs in arrival order — sorted and replayed into the accumulator
+    /// at finalize (see `finalize_ordered_agg`).
+    ordered: Option<Vec<(Vec<Value>, Value)>>,
 }
 
 impl AggState {
@@ -13446,205 +13465,160 @@ fn exec_aggregate(
         .iter()
         .any(|a| crate::plugin::lookup_aggregate(&a.func).is_some())
     {
+        if aggregates.iter().any(|a| !a.order_by.is_empty()) {
+            return Err(Error::Unsupported(
+                "ORDER BY inside a user-defined aggregate",
+            ));
+        }
         return exec_plugin_aggregate(ctx, input, group_by, aggregates);
     }
-    // Fast path #0: SELECT COUNT(*) FROM t  (no WHERE, no GROUP BY, single COUNT(*)).
-    // Uses `Btree::count_rows` which skips decoding every cell payload —
-    // just sums `n_cells` across all leaf pages. For a 10k-row table this is
-    // ~10x faster than the streaming scan + decode path.
-    if group_by.is_empty()
-        && aggregates.len() == 1
-        && matches!(
-            input,
-            Plan::Scan {
-                predicate: None,
-                ..
-            }
-        )
-    {
-        if let Plan::Scan { table, .. } = input {
-            // Virtual tables have no B+tree to count cells in.
-            if table.vtab.is_some() {
-                // fall through to the general path (vtab scan + aggregate)
-            } else {
-                let agg = &aggregates[0];
-                // COUNT(*) — arg is None (the planner emits COUNT(*) with no arg).
-                // COUNT(col) — arg is Some(Column). We can't use the fast path
-                // for COUNT(col) because we need to skip NULLs, which requires
-                // decoding.
-                // A per-aggregate FILTER also opts out (the cell count is
-                // unfiltered; the FILTER needs per-row evaluation).
-                if agg.func == "count" && agg.arg.is_none() && !agg.distinct && agg.filter.is_none()
-                {
-                    // Parallel split first (big tables): each worker counts
-                    // leaf cells in its rowid range (still zero decode),
-                    // counts sum. Declines below threshold / config off.
-                    if let Some(n) = crate::executor::parallel::try_parallel_count(ctx, table)? {
+    // `agg(x ORDER BY …)`: only the general serial loop below buffers and
+    // orders a group's inputs — every fast path (and the parallel
+    // splits) accumulate in arrival order.
+    let ordered = aggregates.iter().any(agg_is_ordered);
+    'fast: {
+        if ordered {
+            break 'fast;
+        }
+        // Fast path #0: SELECT COUNT(*) FROM t  (no WHERE, no GROUP BY, single COUNT(*)).
+        // Uses `Btree::count_rows` which skips decoding every cell payload —
+        // just sums `n_cells` across all leaf pages. For a 10k-row table this is
+        // ~10x faster than the streaming scan + decode path.
+        if group_by.is_empty()
+            && aggregates.len() == 1
+            && matches!(
+                input,
+                Plan::Scan {
+                    predicate: None,
+                    ..
+                }
+            )
+        {
+            if let Plan::Scan { table, .. } = input {
+                // Virtual tables have no B+tree to count cells in.
+                if table.vtab.is_some() {
+                    // fall through to the general path (vtab scan + aggregate)
+                } else {
+                    let agg = &aggregates[0];
+                    // COUNT(*) — arg is None (the planner emits COUNT(*) with no arg).
+                    // COUNT(col) — arg is Some(Column). We can't use the fast path
+                    // for COUNT(col) because we need to skip NULLs, which requires
+                    // decoding.
+                    // A per-aggregate FILTER also opts out (the cell count is
+                    // unfiltered; the FILTER needs per-row evaluation).
+                    if agg.func == "count"
+                        && agg.arg.is_none()
+                        && !agg.distinct
+                        && agg.filter.is_none()
+                    {
+                        // Parallel split first (big tables): each worker counts
+                        // leaf cells in its rowid range (still zero decode),
+                        // counts sum. Declines below threshold / config off.
+                        if let Some(n) = crate::executor::parallel::try_parallel_count(ctx, table)?
+                        {
+                            let row: Vec<Value> = vec![Value::Integer(n as i64)];
+                            return Ok(ExecResult {
+                                columns: Arc::from(vec!["__agg_0".to_string()]),
+                                rows: vec![row],
+                            });
+                        }
+                        let root = ctx.table_root(table);
+                        let mut bt = Btree::new(ctx.pager, root, false);
+                        let n = bt.count_rows()?;
                         let row: Vec<Value> = vec![Value::Integer(n as i64)];
                         return Ok(ExecResult {
                             columns: Arc::from(vec!["__agg_0".to_string()]),
                             rows: vec![row],
                         });
                     }
-                    let root = ctx.table_root(table);
-                    let mut bt = Btree::new(ctx.pager, root, false);
-                    let n = bt.count_rows()?;
-                    let row: Vec<Value> = vec![Value::Integer(n as i64)];
-                    return Ok(ExecResult {
-                        columns: Arc::from(vec!["__agg_0".to_string()]),
-                        rows: vec![row],
-                    });
                 }
             }
         }
-    }
-    // Index min/max (SQLite's min/max optimization): `SELECT min(c)` /
-    // `max(c)` with no GROUP BY, over an unfiltered scan or a range of an
-    // index whose leading key is `c` — read from the index's first / last
-    // non-NULL entry instead of scanning every row.
-    // Repeated identical calls (`SELECT max(x), typeof(max(x))` plans two)
-    // are one aggregate, as in SQLite's AggInfo: computed once, the value
-    // fills every slot.
-    if group_by.is_empty()
-        && !aggregates.is_empty()
-        && aggregates.iter().all(|a| {
-            a.func == aggregates[0].func
-                && a.distinct == aggregates[0].distinct
-                && a.filter.is_none()
-                && format!("{:?}", a.arg) == format!("{:?}", aggregates[0].arg)
-        })
-    {
-        if let Some(mut res) = try_index_min_max(ctx, input, &aggregates[0])? {
-            if aggregates.len() > 1 {
-                let v = res.rows[0][0].clone();
-                res.columns = (0..aggregates.len())
-                    .map(|i| format!("__agg_{}", i))
-                    .collect::<Vec<_>>()
-                    .into();
-                res.rows = vec![vec![v; aggregates.len()]];
-            }
-            return Ok(res);
-        }
-    }
-    // Fast path #1: input is a bare Scan.
-    // Handles: `SELECT SUM/AVG/MIN/MAX/COUNT(*) FROM t`
-    //          `SELECT col, COUNT(*) FROM t GROUP BY col`
-    // BARE-COLUMN pseudo-aggregates route to the general path below: the
-    // streaming/selective/compiled machines have no representative-row
-    // handling (first-seen + the single-min/max rule); the general serial
-    // loop does (SQLite's bare-column semantics).
-    if !aggregates.iter().any(|a| a.func == "bare") {
-        if let Plan::Scan {
-            table,
-            alias,
-            index: None,
-            predicate: None,
-        } = input
+        // Index min/max (SQLite's min/max optimization): `SELECT min(c)` /
+        // `max(c)` with no GROUP BY, over an unfiltered scan or a range of an
+        // index whose leading key is `c` — read from the index's first / last
+        // non-NULL entry instead of scanning every row.
+        // Repeated identical calls (`SELECT max(x), typeof(max(x))` plans two)
+        // are one aggregate, as in SQLite's AggInfo: computed once, the value
+        // fills every slot.
+        if group_by.is_empty()
+            && !aggregates.is_empty()
+            && aggregates.iter().all(|a| {
+                a.func == aggregates[0].func
+                    && a.distinct == aggregates[0].distinct
+                    && a.filter.is_none()
+                    && format!("{:?}", a.arg) == format!("{:?}", aggregates[0].arg)
+            })
         {
-            if table.vtab.is_none() {
-                return exec_aggregate_streaming_scan(
-                    ctx,
-                    table.clone(),
-                    alias.clone(),
-                    None,
-                    group_by,
-                    aggregates,
-                    projection,
-                );
+            if let Some(mut res) = try_index_min_max(ctx, input, &aggregates[0])? {
+                if aggregates.len() > 1 {
+                    let v = res.rows[0][0].clone();
+                    res.columns = (0..aggregates.len())
+                        .map(|i| format!("__agg_{}", i))
+                        .collect::<Vec<_>>()
+                        .into();
+                    res.rows = vec![vec![v; aggregates.len()]];
+                }
+                return Ok(res);
             }
         }
-    }
-    // Fast path #1b: COUNT(*) over a RowidRange — count leaf CELLS in the
-    // rowid range with no payload decoding. `SELECT COUNT(*) FROM t WHERE
-    // id BETWEEN ? AND ?` used to fall to the general path, which
-    // materialized every row in the range (full payload decode + a Vec of
-    // Values per row) just to count them. `count_rows_range` binary
-    // searches each leaf for the first rowid >= start and counts cells
-    // until rowid > end. Only for a residual-free range: a residual
-    // predicate (strict < / >, extra filters) needs row data.
-    if group_by.is_empty()
-        && aggregates.len() == 1
-        && aggregates[0].func == "count"
-        && aggregates[0].arg.is_none()
-        && !aggregates[0].distinct
-        && aggregates[0].filter.is_none()
-    {
-        if let Plan::RowidRange {
-            table,
-            start,
-            end,
-            residual: None,
-            ..
-        } = input
-        {
-            let empty_row: Vec<Value> = Vec::new();
-            let empty_cols: Vec<String> = Vec::new();
-            let eval_ctx =
-                EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
-            // Cross-type rowid bound semantics (see exec_rowid_range);
-            // the NULL short-circuit is subsumed by Never.
-            let start_val = match start {
-                Some(e) => Some(evaluate(e, &eval_ctx)?),
-                None => None,
-            };
-            let end_val = match end {
-                Some(e) => Some(evaluate(e, &eval_ctx)?),
-                None => None,
-            };
-            let Some((start_v, end_v)) = rowid_range_bounds(start_val.as_ref(), end_val.as_ref())
-            else {
-                let row: Vec<Value> = vec![Value::Integer(0)];
-                return Ok(ExecResult {
-                    columns: Arc::from(vec!["__agg_0".to_string()]),
-                    rows: vec![row],
-                });
-            };
-            let root = ctx.table_root(table);
-            let mut bt = Btree::new(ctx.pager, root, false);
-            let n = bt.count_rows_range(start_v, end_v)?;
-            let row: Vec<Value> = vec![Value::Integer(n as i64)];
-            return Ok(ExecResult {
-                columns: Arc::from(vec!["__agg_0".to_string()]),
-                rows: vec![row],
-            });
+        // Fast path #1: input is a bare Scan.
+        // Handles: `SELECT SUM/AVG/MIN/MAX/COUNT(*) FROM t`
+        //          `SELECT col, COUNT(*) FROM t GROUP BY col`
+        // BARE-COLUMN pseudo-aggregates route to the general path below: the
+        // streaming/selective/compiled machines have no representative-row
+        // handling (first-seen + the single-min/max rule); the general serial
+        // loop does (SQLite's bare-column semantics).
+        if !aggregates.iter().any(|a| a.func == "bare") {
+            if let Plan::Scan {
+                table,
+                alias,
+                index: None,
+                predicate: None,
+            } = input
+            {
+                if table.vtab.is_none() {
+                    return exec_aggregate_streaming_scan(
+                        ctx,
+                        table.clone(),
+                        alias.clone(),
+                        None,
+                        group_by,
+                        aggregates,
+                        projection,
+                    );
+                }
+            }
         }
-    }
-    // Fast path #1c: ANY aggregate list (with or without GROUP BY) over a
-    // residual-free RowidRange — the `WHERE id <op> ?` analytics battery
-    // shape (`SELECT count(*), sum(k), min(k), max(k) FROM t WHERE
-    // id <= ?`, `SELECT k % 97, count(*) ... GROUP BY k % 97`). The
-    // general path materialized every row in the range (a full payload
-    // decode + a Vec of Values per row — ~260 MB of transient RSS at
-    // 2M rows, gigabytes at mega scale) just to fold a single output
-    // row or 97 group rows. This streams the range walk through the
-    // same accumulation machines as the bare-scan shapes
-    // (scan_table_maybe_range). Guards: DISTINCT and per-aggregate
-    // FILTER keep the general path (their row gating lives there);
-    // bare-column pseudo-aggregates need the representative-row
-    // semantics of the general loop; plugin aggregates keep their own
-    // path; virtual tables and WITHOUT ROWID tables never take
-    // RowidRange plans.
-    if !aggregates
-        .iter()
-        .any(|a| a.distinct || a.filter.is_some() || a.func == "bare")
-        && !aggregates
-            .iter()
-            .any(|a| crate::plugin::lookup_aggregate(&a.func).is_some())
-    {
-        if let Plan::RowidRange {
-            table,
-            alias,
-            start,
-            end,
-            residual: None,
-            ..
-        } = input
+        // Fast path #1b: COUNT(*) over a RowidRange — count leaf CELLS in the
+        // rowid range with no payload decoding. `SELECT COUNT(*) FROM t WHERE
+        // id BETWEEN ? AND ?` used to fall to the general path, which
+        // materialized every row in the range (full payload decode + a Vec of
+        // Values per row) just to count them. `count_rows_range` binary
+        // searches each leaf for the first rowid >= start and counts cells
+        // until rowid > end. Only for a residual-free range: a residual
+        // predicate (strict < / >, extra filters) needs row data.
+        if group_by.is_empty()
+            && aggregates.len() == 1
+            && aggregates[0].func == "count"
+            && aggregates[0].arg.is_none()
+            && !aggregates[0].distinct
+            && aggregates[0].filter.is_none()
         {
-            if table.vtab.is_none() && !table.without_rowid {
+            if let Plan::RowidRange {
+                table,
+                start,
+                end,
+                residual: None,
+                ..
+            } = input
+            {
                 let empty_row: Vec<Value> = Vec::new();
                 let empty_cols: Vec<String> = Vec::new();
                 let eval_ctx =
                     EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+                // Cross-type rowid bound semantics (see exec_rowid_range);
+                // the NULL short-circuit is subsumed by Never.
                 let start_val = match start {
                     Some(e) => Some(evaluate(e, &eval_ctx)?),
                     None => None,
@@ -13653,135 +13627,391 @@ fn exec_aggregate(
                     Some(e) => Some(evaluate(e, &eval_ctx)?),
                     None => None,
                 };
-                match rowid_range_bounds(start_val.as_ref(), end_val.as_ref()) {
-                    Some((s, e)) => {
-                        if group_by.is_empty() {
-                            return exec_aggregate_no_group_by(
+                let Some((start_v, end_v)) =
+                    rowid_range_bounds(start_val.as_ref(), end_val.as_ref())
+                else {
+                    let row: Vec<Value> = vec![Value::Integer(0)];
+                    return Ok(ExecResult {
+                        columns: Arc::from(vec!["__agg_0".to_string()]),
+                        rows: vec![row],
+                    });
+                };
+                let root = ctx.table_root(table);
+                let mut bt = Btree::new(ctx.pager, root, false);
+                let n = bt.count_rows_range(start_v, end_v)?;
+                let row: Vec<Value> = vec![Value::Integer(n as i64)];
+                return Ok(ExecResult {
+                    columns: Arc::from(vec!["__agg_0".to_string()]),
+                    rows: vec![row],
+                });
+            }
+        }
+        // Fast path #1c: ANY aggregate list (with or without GROUP BY) over a
+        // residual-free RowidRange — the `WHERE id <op> ?` analytics battery
+        // shape (`SELECT count(*), sum(k), min(k), max(k) FROM t WHERE
+        // id <= ?`, `SELECT k % 97, count(*) ... GROUP BY k % 97`). The
+        // general path materialized every row in the range (a full payload
+        // decode + a Vec of Values per row — ~260 MB of transient RSS at
+        // 2M rows, gigabytes at mega scale) just to fold a single output
+        // row or 97 group rows. This streams the range walk through the
+        // same accumulation machines as the bare-scan shapes
+        // (scan_table_maybe_range). Guards: DISTINCT and per-aggregate
+        // FILTER keep the general path (their row gating lives there);
+        // bare-column pseudo-aggregates need the representative-row
+        // semantics of the general loop; plugin aggregates keep their own
+        // path; virtual tables and WITHOUT ROWID tables never take
+        // RowidRange plans.
+        if !aggregates
+            .iter()
+            .any(|a| a.distinct || a.filter.is_some() || a.func == "bare")
+            && !aggregates
+                .iter()
+                .any(|a| crate::plugin::lookup_aggregate(&a.func).is_some())
+        {
+            if let Plan::RowidRange {
+                table,
+                alias,
+                start,
+                end,
+                residual: None,
+                ..
+            } = input
+            {
+                if table.vtab.is_none() && !table.without_rowid {
+                    let empty_row: Vec<Value> = Vec::new();
+                    let empty_cols: Vec<String> = Vec::new();
+                    let eval_ctx =
+                        EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+                    let start_val = match start {
+                        Some(e) => Some(evaluate(e, &eval_ctx)?),
+                        None => None,
+                    };
+                    let end_val = match end {
+                        Some(e) => Some(evaluate(e, &eval_ctx)?),
+                        None => None,
+                    };
+                    match rowid_range_bounds(start_val.as_ref(), end_val.as_ref()) {
+                        Some((s, e)) => {
+                            if group_by.is_empty() {
+                                return exec_aggregate_no_group_by(
+                                    ctx,
+                                    table.clone(),
+                                    alias.clone(),
+                                    None,
+                                    aggregates,
+                                    Some((s, e)),
+                                );
+                            }
+                            let grouper = scan_groupby_grouper(
                                 ctx,
                                 table.clone(),
                                 alias.clone(),
                                 None,
+                                group_by,
                                 aggregates,
                                 Some((s, e)),
-                            );
+                            )?;
+                            return finish_group_result(grouper, group_by, aggregates, projection);
                         }
-                        let grouper = scan_groupby_grouper(
-                            ctx,
-                            table.clone(),
-                            alias.clone(),
-                            None,
-                            group_by,
-                            aggregates,
-                            Some((s, e)),
-                        )?;
-                        return finish_group_result(grouper, group_by, aggregates, projection);
-                    }
-                    None => {
-                        // Never-matching range: the no-GROUP-BY aggregate
-                        // still emits ONE row (COUNT=0, SUM=NULL — SQL
-                        // semantics); GROUP BY over zero rows emits zero
-                        // groups. The (0, -1) range walks nothing.
-                        if group_by.is_empty() {
-                            let states: Vec<AggState> =
-                                (0..aggregates.len()).map(|_| AggState::default()).collect();
-                            return finish_no_group_by(aggregates, states, false);
+                        None => {
+                            // Never-matching range: the no-GROUP-BY aggregate
+                            // still emits ONE row (COUNT=0, SUM=NULL — SQL
+                            // semantics); GROUP BY over zero rows emits zero
+                            // groups. The (0, -1) range walks nothing.
+                            if group_by.is_empty() {
+                                let states: Vec<AggState> =
+                                    (0..aggregates.len()).map(|_| AggState::default()).collect();
+                                return finish_no_group_by(aggregates, states, false);
+                            }
+                            let grouper = scan_groupby_grouper(
+                                ctx,
+                                table.clone(),
+                                alias.clone(),
+                                None,
+                                group_by,
+                                aggregates,
+                                Some((0, -1)),
+                            )?;
+                            return finish_group_result(grouper, group_by, aggregates, projection);
                         }
-                        let grouper = scan_groupby_grouper(
-                            ctx,
-                            table.clone(),
-                            alias.clone(),
-                            None,
-                            group_by,
-                            aggregates,
-                            Some((0, -1)),
-                        )?;
-                        return finish_group_result(grouper, group_by, aggregates, projection);
                     }
                 }
             }
         }
-    }
-    // Fast path #2: input is Filter(Scan, predicate).
-    // Handles: `SELECT COUNT(*) FROM t WHERE val > 5000`
-    //          `SELECT col, COUNT(*) FROM t WHERE x > 0 GROUP BY col`
-    if !aggregates.iter().any(|a| a.func == "bare") {
-        if let Plan::Filter {
-            input: inner,
-            predicate,
-        } = input
+        // Fast path #2: input is Filter(Scan, predicate).
+        // Handles: `SELECT COUNT(*) FROM t WHERE val > 5000`
+        //          `SELECT col, COUNT(*) FROM t WHERE x > 0 GROUP BY col`
+        if !aggregates.iter().any(|a| a.func == "bare") {
+            if let Plan::Filter {
+                input: inner,
+                predicate,
+            } = input
+            {
+                if let Plan::Scan {
+                    table,
+                    alias,
+                    index: None,
+                    predicate: None,
+                } = inner.as_ref()
+                {
+                    if table.vtab.is_none() {
+                        return exec_aggregate_streaming_scan(
+                            ctx,
+                            table.clone(),
+                            alias.clone(),
+                            Some(predicate),
+                            group_by,
+                            aggregates,
+                            projection,
+                        );
+                    }
+                }
+            }
+        }
+        // Fast path #3b: COUNT(*) over an IndexLookup — count the index
+        // ENTRIES matching the (runtime-bound) equality keys directly: no
+        // row fetching, no payload decoding, no per-call AggState. This is
+        // exactly the shape the correlated-parameter rewrite produces per
+        // outer row (`WHERE o.user_id = ?binding` over an index), where the
+        // api.rs IndexCount OLTP fastpath is unreachable — the bridge's
+        // `execute(&plan, ctx)` landed on the general materialize+aggregate
+        // pipeline (~2.6 us/outer-row vs ~0.4 us app-driven, measured in
+        // examples/prof_corr.rs / prof_corr2.rs).
+        if group_by.is_empty()
+            && aggregates.len() == 1
+            && aggregates[0].func == "count"
+            && aggregates[0].arg.is_none()
+            && !aggregates[0].distinct
+            && aggregates[0].filter.is_none()
         {
-            if let Plan::Scan {
+            if let Plan::IndexLookup {
                 table,
-                alias,
-                index: None,
-                predicate: None,
-            } = inner.as_ref()
+                index,
+                key_exprs,
+                ..
+            } = input
             {
                 if table.vtab.is_none() {
-                    return exec_aggregate_streaming_scan(
-                        ctx,
-                        table.clone(),
-                        alias.clone(),
-                        Some(predicate),
-                        group_by,
-                        aggregates,
-                        projection,
-                    );
+                    let empty_row: Vec<Value> = Vec::new();
+                    let empty_cols: Vec<String> = Vec::new();
+                    let eval_ctx =
+                        EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+                    let key_values: Vec<Value> = key_exprs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, e)| {
+                            evaluate(e, &eval_ctx)
+                                .map(|v| probe_affinity_value(table, index, i, e, &v))
+                        })
+                        .collect::<Result<_>>()?;
+                    // NULL equality probes match nothing (SQL 3VL).
+                    let n: i64 = if key_values.iter().any(|v| v.is_null()) {
+                        0
+                    } else {
+                        let mut key_bytes = Vec::with_capacity(16);
+                        crate::plugin::encode_collated_index_key_into(
+                            &index.columns,
+                            &key_values,
+                            &mut key_bytes,
+                        );
+                        let index_root = ctx.index_root(index);
+                        let mut index_bt = Btree::new(ctx.pager, index_root, true);
+                        let mut rowids: Vec<i64> = Vec::new();
+                        index_bt.lookup_index_into(&key_bytes, &mut rowids)?;
+                        rowids.len() as i64
+                    };
+                    let row: Vec<Value> = vec![Value::Integer(n)];
+                    return Ok(ExecResult {
+                        columns: Arc::from(vec!["__agg_0".to_string()]),
+                        rows: vec![row],
+                    });
                 }
             }
         }
-    }
-    // Fast path #3b: COUNT(*) over an IndexLookup — count the index
-    // ENTRIES matching the (runtime-bound) equality keys directly: no
-    // row fetching, no payload decoding, no per-call AggState. This is
-    // exactly the shape the correlated-parameter rewrite produces per
-    // outer row (`WHERE o.user_id = ?binding` over an index), where the
-    // api.rs IndexCount OLTP fastpath is unreachable — the bridge's
-    // `execute(&plan, ctx)` landed on the general materialize+aggregate
-    // pipeline (~2.6 us/outer-row vs ~0.4 us app-driven, measured in
-    // examples/prof_corr.rs / prof_corr2.rs).
-    if group_by.is_empty()
-        && aggregates.len() == 1
-        && aggregates[0].func == "count"
-        && aggregates[0].arg.is_none()
-        && !aggregates[0].distinct
-        && aggregates[0].filter.is_none()
-    {
-        if let Plan::IndexLookup {
-            table,
-            index,
-            key_exprs,
-            ..
-        } = input
+        // Fast path #3c: COUNT(*) over a COVERING IndexNestedLoopJoin — count
+        // index ENTRIES per outer-row probe: no table fetches, no row
+        // materialization, no per-row Vec allocation. This is the adversarial
+        // 3-join shape (`SELECT COUNT(*) FROM big1 JOIN big2 ON big1.k=big2.k
+        // JOIN small ON small.k=big1.k WHERE small.id = 3`): the covering INLJ
+        // would emit one combined row per matched entry purely so the count
+        // can throw it away.
+        if group_by.is_empty()
+            && aggregates.len() == 1
+            && aggregates[0].func == "count"
+            && aggregates[0].arg.is_none()
+            && !aggregates[0].distinct
+            && aggregates[0].filter.is_none()
         {
-            if table.vtab.is_none() {
+            // The reorder pass's restoration Project (a bare-column re-export)
+            // may sit between the Aggregate and the join — a Project never
+            // changes cardinality, so count through it. A Filter DOES (it can
+            // drop rows) and is never skipped.
+            let input = match input {
+                Plan::Project { input: inner, .. } => inner.as_ref(),
+                other => other,
+            };
+            if let Plan::IndexNestedLoopJoin {
+                outer,
+                inner_table,
+                inner_index,
+                outer_key_col,
+                covering: true,
+                ..
+            } = input
+            {
+                if inner_table.vtab.is_none() {
+                    let outer_res = execute(outer, ctx)?;
+                    let mut count: i64 = 0;
+                    let mut inner_index_root = ctx.index_root(inner_index);
+                    let mut index_bt = Btree::new(ctx.pager, inner_index_root, true);
+                    let mut rowids: Vec<i64> = Vec::new();
+                    let mut key_buf: Vec<u8> = Vec::with_capacity(16);
+                    for outer_row in &outer_res.rows {
+                        let Some(key_value) = outer_row.get(*outer_key_col) else {
+                            continue;
+                        };
+                        if key_value.is_null() {
+                            continue; // NULL join key: no matches (INNER join)
+                        }
+                        key_buf.clear();
+                        match inner_index.columns.first() {
+                            Some(ic) => {
+                                crate::plugin::collation_fold_key_ref(&ic.collation, key_value)
+                                    .encode_order_key_into(&mut key_buf)
+                            }
+                            None => key_value.encode_order_key_into(&mut key_buf),
+                        }
+                        if index_bt.root != inner_index_root {
+                            index_bt = Btree::new(ctx.pager, inner_index_root, true);
+                        }
+                        index_bt.lookup_index_into(&key_buf, &mut rowids)?;
+                        if index_bt.root != inner_index_root {
+                            inner_index_root = index_bt.root;
+                        }
+                        count += rowids.len() as i64;
+                    }
+                    let row: Vec<Value> = vec![Value::Integer(count)];
+                    return Ok(ExecResult {
+                        columns: Arc::from(vec!["__agg_0".to_string()]),
+                        rows: vec![row],
+                    });
+                }
+            }
+        }
+        // Fast path #3: COUNT(*) over an IndexRange — COVERING INDEX count.
+        // `SELECT COUNT(*) FROM t WHERE indexed_col > ?` counts index ENTRIES
+        // directly: no row fetching, no decoding. The general path materialized
+        // every matching row (a B+tree descent per rowid) just to count them.
+        if group_by.is_empty()
+            && aggregates.len() == 1
+            && aggregates[0].func == "count"
+            && aggregates[0].arg.is_none()
+            && !aggregates[0].distinct
+            && aggregates[0].filter.is_none()
+        {
+            let covering = match input {
+                Plan::IndexRange {
+                    table,
+                    index,
+                    start,
+                    end,
+                    residual,
+                    ..
+                } => {
+                    if residual.is_none() {
+                        Some((table.clone(), index.clone(), start.as_ref(), end.as_ref()))
+                    } else {
+                        None
+                    }
+                }
+                Plan::Filter { input: inner, .. } => {
+                    // The planner sometimes wraps IndexRange in a Filter with
+                    // the range predicate as residual; only cover when the
+                    // filter is exactly the index range (residual == predicate).
+                    if let Plan::IndexRange {
+                        table,
+                        index,
+                        start,
+                        end,
+                        residual,
+                        ..
+                    } = inner.as_ref()
+                    {
+                        // Only cover when there is NO residual predicate —
+                        // any residual condition needs row data, so the index
+                        // alone can't answer the count. (Conservative: even a
+                        // residual identical to the filter is skipped; those
+                        // plans fall through to the general path.)
+                        if residual.is_none() {
+                            Some((table.clone(), index.clone(), start.as_ref(), end.as_ref()))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some((_table, index, start, end)) = covering {
+                // Evaluate the bounds (same logic as exec_index_range —
+                // collated index bounds fold through the first column's
+                // collation).
                 let empty_row: Vec<Value> = Vec::new();
                 let empty_cols: Vec<String> = Vec::new();
                 let eval_ctx =
                     EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
-                let key_values: Vec<Value> = key_exprs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, e)| {
-                        evaluate(e, &eval_ctx).map(|v| probe_affinity_value(table, index, i, e, &v))
-                    })
-                    .collect::<Result<_>>()?;
-                // NULL equality probes match nothing (SQL 3VL).
-                let n: i64 = if key_values.iter().any(|v| v.is_null()) {
-                    0
-                } else {
-                    let mut key_bytes = Vec::with_capacity(16);
-                    crate::plugin::encode_collated_index_key_into(
-                        &index.columns,
-                        &key_values,
-                        &mut key_bytes,
-                    );
-                    let index_root = ctx.index_root(index);
-                    let mut index_bt = Btree::new(ctx.pager, index_root, true);
-                    let mut rowids: Vec<i64> = Vec::new();
-                    index_bt.lookup_index_into(&key_bytes, &mut rowids)?;
-                    rowids.len() as i64
+                // NULL bound: comparison is NULL (SQL 3VL) — zero rows (the
+                // encoded NULL key would otherwise match the stored NULL
+                // entries exactly).
+                let null_bound = match (start, end) {
+                    (Some((e, _)), _) | (_, Some((e, _))) => evaluate(e, &eval_ctx)?.is_null(),
+                    (None, None) => false,
                 };
+                if null_bound {
+                    let row: Vec<Value> = vec![Value::Integer(0)];
+                    return Ok(ExecResult {
+                        columns: Arc::from(vec!["__agg_0".to_string()]),
+                        rows: vec![row],
+                    });
+                }
+                let fold_bound = |e: &Expr| eval_index_bound(e, &eval_ctx, &_table, &index);
+                let start_key: Option<(Vec<u8>, bool)> = match start {
+                    Some((e, inc)) => Some((fold_bound(e)?.encode_order_key(), *inc)),
+                    None => None,
+                };
+                let end_key: Option<(Vec<u8>, bool)> = match end {
+                    Some((e, inc)) => Some((fold_bound(e)?.encode_order_key(), *inc)),
+                    None => None,
+                };
+                // No lower bound: start PAST the NULL entries (NULL's order key is
+                // the single byte 0x00, every non-NULL key starts at >= 0x01) —
+                // `col < X` never matches NULL (SQLite OP_SeekGT on NULL). Starting
+                // at the empty key used to return the col-IS-NULL rows, and
+                // `DELETE ... WHERE col < X` deleted them.
+                let scan_start: Vec<u8> = start_key
+                    .as_ref()
+                    .map(|(k, _)| k.clone())
+                    .unwrap_or_else(|| vec![0x01]);
+                let mut n: i64 = 0;
+                let index_root = ctx.index_root(&index);
+                let mut index_bt = Btree::new(ctx.pager, index_root, true);
+                index_bt.scan_index_from(&scan_start, |_rowid, cell_key| {
+                    if let Some((k, false)) = &start_key {
+                        if cell_key.starts_with(k) {
+                            return true; // exclusive lower bound
+                        }
+                    }
+                    if let Some((k, inc)) = &end_key {
+                        match index_key_prefix_cmp(cell_key, k) {
+                            std::cmp::Ordering::Greater => return false,
+                            std::cmp::Ordering::Equal if !*inc => return false,
+                            _ => {}
+                        }
+                    }
+                    n += 1;
+                    true
+                })?;
                 let row: Vec<Value> = vec![Value::Integer(n)];
                 return Ok(ExecResult {
                     columns: Arc::from(vec!["__agg_0".to_string()]),
@@ -13789,231 +14019,42 @@ fn exec_aggregate(
                 });
             }
         }
-    }
-    // Fast path #3c: COUNT(*) over a COVERING IndexNestedLoopJoin — count
-    // index ENTRIES per outer-row probe: no table fetches, no row
-    // materialization, no per-row Vec allocation. This is the adversarial
-    // 3-join shape (`SELECT COUNT(*) FROM big1 JOIN big2 ON big1.k=big2.k
-    // JOIN small ON small.k=big1.k WHERE small.id = 3`): the covering INLJ
-    // would emit one combined row per matched entry purely so the count
-    // can throw it away.
-    if group_by.is_empty()
-        && aggregates.len() == 1
-        && aggregates[0].func == "count"
-        && aggregates[0].arg.is_none()
-        && !aggregates[0].distinct
-        && aggregates[0].filter.is_none()
-    {
-        // The reorder pass's restoration Project (a bare-column re-export)
-        // may sit between the Aggregate and the join — a Project never
-        // changes cardinality, so count through it. A Filter DOES (it can
-        // drop rows) and is never skipped.
-        let input = match input {
-            Plan::Project { input: inner, .. } => inner.as_ref(),
-            other => other,
-        };
-        if let Plan::IndexNestedLoopJoin {
-            outer,
-            inner_table,
-            inner_index,
-            outer_key_col,
-            covering: true,
-            ..
-        } = input
+        // Fast path #3e: COUNT(*) over an INNER HASH JOIN of two bare table
+        // scans — the fused streaming join's COUNT-ONLY mode. The join's
+        // cardinality IS the answer: key columns decode on both sides, the
+        // open-addressing table counts chain lengths, and the 8.33M-row
+        // `SELECT COUNT(*) FROM a JOIN b ON a.x = b.x` shape never builds a
+        // single output row (was: one Vec<Value> per match, then thrown
+        // away). Declines (outer joins, residual conditions, cross-affinity
+        // keys, non-scan sides) fall through to the general path unchanged.
+        if group_by.is_empty()
+            && aggregates.len() == 1
+            && aggregates[0].func == "count"
+            && aggregates[0].arg.is_none()
+            && !aggregates[0].distinct
+            && aggregates[0].filter.is_none()
         {
-            if inner_table.vtab.is_none() {
-                let outer_res = execute(outer, ctx)?;
-                let mut count: i64 = 0;
-                let mut inner_index_root = ctx.index_root(inner_index);
-                let mut index_bt = Btree::new(ctx.pager, inner_index_root, true);
-                let mut rowids: Vec<i64> = Vec::new();
-                let mut key_buf: Vec<u8> = Vec::with_capacity(16);
-                for outer_row in &outer_res.rows {
-                    let Some(key_value) = outer_row.get(*outer_key_col) else {
-                        continue;
-                    };
-                    if key_value.is_null() {
-                        continue; // NULL join key: no matches (INNER join)
-                    }
-                    key_buf.clear();
-                    match inner_index.columns.first() {
-                        Some(ic) => crate::plugin::collation_fold_key_ref(&ic.collation, key_value)
-                            .encode_order_key_into(&mut key_buf),
-                        None => key_value.encode_order_key_into(&mut key_buf),
-                    }
-                    if index_bt.root != inner_index_root {
-                        index_bt = Btree::new(ctx.pager, inner_index_root, true);
-                    }
-                    index_bt.lookup_index_into(&key_buf, &mut rowids)?;
-                    if index_bt.root != inner_index_root {
-                        inner_index_root = index_bt.root;
-                    }
-                    count += rowids.len() as i64;
-                }
-                let row: Vec<Value> = vec![Value::Integer(count)];
-                return Ok(ExecResult {
-                    columns: Arc::from(vec!["__agg_0".to_string()]),
-                    rows: vec![row],
-                });
-            }
-        }
-    }
-    // Fast path #3: COUNT(*) over an IndexRange — COVERING INDEX count.
-    // `SELECT COUNT(*) FROM t WHERE indexed_col > ?` counts index ENTRIES
-    // directly: no row fetching, no decoding. The general path materialized
-    // every matching row (a B+tree descent per rowid) just to count them.
-    if group_by.is_empty()
-        && aggregates.len() == 1
-        && aggregates[0].func == "count"
-        && aggregates[0].arg.is_none()
-        && !aggregates[0].distinct
-        && aggregates[0].filter.is_none()
-    {
-        let covering = match input {
-            Plan::IndexRange {
-                table,
-                index,
-                start,
-                end,
-                residual,
-                ..
-            } => {
-                if residual.is_none() {
-                    Some((table.clone(), index.clone(), start.as_ref(), end.as_ref()))
-                } else {
-                    None
-                }
-            }
-            Plan::Filter { input: inner, .. } => {
-                // The planner sometimes wraps IndexRange in a Filter with
-                // the range predicate as residual; only cover when the
-                // filter is exactly the index range (residual == predicate).
-                if let Plan::IndexRange {
-                    table,
-                    index,
-                    start,
-                    end,
-                    residual,
-                    ..
-                } = inner.as_ref()
-                {
-                    // Only cover when there is NO residual predicate —
-                    // any residual condition needs row data, so the index
-                    // alone can't answer the count. (Conservative: even a
-                    // residual identical to the filter is skipped; those
-                    // plans fall through to the general path.)
-                    if residual.is_none() {
-                        Some((table.clone(), index.clone(), start.as_ref(), end.as_ref()))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
-        if let Some((_table, index, start, end)) = covering {
-            // Evaluate the bounds (same logic as exec_index_range —
-            // collated index bounds fold through the first column's
-            // collation).
-            let empty_row: Vec<Value> = Vec::new();
-            let empty_cols: Vec<String> = Vec::new();
-            let eval_ctx =
-                EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
-            // NULL bound: comparison is NULL (SQL 3VL) — zero rows (the
-            // encoded NULL key would otherwise match the stored NULL
-            // entries exactly).
-            let null_bound = match (start, end) {
-                (Some((e, _)), _) | (_, Some((e, _))) => evaluate(e, &eval_ctx)?.is_null(),
-                (None, None) => false,
+            let join_input = match input {
+                Plan::Project { input: inner, .. } => inner.as_ref(),
+                other => other,
             };
-            if null_bound {
-                let row: Vec<Value> = vec![Value::Integer(0)];
-                return Ok(ExecResult {
-                    columns: Arc::from(vec!["__agg_0".to_string()]),
-                    rows: vec![row],
-                });
-            }
-            let fold_bound = |e: &Expr| eval_index_bound(e, &eval_ctx, &_table, &index);
-            let start_key: Option<(Vec<u8>, bool)> = match start {
-                Some((e, inc)) => Some((fold_bound(e)?.encode_order_key(), *inc)),
-                None => None,
-            };
-            let end_key: Option<(Vec<u8>, bool)> = match end {
-                Some((e, inc)) => Some((fold_bound(e)?.encode_order_key(), *inc)),
-                None => None,
-            };
-            // No lower bound: start PAST the NULL entries (NULL's order key is
-            // the single byte 0x00, every non-NULL key starts at >= 0x01) —
-            // `col < X` never matches NULL (SQLite OP_SeekGT on NULL). Starting
-            // at the empty key used to return the col-IS-NULL rows, and
-            // `DELETE ... WHERE col < X` deleted them.
-            let scan_start: Vec<u8> = start_key
-                .as_ref()
-                .map(|(k, _)| k.clone())
-                .unwrap_or_else(|| vec![0x01]);
-            let mut n: i64 = 0;
-            let index_root = ctx.index_root(&index);
-            let mut index_bt = Btree::new(ctx.pager, index_root, true);
-            index_bt.scan_index_from(&scan_start, |_rowid, cell_key| {
-                if let Some((k, false)) = &start_key {
-                    if cell_key.starts_with(k) {
-                        return true; // exclusive lower bound
-                    }
-                }
-                if let Some((k, inc)) = &end_key {
-                    match index_key_prefix_cmp(cell_key, k) {
-                        std::cmp::Ordering::Greater => return false,
-                        std::cmp::Ordering::Equal if !*inc => return false,
-                        _ => {}
-                    }
-                }
-                n += 1;
-                true
-            })?;
-            let row: Vec<Value> = vec![Value::Integer(n)];
-            return Ok(ExecResult {
-                columns: Arc::from(vec!["__agg_0".to_string()]),
-                rows: vec![row],
-            });
-        }
-    }
-    // Fast path #3e: COUNT(*) over an INNER HASH JOIN of two bare table
-    // scans — the fused streaming join's COUNT-ONLY mode. The join's
-    // cardinality IS the answer: key columns decode on both sides, the
-    // open-addressing table counts chain lengths, and the 8.33M-row
-    // `SELECT COUNT(*) FROM a JOIN b ON a.x = b.x` shape never builds a
-    // single output row (was: one Vec<Value> per match, then thrown
-    // away). Declines (outer joins, residual conditions, cross-affinity
-    // keys, non-scan sides) fall through to the general path unchanged.
-    if group_by.is_empty()
-        && aggregates.len() == 1
-        && aggregates[0].func == "count"
-        && aggregates[0].arg.is_none()
-        && !aggregates[0].distinct
-        && aggregates[0].filter.is_none()
-    {
-        let join_input = match input {
-            Plan::Project { input: inner, .. } => inner.as_ref(),
-            other => other,
-        };
-        if let Plan::Join {
-            left,
-            right,
-            join_type,
-            condition,
-            algorithm: crate::planner::plan::JoinAlgorithm::Hash,
-        } = join_input
-        {
-            if matches!(
+            if let Plan::Join {
+                left,
+                right,
                 join_type,
-                crate::sql::ast::JoinType::Inner | crate::sql::ast::JoinType::Cross
-            ) {
-                if let Some(res) =
-                    try_fused_scan_hash_join(ctx, left, right, *join_type, condition, None, true)?
-                {
-                    return Ok(res);
+                condition,
+                algorithm: crate::planner::plan::JoinAlgorithm::Hash,
+            } = join_input
+            {
+                if matches!(
+                    join_type,
+                    crate::sql::ast::JoinType::Inner | crate::sql::ast::JoinType::Cross
+                ) {
+                    if let Some(res) = try_fused_scan_hash_join(
+                        ctx, left, right, *join_type, condition, None, true,
+                    )? {
+                        return Ok(res);
+                    }
                 }
             }
         }
@@ -14025,7 +14066,7 @@ fn exec_aggregate(
     // AggStates through the serial update_agg_state (DISTINCT included),
     // merge in chunk order, finish serially. Declines leave the rows in
     // place for the general loop below.
-    if group_by.is_empty() && !inner.rows.is_empty() {
+    if group_by.is_empty() && !inner.rows.is_empty() && !ordered {
         if let Some(res) = crate::executor::parallel::try_parallel_aggregate_rows(
             ctx,
             &mut inner.rows,
@@ -14166,7 +14207,7 @@ fn exec_aggregate(
     // ordered merge reproducing the serial first-seen group order. The
     // merged grouper drops into the emission path below unchanged. A
     // decline (or empty input) leaves the serial general loop in charge.
-    if !group_by.is_empty() && !inner.rows.is_empty() {
+    if !group_by.is_empty() && !inner.rows.is_empty() && !ordered {
         if let Some(merged) = crate::executor::parallel::try_parallel_groupby_rows(
             ctx,
             &inner.rows,
@@ -14251,6 +14292,40 @@ fn exec_aggregate(
                     }
                     continue;
                 }
+                if agg_is_ordered(agg) {
+                    let st = grouper.state(gi, i);
+                    // DISTINCT applies on ARRIVAL (SQLite's codeDistinct
+                    // runs before the row enters the ORDER BY table): the
+                    // first value of each distinct class survives, then
+                    // the survivors sort. The ORDER-BY-is-the-argument
+                    // form dedups on the sort key instead (see
+                    // finalize_ordered_agg).
+                    if agg.distinct
+                        && !ordered_agg_unique(agg)
+                        && !st
+                            .cold_mut()
+                            .distinct
+                            .get_or_insert_with(Default::default)
+                            .insert(SqlValueKey(match agg_coll_at(aggregates, i) {
+                                Some(c) => crate::plugin::collation_fold_key(c, &arg_val),
+                                None => arg_val.clone(),
+                            }))
+                    {
+                        continue;
+                    }
+                    let keys = agg
+                        .order_by
+                        .iter()
+                        .map(|t| sort_key(&t.expr, row, &inner.columns, params, named_params))
+                        .collect::<Result<Vec<_>>>()?;
+                    grouper
+                        .state(gi, i)
+                        .cold_mut()
+                        .ordered
+                        .get_or_insert_with(Vec::new)
+                        .push((keys, arg_val));
+                    continue;
+                }
                 update_agg_state(
                     grouper.state(gi, i),
                     agg_funcs[i],
@@ -14293,7 +14368,11 @@ fn exec_aggregate(
         row.extend(keys.iter().cloned());
         for (i, agg) in aggregates.iter().enumerate() {
             if i < states.len() {
-                row.push(finalize_agg(&states[i], &agg.func)?);
+                if agg_is_ordered(agg) {
+                    row.push(finalize_ordered_agg(&states[i], agg, agg_funcs[i])?);
+                } else {
+                    row.push(finalize_agg(&states[i], &agg.func)?);
+                }
             } else {
                 row.push(Value::Null);
             }
@@ -14566,6 +14645,124 @@ fn exec_plugin_aggregate(
         columns: out_cols.into(),
         rows: out_rows,
     })
+}
+
+/// Finalize an `agg(x ORDER BY …)` state: stably sort the group's
+/// buffered (keys, value) pairs by the ORDER BY terms — direction, NULL
+/// placement, collation — then replay them through the aggregate's
+/// ordinary accumulator (DISTINCT keeps the first in that order) and
+/// finalize it.
+fn finalize_ordered_agg(state: &AggState, agg: &AggExpr, func: AggFunc) -> Result<Value> {
+    use std::cmp::Ordering;
+    let mut pairs: Vec<&(Vec<Value>, Value)> = state
+        .cold()
+        .and_then(|c| c.ordered.as_ref())
+        .map(|v| v.iter().collect())
+        .unwrap_or_default();
+    let colls: Vec<Option<std::sync::Arc<dyn crate::plugin::Collation>>> = (0..agg.order_by.len())
+        .map(|k| {
+            agg.order_coll
+                .get(k)
+                .cloned()
+                .flatten()
+                .map(|name| {
+                    crate::plugin::lookup_collation(&name).ok_or_else(|| {
+                        Error::semantic(format!("no such collation sequence: {}", name))
+                    })
+                })
+                .transpose()
+        })
+        .collect::<Result<_>>()?;
+    pairs.sort_by(|a, b| {
+        for (k, t) in agg.order_by.iter().enumerate() {
+            let (x, y) = (&a.0[k], &b.0[k]);
+            let nulls_first = match t.nulls {
+                NullsOrder::First => true,
+                NullsOrder::Last => false,
+                NullsOrder::Default => t.order == Order::Asc,
+            };
+            let o = match (x.is_null(), y.is_null()) {
+                (true, true) => Ordering::Equal,
+                (true, false) if nulls_first => Ordering::Less,
+                (true, false) => Ordering::Greater,
+                (false, true) if nulls_first => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                _ => {
+                    let o = match &colls[k] {
+                        Some(c) => crate::plugin::compare_collated(x, y, c.as_ref()),
+                        None => value_cmp_conn(x, y),
+                    };
+                    if t.order == Order::Desc {
+                        o.reverse()
+                    } else {
+                        o
+                    }
+                }
+            };
+            if o != Ordering::Equal {
+                return o;
+            }
+        }
+        Ordering::Equal
+    });
+    // `agg(DISTINCT x ORDER BY x)`: SQLite keeps the ORDER BY table as a
+    // UNIQUE index on the key, so among equal keys the LAST arrival
+    // replaces the earlier ones (`group_concat(DISTINCT b ORDER BY b)` over
+    // NOCASE b keeps the later spelling). Every other DISTINCT form was
+    // deduplicated on arrival.
+    if agg.distinct && ordered_agg_unique(agg) {
+        let mut kept: Vec<&(Vec<Value>, Value)> = Vec::with_capacity(pairs.len());
+        for p in pairs {
+            let same = kept.last().is_some_and(|q| {
+                let (x, y) = (&q.0[0], &p.0[0]);
+                match (x.is_null(), y.is_null()) {
+                    (true, true) => true,
+                    (false, false) => {
+                        let o = match &colls[0] {
+                            Some(c) => crate::plugin::compare_collated(x, y, c.as_ref()),
+                            None => value_cmp_conn(x, y),
+                        };
+                        o == Ordering::Equal
+                    }
+                    _ => false,
+                }
+            });
+            if same {
+                kept.pop();
+            }
+            kept.push(p);
+        }
+        pairs = kept;
+    }
+    let mut fresh = AggState::default();
+    for (_, v) in pairs {
+        update_agg_state(
+            &mut fresh,
+            func,
+            v,
+            false,
+            agg.sep.as_deref(),
+            agg.collation.as_deref(),
+        );
+    }
+    finalize_agg(&fresh, &agg.func)
+}
+
+/// Does this aggregate read its rows in an ORDER BY order? min() / max()
+/// ignore the clause (SQLite skips it for its NEEDCOLL aggregates — their
+/// answer does not depend on input order).
+fn agg_is_ordered(agg: &AggExpr) -> bool {
+    !agg.order_by.is_empty() && !matches!(agg.func.as_str(), "min" | "max")
+}
+
+/// SQLite's `bOBUnique` shape: one ORDER BY term that IS the single
+/// argument (`agg(DISTINCT x ORDER BY x)`).
+fn ordered_agg_unique(agg: &AggExpr) -> bool {
+    agg.order_by.len() == 1
+        && agg
+            .arg
+            .as_ref()
+            .is_some_and(|a| format!("{:?}", a) == format!("{:?}", agg.order_by[0].expr))
 }
 
 /// Per-aggregate constant separator (group_concat(x, sep)) if any.
