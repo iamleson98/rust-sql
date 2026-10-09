@@ -380,14 +380,16 @@ fn two_concurrent_owners_multi_writer() {
     assert_eq!(exec(a, "INSERT INTO ta VALUES (2)"), SQLITE_OK);
     assert_eq!(exec(b, "INSERT INTO tb VALUES (2)"), SQLITE_OK);
 
-    // Each sees only its own uncommitted rows.
+    // Each sees only its own uncommitted rows. Only A looks at the
+    // other side's table: A commits first, so its read of tb is still
+    // current at its commit, and B read nothing A wrote — a valid
+    // serial order (A, B) exists and both commits merge.
     assert_eq!(query_int(a, "SELECT count(*) FROM ta"), 2);
     assert_eq!(query_int(a, "SELECT count(*) FROM tb"), 0);
     assert_eq!(query_int(b, "SELECT count(*) FROM tb"), 2);
-    assert_eq!(query_int(b, "SELECT count(*) FROM ta"), 0);
 
     assert_eq!(exec(a, "COMMIT"), SQLITE_OK);
-    assert_eq!(exec(b, "COMMIT"), SQLITE_OK);
+    assert_eq!(exec(b, "COMMIT"), SQLITE_OK, "{}", err_of(b));
 
     assert_eq!(query_int(a, "SELECT count(*) FROM ta"), 2);
     assert_eq!(query_int(a, "SELECT count(*) FROM tb"), 2);
@@ -398,6 +400,61 @@ fn two_concurrent_owners_multi_writer() {
     let back = open_db(&path);
     assert_eq!(query_int(back, "SELECT count(*) FROM ta"), 2);
     assert_eq!(query_int(back, "SELECT count(*) FROM tb"), 2);
+    assert_eq!(sqlite3_close_wrapper(back), SQLITE_OK);
+}
+
+/// Disjoint WRITES with CROSSED READS are not serializable: A reads tb
+/// (which B writes) and B reads ta (which A writes), so neither serial
+/// order reproduces both reads. The first committer wins; the second
+/// COMMIT fails SQLITE_BUSY_SNAPSHOT (517) — the begin-concurrent
+/// branch's page-level read validation rejects it the same way — and
+/// the retried transaction, now seeing A's rows, commits.
+#[test]
+fn crossed_reads_second_committer_busy_snapshot() {
+    let path = temp_db("crossedreads");
+    let _ = std::fs::remove_file(&path);
+    let a = open_wal_db(&path);
+    let b = open_wal_db(&path);
+    assert_eq!(
+        exec(a, "CREATE TABLE ta (id INTEGER PRIMARY KEY)"),
+        SQLITE_OK
+    );
+    assert_eq!(
+        exec(a, "CREATE TABLE tb (id INTEGER PRIMARY KEY)"),
+        SQLITE_OK
+    );
+
+    assert_eq!(exec(a, "BEGIN CONCURRENT"), SQLITE_OK);
+    assert_eq!(exec(b, "BEGIN CONCURRENT"), SQLITE_OK, "{}", err_of(b));
+    assert_eq!(exec(a, "INSERT INTO ta VALUES (1)"), SQLITE_OK);
+    assert_eq!(exec(b, "INSERT INTO tb VALUES (1)"), SQLITE_OK);
+    assert_eq!(query_int(a, "SELECT count(*) FROM tb"), 0);
+    assert_eq!(query_int(b, "SELECT count(*) FROM ta"), 0);
+
+    assert_eq!(exec(a, "COMMIT"), SQLITE_OK);
+    let rc = exec(b, "COMMIT");
+    assert_eq!(
+        rc,
+        SQLITE_BUSY_SNAPSHOT,
+        "expected 517, got {rc}: {}",
+        err_of(b)
+    );
+    assert_eq!(unsafe { sqlite3_get_autocommit(b) }, 1);
+    // Nothing of B's attempt landed.
+    assert_eq!(query_int(a, "SELECT count(*) FROM tb"), 0);
+
+    // Retry: B now reads A's committed row and commits.
+    assert_eq!(exec(b, "BEGIN CONCURRENT"), SQLITE_OK, "{}", err_of(b));
+    assert_eq!(query_int(b, "SELECT count(*) FROM ta"), 1);
+    assert_eq!(exec(b, "INSERT INTO tb VALUES (1)"), SQLITE_OK);
+    assert_eq!(exec(b, "COMMIT"), SQLITE_OK, "{}", err_of(b));
+
+    assert_eq!(sqlite3_close_wrapper(a), SQLITE_OK);
+    assert_eq!(sqlite3_close_wrapper(b), SQLITE_OK);
+
+    let back = open_db(&path);
+    assert_eq!(query_int(back, "SELECT count(*) FROM ta"), 1);
+    assert_eq!(query_int(back, "SELECT count(*) FROM tb"), 1);
     assert_eq!(sqlite3_close_wrapper(back), SQLITE_OK);
 }
 
