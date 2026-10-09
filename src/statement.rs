@@ -404,6 +404,23 @@ impl<'a> Statement<'a> {
         self.named.clear();
     }
 
+    /// The result column names of a SELECT WITHOUT executing it: the plan
+    /// runs over empty row sources (no row is read, no expression is
+    /// evaluated, no parameter needs a binding — `LIMIT ?` unbound is
+    /// fine). `None` when the statement is not a planned SELECT or its
+    /// shape cannot be emptied; the caller then has to step it.
+    pub fn describe_columns(&mut self) -> Option<Vec<String>> {
+        if !matches!(self.stmt.as_ref(), AstStatement::Select(_)) {
+            return None;
+        }
+        let plan = self.plan.clone()?;
+        let empty = crate::executor::empty_input_plan(&plan)?;
+        let res = self
+            .exec_with_ctx(|ctx| crate::executor::execute(&empty, ctx))
+            .ok()?;
+        Some(res.columns.to_vec())
+    }
+
     /// Number of output columns (valid after the first step).
     pub fn column_count(&self) -> usize {
         self.columns.as_ref().map(|c| c.len()).unwrap_or(0)

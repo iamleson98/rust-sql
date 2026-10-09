@@ -7655,7 +7655,7 @@ fn limit_operand(ctx: &ExecContext<'_>, e: &Expr) -> Result<i64> {
 /// rewritten plan evaluates an expression. `None` for shapes whose names
 /// are not statically known (virtual tables, table functions, nested
 /// selects planned at execution) — the caller then runs the plan as is.
-fn empty_input_plan(plan: &Plan) -> Option<Plan> {
+pub(crate) fn empty_input_plan(plan: &Plan) -> Option<Plan> {
     let empty = |columns: Arc<[String]>| Plan::CteRows {
         rows: Arc::new(Vec::new()),
         columns,

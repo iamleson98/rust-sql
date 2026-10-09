@@ -918,6 +918,31 @@ fn coerce_comparison_operands(
 }
 
 /// Evaluate an expression in the given context.
+/// sqlite3ExprSimplifiedAndOr: an AND / OR with an ALWAYS-true or
+/// ALWAYS-false operand (an integer literal — SQLite's EP_IsTrue /
+/// EP_IsFalse; TRUE / FALSE parse to one) reduces, recursively, to the
+/// side that decides the result: `X AND 0` → `0`, `X OR 1` → `1`,
+/// `X AND 1` / `X OR 0` → `X`. Returns `e` itself when nothing reduces.
+fn simplified_and_or(e: &Expr) -> &Expr {
+    if let Expr::Binary {
+        op: op @ (BinaryOp::And | BinaryOp::Or),
+        left,
+        right,
+    } = e
+    {
+        let r = simplified_and_or(right);
+        let l = simplified_and_or(left);
+        let always = |x: &Expr, truth: bool| matches!(x, Expr::Literal(Value::Integer(n)) if (*n != 0) == truth);
+        if always(l, true) || always(r, false) {
+            return if *op == BinaryOp::And { r } else { l };
+        }
+        if always(r, true) || always(l, false) {
+            return if *op == BinaryOp::And { l } else { r };
+        }
+    }
+    e
+}
+
 pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
     match expr {
         Expr::Literal(v) => Ok(v.clone()),
@@ -944,6 +969,15 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
             left,
             right,
         } => {
+            // sqlite3ExprSimplifiedAndOr (every context): an operand that
+            // is ALWAYS false/true — an integer literal — decides, and the
+            // other side is never evaluated (`abs(-9223372036854775808)
+            // AND 0` is 0); the survivor's truth value is the result.
+            let alt = simplified_and_or(expr);
+            if !std::ptr::eq(alt, expr) {
+                let v = evaluate(alt, ctx)?;
+                return Ok(apply_binary(BinaryOp::And, &v, &v));
+            }
             let (first, second) = if crate::executor::expr_has_subquery(left)
                 && !crate::executor::expr_has_subquery(right)
             {

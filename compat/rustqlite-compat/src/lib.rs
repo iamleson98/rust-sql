@@ -2374,6 +2374,35 @@ unsafe fn prepare_impl(
                 }
             } else {
                 let mut s = eng_stmt;
+                // Name the columns WITHOUT executing when the engine can
+                // (an emptied plan: no rows read, nothing evaluated, no
+                // parameter binding needed — `LIMIT ?` unbound would raise
+                // "datatype mismatch" if stepped); otherwise run it once.
+                let described = {
+                    let _rd = engine.db.read();
+                    s.describe_columns()
+                };
+                if let Some(cols) = described {
+                    for name in cols {
+                        if let Ok(c) = CString::new(sqlite_result_name(&name)) {
+                            static_columns.push(c);
+                        }
+                    }
+                    s.reset();
+                    let erased: EngineStatement<'static> = std::mem::transmute(s);
+                    return finish_prepare(
+                        conn,
+                        engine,
+                        stmt_text,
+                        kind,
+                        is_write,
+                        tx_kind,
+                        Exec::Rows(Box::new(erased)),
+                        params,
+                        static_columns,
+                        pp_stmt,
+                    );
+                }
                 {
                     let _rd = engine.db.read();
                     let _ = s.step();

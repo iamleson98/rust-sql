@@ -280,7 +280,6 @@ The honest ledger — verifiable absence (`module_list` / `function_list` / `com
 
 **Known residual SQL divergences** (each verified against 3.53.4; none corrupts data):
 - Error timing that depends on the PLAN SQLite picks: `SELECT <raising expr> … ORDER BY x LIMIT k` raises in SQLite when it sorts (its sorter computes every row's result columns first) but not when an index supplies the order (only k rows are evaluated); the engine's top-N path projects only the surviving rows, i.e. it behaves like SQLite's index-order plan. Constant WHERE terms, LIMIT 0, LIMIT early-stop over non-compilable predicates, scalar/EXISTS `LIMIT (X <> 0)`, and EXCEPT/INTERSECT's lazy right arm all follow SQLite's evaluation order (pinned in `tests/fixtures/semantics/`).
-- `SELECT (<raising expr> AND 0)` raises here; SQLite's value-context AND simplification skips the left operand next to a literal 0 (in WHERE both engines raise).
 - Plan-dependent answers SQLite itself does not fix, which the fuzzer reports as "unspecified" rather than divergent: which of several equal values (`1` / `1.0`, `'a'` / `'A'` under NOCASE) represents a DISTINCT / UNION / GROUP BY group; the order of ORDER BY ties; floating SUM/TOTAL/AVG last bits and ±inf-vs-NULL under overflow when SQLite walks a covering index in a different order; DML whose subqueries read the statement's own target table (SQLite may see its own earlier row changes through a live index). GROUP BY output now follows SQLite's key order (it used to be first-seen order).
 
 ### Performance (measured residuals, CI-tracked)
