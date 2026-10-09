@@ -16412,10 +16412,14 @@ fn compile_join_jexpr(
 /// (left columns then right, slots interleaved as emitted). `None` for
 /// anything else (projections, aggregates, subqueries) — callers then
 /// skip affinity folding rather than guess.
-fn plan_output_affinities(plan: &Plan) -> Option<Vec<crate::types::Affinity>> {
+pub(crate) fn plan_output_affinities(plan: &Plan) -> Option<Vec<crate::types::Affinity>> {
     use crate::types::Affinity;
     match plan {
-        Plan::Scan { table, .. } => {
+        Plan::Scan { table, .. }
+        | Plan::RowidLookup { table, .. }
+        | Plan::RowidRange { table, .. }
+        | Plan::IndexLookup { table, .. }
+        | Plan::IndexRange { table, .. } => {
             let mut v: Vec<Affinity> = table.col_affinities.iter().copied().collect();
             if crate::planner::wants_rowid_slot(table) {
                 v.push(Affinity::Integer);
@@ -18706,6 +18710,25 @@ fn exec_index_nested_loop_join(
     // (a fresh `Btree::new` per rowid re-fetched the root page per row).
     let mut index_bt = Btree::new(ctx.pager, inner_index_root, true);
     let mut table_bt = Btree::new(ctx.pager, inner_root, false);
+    // sqlite3IndexAffinityOk: the planner only probes an index whose key
+    // column has NUMERIC affinity with a value of any class when the
+    // comparison is numeric — and the seek then applies NUMERIC affinity
+    // to the probe value first (OP_Affinity): a TEXT outer key '0' finds
+    // the INTEGER entry 0 (`t1 JOIN t2 ON t2.g = t1.b`, b TEXT, g
+    // INTEGER, probed t2_g with the raw text and matched nothing).
+    let numeric_probe = inner_index
+        .columns
+        .first()
+        .filter(|ic| ic.expr.is_none())
+        .and_then(|ic| inner_table.find_column(&ic.name))
+        .is_some_and(|i| {
+            matches!(
+                inner_table.columns[i].affinity,
+                crate::types::Affinity::Integer
+                    | crate::types::Affinity::Real
+                    | crate::types::Affinity::Numeric
+            )
+        });
 
     for outer_row in &outer_res.rows {
         // Extract the join key from the outer row (borrowed — no clone;
@@ -18716,6 +18739,23 @@ fn exec_index_nested_loop_join(
         let key_value = match outer_row.get(outer_key_col) {
             Some(Value::Null) | None => continue,
             Some(v) => v,
+        };
+        let converted: Value;
+        let key_value = match key_value {
+            Value::Text(t) if numeric_probe => {
+                match crate::types::numeric::apply_numeric_affinity(t.as_bytes()) {
+                    Some(crate::types::numeric::NumericAffinity::Integer(i)) => {
+                        converted = Value::Integer(i);
+                        &converted
+                    }
+                    Some(crate::types::numeric::NumericAffinity::Real(r)) => {
+                        converted = Value::Real(r);
+                        &converted
+                    }
+                    None => key_value,
+                }
+            }
+            v => v,
         };
 
         // Encode the key for index lookup (order-preserving form, folded

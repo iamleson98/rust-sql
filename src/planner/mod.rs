@@ -8625,6 +8625,32 @@ fn join_condition_is_pure_equi(cond: Option<&Expr>) -> bool {
 /// declared one — the LEFT column's, even BINARY, wins), else BINARY. A
 /// NOCASE index probed for `t1.b = t2.h` (BINARY: the left column
 /// decides) matched case variants SQLite's comparison rejects.
+/// sqlite3IndexAffinityOk for an index nested-loop probe `outer = inner`
+/// (both columns): the comparison is NUMERIC when either side has numeric
+/// affinity (sqlite3CompareAffinity), and a NUMERIC comparison can only
+/// seek an index whose key column is numeric (the executor then applies
+/// NUMERIC affinity to the probe value). A TEXT / BLOB / untyped inner
+/// index probed with a numeric outer column would miss every
+/// numerically-equal TEXT entry — decline (the hash join compares with
+/// the affinities). An outer column of unknown affinity declines too.
+fn inlj_index_affinity_ok(left: &Plan, outer_key_col: usize, inner: &Table, idx: &Index) -> bool {
+    use crate::types::Affinity as A;
+    let numeric = |a: A| matches!(a, A::Integer | A::Real | A::Numeric);
+    let inner_numeric = match idx.columns.first() {
+        Some(ic) if ic.expr.is_none() => match inner.find_column(&ic.name) {
+            Some(i) => numeric(inner.columns[i].affinity),
+            None => true, // the rowid: INTEGER
+        },
+        _ => return false,
+    };
+    if inner_numeric {
+        return true;
+    }
+    crate::executor::plan_output_affinities(left)
+        .and_then(|a| a.get(outer_key_col).copied())
+        .is_some_and(|a| !numeric(a))
+}
+
 fn inlj_index_collation_ok(
     cond: Option<&Expr>,
     left_key: (Option<&str>, &str),
@@ -8863,12 +8889,13 @@ fn inlj_walk(catalog: &Catalog, plan: Plan, needed: &NeededCols) -> Plan {
                         {
                             if let Some(idx) = find_index_for_column(catalog, r_table, r_col)
                                 .filter(|idx| {
-                                    inlj_index_collation_ok(
-                                        condition.as_ref(),
-                                        (l_qual.as_deref(), l_col),
-                                        (r_qual.as_deref(), r_col),
-                                        idx,
-                                    )
+                                    inlj_index_affinity_ok(&left, outer_key_col, r_table, idx)
+                                        && inlj_index_collation_ok(
+                                            condition.as_ref(),
+                                            (l_qual.as_deref(), l_col),
+                                            (r_qual.as_deref(), r_col),
+                                            idx,
+                                        )
                                 })
                             {
                                 // The index seek enforces ONE key; every other
@@ -8931,12 +8958,13 @@ fn inlj_walk(catalog: &Catalog, plan: Plan, needed: &NeededCols) -> Plan {
                         {
                             if let Some(idx) = find_index_for_column(catalog, l_table, l_col)
                                 .filter(|idx| {
-                                    inlj_index_collation_ok(
-                                        condition.as_ref(),
-                                        (l_qual.as_deref(), l_col),
-                                        (r_qual.as_deref(), r_col),
-                                        idx,
-                                    )
+                                    inlj_index_affinity_ok(&right, outer_key_col, l_table, idx)
+                                        && inlj_index_collation_ok(
+                                            condition.as_ref(),
+                                            (l_qual.as_deref(), l_col),
+                                            (r_qual.as_deref(), r_col),
+                                            idx,
+                                        )
                                 })
                             {
                                 // Residual conjuncts: see the right-inner arm.
