@@ -466,9 +466,12 @@ pub(crate) enum WalLease {
     Foreign(String),
 }
 
-/// Try to take (or confirm) the write lease for `owner` on `path`.
-pub(crate) fn acquire_wal_lease(path: &Path, owner: u64) -> WalLease {
-    let key = lease_key(path);
+/// Try to take (or confirm) the write lease for `owner` under the
+/// resolved [`lease_key`] of the sidecar path. A pager resolves its key
+/// ONCE (`canonicalize` is a realpath walk: a
+/// `getattrlist` per path component, ~28% of an autocommit UPDATE on a
+/// WAL file when it ran per commit).
+pub(crate) fn acquire_wal_lease_key(key: PathBuf, owner: u64) -> WalLease {
     let mut leases = wal_writer_leases().lock().unwrap();
     match leases.get(&key) {
         Some(&held) if held != owner => WalLease::Foreign(key.display().to_string()),
@@ -492,12 +495,12 @@ pub(crate) fn wal_lease_busy(foreign: String) -> std::io::Error {
     )
 }
 
-/// Release the lease on `path` when `owner` holds it.
-pub(crate) fn release_wal_lease(path: &Path, owner: u64) {
-    let key = lease_key(path);
+/// Release the lease under the resolved [`lease_key`] when `owner`
+/// holds it.
+pub(crate) fn release_wal_lease_key(key: &Path, owner: u64) {
     let mut leases = wal_writer_leases().lock().unwrap();
-    if leases.get(&key).copied() == Some(owner) {
-        leases.remove(&key);
+    if leases.get(key).copied() == Some(owner) {
+        leases.remove(key);
     }
 }
 

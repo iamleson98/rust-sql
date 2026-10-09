@@ -991,6 +991,9 @@ pub struct Pager {
     /// the same page ids (they always do: roots start at low sequential
     /// ids). See `write_epoch`.
     pub(crate) instance_id: u64,
+    /// This pager's WAL writer-lease key (`wal::lease_key` of its
+    /// sidecar), resolved once — see [`Self::wal_lease_key`].
+    wal_lease_key: std::sync::OnceLock<PathBuf>,
     /// GLOBAL rowid high-water for the concurrent regime (the highest id
     /// ever handed to an auto-rowid allocation inside a BEGIN CONCURRENT
     /// transaction). Sibling concurrent transactions allocate from the
@@ -1823,8 +1826,7 @@ impl Drop for Pager {
         // later writers get SQLITE_BUSY — the same behavior a leaked
         // sqlite3* connection exhibits through its held POSIX locks.
         if !self.store.read().is_memory() {
-            let sidecar = crate::storage::wal::wal_path_for(&self.path);
-            crate::storage::wal::release_wal_lease(&sidecar, self.instance_id);
+            crate::storage::wal::release_wal_lease_key(self.wal_lease_key(), self.instance_id);
             // The cross-process WRITE byte releases with it — the OS
             // analogue of the release above (a handle dropped WITHOUT
             // Drop leaks both, exactly like a leaked sqlite3* connection
@@ -1871,9 +1873,11 @@ impl Drop for Pager {
             // remove the sidecar. A read-only second handle closing while
             // the live owner appends would otherwise truncate the log
             // under it (the same datxevui class, intra-process).
-            let sidecar = crate::storage::wal::wal_path_for(&self.path);
             let mut am_owner = !matches!(
-                crate::storage::wal::acquire_wal_lease(&sidecar, self.instance_id),
+                crate::storage::wal::acquire_wal_lease_key(
+                    self.wal_lease_key().to_path_buf(),
+                    self.instance_id
+                ),
                 crate::storage::wal::WalLease::Foreign(_)
             );
             if am_owner {
@@ -1886,7 +1890,10 @@ impl Drop for Pager {
                 // already, so its re-take cannot fail), and leaking it
                 // would busy-lock this path in-process forever.
                 if self.xlock_take_writer_role().is_err() {
-                    crate::storage::wal::release_wal_lease(&sidecar, self.instance_id);
+                    crate::storage::wal::release_wal_lease_key(
+                        self.wal_lease_key(),
+                        self.instance_id,
+                    );
                     am_owner = false;
                 }
             }
@@ -1957,7 +1964,7 @@ impl Drop for Pager {
                         mine,
                     );
                 }
-                crate::storage::wal::release_wal_lease(&sidecar, self.instance_id);
+                crate::storage::wal::release_wal_lease_key(self.wal_lease_key(), self.instance_id);
                 self.xlock_drop_writer_role();
             }
         }
@@ -2387,6 +2394,7 @@ impl Pager {
                 .fetch_add(1, Ordering::Relaxed)
                 .checked_add(1)
                 .unwrap_or(0),
+            wal_lease_key: std::sync::OnceLock::new(),
             concurrent_rowid_hw: std::sync::atomic::AtomicI64::new(0),
             savepoints: Mutex::new(Vec::new()),
             savepoint_min_base: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -3090,6 +3098,15 @@ impl Pager {
     #[inline]
     pub(crate) fn structural_scope(&self) -> crate::storage::concurrent::StructuralScope {
         crate::storage::concurrent::StructuralScope::enter(self.concurrent.scope_armed_any())
+    }
+
+    /// The process-wide WAL writer-lease key for this pager's sidecar,
+    /// canonicalized on first use and reused by every acquire / release
+    /// (the per-commit lease confirmation used to re-run the realpath).
+    fn wal_lease_key(&self) -> &Path {
+        self.wal_lease_key.get_or_init(|| {
+            crate::storage::wal::lease_key(&crate::storage::wal::wal_path_for(&self.path))
+        })
     }
 
     /// True while any BEGIN CONCURRENT scope is armed on this pager — a
@@ -4708,7 +4725,7 @@ impl Pager {
     // DELETE-mode files) — the OnceLock is simply never set.
 
     /// Take the cross-process WRITE byte — the OS-level half of the WAL
-    /// writer lease. Pairs with `acquire_wal_lease` at every site that
+    /// writer lease. Pairs with `acquire_wal_lease_key` at every site that
     /// takes the in-process lease: a foreign holder (another process is
     /// the writer) is the same busy-class condition as a foreign
     /// in-process lease. Idempotent while held (a same-fd OFD request on
@@ -4733,7 +4750,7 @@ impl Pager {
     }
 
     /// Release the cross-process WRITE byte. Pairs with every
-    /// `release_wal_lease` site. No-op without a lock file.
+    /// `release_wal_lease_key` site. No-op without a lock file.
     fn xlock_drop_writer_role(&self) {
         if let Some(xl) = self.xlock.get() {
             let _ = xl.unlock(crate::storage::xlock::WRITE_BYTE);
@@ -5221,9 +5238,11 @@ impl Pager {
         // WRITER LEASE: only the lease owner may checkpoint + reset the
         // sidecar (a read-only second handle flipping its OWN mode must
         // not truncate the live owner's log).
-        let sidecar = crate::storage::wal::wal_path_for(&self.path);
         if let crate::storage::wal::WalLease::Foreign(f) =
-            crate::storage::wal::acquire_wal_lease(&sidecar, self.instance_id)
+            crate::storage::wal::acquire_wal_lease_key(
+                self.wal_lease_key().to_path_buf(),
+                self.instance_id,
+            )
         {
             return Err(crate::error::Error::Transaction(format!(
                 "database is locked (SQLITE_BUSY): {}",
@@ -5236,11 +5255,11 @@ impl Pager {
         // FOLD itself (checked inside), matching SQLite's "cannot change
         // journal_mode while another connection is open" busy class.
         if let Err(e) = self.xlock_take_writer_role() {
-            crate::storage::wal::release_wal_lease(&sidecar, self.instance_id);
+            crate::storage::wal::release_wal_lease_key(self.wal_lease_key(), self.instance_id);
             return Err(e);
         }
         let result = self.disable_wal_locked();
-        crate::storage::wal::release_wal_lease(&sidecar, self.instance_id);
+        crate::storage::wal::release_wal_lease_key(self.wal_lease_key(), self.instance_id);
         self.xlock_drop_writer_role();
         result
     }
@@ -5341,9 +5360,10 @@ impl Pager {
         // the lease stays held; `Acquired` = the lease was free (no live
         // writer) — transient take, released below; `Foreign` = busy.
         if !self.store.read().is_memory() {
-            let sidecar = crate::storage::wal::wal_path_for(&self.path);
-            let acquired = match crate::storage::wal::acquire_wal_lease(&sidecar, self.instance_id)
-            {
+            let acquired = match crate::storage::wal::acquire_wal_lease_key(
+                self.wal_lease_key().to_path_buf(),
+                self.instance_id,
+            ) {
                 crate::storage::wal::WalLease::Foreign(f) => {
                     return Err(crate::error::Error::Transaction(format!(
                         "database is locked (SQLITE_BUSY): {}",
@@ -5360,7 +5380,10 @@ impl Pager {
             // holds the sticky role from `flush_wal_opts`.
             if let Err(e) = self.xlock_take_writer_role() {
                 if acquired {
-                    crate::storage::wal::release_wal_lease(&sidecar, self.instance_id);
+                    crate::storage::wal::release_wal_lease_key(
+                        self.wal_lease_key(),
+                        self.instance_id,
+                    );
                 }
                 return Err(e);
             }
@@ -5390,7 +5413,7 @@ impl Pager {
                 }
             };
             if acquired {
-                crate::storage::wal::release_wal_lease(&sidecar, self.instance_id);
+                crate::storage::wal::release_wal_lease_key(self.wal_lease_key(), self.instance_id);
                 self.xlock_drop_writer_role();
             }
             r
@@ -5414,8 +5437,10 @@ impl Pager {
         if self.store.read().is_memory() {
             return self.checkpoint_wal_locked(true);
         }
-        let sidecar = crate::storage::wal::wal_path_for(&self.path);
-        let acquired = match crate::storage::wal::acquire_wal_lease(&sidecar, self.instance_id) {
+        let acquired = match crate::storage::wal::acquire_wal_lease_key(
+            self.wal_lease_key().to_path_buf(),
+            self.instance_id,
+        ) {
             crate::storage::wal::WalLease::Foreign(f) => {
                 return Err(crate::error::Error::Transaction(format!(
                     "database is locked (SQLITE_BUSY): {}",
@@ -5427,7 +5452,7 @@ impl Pager {
         };
         if let Err(e) = self.xlock_take_writer_role() {
             if acquired {
-                crate::storage::wal::release_wal_lease(&sidecar, self.instance_id);
+                crate::storage::wal::release_wal_lease_key(self.wal_lease_key(), self.instance_id);
             }
             return Err(e);
         }
@@ -5443,7 +5468,7 @@ impl Pager {
             ))),
         };
         if acquired {
-            crate::storage::wal::release_wal_lease(&sidecar, self.instance_id);
+            crate::storage::wal::release_wal_lease_key(self.wal_lease_key(), self.instance_id);
             self.xlock_drop_writer_role();
         }
         r
@@ -5698,9 +5723,11 @@ impl Pager {
         // busy-class error. Read-only handles attach freely (WAL frames
         // are plain positioned reads).
         if !self.store.read().is_memory() {
-            let sidecar = crate::storage::wal::wal_path_for(&self.path);
             if let crate::storage::wal::WalLease::Foreign(f) =
-                crate::storage::wal::acquire_wal_lease(&sidecar, self.instance_id)
+                crate::storage::wal::acquire_wal_lease_key(
+                    self.wal_lease_key().to_path_buf(),
+                    self.instance_id,
+                )
             {
                 return Err(crate::error::Error::Transaction(format!(
                     "database is locked (SQLITE_BUSY): {}",
@@ -5714,7 +5741,7 @@ impl Pager {
             // offsets. (A sticky take never fails: if we already hold
             // byte-1 the same-fd request re-succeeds.)
             if let Err(e) = self.xlock_take_writer_role() {
-                crate::storage::wal::release_wal_lease(&sidecar, self.instance_id);
+                crate::storage::wal::release_wal_lease_key(self.wal_lease_key(), self.instance_id);
                 return Err(e);
             }
         }
@@ -5731,9 +5758,20 @@ impl Pager {
         // Page 0 carries the header (n_pages, freelist, cookie). Refresh
         // it through the normal page path (cache → WAL → file) so the
         // newest committed version is the base.
+        //
+        // Page 0 joins the commit only when its header bytes CHANGED (or
+        // something else already dirtied it): an unchanged header frame
+        // per commit doubled a single-row autocommit's WAL traffic — two
+        // frames instead of one, so the 1000-frame auto-checkpoint (and
+        // its syncs) fired twice as often. Recovery needs no page-0 frame:
+        // the commit mark rides the commit's last frame, and an unchanged
+        // header's newest version is already in the WAL or the file.
         let page0 = self.get_page(0)?;
-        {
+        let header_changed = {
             let mut borrowed = page0.lock();
+            let hdr = crate::storage::page::DB_HEADER_SIZE as usize;
+            let mut before = [0u8; crate::storage::page::DB_HEADER_SIZE as usize];
+            before.copy_from_slice(&borrowed.data[..hdr]);
             FileHeader::write(&mut borrowed.data, psz, n_pages_val, schema_cookie_val);
             borrowed.data[20..24].copy_from_slice(&freelist_head_val.to_le_bytes());
             borrowed.data[24..28].copy_from_slice(&freelist_count_val.to_le_bytes());
@@ -5745,9 +5783,15 @@ impl Pager {
                 &mut borrowed.data,
                 crate::storage::page::JOURNAL_MODE_WAL,
             );
-            borrowed.touch();
+            let changed = borrowed.data[..hdr] != before;
+            if changed {
+                borrowed.touch();
+            }
+            changed
+        };
+        if header_changed {
+            self.dirty_pages.lock().insert(0);
         }
-        self.dirty_pages.lock().insert(0);
 
         // --- collect dirty page ids ---
         let mut dirty_ids: Vec<PageId> = {

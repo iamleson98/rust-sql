@@ -204,6 +204,35 @@ fn xproc_helper_dispatch() {
             write_marker(&dir, "p1-ready-1");
             std::thread::sleep(Duration::from_secs(300));
         }
+        "update_crash_writer" => {
+            // Commits whose header page is UNCHANGED (in-place UPDATEs)
+            // log no page-0 frame; a later INSERT that grows the file
+            // does. The parent SIGKILLs us with every commit only in the
+            // WAL (well under the 1000-frame auto-checkpoint).
+            let mut db = open_wal(&db_path);
+            db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", [])
+                .unwrap();
+            db.execute("BEGIN", []).unwrap();
+            for i in 1..=200i64 {
+                db.execute("INSERT INTO t (v) VALUES (?)", [Value::Integer(i)])
+                    .unwrap();
+            }
+            db.execute("COMMIT", []).unwrap();
+            for i in 1..=300i64 {
+                db.execute(
+                    "UPDATE t SET v = v + 1000 WHERE id = ?",
+                    [Value::Integer(i % 200 + 1)],
+                )
+                .unwrap();
+            }
+            db.execute("INSERT INTO t (v) VALUES (-1)", []).unwrap();
+            for i in 1..=50i64 {
+                db.execute("UPDATE t SET v = v + 1 WHERE id = ?", [Value::Integer(i)])
+                    .unwrap();
+            }
+            write_marker(&dir, "p1-ready-1");
+            std::thread::sleep(Duration::from_secs(300));
+        }
         "plain_reader" => {
             // Open read-mostly, hold the file open until told to go.
             let db = open_wal(&db_path);
@@ -353,6 +382,32 @@ fn killed_writer_releases_locks_and_state_is_consistent() {
         .unwrap()
         .as_integer();
     assert_eq!(n, 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// WAL commits that leave the header page unchanged log no page-0 frame;
+/// a writer killed with all of them still in the WAL recovers every one
+/// of them on the next open.
+#[test]
+fn killed_writer_recovers_header_free_commits() {
+    let dir = tempdir("hdrfree");
+    let db_path = dir.join(DB_NAME);
+    let mut child = spawn_helper(&dir, "update_crash_writer");
+    assert!(wait_marker(&dir, "p1-ready-1", Duration::from_secs(60)));
+    child.kill().unwrap();
+    let _ = child.wait();
+
+    let db = open_wal(&db_path);
+    let q = |sql: &str| db.query(sql, []).unwrap()[0][0].as_integer();
+    // 200 rows of v = id, +1000 x 300 updates spread over the ids, one
+    // appended row of -1, then +1 on ids 1..=50.
+    assert_eq!(q("SELECT COUNT(*) FROM t"), 201);
+    let expected: i64 = (1..=200i64).sum::<i64>() + 300 * 1000 - 1 + 50;
+    assert_eq!(q("SELECT SUM(v) FROM t"), expected);
+    assert_eq!(q("SELECT v FROM t WHERE id = 201"), -1);
+    let ok = db.query("PRAGMA integrity_check", []).unwrap();
+    assert_eq!(ok[0][0], Value::Text("ok".into()));
+    drop(db);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
