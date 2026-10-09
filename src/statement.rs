@@ -527,7 +527,7 @@ impl<'a> Statement<'a> {
                 &self.cells,
                 &mut self.cell_idx,
                 &mut self.serve_row,
-            ) {
+            )? {
                 self.cell_row_live = true;
                 return Ok(StepResult::Row);
             }
@@ -657,7 +657,7 @@ impl<'a> Statement<'a> {
                             &self.cells,
                             &mut self.cell_idx,
                             &mut self.serve_row,
-                        ) {
+                        )? {
                             self.cell_mode = true;
                             self.cell_row_live = true;
                             return Ok(StepResult::Row);
@@ -1621,8 +1621,8 @@ fn serve_cell_row(
     cells: &[crate::storage::btree::CellEntry],
     cell_idx: &mut usize,
     serve_row: &mut Vec<Value>,
-) -> bool {
-    while *cell_idx < cells.len() {
+) -> Result<bool> {
+    if *cell_idx < cells.len() {
         let entry = cells[*cell_idx];
         *cell_idx += 1;
         if plan.all_rowid {
@@ -1631,7 +1631,7 @@ fn serve_cell_row(
             // degenerates to Integer writes.
             serve_row.clear();
             serve_row.resize(plan.project.len(), Value::Integer(entry.rowid));
-            return true;
+            return Ok(true);
         }
         let start = entry.off as usize;
         let end = start + entry.len as usize;
@@ -1653,12 +1653,12 @@ fn serve_cell_row(
             serve_row,
             plan.mem_pager,
         );
-        if decoded.is_ok() {
-            return true;
-        }
-        // Corrupt entry: skip (mirrors the pooled scan's tolerance).
+        // An undecodable record is corruption: the step fails (it used
+        // to be skipped — a corrupt page silently dropped rows).
+        decoded?;
+        return Ok(true);
     }
-    false
+    Ok(false)
 }
 
 /// Output column names for a scan driver (mirrors exec_scan).
@@ -2478,6 +2478,11 @@ struct ScanDriver {
     append_rowid: bool,
     last_rowid: i64,
     eof: bool,
+    /// A row-level error (undecodable record, raising predicate) hit
+    /// mid-batch: the rows before it are delivered first, the error is
+    /// raised by the NEXT pull — SQLite returns every row up to the
+    /// failing one, then the step that reaches it fails.
+    pending_err: Option<crate::error::Error>,
 }
 
 impl ScanDriver {
@@ -2499,6 +2504,7 @@ impl ScanDriver {
             append_rowid,
             last_rowid: i64::MIN,
             eof: false,
+            pending_err: None,
         }
     }
 }
@@ -2515,6 +2521,10 @@ impl Driver for ScanDriver {
         budget: usize,
         pool: &mut Vec<Row>,
     ) -> Result<Vec<Row>> {
+        if let Some(e) = self.pending_err.take() {
+            return Err(e);
+        }
+        let mut pull_err: Option<crate::error::Error> = None;
         if self.eof {
             return Ok(Vec::new());
         }
@@ -2566,14 +2576,16 @@ impl Driver for ScanDriver {
                 }
                 None => Vec::with_capacity(n_cols + 1),
             };
-            if crate::storage::row_codec::decode_row_into(
+            if let Err(e) = crate::storage::row_codec::decode_row_into(
                 payload,
                 n_cols,
                 rowid,
                 rowid_alias,
                 &mut row,
-            )
-            .is_ok()
+            ) {
+                pull_err = Some(e);
+                return false;
+            }
             {
                 // Hidden rowid slot BEFORE predicate eval: the predicate
                 // may itself reference rowid (name resolution happens
@@ -2584,6 +2596,10 @@ impl Driver for ScanDriver {
                 if let Some(pred) = predicate {
                     match crate::executor::eval_row(pred, &row, &col_names, &params_owned, named) {
                         Ok(v) if v.is_truthy() => {}
+                        Err(e) => {
+                            pull_err = Some(e);
+                            return false;
+                        }
                         _ => {
                             last = last.max(rowid);
                             row.clear();
@@ -2605,11 +2621,16 @@ impl Driver for ScanDriver {
                     hit_end = false;
                     return false;
                 }
-                return true;
+                true
             }
-            last = last.max(rowid);
-            true
         })?;
+        if let Some(e) = pull_err.take() {
+            if out.is_empty() {
+                return Err(e);
+            }
+            self.pending_err = Some(e);
+            hit_end = false;
+        }
         self.eof = hit_end && out.len() < budget;
         self.last_rowid = last;
         Ok(out)
@@ -2638,6 +2659,11 @@ struct FilteredScanDriver {
     append_rowid: bool,
     last_rowid: i64,
     eof: bool,
+    /// A row-level error (undecodable record, raising predicate) hit
+    /// mid-batch: the rows before it are delivered first, the error is
+    /// raised by the NEXT pull — SQLite returns every row up to the
+    /// failing one, then the step that reaches it fails.
+    pending_err: Option<crate::error::Error>,
 }
 
 impl FilteredScanDriver {
@@ -2665,6 +2691,7 @@ impl FilteredScanDriver {
             append_rowid,
             last_rowid: i64::MIN,
             eof: false,
+            pending_err: None,
         }
     }
 }
@@ -2681,6 +2708,10 @@ impl Driver for FilteredScanDriver {
         budget: usize,
         pool: &mut Vec<Row>,
     ) -> Result<Vec<Row>> {
+        if let Some(e) = self.pending_err.take() {
+            return Err(e);
+        }
+        let mut pull_err: Option<crate::error::Error> = None;
         if self.eof {
             return Ok(Vec::new());
         }
@@ -2781,14 +2812,16 @@ impl Driver for FilteredScanDriver {
                         }
                         None => Vec::with_capacity(n_cols + 1),
                     };
-                    if crate::storage::row_codec::decode_row_into(
+                    if let Err(e) = crate::storage::row_codec::decode_row_into(
                         payload,
                         n_cols,
                         rowid,
                         rowid_alias,
                         &mut row,
-                    )
-                    .is_ok()
+                    ) {
+                        pull_err = Some(e);
+                        return false;
+                    }
                     {
                         if append_rowid {
                             row.push(Value::Integer(rowid));
@@ -2812,16 +2845,22 @@ impl Driver for FilteredScanDriver {
                     ) {
                         Some(crate::storage::row_codec::ProbeNum::Int(v)) => {
                             if v >= lo && v <= hi {
-                                if let Ok(mut row) = crate::storage::row_codec::decode_row(
+                                match crate::storage::row_codec::decode_row(
                                     payload,
                                     n_cols,
                                     rowid,
                                     rowid_alias,
                                 ) {
-                                    if append_rowid {
-                                        row.push(Value::Integer(rowid));
+                                    Ok(mut row) => {
+                                        if append_rowid {
+                                            row.push(Value::Integer(rowid));
+                                        }
+                                        out.push(row);
                                     }
-                                    out.push(row);
+                                    Err(e) => {
+                                        pull_err = Some(e);
+                                        return false;
+                                    }
                                 }
                             }
                         }
@@ -2840,14 +2879,16 @@ impl Driver for FilteredScanDriver {
                                 }
                                 None => Vec::with_capacity(n_cols + 1),
                             };
-                            if crate::storage::row_codec::decode_row_into(
+                            if let Err(e) = crate::storage::row_codec::decode_row_into(
                                 payload,
                                 n_cols,
                                 rowid,
                                 rowid_alias,
                                 &mut row,
-                            )
-                            .is_ok()
+                            ) {
+                                pull_err = Some(e);
+                                return false;
+                            }
                             {
                                 if append_rowid {
                                     row.push(Value::Integer(rowid));
@@ -2861,6 +2902,13 @@ impl Driver for FilteredScanDriver {
                     }
                     true
                 })?;
+            }
+            if let Some(e) = pull_err.take() {
+                if out.is_empty() {
+                    return Err(e);
+                }
+                self.pending_err = Some(e);
+                hit_end = false;
             }
             self.eof = hit_end && out.len() < budget;
             self.last_rowid = last;
@@ -2883,15 +2931,17 @@ impl Driver for FilteredScanDriver {
                     }
                     None => Vec::with_capacity(n_cols + 1),
                 };
-                let keep = crate::storage::row_codec::decode_row_into(
+                if let Err(e) = crate::storage::row_codec::decode_row_into(
                     payload,
                     n_cols,
                     rowid,
                     rowid_alias,
                     &mut row,
-                )
-                .is_ok()
-                    && sel_pred.eval(&row, &positions, params);
+                ) {
+                    pull_err = Some(e);
+                    return false;
+                }
+                let keep = sel_pred.eval(&row, &positions, params);
                 if keep {
                     if self.append_rowid {
                         row.push(Value::Integer(rowid));
@@ -2918,17 +2968,16 @@ impl Driver for FilteredScanDriver {
                     return false; // stop the walk; resume next batch
                 }
                 last = last.max(rowid);
-                if crate::storage::row_codec::decode_row_selective(
+                if let Err(e) = crate::storage::row_codec::decode_row_selective(
                     payload,
                     n_cols,
                     &wanted,
                     rowid,
                     rowid_alias,
                     &mut sel_buf,
-                )
-                .is_err()
-                {
-                    return true;
+                ) {
+                    pull_err = Some(e);
+                    return false;
                 }
                 if !sel_pred.eval(&sel_buf, &positions, params) {
                     return true; // non-matching row: selective decode only
@@ -2941,25 +2990,29 @@ impl Driver for FilteredScanDriver {
                     }
                     None => Vec::with_capacity(n_cols + 1),
                 };
-                if crate::storage::row_codec::decode_row_into(
+                if let Err(e) = crate::storage::row_codec::decode_row_into(
                     payload,
                     n_cols,
                     rowid,
                     rowid_alias,
                     &mut row,
-                )
-                .is_ok()
-                {
-                    if self.append_rowid {
-                        row.push(Value::Integer(rowid));
-                    }
-                    out.push(row);
-                } else {
-                    row.clear();
-                    pool.push(row);
+                ) {
+                    pull_err = Some(e);
+                    return false;
                 }
+                if self.append_rowid {
+                    row.push(Value::Integer(rowid));
+                }
+                out.push(row);
                 true
             })?;
+        }
+        if let Some(e) = pull_err.take() {
+            if out.is_empty() {
+                return Err(e);
+            }
+            self.pending_err = Some(e);
+            hit_end = false;
         }
         self.eof = hit_end && out.len() < budget;
         self.last_rowid = last;
@@ -2978,6 +3031,11 @@ struct RangeDriver {
     append_rowid: bool,
     last_rowid: i64,
     eof: bool,
+    /// A row-level error (undecodable record, raising predicate) hit
+    /// mid-batch: the rows before it are delivered first, the error is
+    /// raised by the NEXT pull — SQLite returns every row up to the
+    /// failing one, then the step that reaches it fails.
+    pending_err: Option<crate::error::Error>,
 }
 
 impl RangeDriver {
@@ -3003,6 +3061,7 @@ impl RangeDriver {
             append_rowid,
             last_rowid: i64::MIN,
             eof: false,
+            pending_err: None,
         }
     }
 }
@@ -3019,6 +3078,10 @@ impl Driver for RangeDriver {
         budget: usize,
         pool: &mut Vec<Row>,
     ) -> Result<Vec<Row>> {
+        if let Some(e) = self.pending_err.take() {
+            return Err(e);
+        }
+        let mut pull_err: Option<crate::error::Error> = None;
         if self.eof {
             return Ok(Vec::new());
         }
@@ -3092,14 +3155,16 @@ impl Driver for RangeDriver {
                 }
                 None => Vec::with_capacity(n_cols + 1),
             };
-            if crate::storage::row_codec::decode_row_into(
+            if let Err(e) = crate::storage::row_codec::decode_row_into(
                 payload,
                 n_cols,
                 rowid,
                 rowid_alias,
                 &mut row,
-            )
-            .is_ok()
+            ) {
+                pull_err = Some(e);
+                return false;
+            }
             {
                 // Hidden rowid slot BEFORE residual eval (see ScanDriver).
                 if self.append_rowid {
@@ -3108,6 +3173,10 @@ impl Driver for RangeDriver {
                 if let Some(pred) = residual {
                     match crate::executor::eval_row(pred, &row, &col_names, &params_owned, named) {
                         Ok(v) if v.is_truthy() => {}
+                        Err(e) => {
+                            pull_err = Some(e);
+                            return false;
+                        }
                         _ => {
                             last = last.max(rowid);
                             row.clear();
@@ -3127,11 +3196,16 @@ impl Driver for RangeDriver {
                     hit_end = false;
                     return false;
                 }
-                return true;
+                true
             }
-            last = last.max(rowid);
-            true
         })?;
+        if let Some(e) = pull_err.take() {
+            if out.is_empty() {
+                return Err(e);
+            }
+            self.pending_err = Some(e);
+            hit_end = false;
+        }
         self.eof = hit_end && out.len() < budget;
         self.last_rowid = last;
         Ok(out)
@@ -3221,6 +3295,9 @@ struct FilterDriver {
     /// Leftover rows that matched but exceeded the budget.
     leftover: Vec<Row>,
     base_eof: bool,
+    /// A raising predicate mid-batch: the matched rows before it are
+    /// delivered, the error is raised by the next pull (SQLite's order).
+    pending_err: Option<crate::error::Error>,
 }
 
 impl FilterDriver {
@@ -3230,6 +3307,7 @@ impl FilterDriver {
             predicate,
             leftover: Vec::new(),
             base_eof: false,
+            pending_err: None,
         }
     }
 }
@@ -3251,6 +3329,9 @@ impl Driver for FilterDriver {
             let out: Vec<Row> = self.leftover.drain(..take).collect();
             return Ok(out);
         }
+        if let Some(e) = self.pending_err.take() {
+            return Err(e);
+        }
         if self.base_eof {
             return Ok(Vec::new());
         }
@@ -3267,15 +3348,26 @@ impl Driver for FilterDriver {
                 break;
             }
             for row in batch {
-                let keep = crate::executor::eval_row(
+                // A raising predicate fails the step (it used to drop the
+                // row silently — the materialized path raised): rows
+                // matched before it are delivered first.
+                let keep = match crate::executor::eval_row(
                     &self.predicate,
                     &row,
                     &col_names,
                     &params_owned,
                     named,
-                )
-                .map(|v| v.is_truthy())
-                .unwrap_or(false);
+                ) {
+                    Ok(v) => v.is_truthy(),
+                    Err(e) => {
+                        if matched.is_empty() {
+                            return Err(e);
+                        }
+                        self.pending_err = Some(e);
+                        self.base_eof = true;
+                        return Ok(matched);
+                    }
+                };
                 if keep {
                     matched.push(row);
                     if matched.len() >= budget {

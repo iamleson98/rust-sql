@@ -572,18 +572,19 @@ pub(crate) fn try_parallel_distinct_aggregate(
                 let mut states: Vec<AggState> = (0..n_aggs).map(|_| AggState::default()).collect();
                 let mut saw_any_row = false;
                 let mut sel_buf: Vec<Value> = Vec::with_capacity(wanted.len());
+                // An undecodable record is corruption: fail, never skip.
+                let mut decode_err: Option<crate::error::Error> = None;
                 bt.scan_table_range_borrowed(lo, hi, |rowid, payload| {
-                    if crate::storage::row_codec::decode_row_selective(
+                    if let Err(e) = crate::storage::row_codec::decode_row_selective(
                         payload,
                         n_cols,
                         &wanted,
                         rowid,
                         rowid_alias,
                         &mut sel_buf,
-                    )
-                    .is_err()
-                    {
-                        return true; // skip corrupt rows (serial contract)
+                    ) {
+                        decode_err = Some(e);
+                        return false;
                     }
                     if let Some(pred) = &compiled {
                         if !pred.eval(&sel_buf, &positions, params) {
@@ -610,6 +611,9 @@ pub(crate) fn try_parallel_distinct_aggregate(
                     }
                     true
                 })?;
+                if let Some(e) = decode_err {
+                    return Err(e);
+                }
                 Ok((states, saw_any_row))
             }));
         }
@@ -802,18 +806,19 @@ pub(crate) fn try_parallel_groupby_selective(
                 grouper.set_key_collations(key_collations);
                 let mut sel_buf: Vec<Value> = Vec::with_capacity(wanted.len().max(1));
                 let mut key_buf: Vec<Value> = Vec::with_capacity(key_pos.len());
+                // An undecodable record is corruption: fail, never skip.
+                let mut decode_err: Option<crate::error::Error> = None;
                 bt.scan_table_range_borrowed(lo, hi, |rowid, payload| {
-                    if crate::storage::row_codec::decode_row_selective(
+                    if let Err(e) = crate::storage::row_codec::decode_row_selective(
                         payload,
                         n_cols,
                         wanted,
                         rowid,
                         rowid_alias,
                         &mut sel_buf,
-                    )
-                    .is_err()
-                    {
-                        return true; // skip corrupt rows (serial branch's contract)
+                    ) {
+                        decode_err = Some(e);
+                        return false;
                     }
                     key_buf.clear();
                     for &pos in key_pos.iter() {
@@ -844,6 +849,9 @@ pub(crate) fn try_parallel_groupby_selective(
                     }
                     true
                 })?;
+                if let Some(e) = decode_err {
+                    return Err(e);
+                }
                 Ok(grouper)
             }));
         }
@@ -1221,18 +1229,19 @@ pub(crate) fn try_parallel_groupby_compiled(
                 let mut wide: Vec<Value> = vec![Value::Null; n_cols];
                 let mut key_buf: Vec<Value> = Vec::with_capacity(group_by_len.max(1));
                 let mut owned_key: Value = Value::Null;
+                // An undecodable record is corruption: fail, never skip.
+                let mut decode_err: Option<crate::error::Error> = None;
                 bt.scan_table_range_borrowed(lo, hi, |rowid, payload| {
-                    if crate::storage::row_codec::decode_row_selective_wide(
+                    if let Err(e) = crate::storage::row_codec::decode_row_selective_wide(
                         payload,
                         n_cols,
                         wanted,
                         rowid,
                         rowid_alias,
                         &mut wide,
-                    )
-                    .is_err()
-                    {
-                        return true; // skip corrupt rows (serial branch's contract)
+                    ) {
+                        decode_err = Some(e);
+                        return false;
                     }
                     if let Some(cp) = filter {
                         if !cp.eval(&wide, identity, params) {
@@ -1288,6 +1297,9 @@ pub(crate) fn try_parallel_groupby_compiled(
                     }
                     true
                 })?;
+                if let Some(e) = decode_err {
+                    return Err(e);
+                }
                 Ok(grouper)
             }));
         }
@@ -1657,18 +1669,19 @@ pub(crate) fn try_parallel_topn_expr(
                 let mut bt = Btree::new(pager, root, false);
                 let mut sel: Vec<super::TopnSel> = Vec::with_capacity(keep.min(4096));
                 let mut wide: Vec<Value> = Vec::with_capacity(n_cols + 1);
+                // An undecodable record is corruption: fail, never skip.
+                let mut decode_err: Option<crate::error::Error> = None;
                 bt.scan_table_range_borrowed(lo, hi, |rowid, payload| {
-                    if crate::storage::row_codec::decode_row_selective_wide(
+                    if let Err(e) = crate::storage::row_codec::decode_row_selective_wide(
                         payload,
                         n_cols,
                         identity,
                         rowid,
                         rowid_alias,
                         &mut wide,
-                    )
-                    .is_err()
-                    {
-                        return true; // skip corrupt rows (serial contract)
+                    ) {
+                        decode_err = Some(e);
+                        return false;
                     }
                     wide.push(Value::Integer(rowid));
                     let key = compiled.eval(&wide, params);
@@ -1714,6 +1727,9 @@ pub(crate) fn try_parallel_topn_expr(
                     }
                     true
                 })?;
+                if let Some(e) = decode_err {
+                    return Err(e);
+                }
                 Ok(sel)
             }));
         }
@@ -1926,18 +1942,19 @@ pub(crate) fn try_parallel_sort_expr(
                 let mut bt = Btree::new(pager, root, false);
                 let mut wide: Vec<Value> = Vec::with_capacity(n_cols + 1);
                 let mut rows: Vec<(i64, Vec<Value>, Row)> = Vec::new();
+                // An undecodable record is corruption: fail, never skip.
+                let mut decode_err: Option<crate::error::Error> = None;
                 bt.scan_table_range_borrowed(lo, hi, |rowid, payload| {
-                    if crate::storage::row_codec::decode_row_selective_wide(
+                    if let Err(e) = crate::storage::row_codec::decode_row_selective_wide(
                         payload,
                         n_cols,
                         identity,
                         rowid,
                         rowid_alias,
                         &mut wide,
-                    )
-                    .is_err()
-                    {
-                        return true; // skip corrupt rows (serial contract)
+                    ) {
+                        decode_err = Some(e);
+                        return false;
                     }
                     // Trailing rowid slot (Col(n_cols) reads it; ordinal
                     // terms over the hidden slot address it too).
@@ -1958,6 +1975,9 @@ pub(crate) fn try_parallel_sort_expr(
                     wide.truncate(rowid_slot);
                     true
                 })?;
+                if let Some(e) = decode_err {
+                    return Err(e);
+                }
                 rows.sort_unstable_by(|a, b| expr_sort_cmp(&a.1, a.0, &b.1, b.0, resolved));
                 Ok(ExprSortChunk { rows })
             }));
@@ -3141,18 +3161,19 @@ pub(crate) fn try_parallel_join_probe(
                     Vec::new()
                 };
                 let mut bt = Btree::new(pager, probe_root, false);
+                // An undecodable record is corruption: fail, never skip.
+                let mut decode_err: Option<crate::error::Error> = None;
                 bt.scan_table_range_borrowed(lo, hi, |rowid, payload| {
-                    if crate::storage::row_codec::decode_row_selective_sorted(
+                    if let Err(e) = crate::storage::row_codec::decode_row_selective_sorted(
                         payload,
                         probe_n_cols,
                         &wanted,
                         rowid,
                         probe_alias,
                         &mut pbuf,
-                    )
-                    .is_err()
-                    {
-                        return true; // corrupt row: skip (serial parity)
+                    ) {
+                        decode_err = Some(e);
+                        return false;
                     }
                     let mut key_ok = true;
                     for (j, &kp) in probe_key_pos.iter().enumerate() {
@@ -3309,6 +3330,9 @@ pub(crate) fn try_parallel_join_probe(
                     }
                     true
                 })?;
+                if let Some(e) = decode_err {
+                    return Err(e);
+                }
                 Ok((out_rows, bitmap))
             }));
         }

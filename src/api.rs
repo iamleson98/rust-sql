@@ -379,6 +379,22 @@ pub struct Database {
     /// ROLLBACK TO restores the maps Arc wholesale — root overrides and
     /// max-rowid caches move with the rolled-back pages.
     savepoint_maps: Mutex<Vec<std::sync::Arc<crate::executor::StmtMaps>>>,
+    /// The catalog as it was before the open transaction's FIRST DDL
+    /// statement (taken lazily — data-only transactions never clone it).
+    /// DDL mutates the in-memory catalog in place, so without this a
+    /// ROLLBACK restored the schema PAGES but kept the rolled-back tables
+    /// and indexes in the catalog: queries planned through an index whose
+    /// pages no longer existed ("page N out of range"), and re-creating
+    /// it failed "already exists". TEMP objects (catalog-only, never in
+    /// the schema b-tree) are why this is a snapshot, not a reload.
+    txn_catalog_snap: Mutex<Option<Arc<Catalog>>>,
+    /// Per-savepoint pre-DDL catalogs, aligned with `savepoint_maps`:
+    /// slot i holds the catalog at the first DDL after savepoint i (the
+    /// state ROLLBACK TO i restores); `None` = no DDL since.
+    savepoint_catalogs: Mutex<Vec<Option<Arc<Catalog>>>>,
+    /// A ROLLBACK's pre-DDL catalog awaiting reinstatement once the
+    /// statement that rolled back returns (see `execute_cached_stmt`).
+    catalog_restore_pending: Mutex<Option<Arc<Catalog>>>,
     /// True when the open transaction was started by SAVEPOINT (not
     /// BEGIN) — releasing the outermost savepoint then COMMITS.
     savepoint_txn: AtomicBool,
@@ -2525,6 +2541,9 @@ impl Database {
             concurrent_active: AtomicBool::new(false),
             plain_dml_tid: AtomicU64::new(0),
             savepoint_maps: Mutex::new(Vec::new()),
+            txn_catalog_snap: Mutex::new(None),
+            savepoint_catalogs: Mutex::new(Vec::new()),
+            catalog_restore_pending: Mutex::new(None),
             savepoint_txn: AtomicBool::new(false),
             preupdate_hook: crate::preupdate::HookSlot::new(None),
             has_preupdate_hook: AtomicBool::new(false),
@@ -2924,6 +2943,9 @@ impl Database {
             concurrent_active: AtomicBool::new(false),
             plain_dml_tid: AtomicU64::new(0),
             savepoint_maps: Mutex::new(Vec::new()),
+            txn_catalog_snap: Mutex::new(None),
+            savepoint_catalogs: Mutex::new(Vec::new()),
+            catalog_restore_pending: Mutex::new(None),
             savepoint_txn: AtomicBool::new(false),
             preupdate_hook: crate::preupdate::HookSlot::new(None),
             has_preupdate_hook: AtomicBool::new(false),
@@ -6027,7 +6049,12 @@ impl Database {
         bt.scan_table(|rowid, payload| {
             if let Ok(row) = decode_row(payload, 5, 0, None) {
                 if let Some((k, n, _, _, _)) = crate::schema::decode_schema_row(&row) {
-                    if k == kind && n.eq_ignore_ascii_case(name) {
+                    // A WITHOUT ROWID table's hidden PK-index row moves
+                    // with its tree like any index row (a stale root on
+                    // reopen would cut the index off at its old root).
+                    let kind_matches =
+                        k == kind || (kind == "index" && crate::schema::is_index_schema_kind(k));
+                    if kind_matches && n.eq_ignore_ascii_case(name) {
                         found = Some((rowid, row));
                         return false;
                     }
@@ -6369,6 +6396,21 @@ impl Database {
         cached: Arc<CachedStmt>,
         params: P,
     ) -> Result<()> {
+        let r = self.execute_cached_stmt_inner(sql, cached, params);
+        // A ROLLBACK that undid DDL parked its pre-DDL catalog: reinstate
+        // it now that no statement context borrows the engine.
+        if let Some(snap) = self.catalog_restore_pending.get_mut().take() {
+            self.restore_catalog_snapshot(snap);
+        }
+        r
+    }
+
+    fn execute_cached_stmt_inner<P: Params>(
+        &mut self,
+        sql: &str,
+        cached: Arc<CachedStmt>,
+        params: P,
+    ) -> Result<()> {
         // Write-epoch bump (mirrors execute_stmt's prelude — the router
         // enters here DIRECTLY on the attached engine, skipping the
         // prelude; the double bump on the plain path is a harmless count
@@ -6376,6 +6418,10 @@ impl Database {
         self.write_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         let is_ddl = is_ddl_sql(sql);
+        if is_ddl || matches!(cached.stmt.as_ref(), Statement::Analyze { .. }) {
+            self.snapshot_catalog_before_ddl();
+        }
+
         let dirty_before = self.pager.dirty_page_count() as u64;
         // Marked-dirty watermark for the fast-insert recovery paths
         // (captured here: the chained/byte-scanner fast paths ran in
@@ -7150,6 +7196,11 @@ impl Database {
             let keep = self.maps.read().clone();
             *self.maps.get_mut() = restored.unwrap_or(keep);
             self.refresh_maps_flag();
+            // DDL inside the transaction: the catalog returns to its
+            // pre-DDL state with the pages (applied below, once the
+            // statement context's borrow of the pager ends).
+            self.savepoint_catalogs.lock().clear();
+            *self.catalog_restore_pending.lock() = self.txn_catalog_snap.lock().take();
             // `schema_root_pages` mirrors "what the schema rows on disk
             // say" — after rollback that is exactly the begin-time roots.
             {
@@ -7246,6 +7297,10 @@ impl Database {
                         _ => self.attached_rollback(),
                     }
                     *self.txn_maps_snap.write() = None;
+                    // The transaction is over (COMMIT kept its DDL; a
+                    // ROLLBACK already restored the snapshot above).
+                    *self.txn_catalog_snap.lock() = None;
+                    self.savepoint_catalogs.lock().clear();
                     self.txn_owner_tid.store(0, Ordering::Release);
                     // Committed-view entries: `clear_savepoints` (run by
                     // the COMMIT/ROLLBACK machinery above) already removed
@@ -9601,7 +9656,45 @@ impl Database {
         self.savepoint_maps
             .lock()
             .push(std::sync::Arc::new((**self.maps.read()).clone()));
+        self.savepoint_catalogs.lock().push(None);
         Ok(())
+    }
+
+    /// Before a DDL (or ANALYZE) statement inside a transaction: record
+    /// the current catalog as the restore point of the transaction and of
+    /// every savepoint that has no restore point yet (they all saw this
+    /// same catalog since their creation — only DDL changes it).
+    fn snapshot_catalog_before_ddl(&self) {
+        if !self.in_transaction.load(Ordering::Acquire) {
+            return;
+        }
+        let mut txn = self.txn_catalog_snap.lock();
+        let mut sps = self.savepoint_catalogs.lock();
+        if txn.is_some() && sps.iter().all(|s| s.is_some()) {
+            return;
+        }
+        let snap = Arc::new(self.catalog.clone());
+        if txn.is_none() {
+            *txn = Some(Arc::clone(&snap));
+        }
+        for slot in sps.iter_mut().filter(|s| s.is_none()) {
+            *slot = Some(Arc::clone(&snap));
+        }
+    }
+
+    /// Reinstate a pre-DDL catalog (ROLLBACK / ROLLBACK TO): every plan,
+    /// prepared statement and join cache built against the rolled-back
+    /// schema is invalid.
+    fn restore_catalog_snapshot(&mut self, snap: Arc<Catalog>) {
+        let mut catalog = Arc::try_unwrap(snap).unwrap_or_else(|a| (*a).clone());
+        // The pager's in-memory cookie only moves forward; keep the
+        // catalog in step so cookie-keyed caches revalidate.
+        catalog.schema_cookie = self.pager.schema_cookie();
+        self.catalog = catalog;
+        self.invalidate_stmt_cache();
+        self.seen_hashes.lock().clear();
+        self.schema_epoch.fetch_add(1, Ordering::AcqRel);
+        self.pager.join_build_cache().lock().clear();
     }
 
     /// ROLLBACK TO SAVEPOINT <name> — restore pager + bookkeeping maps to
@@ -9613,8 +9706,17 @@ impl Database {
         self.txn_has_ddl.store(true, Ordering::Release);
         self.schema_epoch.fetch_add(1, Ordering::Release);
         self.pager.clear_committed_view();
+        // The pager's stack carries a BEGIN-started transaction's
+        // internal `__begin__` level below the user savepoints that
+        // `savepoint_maps` / `savepoint_catalogs` mirror: translate its
+        // depth (counting from the bottom of ITS stack) into theirs.
+        let internal_levels = self
+            .pager
+            .savepoint_depth()
+            .saturating_sub(self.savepoint_maps.lock().len());
         match self.pager.rollback_savepoint(name)? {
             Some(depth) => {
+                let depth = depth.saturating_sub(internal_levels);
                 let mut maps_snaps = self.savepoint_maps.lock();
                 maps_snaps.truncate(depth);
                 if let Some(restored) = maps_snaps.last().cloned() {
@@ -9623,6 +9725,17 @@ impl Database {
                     // Restored shadow pages may have pulled content rows
                     // out from under vtab modules' in-memory state.
                     self.resync_vtabs_after_rollback();
+                }
+                drop(maps_snaps);
+                // DDL since the savepoint: its pre-DDL catalog comes back
+                // (the savepoint stays open, with no DDL since).
+                let snap = {
+                    let mut cats = self.savepoint_catalogs.lock();
+                    cats.truncate(depth);
+                    cats.last_mut().and_then(|slot| slot.take())
+                };
+                if let Some(snap) = snap {
+                    self.restore_catalog_snapshot(snap);
                 }
                 Ok(())
             }
@@ -9640,13 +9753,23 @@ impl Database {
         self.txn_has_ddl.store(true, Ordering::Release);
         self.schema_epoch.fetch_add(1, Ordering::Release);
         self.pager.clear_committed_view();
+        // See exec_rollback_to_savepoint: the pager's depth counts the
+        // internal `__begin__` level the user-savepoint mirrors lack.
+        let internal_levels = self
+            .pager
+            .savepoint_depth()
+            .saturating_sub(self.savepoint_maps.lock().len());
         match self.pager.release_savepoint(name) {
             Some(remaining) => {
-                self.savepoint_maps.lock().truncate(remaining);
+                let user_remaining = remaining.saturating_sub(internal_levels);
+                self.savepoint_maps.lock().truncate(user_remaining);
+                self.savepoint_catalogs.lock().truncate(user_remaining);
                 if remaining == 0 && self.savepoint_txn.load(Ordering::Acquire) {
                     // Outermost savepoint released -> COMMIT.
                     self.pager.clear_savepoints();
                     self.savepoint_maps.lock().clear();
+                    self.savepoint_catalogs.lock().clear();
+                    *self.txn_catalog_snap.lock() = None;
                     self.savepoint_txn.store(false, Ordering::Release);
                     self.in_transaction.store(false, Ordering::Release);
                     *self.txn_snapshot.lock() = None;
@@ -11965,13 +12088,22 @@ impl Database {
                     0
                 };
                 let mut rows = Vec::with_capacity(est);
+                // Match the general path: an undecodable row is corruption
+                // and fails the statement.
+                let mut decode_err: Option<Error> = None;
                 bt.scan_table_range_borrowed(lo, hi, |rowid, payload| {
-                    // Match the general path: skip undecodable rows.
-                    if let Ok(row) = decode_projected(payload, table, rowid, project.as_deref()) {
-                        rows.push(row);
+                    match decode_projected(payload, table, rowid, project.as_deref()) {
+                        Ok(row) => rows.push(row),
+                        Err(e) => {
+                            decode_err = Some(e);
+                            return false;
+                        }
                     }
                     true
                 })?;
+                if let Some(e) = decode_err {
+                    return Err(e);
+                }
                 Ok(rows)
             }
         }
@@ -12522,35 +12654,44 @@ impl Database {
             .collect();
         let params: Vec<Value> = Vec::new();
         let named_params = std::collections::HashMap::new();
+        let mut decode_err: Option<Error> = None;
         bt.scan_table(|rowid, payload| {
-            if let Ok(row) = decode_row(payload, n_cols, rowid, table.rowid_alias) {
-                // Partial index: only rows matching the predicate.
-                if let Some(p) = &index.partial_expr {
-                    match Self::analyze_eval_expr(p, &row, &named, &params, &named_params) {
-                        Ok(v) if v.is_truthy() => {}
-                        _ => return true,
-                    }
+            let row = match decode_row(payload, n_cols, rowid, table.rowid_alias) {
+                Ok(r) => r,
+                Err(e) => {
+                    decode_err = Some(e);
+                    return false;
                 }
-                let mut folded = Vec::with_capacity(idx_cols.len());
-                let mut raw = Vec::with_capacity(idx_cols.len());
-                for c in idx_cols {
-                    let v = match &c.expr {
-                        Some(e) => Self::analyze_eval_expr(e, &row, &named, &params, &named_params)
-                            .unwrap_or(Value::Null),
-                        None => row
-                            .iter()
-                            .enumerate()
-                            .find(|(i, _)| table.columns[*i].name.eq_ignore_ascii_case(&c.name))
-                            .map(|(_, v)| v.clone())
-                            .unwrap_or(Value::Null),
-                    };
-                    folded.push(collation_fold_key_ref(&c.collation, &v).into_owned());
-                    raw.push(v);
+            };
+            // Partial index: only rows matching the predicate.
+            if let Some(p) = &index.partial_expr {
+                match Self::analyze_eval_expr(p, &row, &named, &params, &named_params) {
+                    Ok(v) if v.is_truthy() => {}
+                    _ => return true,
                 }
-                entries.push((folded, raw, rowid));
             }
+            let mut folded = Vec::with_capacity(idx_cols.len());
+            let mut raw = Vec::with_capacity(idx_cols.len());
+            for c in idx_cols {
+                let v = match &c.expr {
+                    Some(e) => Self::analyze_eval_expr(e, &row, &named, &params, &named_params)
+                        .unwrap_or(Value::Null),
+                    None => row
+                        .iter()
+                        .enumerate()
+                        .find(|(i, _)| table.columns[*i].name.eq_ignore_ascii_case(&c.name))
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or(Value::Null),
+                };
+                folded.push(collation_fold_key_ref(&c.collation, &v).into_owned());
+                raw.push(v);
+            }
+            entries.push((folded, raw, rowid));
             true
         })?;
+        if let Some(e) = decode_err {
+            return Err(e);
+        }
         drop(bt);
         let _ = catalog;
         // Index order: folded column values with DESC columns inverted,
@@ -13190,6 +13331,19 @@ impl Database {
                             page.lock().init_leaf_index();
                         }
                         let idx_columns = crate::schema::build_index_columns(&pk_cols, &table)?;
+                        // Persist the root in a hidden schema row (see
+                        // WRPK_SCHEMA_TYPE) so reopen adopts this tree.
+                        if !temp {
+                            let schema_row = crate::schema::encode_schema_row_opt(
+                                crate::schema::WRPK_SCHEMA_TYPE,
+                                &idx_name,
+                                &table.name,
+                                idx_root,
+                                None,
+                            );
+                            insert_schema_row(ctx.pager, &schema_row)?;
+                            ctx.pager.stamp_current_format()?;
+                        }
                         catalog.add_index(crate::schema::Index {
                             name: idx_name,
                             table: table.name.clone(),
@@ -13373,17 +13527,16 @@ impl Database {
                         // any-indexed-column-is-NULL rule).
                         let mut arena: Vec<u8> = Vec::new();
                         let mut recs: Vec<BackfillRec> = Vec::new();
-                        table_bt.scan_table_borrowed(|rowid, payload| {
-                            if crate::storage::row_codec::decode_row_into(
+                        let scan_res = table_bt.scan_table_borrowed(|rowid, payload| {
+                            if let Err(e) = crate::storage::row_codec::decode_row_into(
                                 payload,
                                 n_cols,
                                 rowid,
                                 alias,
                                 &mut row_buf,
-                            )
-                            .is_err()
-                            {
-                                return true; // skip corrupt rows
+                            ) {
+                                backfill_err = Some(e);
+                                return false;
                             }
                             if let Some(pred) = &partial {
                                 match crate::executor::eval_row_public(
@@ -13424,9 +13577,9 @@ impl Database {
                                 });
                             }
                             true
-                        })?;
-                        if let Some(e) = backfill_err {
-                            return Err(e);
+                        });
+                        if let Err(e) = scan_res.and(backfill_err.map_or(Ok(()), Err)) {
+                            return Err(abandon_index_build(ctx.pager, index_bt.root, e));
                         }
                         // Sort by (key, rowid) — the tree's total order.
                         backfill_sort_recs(&mut recs, &arena);
@@ -13446,10 +13599,14 @@ impl Database {
                                             .map(|c| c.name.as_str())
                                             .collect::<Vec<_>>()
                                             .join(", ");
-                                        return Err(Error::constraint(format!(
-                                            "UNIQUE constraint failed: {}.{}",
-                                            table_name, cols
-                                        )));
+                                        return Err(abandon_index_build(
+                                            ctx.pager,
+                                            index_bt.root,
+                                            Error::constraint(format!(
+                                                "UNIQUE constraint failed: {}.{}",
+                                                table_name, cols
+                                            )),
+                                        ));
                                     }
                                 }
                                 prev = Some((key, null_exempt));
@@ -13461,21 +13618,25 @@ impl Database {
                         let mut hint = None;
                         for r in &recs {
                             let key = backfill_key(r, &arena);
-                            hint = index_bt.insert_index_append_hinted(key, r.rowid, hint)?;
+                            hint = match index_bt.insert_index_append_hinted(key, r.rowid, hint) {
+                                Ok(h) => h,
+                                Err(e) => {
+                                    return Err(abandon_index_build(ctx.pager, index_bt.root, e))
+                                }
+                            };
                         }
                         final_root = index_bt.root;
                     } else {
-                        table_bt.scan_table_borrowed(|rowid, payload| {
-                            if crate::storage::row_codec::decode_row_into(
+                        let scan_res = table_bt.scan_table_borrowed(|rowid, payload| {
+                            if let Err(e) = crate::storage::row_codec::decode_row_into(
                                 payload,
                                 n_cols,
                                 rowid,
                                 alias,
                                 &mut row_buf,
-                            )
-                            .is_err()
-                            {
-                                return true; // skip corrupt rows
+                            ) {
+                                backfill_err = Some(e);
+                                return false;
                             }
                             // Partial index: only rows matching the WHERE clause.
                             if let Some(pred) = &partial {
@@ -13546,9 +13707,9 @@ impl Database {
                                 }
                             }
                             true
-                        })?;
-                        if let Some(e) = backfill_err {
-                            return Err(e);
+                        });
+                        if let Err(e) = scan_res.and(backfill_err.map_or(Ok(()), Err)) {
+                            return Err(abandon_index_build(ctx.pager, index_bt.root, e));
                         }
                         // Splits during the backfill may have moved the root.
                         final_root = index_bt.root;
@@ -13991,7 +14152,9 @@ impl Database {
                         if let Some((kind, _n, tbl_name, _rootpage, _sql)) =
                             crate::schema::decode_schema_row(&row)
                         {
-                            if kind == "index" && tbl_name.eq_ignore_ascii_case(&d.name) {
+                            if crate::schema::is_index_schema_kind(kind)
+                                && tbl_name.eq_ignore_ascii_case(&d.name)
+                            {
                                 to_delete.push(rowid);
                             }
                         }
@@ -14298,14 +14461,23 @@ impl Database {
                     let mut updates: Vec<(i64, Vec<u8>)> = Vec::new();
                     {
                         let mut bt = Btree::new(ctx.pager, live_root, false);
+                        let mut decode_err: Option<Error> = None;
                         bt.scan_table(|rowid, payload| {
-                            if let Ok(mut row) = decode_row(payload, n_cols, rowid, alias) {
-                                row.push(default_value.clone());
-                                let new_payload = encode_row_aliased(&row, alias);
-                                updates.push((rowid, new_payload));
-                            }
+                            let mut row = match decode_row(payload, n_cols, rowid, alias) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    decode_err = Some(e);
+                                    return false;
+                                }
+                            };
+                            row.push(default_value.clone());
+                            let new_payload = encode_row_aliased(&row, alias);
+                            updates.push((rowid, new_payload));
                             true
                         })?;
+                        if let Some(e) = decode_err {
+                            return Err(e);
+                        }
                     }
                     let mut bt = Btree::new(ctx.pager, live_root, false);
                     for (rowid, payload) in updates {
@@ -14712,24 +14884,33 @@ impl Database {
                     let mut updates: Vec<(i64, Vec<u8>)> = Vec::new();
                     {
                         let mut bt = Btree::new(ctx.pager, live_root, false);
+                        let mut decode_err: Option<Error> = None;
                         bt.scan_table(|rowid, payload| {
-                            if let Ok(mut row) = decode_row(payload, old_n_cols, rowid, old_alias) {
-                                if col_idx < row.len() {
-                                    row.remove(col_idx);
+                            let mut row = match decode_row(payload, old_n_cols, rowid, old_alias) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    decode_err = Some(e);
+                                    return false;
                                 }
-                                // Rowid-alias marker may shift: the alias
-                                // column's encoded position moved when a
-                                // column before it was dropped.
-                                let new_alias = if dropped_is_before_alias {
-                                    old_alias.map(|a| a - 1)
-                                } else {
-                                    old_alias
-                                };
-                                let new_payload = encode_row_aliased(&row, new_alias);
-                                updates.push((rowid, new_payload));
+                            };
+                            if col_idx < row.len() {
+                                row.remove(col_idx);
                             }
+                            // Rowid-alias marker may shift: the alias
+                            // column's encoded position moved when a
+                            // column before it was dropped.
+                            let new_alias = if dropped_is_before_alias {
+                                old_alias.map(|a| a - 1)
+                            } else {
+                                old_alias
+                            };
+                            let new_payload = encode_row_aliased(&row, new_alias);
+                            updates.push((rowid, new_payload));
                             true
                         })?;
+                        if let Some(e) = decode_err {
+                            return Err(e);
+                        }
                     }
                     let mut bt = Btree::new(ctx.pager, live_root, false);
                     for (rowid, payload) in updates {
@@ -16664,7 +16845,16 @@ fn rewrite_index_tbl_names(pager: &Pager, old_table: &str, new_table: &str) -> R
             if let Some((kind, name, tbl_name, rootpage, sql)) =
                 crate::schema::decode_schema_row(&row)
             {
-                if kind == "index" && tbl_name.eq_ignore_ascii_case(old_table) {
+                if kind == crate::schema::WRPK_SCHEMA_TYPE
+                    && tbl_name.eq_ignore_ascii_case(old_table)
+                {
+                    // Hidden WITHOUT ROWID PK row: same type, NULL sql.
+                    let internal = crate::schema::rootpage_to_internal(rootpage);
+                    updates.push((
+                        rowid,
+                        crate::schema::encode_schema_row_opt(kind, name, new_table, internal, None),
+                    ));
+                } else if kind == "index" && tbl_name.eq_ignore_ascii_case(old_table) {
                     let new_sql = rewrite_on_table(sql, old_table, new_table);
                     // rootpage decodes in SQLite's 1-based convention —
                     // back to internal before re-encoding (+1 again).
@@ -16846,7 +17036,9 @@ fn delete_schema_row(pager: &Pager, kind: &str, name: &str) -> Result<()> {
     bt.scan_table(|rowid, payload| {
         if let Ok(row) = decode_row(payload, 5, 0, None) {
             if let Some((k, n, _, _, _)) = crate::schema::decode_schema_row(&row) {
-                if k == kind && n.eq_ignore_ascii_case(name) {
+                let kind_matches =
+                    k == kind || (kind == "index" && crate::schema::is_index_schema_kind(k));
+                if kind_matches && n.eq_ignore_ascii_case(name) {
                     to_delete.push(rowid);
                 }
             }
@@ -16857,6 +17049,23 @@ fn delete_schema_row(pager: &Pager, kind: &str, name: &str) -> Result<()> {
         bt.delete_table(rowid)?;
     }
     Ok(())
+}
+
+/// A failed CREATE INDEX backfill (UNIQUE violation, bad partial
+/// predicate, I/O): free the partly built tree — from its CURRENT root,
+/// splits move it — then hand back the statement's error. A file-backed
+/// autocommit statement is also restored page-wise afterwards, but an
+/// in-memory / deferred-flush or in-transaction one is not: without this
+/// its root and every built page stayed allocated and unreferenced
+/// ("Page N is never used").
+fn abandon_index_build(pager: &Pager, root: u32, err: Error) -> Error {
+    let mut pages = Vec::new();
+    if crate::storage::btree::collect_tree_pages(pager, root, &mut pages).is_ok() {
+        for p in pages {
+            let _ = pager.free_page(p);
+        }
+    }
+    err
 }
 
 /// Load the schema from the schema table (page 0) into the catalog.
@@ -16885,9 +17094,20 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
     // SQLite — they are rebuilt from the TABLE's DDL, not parsed).
     let mut index_row_by_name: std::collections::HashMap<String, (u32, String)> =
         std::collections::HashMap::new();
+    // Hidden WITHOUT ROWID PK index rows (WRPK_SCHEMA_TYPE), keyed by the
+    // lowercased table name: the persisted root the table branch adopts.
+    let mut wrpk_root_by_table: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
     for row in entries {
         if let Some((kind, _name, tbl_name, rootpage, sql)) = crate::schema::decode_schema_row(&row)
         {
+            if kind == crate::schema::WRPK_SCHEMA_TYPE {
+                wrpk_root_by_table.insert(
+                    tbl_name.to_ascii_lowercase(),
+                    crate::schema::rootpage_to_internal(rootpage),
+                );
+                continue;
+            }
             if kind == "index" {
                 // Persisted rootpages follow SQLite's 1-based convention —
                 // convert to the engine's internal 0-based ids for the
@@ -16971,8 +17191,11 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
                                     .keys()
                                     .filter(|k| k.to_ascii_lowercase().starts_with(&prefix))
                                     .count();
+                                let persisted = wrpk_root_by_table
+                                    .get(&table.name.to_ascii_lowercase())
+                                    .copied();
                                 rebuild_without_rowid_pk_index(
-                                    pager, &table, &pk_cols, n_autoidx, catalog,
+                                    pager, &table, &pk_cols, n_autoidx, catalog, persisted,
                                 )?;
                             }
                         }
@@ -17164,19 +17387,39 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
     Ok(())
 }
 
-/// Rebuild a WITHOUT ROWID table's engine-internal PK index on reopen
-/// (`IndexOrigin::WithoutRowidPk` — no schema row, fresh root page):
-/// scan the table's rows and insert one index entry per row.
+/// Register a WITHOUT ROWID table's engine-internal PK index on reopen
+/// (`IndexOrigin::WithoutRowidPk`). A file that recorded the index's root
+/// in its hidden schema row (`WRPK_SCHEMA_TYPE`) ADOPTS that tree as is.
+/// A file without one (written before the row existed) gets a one-time
+/// rebuild — scan the table's rows, insert one entry per row — and the
+/// new root is recorded so later opens adopt it. (The pages earlier
+/// versions rebuilt on every open stay orphaned until VACUUM.)
 fn rebuild_without_rowid_pk_index(
     pager: &Pager,
     table: &crate::schema::Table,
     pk_cols: &[crate::sql::ast::IndexedColumn],
     n_autoindexes: usize,
     catalog: &mut Catalog,
+    persisted_root: Option<u32>,
 ) -> Result<()> {
     // SQLite's naming: N runs after every other autoindex of the table
     // (see the CREATE-time synthesis above — no uniques -> _1, etc.).
     let idx_name = format!("sqlite_autoindex_{}_{}", table.name, n_autoindexes + 1);
+    if let Some(root) = persisted_root {
+        let idx_columns = crate::schema::build_index_columns(pk_cols, table)?;
+        catalog.add_index(crate::schema::Index {
+            name: idx_name,
+            table: table.name.clone(),
+            columns: idx_columns,
+            root_page: root,
+            unique: true,
+            partial_expr: None,
+            create_sql: String::new(),
+            origin: crate::schema::IndexOrigin::WithoutRowidPk,
+            kind: crate::schema::IndexKind::Btree,
+        });
+        return Ok(());
+    }
     let idx_root = pager.allocate_page()?;
     {
         let page = pager.get_page(idx_root)?;
@@ -17206,23 +17449,42 @@ fn rebuild_without_rowid_pk_index(
         let mut index_bt = crate::storage::btree::Btree::new(pager, idx_root, true);
         let table = table.clone();
         let index = index.clone();
+        let mut build_err: Option<Error> = None;
         table_bt.scan_table_borrowed(|rowid, payload| {
-            if crate::storage::row_codec::decode_row_into(
+            if let Err(e) = crate::storage::row_codec::decode_row_into(
                 payload,
                 n_cols,
                 rowid,
                 table.rowid_alias,
                 &mut row_buf,
-            )
-            .is_err()
-            {
-                return true; // skip corrupt rows
+            ) {
+                build_err = Some(e);
+                return false;
             }
             let key = crate::executor::encode_index_key(&index, &table, &row_buf);
-            let _ = index_bt.insert_index(&key, rowid);
+            if let Err(e) = index_bt.insert_index(&key, rowid) {
+                build_err = Some(e);
+                return false;
+            }
             true
         })?;
+        if let Some(e) = build_err {
+            return Err(e);
+        }
         final_root = index_bt.root;
+    }
+    // Record the root (one-time upgrade of a pre-WRPK-row file). Best
+    // effort: a read-only store keeps the in-memory index for the
+    // session, exactly as before.
+    let schema_row = crate::schema::encode_schema_row_opt(
+        crate::schema::WRPK_SCHEMA_TYPE,
+        &index.name,
+        &table.name,
+        final_root,
+        None,
+    );
+    if insert_schema_row(pager, &schema_row).is_ok() {
+        let _ = pager.stamp_current_format();
     }
     let index = crate::schema::Index {
         root_page: final_root,

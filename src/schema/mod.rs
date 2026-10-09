@@ -474,7 +474,9 @@ impl Clone for Trigger {
 }
 
 /// The in-memory catalog: maps names to tables, indexes, views, triggers.
-#[derive(Default)]
+/// `Clone` is cheap (maps of `Arc`s) — a transaction snapshots it before
+/// its first DDL statement so ROLLBACK can restore it.
+#[derive(Default, Clone)]
 pub struct Catalog {
     tables: HashMap<String, Arc<Table>>,
     indexes: HashMap<String, Arc<Index>>,
@@ -1673,6 +1675,23 @@ pub fn encode_schema_row_opt(
 /// internal 0-based page id. 0 (view/trigger) stays 0.
 pub fn rootpage_to_internal(rootpage: u32) -> PageId {
     rootpage.saturating_sub(1)
+}
+
+/// Schema-row `type` of a WITHOUT ROWID table's engine-internal PK index
+/// (`IndexOrigin::WithoutRowidPk`): `(type, name, tbl_name, rootpage,
+/// NULL)`. SQLite files never carry such an index, so the row is hidden
+/// from every SQL view of the schema (the planner filters it out of
+/// `sqlite_master` / `sqlite_schema` scans) and from SQLite-format
+/// exports (catalog-based). Persisting the root is what lets a reopen
+/// ADOPT the index instead of rebuilding it into fresh pages — the old
+/// rebuild orphaned the previous session's index pages on every open
+/// (an O(table) open and an ever-growing file).
+pub const WRPK_SCHEMA_TYPE: &str = "rsql_wrpk";
+
+/// Schema rows describing an index b-tree: real `index` rows and the
+/// hidden WITHOUT ROWID PK rows (root moves, DROP, RENAME treat them alike).
+pub fn is_index_schema_kind(kind: &str) -> bool {
+    kind == "index" || kind == WRPK_SCHEMA_TYPE
 }
 
 /// The `sqlite_master` (aka `sqlite_schema`) table: a real, queryable view

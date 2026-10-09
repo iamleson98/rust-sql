@@ -201,6 +201,9 @@ pub fn integrity_check(
     let mut table_rowids: Vec<(String, std::sync::Arc<RowidSet>)> =
         Vec::with_capacity(tables.len());
     let mut table_rows: Vec<(String, RowidRows)> = Vec::new();
+    // Every b-tree root walked (page accounting below): the schema tree
+    // plus each table and index.
+    let mut all_roots: Vec<u32> = vec![0];
     for (name, table) in &tables {
         let root = roots
             .get(&name.to_ascii_lowercase())
@@ -220,6 +223,9 @@ pub fn integrity_check(
         } else {
             root
         };
+        if table.vtab.is_none() && root != 0 {
+            all_roots.push(root);
+        }
         let capture = partial_owners.contains(&name.to_ascii_lowercase());
         let (rowids, rows) = check_table_tree(pager, table, root, &mut p, capture);
         table_rowids.push((name.clone(), std::sync::Arc::new(rowids)));
@@ -241,6 +247,9 @@ pub fn integrity_check(
             } else {
                 root
             };
+            if root != 0 {
+                all_roots.push(root);
+            }
             // Find the owning table's rowid set for cross-verification.
             let owner_entry = table_rowids
                 .iter()
@@ -268,6 +277,16 @@ pub fn integrity_check(
                 table_desc,
                 &mut p,
             );
+        }
+    }
+
+    // ---- 6. Page accounting (full check only) ---------------------------
+    // Only meaningful when every b-tree was resolvable: a quick check
+    // skips the index walk, and a damaged tree already reported above
+    // would cascade into "never used" noise for its unreachable pages.
+    if !quick && p.is_clean() {
+        for msg in check_page_accounting(pager, &all_roots) {
+            p.push(msg);
         }
     }
 
@@ -552,4 +571,152 @@ fn check_index_tree(
             ));
         }
     }
+}
+
+/// Page accounting (SQLite's checkTreePage / checkList bookkeeping): every
+/// page of the file must be owned by EXACTLY ONE structure — a b-tree page
+/// reachable from a root (page 0 is the schema root and the header), an
+/// overflow page on a chain hanging off a reachable cell, or a freelist
+/// trunk / leaf. Reports SQLite's "Page N is never used" for leaked pages
+/// (allocated, then orphaned — the file only ever grows) and "2nd
+/// reference to page N" for pages two owners claim (a corruption that
+/// ends with one structure overwriting the other).
+pub(crate) fn check_page_accounting(pager: &Pager, roots: &[u32]) -> Vec<String> {
+    use crate::storage::btree::Cell;
+    use crate::storage::page::PageType;
+    let n_pages = pager.n_pages();
+    let mut owned = vec![false; n_pages as usize];
+    let mut problems: Vec<String> = Vec::new();
+    let mut claim = |id: u32, problems: &mut Vec<String>| -> bool {
+        if id >= n_pages {
+            problems.push(format!("invalid page number {}", id));
+            return false;
+        }
+        if std::mem::replace(&mut owned[id as usize], true) {
+            problems.push(format!("2nd reference to page {}", id));
+            return false;
+        }
+        true
+    };
+
+    // Freelist: trunk pages + their leaf entries.
+    let mut cur = pager.freelist_head();
+    let mut guard = 0u32;
+    while cur != 0 && guard <= n_pages {
+        guard += 1;
+        if !claim(cur, &mut problems) {
+            break;
+        }
+        let (next, leaves) = match pager.get_page(cur) {
+            Ok(page) => {
+                let b = page.lock();
+                let rd = |o: usize| {
+                    u32::from_le_bytes(
+                        b.data
+                            .get(o..o + 4)
+                            .and_then(|s| s.try_into().ok())
+                            .unwrap_or([0; 4]),
+                    )
+                };
+                let k = (rd(4) as usize).min((b.data.len().saturating_sub(8)) / 4);
+                (rd(0), (0..k).map(|i| rd(8 + 4 * i)).collect::<Vec<u32>>())
+            }
+            Err(_) => break,
+        };
+        for leaf in leaves {
+            claim(leaf, &mut problems);
+        }
+        cur = next;
+    }
+
+    // B-trees and their overflow chains.
+    let mut stack: Vec<u32> = Vec::new();
+    let mut seen_roots: HashSet<u32> = HashSet::new();
+    for &r in roots {
+        if seen_roots.insert(r) {
+            stack.push(r);
+        }
+    }
+    while let Some(id) = stack.pop() {
+        if !claim(id, &mut problems) {
+            continue;
+        }
+        let Ok(page) = pager.get_page(id) else {
+            problems.push(format!("page {} unreadable", id));
+            continue;
+        };
+        let mut chains: Vec<u32> = Vec::new();
+        {
+            let b = page.lock();
+            let Ok(pt) = b.page_type() else {
+                problems.push(format!("page {} has no b-tree page type", id));
+                continue;
+            };
+            if pt == PageType::Overflow {
+                problems.push(format!("overflow page {} referenced as a b-tree page", id));
+                continue;
+            }
+            for i in 0..b.n_cells() {
+                let ptr = b.cell_pointer(i) as usize;
+                let Ok(slice) = b.cell_slice_checked(ptr) else {
+                    problems.push(format!("page {} cell {} out of bounds", id, i));
+                    continue;
+                };
+                let Ok(cell) = Cell::decode(slice, pt, b.page_size()) else {
+                    problems.push(format!("page {} cell {} undecodable", id, i));
+                    continue;
+                };
+                match &cell {
+                    Cell::TableInterior { left_child, .. }
+                    | Cell::IndexInterior { left_child, .. }
+                    | Cell::IndexInteriorOverflow { left_child, .. } => stack.push(*left_child),
+                    _ => {}
+                }
+                let chain = match &cell {
+                    Cell::TableLeafOverflow { overflow, .. } => *overflow,
+                    other => other.index_overflow(),
+                };
+                if chain != 0 {
+                    chains.push(chain);
+                }
+            }
+            if matches!(pt, PageType::InteriorTable | PageType::InteriorIndex) {
+                let rm = b.right_most_pointer();
+                if rm != 0 {
+                    stack.push(rm);
+                }
+            }
+        }
+        for first in chains {
+            let mut c = first;
+            let mut steps = 0u32;
+            while c != 0 && steps <= n_pages {
+                steps += 1;
+                if !claim(c, &mut problems) {
+                    break;
+                }
+                c = match pager.get_page(c) {
+                    Ok(p) => {
+                        let b = p.lock();
+                        match b.page_type() {
+                            Ok(PageType::Overflow) => b.overflow_next(),
+                            _ => {
+                                problems
+                                    .push(format!("overflow chain hits non-overflow page {}", c));
+                                0
+                            }
+                        }
+                    }
+                    Err(_) => 0,
+                };
+            }
+        }
+    }
+
+    for (id, used) in owned.iter().enumerate() {
+        if !used {
+            problems.push(format!("Page {} is never used", id));
+        }
+    }
+    problems
 }

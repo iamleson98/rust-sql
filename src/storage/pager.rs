@@ -1179,6 +1179,10 @@ pub struct Pager {
     /// serving pages normally — table trees are rowid-keyed and
     /// format-independent.
     legacy_index_format: std::sync::atomic::AtomicBool,
+    /// The opened file still carries the `RSQLDB05` magic: readable as is,
+    /// re-stamped `RSQLDB06` by the first write of a marked index cell
+    /// (`note_index_v6_cell`).
+    v5_magic: std::sync::atomic::AtomicBool,
 }
 
 thread_local! {
@@ -2411,6 +2415,7 @@ impl Pager {
             ),
             temp_store: std::sync::atomic::AtomicI64::new(0),
             legacy_index_format: std::sync::atomic::AtomicBool::new(false),
+            v5_magic: std::sync::atomic::AtomicBool::new(false),
         };
 
         let file_size = pager.store.read().len()?;
@@ -2470,6 +2475,39 @@ impl Pager {
         // (the 2026-10-03 prod incident — see the module notes).
         pager.apply_persisted_file_settings();
         Ok(pager)
+    }
+
+    /// A marked (`RSQLDB06`) index cell is about to be stored: re-stamp a
+    /// `RSQLDB05` file's magic in page 0 inside the SAME write, so the
+    /// mark never reaches a file an older build would accept. The page's
+    /// own magic is re-checked each time (a rolled-back stamp reverts
+    /// with its transaction); files opened as `06` skip it on one load.
+    pub fn note_index_v6_cell(&self) -> Result<()> {
+        self.stamp_current_format()
+    }
+
+    /// Re-stamp a `RSQLDB05` file `RSQLDB06` inside the current write —
+    /// called before storing anything an older build would misread (a
+    /// marked index cell, a hidden WITHOUT ROWID PK schema row).
+    pub fn stamp_current_format(&self) -> Result<()> {
+        if !self.v5_magic.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let page = self.get_page(0)?;
+        let stamped = {
+            let mut b = page.lock();
+            if b.data[..8] == crate::storage::page::DB_MAGIC {
+                false
+            } else {
+                b.data[..8].copy_from_slice(&crate::storage::page::DB_MAGIC);
+                b.touch();
+                true
+            }
+        };
+        if stamped {
+            self.note_dirty(0);
+        }
+        Ok(())
     }
 
     /// True when the opened file predates the `RSQLDB05` prefix-free
@@ -2653,6 +2691,8 @@ impl Pager {
         let is_v3 = magic == Some(crate::storage::page::DB_MAGIC_V3);
         if is_v4 || is_v3 {
             self.legacy_index_format.store(true, Ordering::Release);
+        } else if magic == Some(crate::storage::page::DB_MAGIC_V5) {
+            self.v5_magic.store(true, Ordering::Release);
         } else if magic != Some(crate::storage::page::DB_MAGIC) {
             // Distinguish "not a rustqlite file" from "old format version"
             // so users get an actionable message.
@@ -7692,11 +7732,47 @@ impl Pager {
     ///
     /// `cap` is the page's overflow capacity (page_size - 16); the caller
     /// passes it so this stays a pure reader.
+    /// Must an overflow read go through [`Self::get_page`]? The cache-
+    /// bypassing chain readers below see only the shared cache, the WAL
+    /// map and the file — not a committed-view scope's BEGIN-time pages
+    /// nor the `BEGIN CONCURRENT` regime's per-transaction views (writer
+    /// shadows, the committed bound, merged siblings' pages). A chain
+    /// reached through a page that `get_page` served from one of those
+    /// views must be read through the same view, or it reads a version
+    /// that does not belong to the tree (a sibling transaction's chain
+    /// short-read as "0 of 16 header bytes").
+    fn overflow_reads_scoped(&self) -> bool {
+        if self.concurrent_gate.load(Ordering::Acquire) != 0 {
+            return true;
+        }
+        self.committed_scope_count.load(Ordering::Acquire) > 0
+            && committed_scope().is_some_and(|(pid, _)| pid == self.instance_id)
+    }
+
+    /// [`Self::read_overflow_page_append`] through `get_page` (the scoped
+    /// views — see `overflow_reads_scoped`).
+    fn read_overflow_page_scoped(&self, id: PageId, out: &mut Vec<u8>) -> Result<(PageId, usize)> {
+        let page_ref = self.get_page(id)?;
+        let p = page_ref.lock();
+        if p.page_type()? != crate::storage::page::PageType::Overflow {
+            return Err(Error::corruption(format!(
+                "overflow chain hit non-overflow page {id}"
+            )));
+        }
+        let next = p.overflow_next();
+        let data = p.overflow_data();
+        out.extend_from_slice(data);
+        Ok((next, data.len()))
+    }
+
     pub(crate) fn read_overflow_page_append(
         &self,
         id: PageId,
         out: &mut Vec<u8>,
     ) -> Result<(PageId, usize)> {
+        if self.overflow_reads_scoped() {
+            return self.read_overflow_page_scoped(id, out);
+        }
         // 1. Cache hit: the cached page is authoritative (lazy write-back
         // keeps committed-but-unflushed pages only in the cache).
         {
@@ -7837,6 +7913,9 @@ impl Pager {
         let mut steps = 0usize;
         let mut cur = first;
         let mut page_pos = local_len;
+        // Scoped views: page by page through get_page (the resident-run
+        // walk below reads the shared cache directly).
+        let scoped = self.overflow_reads_scoped();
         'outer: loop {
             // ONE read-guard for a maximal run of resident pages (lock
             // order cache -> page matches get_page/evict, so holding it
@@ -7852,7 +7931,8 @@ impl Pager {
                 if page_pos >= end {
                     return Ok(appended);
                 }
-                let page_ref = match cache.get(cur) {
+                let resident = if scoped { None } else { cache.get(cur) };
+                let page_ref = match resident {
                     Some(r) => r.clone(),
                     None => {
                         // Cold page: release the guard, use the generic

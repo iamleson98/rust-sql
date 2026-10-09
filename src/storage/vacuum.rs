@@ -686,14 +686,15 @@ fn parse_leaf_chains(
                         if p >= b.data.len() {
                             continue;
                         }
-                        let Some((klen, n_klen)) =
+                        let Some((klen_raw, n_klen)) =
                             crate::storage::btree::varint::decode(&b.data[p..])
                         else {
                             continue;
                         };
                         let key_start = p + n_klen;
-                        let local_len =
-                            crate::storage::btree::overflow_local_len_for(klen as usize, psz);
+                        let (klen, local_len, _) =
+                            crate::storage::btree::index_cell_split(klen_raw, psz);
+                        let klen = klen as u64;
                         if local_len < klen as usize {
                             let chain_off = key_start + local_len;
                             if chain_off + 4 > b.data.len() {
@@ -925,13 +926,12 @@ fn collect_tree(
                         {
                             let p = cell_ptr + 4 + n_rid;
                             if p < b.data.len() {
-                                if let Some((klen, n_klen)) =
+                                if let Some((klen_raw, n_klen)) =
                                     crate::storage::btree::varint::decode(&b.data[p..])
                                 {
-                                    let local_len = crate::storage::btree::overflow_local_len_for(
-                                        klen as usize,
-                                        psz,
-                                    );
+                                    let (klen, local_len, _) =
+                                        crate::storage::btree::index_cell_split(klen_raw, psz);
+                                    let klen = klen as u64;
                                     if local_len < klen as usize {
                                         let chain_off = p + n_klen + local_len;
                                         if chain_off + 4 <= b.data.len() {
@@ -1420,10 +1420,12 @@ fn copy_index_leaf_overflow_chains(
         if p >= psz {
             continue;
         }
-        let Some((klen, n_klen)) = crate::storage::btree::varint::decode(&page_bytes[p..]) else {
+        let Some((klen_raw, n_klen)) = crate::storage::btree::varint::decode(&page_bytes[p..])
+        else {
             continue;
         };
-        let local_len = crate::storage::btree::overflow_local_len_for(klen as usize, psz);
+        let (klen, local_len, _) = crate::storage::btree::index_cell_split(klen_raw, psz);
+        let klen = klen as u64;
         if local_len >= klen as usize {
             continue; // fully in-page key
         }
@@ -1478,10 +1480,12 @@ fn copy_interior_index_separator_chains(
         if p >= psz {
             continue;
         }
-        let Some((klen, n_klen)) = crate::storage::btree::varint::decode(&page_bytes[p..]) else {
+        let Some((klen_raw, n_klen)) = crate::storage::btree::varint::decode(&page_bytes[p..])
+        else {
             continue;
         };
-        let local_len = crate::storage::btree::overflow_local_len_for(klen as usize, psz);
+        let (klen, local_len, _) = crate::storage::btree::index_cell_split(klen_raw, psz);
+        let klen = klen as u64;
         if local_len >= klen as usize {
             continue; // fully in-page separator
         }
@@ -1514,8 +1518,9 @@ fn interior_table_cell_size(buf: &[u8]) -> Result<usize> {
 fn interior_index_cell_size(buf: &[u8], page_size: u32) -> Option<usize> {
     let (_, n_rid) = crate::storage::btree::varint::decode_signed(&buf[4..])?;
     let p = 4 + n_rid;
-    let (klen, n_klen) = crate::storage::btree::varint::decode(&buf[p..])?;
-    let local = crate::storage::btree::overflow_local_len_for(klen as usize, page_size as usize);
+    let (klen_raw, n_klen) = crate::storage::btree::varint::decode(&buf[p..])?;
+    let (klen, local, _) = crate::storage::btree::index_cell_split(klen_raw, page_size as usize);
+    let klen = klen as u64;
     if local >= klen as usize {
         Some(p + n_klen + klen as usize)
     } else {

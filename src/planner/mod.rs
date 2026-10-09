@@ -1024,11 +1024,28 @@ impl<'a> Planner<'a> {
                     .last_mut()
                     .unwrap()
                     .insert(alias_key.to_ascii_lowercase(), table.clone());
+                // sqlite_master / sqlite_schema: the schema b-tree also
+                // holds the engine's hidden WITHOUT ROWID PK-index rows
+                // (`schema::WRPK_SCHEMA_TYPE`) — never part of the SQL
+                // view of the schema.
+                let predicate = (table.root_page == 0
+                    && (table.name.eq_ignore_ascii_case("sqlite_master")
+                        || table.name.eq_ignore_ascii_case("sqlite_schema")))
+                .then(|| Expr::Is {
+                    left: Box::new(Expr::Column {
+                        table: Some(alias_key.clone()),
+                        name: "type".to_string(),
+                    }),
+                    right: Box::new(Expr::Literal(Value::Text(
+                        crate::schema::WRPK_SCHEMA_TYPE.into(),
+                    ))),
+                    negated: true,
+                });
                 Ok(Plan::Scan {
                     table,
                     alias: alias.clone(),
                     index,
-                    predicate: None,
+                    predicate,
                 })
             }
             TableExpression::Subquery {

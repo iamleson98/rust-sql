@@ -22,13 +22,41 @@
 use rustqlite::{Database, StepResult, Value};
 use std::path::PathBuf;
 
-fn temp_path(name: &str) -> PathBuf {
+/// A scratch database path, removed (with its sidecars) when the guard
+/// drops — including on a panicking test — so runs do not accumulate
+/// files in the temp directory.
+struct TempDb(PathBuf);
+
+impl std::ops::Deref for TempDb {
+    type Target = PathBuf;
+    fn deref(&self) -> &PathBuf {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for TempDb {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDb {
+    fn drop(&mut self) {
+        for suffix in ["", "-wal", "-shm", "-journal", "-rsqllock"] {
+            let mut s = self.0.as_os_str().to_os_string();
+            s.push(suffix);
+            let _ = std::fs::remove_file(s);
+        }
+    }
+}
+
+fn temp_path(name: &str) -> TempDb {
     let mut p = std::env::temp_dir();
     p.push(format!("rsql_stmt_dura_{}_{}", name, std::process::id()));
     for suffix in ["", "-wal", "-shm", "-journal"] {
         let _ = std::fs::remove_file(format!("{}{}", p.display(), suffix));
     }
-    p
+    TempDb(p)
 }
 
 fn step_all(db: &mut Database, sql: &str, params: &[Value]) {

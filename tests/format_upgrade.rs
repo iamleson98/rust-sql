@@ -219,13 +219,13 @@ fn v4_fixture_upgrades_in_place() {
 
     // The open itself performs the migration.
     let mut db = Database::open(&path).unwrap();
-    assert_eq!(magic(&path), "RSQLDB05", "magic rewritten in place");
+    assert_eq!(magic(&path), "RSQLDB06", "magic rewritten in place");
     assert_fixture_data(&mut db);
     drop(db);
 
     // Re-open: no second migration, data identical.
     let db2 = Database::open(&path).unwrap();
-    assert_eq!(magic(&path), "RSQLDB05");
+    assert_eq!(magic(&path), "RSQLDB06");
     assert_eq!(q_count(&db2, "SELECT count(*) FROM t_text"), 20);
     assert_eq!(q_count(&db2, "SELECT count(*) FROM t_text WHERE v = ''"), 1);
     // No upgrade temp file left behind.
@@ -240,7 +240,7 @@ fn v4_fixture_with_wal_sidecar_folds_committed_frames() {
     assert!(dir.path().join("v4_fixture_wal.db-wal").exists());
 
     let db = Database::open(&path).unwrap();
-    assert_eq!(magic(&path), "RSQLDB05");
+    assert_eq!(magic(&path), "RSQLDB06");
     // The committed WAL rows survive the rebuild...
     assert_eq!(q_count(&db, "SELECT count(*) FROM t_text"), 2);
     let v: String = match &db.query("SELECT v FROM t_text WHERE id = 2", ()).unwrap()[0][0] {
@@ -275,7 +275,7 @@ fn v3_magic_is_accepted_and_migrated() {
     }
     assert_eq!(magic(&path), "RSQLDB03");
     let db = Database::open(&path).unwrap();
-    assert_eq!(magic(&path), "RSQLDB05");
+    assert_eq!(magic(&path), "RSQLDB06");
     assert_eq!(q_count(&db, "SELECT count(*) FROM t_text"), 20);
     assert_eq!(q_count(&db, "SELECT count(*) FROM t_text WHERE v = ''"), 1);
 }
@@ -313,7 +313,7 @@ fn fresh_files_write_the_current_magic() {
         db.execute("CREATE TABLE t (a)", ()).unwrap();
         db.execute("INSERT INTO t VALUES (1)", ()).unwrap();
     }
-    assert_eq!(magic(&path), "RSQLDB05");
+    assert_eq!(magic(&path), "RSQLDB06");
     let db = Database::open(&path).unwrap();
     assert_eq!(q_count(&db, "SELECT count(*) FROM t"), 1);
 }

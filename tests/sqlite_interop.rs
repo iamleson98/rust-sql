@@ -7,12 +7,45 @@
 use rustqlite::{Database, Value};
 use std::path::PathBuf;
 
-fn temp_path(name: &str) -> PathBuf {
+/// A scratch database path, removed (with its sidecars) when the guard
+/// drops — including on a panicking test — so runs do not accumulate
+/// files in the temp directory.
+struct TempDb(PathBuf);
+
+impl std::ops::Deref for TempDb {
+    type Target = PathBuf;
+    fn deref(&self) -> &PathBuf {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for TempDb {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDb {
+    fn drop(&mut self) {
+        remove_db_files(&self.0);
+    }
+}
+
+fn remove_db_files(p: &std::path::Path) {
+    let _ = std::fs::remove_file(p);
+    let _ = std::fs::remove_file(rustqlite::storage::sqlitefmt::reader::wal_path_of(p));
+    for suffix in ["-shm", "-journal", "-rsqllock"] {
+        let mut s = p.as_os_str().to_os_string();
+        s.push(suffix);
+        let _ = std::fs::remove_file(s);
+    }
+}
+
+fn temp_path(name: &str) -> TempDb {
     let mut p = std::env::temp_dir();
     p.push(format!("rsql_interop_{}_{}", name, std::process::id()));
-    let _ = std::fs::remove_file(&p);
-    let _ = std::fs::remove_file(rustqlite::storage::sqlitefmt::reader::wal_path_of(&p));
-    p
+    remove_db_files(&p);
+    TempDb(p)
 }
 
 fn integrity_check(con: &rusqlite::Connection) -> String {

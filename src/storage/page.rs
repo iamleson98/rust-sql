@@ -61,7 +61,16 @@ pub const MAX_PAGE_SIZE: u32 = 65536;
 /// (size-classed integers, varint lengths, rowid-alias elision) — files
 /// written by v1 are rejected with a clear "unsupported format" error
 /// instead of silently decoding garbage.
-pub const DB_MAGIC: [u8; 8] = *b"RSQLDB05";
+///
+/// `RSQLDB06`: oversized INDEX keys follow SQLite's index-cell local-size
+/// rule (`btree::INDEX_V6_MARK` on the key-length varint). A `RSQLDB05`
+/// file reads unchanged (its cells carry no mark) and is re-stamped
+/// `06` by the first write that stores a marked cell, so an older build
+/// refuses it instead of misreading the mark.
+pub const DB_MAGIC: [u8; 8] = *b"RSQLDB06";
+/// The previous version: same layout minus the marked index cells —
+/// opened as current (no migration).
+pub const DB_MAGIC_V5: [u8; 8] = *b"RSQLDB05";
 /// Pre-05 format versions, accepted at open and migrated by a full
 /// logical rebuild (fresh indexes under the current key encoding). The
 /// legacy freelist migration is subsumed: the rebuilt file is written

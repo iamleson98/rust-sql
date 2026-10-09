@@ -117,6 +117,8 @@ fn worow_scan_order_all_drivers() {
     sdb.export_sqlite_format(dir.join("sfmt.db")).unwrap();
     let sdb = Database::open(dir.join("sfmt.db")).unwrap();
     assert_eq!(texts(&sdb.query("SELECT a FROM t", []).unwrap(), 0), expect);
+    drop(sdb);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Composite PK with a DESC column and a PK-clause COLLATE: SQLite's

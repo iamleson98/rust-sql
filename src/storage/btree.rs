@@ -154,6 +154,70 @@ pub(crate) fn overflow_local_len_for(total: usize, page_size: usize) -> usize {
     }
 }
 
+/// Marker bit on an INDEX cell's key-length varint (`RSQLDB06`): the cell
+/// follows SQLite's index-cell local-size rule ([`index_local_len_v6`])
+/// rather than the table rule. Far above any legal key length (payloads
+/// cap at 1 GiB), so an unmarked length always decodes as before — files
+/// written by earlier versions read unchanged.
+pub(crate) const INDEX_V6_MARK: u64 = 1 << 62;
+
+/// SQLite's index-cell local payload bounds (btreeInitPage, no reserved
+/// bytes): `maxLocal = (U-12)*64/255 - 23`, `minLocal = (U-12)*32/255 - 23`.
+/// Capping an index cell's in-page bytes at ~1/4 page guarantees at
+/// least four cells per index page. The table rule (`page_size - 128`
+/// in-page) let a ~4 KB key sit inline, one cell per page — a fanout-1
+/// tree whose page count grew quadratically with long keys (3,000 rows
+/// with 3 KB TEXT keys: 181k pages, 742 MB, for ~2 MB of data).
+pub(crate) fn index_max_local(page_size: usize) -> usize {
+    (page_size.saturating_sub(12) * 64 / 255).saturating_sub(23)
+}
+
+fn index_min_local(page_size: usize) -> usize {
+    (page_size.saturating_sub(12) * 32 / 255).saturating_sub(23)
+}
+
+/// In-page prefix length of an index key under the SQLite index rule
+/// (the `INDEX_V6_MARK` cells): the whole key when it fits `maxLocal`,
+/// else `minLocal + (total - minLocal) % chain_capacity`, or `minLocal`
+/// when that exceeds `maxLocal`.
+pub(crate) fn index_local_len_v6(total: usize, page_size: usize) -> usize {
+    let max_local = index_max_local(page_size);
+    if total <= max_local {
+        return total;
+    }
+    let min_local = index_min_local(page_size);
+    let chain_cap = page_size.saturating_sub(16).max(1);
+    let surplus = min_local + (total - min_local) % chain_cap;
+    if surplus <= max_local {
+        surplus
+    } else {
+        min_local
+    }
+}
+
+/// The key-length varint an index overflow cell stores.
+#[inline]
+fn index_total_raw(total: u64, v6: bool) -> u64 {
+    if v6 {
+        total | INDEX_V6_MARK
+    } else {
+        total
+    }
+}
+
+/// Decode a stored index cell's key-length varint: `(total key length,
+/// in-page length, v6 rule)`. Marked lengths follow the SQLite index
+/// rule; unmarked ones the legacy (table) rule they were written under.
+pub(crate) fn index_cell_split(raw: u64, page_size: usize) -> (usize, usize, bool) {
+    if raw & INDEX_V6_MARK != 0 {
+        let total = (raw & !INDEX_V6_MARK) as usize;
+        (total, index_local_len_v6(total, page_size), true)
+    } else {
+        let total = raw as usize;
+        (total, overflow_local_len_for(total, page_size), false)
+    }
+}
+
 /// One RAW-record entry for the cell-serving step path
 /// ([`Btree::scan_table_range_cells`]): the record's bytes live in the
 /// caller's arena at `[off, off+len)`; `rowid` is the b-tree cell key.
@@ -248,6 +312,9 @@ pub enum Cell {
         total: u64,
         local: Vec<u8>,
         overflow: PageId,
+        /// SQLite index local-size rule (stored with `INDEX_V6_MARK`);
+        /// false for cells written under the legacy table rule.
+        v6: bool,
     },
     /// Index interior: (left_child_page, key, rowid).
     IndexInterior {
@@ -264,6 +331,8 @@ pub enum Cell {
         total: u64,
         local: Vec<u8>,
         overflow: PageId,
+        /// See `IndexLeafOverflow::v6`.
+        v6: bool,
     },
 }
 
@@ -351,11 +420,12 @@ impl Cell {
                 rowid,
                 total,
                 local,
+                v6,
                 ..
             } => {
-                // Format: varint(rowid) + varint(TOTAL key_len) + local + be_u32(chain)
+                // Format: varint(rowid) + varint(TOTAL key_len [| V6 mark]) + local + be_u32(chain)
                 let r = varint::encode_signed(*rowid, &mut buf);
-                let kl = varint::encode(*total, &mut buf);
+                let kl = varint::encode(index_total_raw(*total, *v6), &mut buf);
                 r + kl + local.len() + 4
             }
             Cell::IndexInterior {
@@ -373,11 +443,12 @@ impl Cell {
                 rowid,
                 total,
                 local,
+                v6,
                 ..
             } => {
-                // Format: be_u32(left_child) + varint(rowid) + varint(TOTAL) + local + be_u32(chain)
+                // Format: be_u32(left_child) + varint(rowid) + varint(TOTAL [| V6 mark]) + local + be_u32(chain)
                 let r = varint::encode_signed(*rowid, &mut buf);
-                let kl = varint::encode(*total, &mut buf);
+                let kl = varint::encode(index_total_raw(*total, *v6), &mut buf);
                 4 + r + kl + local.len() + 4
             }
         }
@@ -424,10 +495,11 @@ impl Cell {
                 total,
                 local,
                 overflow,
+                v6,
             } => {
                 let r = varint::encode_signed(*rowid, &mut buf);
                 out.extend_from_slice(&buf[..r]);
-                let kl = varint::encode(*total, &mut buf);
+                let kl = varint::encode(index_total_raw(*total, *v6), &mut buf);
                 out.extend_from_slice(&buf[..kl]);
                 out.extend_from_slice(local);
                 out.extend_from_slice(&overflow.to_be_bytes());
@@ -450,11 +522,12 @@ impl Cell {
                 total,
                 local,
                 overflow,
+                v6,
             } => {
                 out.extend_from_slice(&left_child.to_be_bytes());
                 let r = varint::encode_signed(*rowid, &mut buf);
                 out.extend_from_slice(&buf[..r]);
-                let kl = varint::encode(*total, &mut buf);
+                let kl = varint::encode(index_total_raw(*total, *v6), &mut buf);
                 out.extend_from_slice(&buf[..kl]);
                 out.extend_from_slice(local);
                 out.extend_from_slice(&overflow.to_be_bytes());
@@ -515,10 +588,11 @@ impl Cell {
                 total,
                 local,
                 overflow,
+                v6,
             } => {
                 let r = varint::encode_signed(*rowid, &mut buf);
                 put!(&buf[..r]);
-                let kl = varint::encode(*total, &mut buf);
+                let kl = varint::encode(index_total_raw(*total, *v6), &mut buf);
                 put!(&buf[..kl]);
                 put!(local);
                 put!(&overflow.to_be_bytes());
@@ -541,11 +615,12 @@ impl Cell {
                 total,
                 local,
                 overflow,
+                v6,
             } => {
                 put!(&left_child.to_be_bytes());
                 let r = varint::encode_signed(*rowid, &mut buf);
                 put!(&buf[..r]);
-                let kl = varint::encode(*total, &mut buf);
+                let kl = varint::encode(index_total_raw(*total, *v6), &mut buf);
                 put!(&buf[..kl]);
                 put!(local);
                 put!(&overflow.to_be_bytes());
@@ -605,11 +680,11 @@ impl Cell {
                 let (rowid, n) = varint::decode_signed(buf)
                     .ok_or_else(|| Error::corruption("truncated index leaf rowid"))?;
                 let rest = &buf[n..];
-                let (key_len, m) = varint::decode(rest)
+                let (raw_len, m) = varint::decode(rest)
                     .ok_or_else(|| Error::corruption("truncated index leaf key length"))?;
                 let rest = &rest[m..];
-                let key_len_us = key_len as usize;
-                let local_len = overflow_local_len_for(key_len_us, page_size as usize);
+                let (key_len_us, local_len, v6) = index_cell_split(raw_len, page_size as usize);
+                let key_len = key_len_us as u64;
                 if local_len == key_len_us {
                     if rest.len() < key_len_us {
                         return Err(Error::corruption("truncated index leaf key"));
@@ -630,6 +705,7 @@ impl Cell {
                         total: key_len,
                         local: rest[..local_len].to_vec(),
                         overflow,
+                        v6,
                     })
                 }
             }
@@ -641,11 +717,11 @@ impl Cell {
                 let (rowid, n) = varint::decode_signed(&buf[4..])
                     .ok_or_else(|| Error::corruption("truncated index interior rowid"))?;
                 let rest = &buf[4 + n..];
-                let (key_len, m) = varint::decode(rest)
+                let (raw_len, m) = varint::decode(rest)
                     .ok_or_else(|| Error::corruption("truncated index interior key length"))?;
                 let rest = &rest[m..];
-                let key_len_us = key_len as usize;
-                let local_len = overflow_local_len_for(key_len_us, page_size as usize);
+                let (key_len_us, local_len, v6) = index_cell_split(raw_len, page_size as usize);
+                let key_len = key_len_us as u64;
                 if local_len == key_len_us {
                     if rest.len() < key_len_us {
                         return Err(Error::corruption("truncated index interior key"));
@@ -667,6 +743,7 @@ impl Cell {
                         total: key_len,
                         local: rest[..local_len].to_vec(),
                         overflow,
+                        v6,
                     })
                 }
             }
@@ -711,9 +788,8 @@ struct IndexCellView<'a> {
 pub(crate) fn index_leaf_cell_size(buf: &[u8], page_size: u32) -> Option<usize> {
     let (_, n1) = varint::decode_signed(buf)?;
     let rest = &buf[n1..];
-    let (klen, n2) = varint::decode(rest)?;
-    let klen = klen as usize;
-    let local = overflow_local_len_for(klen, page_size as usize);
+    let (raw, n2) = varint::decode(rest)?;
+    let (klen, local, _) = index_cell_split(raw, page_size as usize);
     if local == klen {
         Some(n1 + n2 + klen)
     } else {
@@ -760,10 +836,9 @@ fn decode_index_cell(buf: &[u8], interior: bool, page_size: u32) -> Option<Index
     };
     let (rowid, n) = varint::decode_signed(&buf[after_child..])?;
     let rest = &buf[after_child + n..];
-    let (key_len, m) = varint::decode(rest)?;
+    let (raw_len, m) = varint::decode(rest)?;
     let rest = &rest[m..];
-    let key_len = key_len as usize;
-    let local_len = overflow_local_len_for(key_len, page_size as usize);
+    let (key_len, local_len, _) = index_cell_split(raw_len, page_size as usize);
     if local_len == key_len {
         if rest.len() < key_len {
             return None;
@@ -898,21 +973,24 @@ impl<'a> Btree<'a> {
         key: &[u8],
         rowid: i64,
     ) -> Result<Cell> {
-        if key.len() <= self.max_cell_payload() {
+        let psz = self.pager.page_size() as usize;
+        if key.len() <= index_max_local(psz) {
             Ok(Cell::IndexInterior {
                 left_child,
                 key: key.to_vec(),
                 rowid,
             })
         } else {
-            let local_len = overflow_local_len_for(key.len(), self.pager.page_size() as usize);
+            let local_len = index_local_len_v6(key.len(), psz);
             let chain = self.build_overflow_chain(key, local_len)?;
+            self.pager.note_index_v6_cell()?;
             Ok(Cell::IndexInteriorOverflow {
                 left_child,
                 rowid,
                 total: key.len() as u64,
                 local: key[..local_len].to_vec(),
                 overflow: chain,
+                v6: true,
             })
         }
     }
@@ -5035,6 +5113,13 @@ impl<'a> Btree<'a> {
                                 self.pager.note_dirty(page_id);
                                 return Ok(InsertResult::Done);
                             }
+                            // No room: the rebuild path builds its own
+                            // separators — release this one's fresh chain
+                            // (an oversized key copy) or it leaks.
+                            let leaked = cell1.index_overflow();
+                            if leaked != 0 {
+                                self.free_overflow_chain(leaked)?;
+                            }
                         } else if let Some((idx, old_off)) =
                             found.filter(|_| extra_splits.is_empty())
                         {
@@ -5134,6 +5219,13 @@ impl<'a> Btree<'a> {
                                     self.free_overflow_chain(old_chain)?;
                                 }
                                 return Ok(InsertResult::Done);
+                            }
+                            // No room: the old separator stays (its chain
+                            // too); the two fresh copies were never stored.
+                            for leaked in [cell1.index_overflow(), cell2.index_overflow()] {
+                                if leaked != 0 {
+                                    self.free_overflow_chain(leaked)?;
+                                }
                             }
                         }
                         // No room (or inconsistent state): fall through to
@@ -8397,22 +8489,18 @@ impl<'a> Btree<'a> {
                             }
                             None => Vec::with_capacity(wanted.len().max(1)),
                         };
-                        if crate::storage::row_codec::decode_row_selective(
+                        // An undecodable in-page record is corruption:
+                        // the walk fails (it used to skip the row).
+                        crate::storage::row_codec::decode_row_selective(
                             payload,
                             n_cols,
                             wanted,
                             rowid,
                             rowid_alias,
                             &mut row,
-                        )
-                        .is_ok()
-                        {
-                            if !f(rowid, row) {
-                                return Ok(false);
-                            }
-                        } else {
-                            // Corrupt in-page row: skip (mirrors the
-                            // borrowed-scan's decode_row error tolerance).
+                        )?;
+                        if !f(rowid, row) {
+                            return Ok(false);
                         }
                     } else {
                         // Overflow cell: decode wanted column ranges from
@@ -8462,17 +8550,15 @@ impl<'a> Btree<'a> {
                                     }
                                     None => Vec::with_capacity(wanted.len().max(1)),
                                 };
-                                if crate::storage::row_codec::decode_row_selective(
+                                crate::storage::row_codec::decode_row_selective(
                                     &full,
                                     n_cols,
                                     wanted,
                                     rowid,
                                     rowid_alias,
                                     &mut row,
-                                )
-                                .is_ok()
-                                    && !f(rowid, row)
-                                {
+                                )?;
+                                if !f(rowid, row) {
                                     return Ok(false);
                                 }
                             }
@@ -9594,14 +9680,17 @@ impl<'a> Btree<'a> {
         // legal. The cell keeps the deterministic local prefix + chain
         // head; the split point is a pure function of the key length, so
         // every reader derives it identically.
-        let cell = if key.len() > self.max_cell_payload() {
-            let local_len = overflow_local_len_for(key.len(), self.pager.page_size() as usize);
+        let psz = self.pager.page_size() as usize;
+        let cell = if key.len() > index_max_local(psz) {
+            let local_len = index_local_len_v6(key.len(), psz);
             let chain = self.build_overflow_chain(key, local_len)?;
+            self.pager.note_index_v6_cell()?;
             Cell::IndexLeafOverflow {
                 rowid,
                 total: key.len() as u64,
                 local: key[..local_len].to_vec(),
                 overflow: chain,
+                v6: true,
             }
         } else {
             Cell::IndexLeaf {
@@ -10070,7 +10159,7 @@ impl<'a> Btree<'a> {
         key: &[u8],
         rowid: i64,
     ) -> Result<SweepTry> {
-        if key.len() > self.max_cell_payload() {
+        if key.len() > index_max_local(self.pager.page_size() as usize) {
             return Ok(SweepTry::Declined);
         }
         // Index leaf cell layout: varint(rowid) + varint(key_len) + key.

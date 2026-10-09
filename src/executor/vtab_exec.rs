@@ -357,22 +357,31 @@ pub(crate) fn ensure_vtab_synced(
     let root = ctx.table_root(&shadow);
     let mut bt = Btree::new(ctx.pager, root, false);
     let mut rows: Vec<(i64, Vec<Value>)> = Vec::new();
+    let mut decode_err: Option<Error> = None;
     bt.scan_table(|rowid, payload| {
-        if let Ok(row) = decode_row(payload, n_shadow_cols, rowid, shadow.rowid_alias) {
-            let vals = match &content_map {
-                Some(map) => {
-                    let mut v = vec![Value::Null; map.len()];
-                    for (vi, &si) in map.iter().enumerate() {
-                        v[vi] = row.get(si).cloned().unwrap_or(Value::Null);
-                    }
-                    v
+        let row = match decode_row(payload, n_shadow_cols, rowid, shadow.rowid_alias) {
+            Ok(r) => r,
+            Err(e) => {
+                decode_err = Some(e);
+                return false;
+            }
+        };
+        let vals = match &content_map {
+            Some(map) => {
+                let mut v = vec![Value::Null; map.len()];
+                for (vi, &si) in map.iter().enumerate() {
+                    v[vi] = row.get(si).cloned().unwrap_or(Value::Null);
                 }
-                None => row,
-            };
-            rows.push((rowid, vals));
-        }
+                v
+            }
+            None => row,
+        };
+        rows.push((rowid, vals));
         true
     })?;
+    if let Some(e) = decode_err {
+        return Err(e);
+    }
     inst.run_reindex(&rows)?;
     inst.clear_reindex();
     Ok(())
@@ -1241,18 +1250,26 @@ fn run_vtab_command(
                 let mut rows: Vec<(i64, Vec<Value>)> = Vec::new();
                 let root = ctx.table_root(shadow_table);
                 let mut bt = Btree::new(ctx.pager, root, false);
+                let mut decode_err: Option<Error> = None;
                 bt.scan_table(|rid, payload| {
-                    if let Ok(row) = decode_row(
+                    match decode_row(
                         payload,
                         shadow_table.n_columns(),
                         rid,
                         shadow_table.rowid_alias,
                     ) {
-                        rows.push((rid, row));
+                        Ok(row) => rows.push((rid, row)),
+                        Err(e) => {
+                            decode_err = Some(e);
+                            return false;
+                        }
                     }
                     true
                 })?;
                 drop(bt);
+                if let Some(e) = decode_err {
+                    return Err(e);
+                }
                 // Deep compare: reindex the shadow rows into a scratch
                 // copy is the module's own job; here the shadow scan itself
                 // succeeding plus a row-count sanity check is the check.
@@ -1316,22 +1333,31 @@ fn scan_content_rows(
     let mut out = Vec::new();
     let root = ctx.table_root(content);
     let mut bt = Btree::new(ctx.pager, root, false);
+    let mut decode_err: Option<Error> = None;
     bt.scan_table(|_rid, payload| {
-        if let Ok(row) = decode_row(payload, content.n_columns(), _rid, content.rowid_alias) {
-            let key = match row.get(rowid_idx) {
-                Some(Value::Integer(i)) => *i,
-                _ => return true,
-            };
-            let vals: Vec<Value> = row
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i != rowid_idx)
-                .take(n_fts_cols)
-                .map(|(_, v)| v.clone())
-                .collect();
-            out.push((key, vals));
-        }
+        let row = match decode_row(payload, content.n_columns(), _rid, content.rowid_alias) {
+            Ok(r) => r,
+            Err(e) => {
+                decode_err = Some(e);
+                return false;
+            }
+        };
+        let key = match row.get(rowid_idx) {
+            Some(Value::Integer(i)) => *i,
+            _ => return true,
+        };
+        let vals: Vec<Value> = row
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != rowid_idx)
+            .take(n_fts_cols)
+            .map(|(_, v)| v.clone())
+            .collect();
+        out.push((key, vals));
         true
     })?;
+    if let Some(e) = decode_err {
+        return Err(e);
+    }
     Ok(out)
 }

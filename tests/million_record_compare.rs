@@ -135,7 +135,35 @@ fn q_both(db: &rustqlite::Database, rc: &Connection, sql: &str) {
     assert_eq!(r1, r2, "engine/SQLite rows disagree on: {sql}");
 }
 
-fn temp_path(name: &str) -> PathBuf {
+/// A scratch database path, removed (with its sidecars) when the guard
+/// drops — including on a panicking test — so runs do not accumulate
+/// files in the temp directory.
+struct TempDb(PathBuf);
+
+impl std::ops::Deref for TempDb {
+    type Target = PathBuf;
+    fn deref(&self) -> &PathBuf {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for TempDb {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDb {
+    fn drop(&mut self) {
+        for suffix in ["", "-wal", "-shm", "-journal", "-rsqllock"] {
+            let mut s = self.0.as_os_str().to_os_string();
+            s.push(suffix);
+            let _ = std::fs::remove_file(s);
+        }
+    }
+}
+
+fn temp_path(name: &str) -> TempDb {
     let mut p = std::env::temp_dir();
     p.push(format!(
         "rsql_million_{}_{}_{}",
@@ -149,7 +177,7 @@ fn temp_path(name: &str) -> PathBuf {
     ));
     let _ = std::fs::remove_file(&p);
     let _ = std::fs::remove_file(rustqlite::storage::sqlitefmt::reader::wal_path_of(&p));
-    p
+    TempDb(p)
 }
 
 // ---------------------------------------------------------------------------

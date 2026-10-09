@@ -356,13 +356,37 @@ pub fn replay_if_hot(db_path: &Path) -> Result<bool, String> {
 mod tests {
     use super::*;
 
-    fn tmp(name: &str) -> PathBuf {
+    /// Scratch path removed with its journal when dropped (also on panic).
+    struct TempDb(PathBuf);
+
+    impl std::ops::Deref for TempDb {
+        type Target = PathBuf;
+        fn deref(&self) -> &PathBuf {
+            &self.0
+        }
+    }
+
+    impl AsRef<std::path::Path> for TempDb {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-journal"] {
+                let _ = std::fs::remove_file(format!("{}{}", self.0.display(), suffix));
+            }
+        }
+    }
+
+    fn tmp(name: &str) -> TempDb {
         let mut p = std::env::temp_dir();
         p.push(format!("rsql_rj_{}_{}", name, std::process::id()));
         for suffix in ["", "-journal"] {
             let _ = std::fs::remove_file(format!("{}{}", p.display(), suffix));
         }
-        p
+        TempDb(p)
     }
 
     fn page(fill: u8, ps: usize) -> Vec<u8> {

@@ -2468,11 +2468,13 @@ fn fk_parent_exists(
     let rowid_marker = parent_cols.len() == 1 && parent_cols[0] == usize::MAX;
     let mut found = false;
     let mut buf: Vec<Value> = Vec::with_capacity(n_cols);
+    let mut decode_err: Option<Error> = None;
     let mut bt = Btree::new(ctx.pager, root, false);
     bt.scan_table_borrowed(|rowid, payload| {
         buf.clear();
-        if decode_row_into(payload, n_cols, rowid, alias, &mut buf).is_err() {
-            return true;
+        if let Err(e) = decode_row_into(payload, n_cols, rowid, alias, &mut buf) {
+            decode_err = Some(e);
+            return false;
         }
         let matched = if rowid_marker {
             key_values.len() == 1 && Value::Integer(rowid) == key_values[0]
@@ -2489,6 +2491,9 @@ fn fk_parent_exists(
             true
         }
     })?;
+    if let Some(e) = decode_err {
+        return Err(e);
+    }
     Ok(found)
 }
 
@@ -2542,11 +2547,13 @@ fn fk_find_child_rows(
     let alias = child_table.rowid_alias;
     let mut hits: Vec<(i64, Vec<Value>)> = Vec::new();
     let mut buf: Vec<Value> = Vec::with_capacity(n_cols);
+    let mut decode_err: Option<Error> = None;
     let mut bt = Btree::new(ctx.pager, root, false);
     bt.scan_table_borrowed(|rowid, payload| {
         buf.clear();
-        if decode_row_into(payload, n_cols, rowid, alias, &mut buf).is_err() {
-            return true;
+        if let Err(e) = decode_row_into(payload, n_cols, rowid, alias, &mut buf) {
+            decode_err = Some(e);
+            return false;
         }
         let matched = fk
             .columns
@@ -2558,6 +2565,9 @@ fn fk_find_child_rows(
         }
         true
     })?;
+    if let Some(e) = decode_err {
+        return Err(e);
+    }
     Ok(hits)
 }
 
@@ -2661,10 +2671,9 @@ fn fk_write_child_row(
             ctx.set_table_root_lc(&child.name.to_ascii_lowercase(), new_root);
             if let Some(op) = old_payload {
                 if !indexes.is_empty() {
-                    if let Ok(orow) = decode_row(&op, child.n_columns(), rowid, child.rowid_alias) {
-                        for idx in &indexes {
-                            delete_index_entry(ctx, idx, child, &orow, rowid)?;
-                        }
+                    let orow = decode_row(&op, child.n_columns(), rowid, child.rowid_alias)?;
+                    for idx in &indexes {
+                        delete_index_entry(ctx, idx, child, &orow, rowid)?;
                     }
                 }
                 if let Some(t) = journal_arc.as_ref() {
@@ -5357,10 +5366,11 @@ fn exec_scan(
     // rows carry the trailing rowid so expression projections and
     // predicates above can reference it by name.
     let append_rowid = crate::planner::wants_rowid_slot(&table);
+    let mut decode_err: Option<Error> = None;
     scan_table_rows(ctx, &table, false, |rowid, payload| {
         // Fused inline serial decode — semantics identical to
         // `decode_row` (short rows pad NULL, alias column materializes
-        // from the B+tree key, corrupt rows are skipped), but the tag
+        // from the B+tree key, corrupt rows fail the scan), but the tag
         // dispatch happens inline in the scan loop: no per-value
         // Result wrap, no re-entrant length walk, direct Value writes.
         let mut row: Vec<Value> = Vec::with_capacity(n_cols);
@@ -5493,9 +5503,29 @@ fn exec_scan(
                 row.push(Value::Integer(rowid));
             }
             rows.push(row);
+        } else {
+            // The inline decoder rejected the record: the canonical
+            // decoder either accepts it (identical semantics) or names
+            // the corruption, which fails the statement — a corrupt
+            // record is never silently dropped.
+            match decode_row(payload, n_cols, rowid, rowid_alias) {
+                Ok(mut r) => {
+                    if append_rowid {
+                        r.push(Value::Integer(rowid));
+                    }
+                    rows.push(r);
+                }
+                Err(e) => {
+                    decode_err = Some(e);
+                    return false;
+                }
+            }
         }
         true
     })?;
+    if let Some(e) = decode_err {
+        return Err(e);
+    }
     // Column names: if there's an alias, prefix with "alias." so qualified
     // references in the planner/evaluator can find them. We also include
     // the unqualified name for backward compat. Shared with the parallel
@@ -5550,6 +5580,9 @@ fn exec_scan_projected(
     let n_cols = table.n_columns();
     let rowid_alias = table.rowid_alias;
     let mut rows: Vec<Row> = Vec::new();
+    // An undecodable record is corruption (SQLITE_CORRUPT), never a row
+    // to skip: the scan stops and the statement fails.
+    let mut decode_err: Option<Error> = None;
     match project {
         Some(idxs) => {
             // The selective decoder handles ascending, non-ascending,
@@ -5558,21 +5591,31 @@ fn exec_scan_projected(
             // index list through unchanged.
             scan_table_rows(ctx, &table, false, |rowid, payload| {
                 let mut row: Vec<Value> = Vec::with_capacity(idxs.len());
-                if decode_row_selective(payload, n_cols, idxs, rowid, rowid_alias, &mut row).is_ok()
-                {
-                    rows.push(row);
+                match decode_row_selective(payload, n_cols, idxs, rowid, rowid_alias, &mut row) {
+                    Ok(_) => rows.push(row),
+                    Err(e) => {
+                        decode_err = Some(e);
+                        return false;
+                    }
                 }
                 true
             })?;
         }
         None => {
             scan_table_rows(ctx, &table, false, |rowid, payload| {
-                if let Ok(row) = decode_row(payload, n_cols, rowid, rowid_alias) {
-                    rows.push(row);
+                match decode_row(payload, n_cols, rowid, rowid_alias) {
+                    Ok(row) => rows.push(row),
+                    Err(e) => {
+                        decode_err = Some(e);
+                        return false;
+                    }
                 }
                 true
             })?;
         }
+    }
+    if let Some(e) = decode_err {
+        return Err(e);
     }
     Ok(ExecResult {
         columns: out_cols,
@@ -5862,6 +5905,8 @@ fn scan_filter_limit(
     // Hidden rowid slot (no-alias tables — see planner::HIDDEN_ROWID):
     // matching rows carry the trailing rowid for projections above.
     let append_rowid = crate::planner::wants_rowid_slot(table);
+    // Undecodable records fail the statement (see exec_scan).
+    let mut decode_err: Option<Error> = None;
     match (&pred, !wanted.is_empty()) {
         (Some(pred), true) => {
             wanted.sort_unstable();
@@ -5873,27 +5918,32 @@ fn scan_filter_limit(
             let mut sel_buf: Vec<Value> = Vec::with_capacity(wanted.len());
             let stop = stop_after;
             scan_table_rows(ctx, table, false, |rowid, payload| {
-                if crate::storage::row_codec::decode_row_selective(
+                if let Err(e) = crate::storage::row_codec::decode_row_selective(
                     payload,
                     n_cols,
                     &wanted,
                     rowid,
                     rowid_alias,
                     &mut sel_buf,
-                )
-                .is_err()
-                {
-                    return true;
+                ) {
+                    decode_err = Some(e);
+                    return false;
                 }
                 if !pred.eval(&sel_buf, &positions, params) {
                     return true; // non-matching row: cost = selective decode only
                 }
                 // Matching row: materialize the full row for output.
-                if let Ok(mut row) = decode_row(payload, n_cols, rowid, rowid_alias) {
-                    if append_rowid {
-                        row.push(Value::Integer(rowid));
+                match decode_row(payload, n_cols, rowid, rowid_alias) {
+                    Ok(mut row) => {
+                        if append_rowid {
+                            row.push(Value::Integer(rowid));
+                        }
+                        rows.push(row);
                     }
-                    rows.push(row);
+                    Err(e) => {
+                        decode_err = Some(e);
+                        return false;
+                    }
                 }
                 // LIMIT pushdown: stop the scan once enough rows have passed.
                 if let Some(stop) = stop {
@@ -5909,12 +5959,18 @@ fn scan_filter_limit(
             let positions: Vec<usize> = (0..n_cols).collect();
             let stop = stop_after;
             scan_table_rows(ctx, table, false, |rowid, payload| {
-                if let Ok(mut row) = decode_row(payload, n_cols, rowid, rowid_alias) {
-                    if append_rowid {
-                        row.push(Value::Integer(rowid));
+                match decode_row(payload, n_cols, rowid, rowid_alias) {
+                    Ok(mut row) => {
+                        if append_rowid {
+                            row.push(Value::Integer(rowid));
+                        }
+                        if pred.eval(&row, &positions, params) {
+                            rows.push(row);
+                        }
                     }
-                    if pred.eval(&row, &positions, params) {
-                        rows.push(row);
+                    Err(e) => {
+                        decode_err = Some(e);
+                        return false;
                     }
                 }
                 if let Some(stop) = stop {
@@ -5929,11 +5985,17 @@ fn scan_filter_limit(
             // No predicate: accept every row (bare Scan + LIMIT).
             let stop = stop_after;
             scan_table_rows(ctx, table, false, |rowid, payload| {
-                if let Ok(mut row) = decode_row(payload, n_cols, rowid, rowid_alias) {
-                    if append_rowid {
-                        row.push(Value::Integer(rowid));
+                match decode_row(payload, n_cols, rowid, rowid_alias) {
+                    Ok(mut row) => {
+                        if append_rowid {
+                            row.push(Value::Integer(rowid));
+                        }
+                        rows.push(row);
                     }
-                    rows.push(row);
+                    Err(e) => {
+                        decode_err = Some(e);
+                        return false;
+                    }
                 }
                 if let Some(stop) = stop {
                     if rows.len() >= stop {
@@ -5943,6 +6005,9 @@ fn scan_filter_limit(
                 true
             })?;
         }
+    }
+    if let Some(e) = decode_err {
+        return Err(e);
     }
     let columns: Arc<[String]> = if append_rowid {
         // Side-qualified hidden slot: `a.rowid` / `b.rowid` refs in
@@ -7463,15 +7528,21 @@ fn exec_topn_scan(
         }
     };
     if table.without_rowid {
+        let mut decode_err: Option<Error> = None;
         scan_table_rows(ctx, table, false, |rowid, payload| {
             let mut row: Vec<Value> = Vec::with_capacity(wanted.len());
-            if decode_row_selective(payload, n_cols, &wanted, rowid, rowid_alias, &mut row).is_err()
+            if let Err(e) =
+                decode_row_selective(payload, n_cols, &wanted, rowid, rowid_alias, &mut row)
             {
-                return true; // skip corrupt rows (selective scan's contract)
+                decode_err = Some(e);
+                return false;
             }
             offer(rowid, row);
             true
         })?;
+        if let Some(e) = decode_err {
+            return Err(e);
+        }
     } else if let Some((start, end)) = range {
         // Rowid-range walk (the `WHERE id <op> ?` shape): same selective
         // decode + keep-heap, bounded to the range — the materializing
@@ -7545,18 +7616,19 @@ fn exec_topn_scan_expr(
     // per comparison).
     let mut sel: Vec<TopnSel> = Vec::with_capacity(keep.min(4096));
     let mut wide: Vec<Value> = Vec::with_capacity(n_cols + 1);
+    // An undecodable record fails the statement (never skipped).
+    let mut decode_err: Option<Error> = None;
     scan_table_maybe_range(ctx, table, range, false, |rowid, payload| {
-        if crate::storage::row_codec::decode_row_selective_wide(
+        if let Err(e) = crate::storage::row_codec::decode_row_selective_wide(
             payload,
             n_cols,
             &identity,
             rowid,
             rowid_alias,
             &mut wide,
-        )
-        .is_err()
-        {
-            return true; // skip corrupt rows (materializing path's contract)
+        ) {
+            decode_err = Some(e);
+            return false;
         }
         wide.push(Value::Integer(rowid));
         let key = compiled.eval(&wide, &params);
@@ -7598,6 +7670,9 @@ fn exec_topn_scan_expr(
         }
         true
     })?;
+    if let Some(e) = decode_err {
+        return Err(e);
+    }
 
     // Sort the survivors by the total order, then window [offset..keep).
     sel.sort_by(|a, b| cmp_sel(a, b, desc, coll));
@@ -7613,8 +7688,8 @@ fn exec_topn_scan_expr(
 // Limit
 // =========================================================================
 
-///  —
-/// the shapes  and  fuse into the
+/// The top-N fusion target of [`exec_limit`] — the shapes
+/// `Limit(Sort(x))` and `Limit(Project(Sort(x)))` fuse into the
 /// bounded top-N selection.
 type TopnTarget<'a> = Option<(&'a Plan, &'a Vec<OrderTerm>, Option<&'a Vec<ProjectExpr>>)>;
 
@@ -10413,11 +10488,13 @@ pub(crate) fn scan_groupby_grouper(
             })
             .collect();
         let rowid_alias = table.rowid_alias;
+        let mut decode_err: Option<Error> = None;
         scan_table_maybe_range(ctx, &table, range, false, |rowid, payload| {
-            if decode_row_selective(payload, n_cols, &wanted, rowid, rowid_alias, &mut sel_buf)
-                .is_err()
+            if let Err(e) =
+                decode_row_selective(payload, n_cols, &wanted, rowid, rowid_alias, &mut sel_buf)
             {
-                return true; // skip corrupt rows
+                decode_err = Some(e);
+                return false;
             }
             // Build the group key from the decoded slice (positions
             // precomputed above — direct index, no per-row search).
@@ -10450,6 +10527,9 @@ pub(crate) fn scan_groupby_grouper(
             }
             true
         })?;
+        if let Some(e) = decode_err {
+            return Err(e);
+        }
     } else {
         // ==== General path: full decode + eval_row for whatever didn't resolve ====
         // The filter, however, may still COMPILE: evaluate it positionally
@@ -10564,17 +10644,16 @@ pub(crate) fn scan_groupby_grouper(
             // it used to be swallowed as "row filtered out".
             let mut scan_err: Option<crate::error::Error> = None;
             scan_table_maybe_range(ctx, &table, range, pred_may_reenter, |rowid, payload| {
-                if decode_row_selective_wide(
+                if let Err(e) = decode_row_selective_wide(
                     payload,
                     n_cols,
                     &wanted,
                     rowid,
                     rowid_alias,
                     &mut wide,
-                )
-                .is_err()
-                {
-                    return true; // skip corrupt rows
+                ) {
+                    scan_err = Some(e);
+                    return false;
                 }
                 if let Some(pred) = filter_predicate {
                     let keep = if let Some(cp) = &compiled_filter {
@@ -10651,8 +10730,9 @@ pub(crate) fn scan_groupby_grouper(
         let mut scan_err: Option<crate::error::Error> = None;
         scan_table_maybe_range(ctx, &table, range, pred_may_reenter, |rowid, payload| {
             row_buf.clear();
-            if decode_row_into(payload, n_cols, rowid, rowid_alias, &mut row_buf).is_err() {
-                return true; // skip corrupt rows
+            if let Err(e) = decode_row_into(payload, n_cols, rowid, rowid_alias, &mut row_buf) {
+                scan_err = Some(e);
+                return false;
             }
             // Apply the filter predicate inline (if any).
             if let Some(pred) = filter_predicate {
@@ -12318,11 +12398,13 @@ fn exec_aggregate_no_group_by(
             let params = &ctx.params;
             let mut sel_buf: Vec<Value> = Vec::with_capacity(wanted.len());
             let rowid_alias = table.rowid_alias;
+            let mut decode_err: Option<Error> = None;
             scan_table_maybe_range(ctx, &table, range, false, |rowid, payload| {
-                if decode_row_selective(payload, n_cols, &wanted, rowid, rowid_alias, &mut sel_buf)
-                    .is_err()
+                if let Err(e) =
+                    decode_row_selective(payload, n_cols, &wanted, rowid, rowid_alias, &mut sel_buf)
                 {
-                    return true;
+                    decode_err = Some(e);
+                    return false;
                 }
                 if !pred.eval(&sel_buf, &positions, params) {
                     return true;
@@ -12347,6 +12429,9 @@ fn exec_aggregate_no_group_by(
                 }
                 true
             })?;
+            if let Some(e) = decode_err {
+                return Err(e);
+            }
             return finish_no_group_by(aggregates, states, saw_any_row);
         }
     }
@@ -12418,10 +12503,11 @@ fn exec_aggregate_no_group_by(
         let pred_may_reenter = filter_predicate.is_some_and(expr_has_subquery);
         scan_table_maybe_range(ctx, &table, range, pred_may_reenter, |rowid, payload| {
             // Decode only the wanted columns.
-            if decode_row_selective(payload, n_cols, &wanted, rowid, rowid_alias, &mut sel_buf)
-                .is_err()
+            if let Err(e) =
+                decode_row_selective(payload, n_cols, &wanted, rowid, rowid_alias, &mut sel_buf)
             {
-                return true;
+                scan_err = Some(e);
+                return false;
             }
             // Apply the filter predicate, if any. We need a full row buffer
             // because eval_row indexes by column position. The cheap path
@@ -12504,8 +12590,9 @@ fn exec_aggregate_no_group_by(
         let pred_may_reenter = filter_predicate.is_some_and(expr_has_subquery);
         scan_table_maybe_range(ctx, &table, range, pred_may_reenter, |rowid, payload| {
             row_buf.clear();
-            if decode_row_into(payload, n_cols, rowid, rowid_alias, &mut row_buf).is_err() {
-                return true; // skip corrupt rows
+            if let Err(e) = decode_row_into(payload, n_cols, rowid, rowid_alias, &mut row_buf) {
+                scan_err = Some(e);
+                return false;
             }
             if append_rowid {
                 row_buf.push(Value::Integer(rowid));
@@ -16267,18 +16354,18 @@ fn try_fused_scan_hash_join(
         let build_side_gated = rowid_seek_join && !gated_is_probe;
         let build_side_is_alias = rowid_seek_join && gated_is_probe;
         {
+            let mut decode_err: Option<Error> = None;
             scan_table_rows(ctx, &build.table, false, |rowid, payload| {
-                if crate::storage::row_codec::decode_row_selective_sorted(
+                if let Err(e) = crate::storage::row_codec::decode_row_selective_sorted(
                     payload,
                     build.n_cols,
                     &build_wanted,
                     rowid,
                     build_alias,
                     &mut buf,
-                )
-                .is_err()
-                {
-                    return true; // corrupt row: skip (matches exec_scan)
+                ) {
+                    decode_err = Some(e);
+                    return false;
                 }
                 let mut null_key = false;
                 for (j, &kp) in build_key_pos.iter().enumerate() {
@@ -16407,6 +16494,9 @@ fn try_fused_scan_hash_join(
                 }
                 true
             })?;
+            if let Some(e) = decode_err {
+                return Err(e);
+            }
         }
         if aborted {
             return Ok(None);
@@ -16511,18 +16601,18 @@ fn try_fused_scan_hash_join(
     };
     let serial_bitmap = build_unmatched_tail;
     {
+        let mut decode_err: Option<Error> = None;
         scan_table_rows(ctx, &probe.table, false, |rowid, payload| {
-            if crate::storage::row_codec::decode_row_selective_sorted(
+            if let Err(e) = crate::storage::row_codec::decode_row_selective_sorted(
                 payload,
                 probe.n_cols,
                 &probe_wanted,
                 rowid,
                 probe_alias,
                 &mut pbuf,
-            )
-            .is_err()
-            {
-                return true; // corrupt row: skip
+            ) {
+                decode_err = Some(e);
+                return false;
             }
             // Extract the probe keys; NULL / TEXT / BLOB keys cannot equal
             // the all-numeric build keys — no match. For LEFT that still
@@ -16693,6 +16783,9 @@ fn try_fused_scan_hash_join(
             }
             true
         })?;
+        if let Some(e) = decode_err {
+            return Err(e);
+        }
     }
 
     // RIGHT/FULL: the unmatched-build tail — [NULL left..., build
@@ -18420,31 +18513,40 @@ fn exec_inverted_index_scan(
             let ralias = table.rowid_alias;
             let append_rowid = crate::planner::wants_rowid_slot(&table);
             let mut out: Vec<Row> = Vec::new();
+            let mut decode_err: Option<Error> = None;
             table_bt.scan_table_borrowed(|rowid, payload| {
-                if let Ok(mut row) = decode_row(payload, n_cols, rowid, ralias) {
-                    if let Some(pred) = residual {
-                        if let Ok(pv) = eval_row_aff(
-                            pred,
-                            &row,
-                            &table.col_names,
-                            &table.col_affinities,
-                            &ctx.params,
-                            &ctx.named_params,
-                        ) {
-                            if !pv.is_truthy() {
-                                return true;
-                            }
-                        } else {
+                let mut row = match decode_row(payload, n_cols, rowid, ralias) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        decode_err = Some(e);
+                        return false;
+                    }
+                };
+                if let Some(pred) = residual {
+                    if let Ok(pv) = eval_row_aff(
+                        pred,
+                        &row,
+                        &table.col_names,
+                        &table.col_affinities,
+                        &ctx.params,
+                        &ctx.named_params,
+                    ) {
+                        if !pv.is_truthy() {
                             return true;
                         }
+                    } else {
+                        return true;
                     }
-                    if append_rowid {
-                        row.push(Value::Integer(rowid));
-                    }
-                    out.push(row);
                 }
+                if append_rowid {
+                    row.push(Value::Integer(rowid));
+                }
+                out.push(row);
                 true
             })?;
+            if let Some(e) = decode_err {
+                return Err(e);
+            }
             out
         }
     };
@@ -18561,34 +18663,43 @@ fn exec_spatial_knn(
         let n_cols = table.n_columns();
         let ralias = table.rowid_alias;
         let mut out: Vec<Row> = Vec::new();
+        let mut decode_err: Option<Error> = None;
         table_bt.scan_table_borrowed(|rowid, payload| {
             if out.len() >= k {
                 return false;
             }
-            if let Ok(mut row) = decode_row(payload, n_cols, rowid, ralias) {
-                if let Some(pred) = residual {
-                    if let Ok(pv) = eval_row_aff(
-                        pred,
-                        &row,
-                        &table.col_names,
-                        &table.col_affinities,
-                        &ctx.params,
-                        &ctx.named_params,
-                    ) {
-                        if !pv.is_truthy() {
-                            return true;
-                        }
-                    } else {
+            let mut row = match decode_row(payload, n_cols, rowid, ralias) {
+                Ok(r) => r,
+                Err(e) => {
+                    decode_err = Some(e);
+                    return false;
+                }
+            };
+            if let Some(pred) = residual {
+                if let Ok(pv) = eval_row_aff(
+                    pred,
+                    &row,
+                    &table.col_names,
+                    &table.col_affinities,
+                    &ctx.params,
+                    &ctx.named_params,
+                ) {
+                    if !pv.is_truthy() {
                         return true;
                     }
+                } else {
+                    return true;
                 }
-                if append_rowid {
-                    row.push(Value::Integer(rowid));
-                }
-                out.push(row);
             }
+            if append_rowid {
+                row.push(Value::Integer(rowid));
+            }
+            out.push(row);
             true
         })?;
+        if let Some(e) = decode_err {
+            return Err(e);
+        }
         return Ok(ExecResult { columns, rows: out });
     }
     let point_text = pv.as_text();
@@ -18876,44 +18987,52 @@ fn exec_rowid_range(
     let named_params = &ctx.named_params;
     let residual_expr = residual;
     let pred_may_reenter = residual_expr.is_some_and(expr_has_subquery);
+    let mut decode_err: Option<Error> = None;
     bt.scan_table_range_borrowed_opts(
         start,
         end,
         |rowid, payload| {
-            if let Ok(mut row) = decode_row(payload, n_cols, rowid, rowid_alias) {
-                if let Some(res) = residual_expr {
-                    row.push(Value::Integer(rowid));
-                    let keep =
-                        match eval_row_aff(res, &row, &eval_cols, &eval_affs, params, named_params)
-                        {
-                            Ok(v) => v.is_truthy(),
-                            Err(e) => {
-                                residual_err.set(Some(e));
-                                false
-                            }
-                        };
-                    if !keep {
-                        return true;
-                    }
-                    if !append_rowid {
-                        row.pop();
-                    }
-                } else if append_rowid {
-                    row.push(Value::Integer(rowid));
-                }
-                rows.push(row);
-                // LIMIT pushdown: stop the walk once the requested row
-                // count is materialized (the visitor's `false` ends the
-                // range descent). Counts OUTPUT rows — the residual above
-                // already rejected non-matching ones.
-                if stop_after.is_some_and(|n| rows.len() >= n) {
+            let mut row = match decode_row(payload, n_cols, rowid, rowid_alias) {
+                Ok(r) => r,
+                Err(e) => {
+                    decode_err = Some(e);
                     return false;
                 }
+            };
+            if let Some(res) = residual_expr {
+                row.push(Value::Integer(rowid));
+                let keep =
+                    match eval_row_aff(res, &row, &eval_cols, &eval_affs, params, named_params) {
+                        Ok(v) => v.is_truthy(),
+                        Err(e) => {
+                            residual_err.set(Some(e));
+                            false
+                        }
+                    };
+                if !keep {
+                    return true;
+                }
+                if !append_rowid {
+                    row.pop();
+                }
+            } else if append_rowid {
+                row.push(Value::Integer(rowid));
+            }
+            rows.push(row);
+            // LIMIT pushdown: stop the walk once the requested row
+            // count is materialized (the visitor's `false` ends the
+            // range descent). Counts OUTPUT rows — the residual above
+            // already rejected non-matching ones.
+            if stop_after.is_some_and(|n| rows.len() >= n) {
+                return false;
             }
             true
         },
         pred_may_reenter,
     )?;
+    if let Some(e) = decode_err {
+        return Err(e);
+    }
 
     let columns = out_cols;
     if let Some(e) = residual_err.take() {
@@ -19094,6 +19213,7 @@ fn exec_rowid_range_projected_impl(
     let params: &[Value] = &ctx.params;
     let named_params = &ctx.named_params;
     let pred_may_reenter = residual.is_some_and(expr_has_subquery);
+    let mut decode_err: Option<Error> = None;
     bt.scan_table_range_borrowed_opts(
         start,
         end,
@@ -19101,20 +19221,65 @@ fn exec_rowid_range_projected_impl(
             match (project, residual) {
                 (Some(idxs), None) => {
                     let mut row = Vec::with_capacity(idxs.len());
-                    if decode_row_selective(payload, n_cols, idxs, rowid, rowid_alias, &mut row)
-                        .is_ok()
+                    if let Err(e) =
+                        decode_row_selective(payload, n_cols, idxs, rowid, rowid_alias, &mut row)
                     {
-                        rows.push(row);
+                        decode_err = Some(e);
+                        return false;
                     }
+                    rows.push(row);
                 }
                 (Some(idxs), Some(res)) => {
                     // Full decode (the residual may need non-projected
                     // columns), evaluate, then project positionally.
-                    if let Ok(mut full) = decode_row(payload, n_cols, rowid, rowid_alias) {
-                        full.push(Value::Integer(rowid));
+                    let mut full = match decode_row(payload, n_cols, rowid, rowid_alias) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            decode_err = Some(e);
+                            return false;
+                        }
+                    };
+                    full.push(Value::Integer(rowid));
+                    let keep = match eval_row_aff(
+                        res,
+                        &full,
+                        &eval_cols,
+                        &eval_affs,
+                        params,
+                        named_params,
+                    ) {
+                        Ok(v) => v.is_truthy(),
+                        Err(e) => {
+                            residual_err.set(Some(e));
+                            false
+                        }
+                    };
+                    if keep {
+                        full.pop();
+                        let mut row = Vec::with_capacity(idxs.len());
+                        for &p in idxs {
+                            if p == crate::storage::row_codec::ROWID_PROJ {
+                                row.push(Value::Integer(rowid));
+                            } else {
+                                row.push(full.get(p).cloned().unwrap_or(Value::Null));
+                            }
+                        }
+                        rows.push(row);
+                    }
+                }
+                (None, _) => {
+                    let mut row = match decode_row(payload, n_cols, rowid, rowid_alias) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            decode_err = Some(e);
+                            return false;
+                        }
+                    };
+                    if let Some(res) = residual {
+                        row.push(Value::Integer(rowid));
                         let keep = match eval_row_aff(
                             res,
-                            &full,
+                            &row,
                             &eval_cols,
                             &eval_affs,
                             params,
@@ -19126,45 +19291,12 @@ fn exec_rowid_range_projected_impl(
                                 false
                             }
                         };
-                        if keep {
-                            full.pop();
-                            let mut row = Vec::with_capacity(idxs.len());
-                            for &p in idxs {
-                                if p == crate::storage::row_codec::ROWID_PROJ {
-                                    row.push(Value::Integer(rowid));
-                                } else {
-                                    row.push(full.get(p).cloned().unwrap_or(Value::Null));
-                                }
-                            }
-                            rows.push(row);
+                        if !keep {
+                            return true;
                         }
+                        row.pop();
                     }
-                }
-                (None, _) => {
-                    if let Ok(mut row) = decode_row(payload, n_cols, rowid, rowid_alias) {
-                        if let Some(res) = residual {
-                            row.push(Value::Integer(rowid));
-                            let keep = match eval_row_aff(
-                                res,
-                                &row,
-                                &eval_cols,
-                                &eval_affs,
-                                params,
-                                named_params,
-                            ) {
-                                Ok(v) => v.is_truthy(),
-                                Err(e) => {
-                                    residual_err.set(Some(e));
-                                    false
-                                }
-                            };
-                            if !keep {
-                                return true;
-                            }
-                            row.pop();
-                        }
-                        rows.push(row);
-                    }
+                    rows.push(row);
                 }
             }
             // LIMIT pushdown: stop the walk once the requested OUTPUT
@@ -19177,6 +19309,9 @@ fn exec_rowid_range_projected_impl(
         },
         pred_may_reenter,
     )?;
+    if let Some(e) = decode_err {
+        return Err(e);
+    }
     if let Some(e) = residual_err.take() {
         return Err(e);
     }
@@ -19700,6 +19835,7 @@ fn exec_index_range(
         let mut bt = Btree::new(ctx.pager, table_root, false);
         let pred_may_reenter = residual_pred.is_some_and(expr_has_subquery);
         let mut scan_err: Option<crate::error::Error> = None;
+        let mut decode_err: Option<Error> = None;
         bt.scan_table_borrowed_opts(
             |rowid, payload| {
                 // Advance the merge cursor.
@@ -19713,31 +19849,38 @@ fn exec_index_range(
                     return true; // not a match — keep scanning
                 }
                 ri += 1;
-                if let Ok(mut row) = decode_row(payload, n_cols, rowid, table.rowid_alias) {
-                    if append_rowid {
-                        row.push(Value::Integer(rowid));
+                let mut row = match decode_row(payload, n_cols, rowid, table.rowid_alias) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        decode_err = Some(e);
+                        return false;
                     }
-                    let keep = match residual_pred {
-                        Some(pred) => match eval_row(pred, &row, eval_list, &params, &named_params)
-                        {
-                            Ok(v) => v.is_truthy(),
-                            Err(e) => {
-                                scan_err = Some(e);
-                                return false;
-                            }
-                        },
-                        None => true,
-                    };
-                    if keep {
-                        if let Some(&pos) = position.get(&rowid) {
-                            placed[pos] = Some(row);
+                };
+                if append_rowid {
+                    row.push(Value::Integer(rowid));
+                }
+                let keep = match residual_pred {
+                    Some(pred) => match eval_row(pred, &row, eval_list, &params, &named_params) {
+                        Ok(v) => v.is_truthy(),
+                        Err(e) => {
+                            scan_err = Some(e);
+                            return false;
                         }
+                    },
+                    None => true,
+                };
+                if keep {
+                    if let Some(&pos) = position.get(&rowid) {
+                        placed[pos] = Some(row);
                     }
                 }
                 true
             },
             pred_may_reenter,
         )?;
+        if let Some(e) = decode_err {
+            return Err(e);
+        }
         if let Some(e) = scan_err {
             return Err(e);
         }
@@ -19998,6 +20141,7 @@ fn exec_index_range_projected(
         rowids.dedup();
         let mut ri = 0usize;
         let mut bt = Btree::new(ctx.pager, table_root, false);
+        let mut decode_err: Option<Error> = None;
         bt.scan_table_borrowed(|rowid, payload| {
             while ri < rowids.len() && rowids[ri] < rowid {
                 ri += 1;
@@ -20011,27 +20155,32 @@ fn exec_index_range_projected(
             ri += 1;
             let keep = match residual_pred {
                 Some(res) => {
-                    if let Ok(mut full) = decode_row(payload, n_cols, rowid, rowid_alias) {
-                        full.push(Value::Integer(rowid));
-                        let k = match eval_row_aff(
-                            res,
-                            &full,
-                            &eval_cols,
-                            &eval_affs,
-                            &params,
-                            &named_params,
-                        ) {
-                            Ok(v) => v.is_truthy(),
-                            Err(e) => {
-                                residual_err.set(Some(e));
-                                false
-                            }
-                        };
-                        full.pop();
-                        if k {
-                            placed[position.get(&rowid).copied().unwrap_or(usize::MAX)] =
-                                Some(project_row_from_full(project, &full, rowid));
+                    let mut full = match decode_row(payload, n_cols, rowid, rowid_alias) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            decode_err = Some(e);
+                            return false;
                         }
+                    };
+                    full.push(Value::Integer(rowid));
+                    let k = match eval_row_aff(
+                        res,
+                        &full,
+                        &eval_cols,
+                        &eval_affs,
+                        &params,
+                        &named_params,
+                    ) {
+                        Ok(v) => v.is_truthy(),
+                        Err(e) => {
+                            residual_err.set(Some(e));
+                            false
+                        }
+                    };
+                    full.pop();
+                    if k {
+                        placed[position.get(&rowid).copied().unwrap_or(usize::MAX)] =
+                            Some(project_row_from_full(project, &full, rowid));
                     }
                     false // row consumed — resume scanning
                 }
@@ -20041,22 +20190,26 @@ fn exec_index_range_projected(
                 let row = match project {
                     Some(idxs) => {
                         let mut r = Vec::with_capacity(idxs.len());
-                        if decode_row_selective(payload, n_cols, idxs, rowid, rowid_alias, &mut r)
-                            .is_ok()
-                        {
-                            Some(r)
-                        } else {
-                            None
-                        }
+                        decode_row_selective(payload, n_cols, idxs, rowid, rowid_alias, &mut r)
+                            .map(|_| r)
                     }
-                    None => decode_row(payload, n_cols, rowid, rowid_alias).ok(),
+                    None => decode_row(payload, n_cols, rowid, rowid_alias),
                 };
-                if let Some(r) = row {
-                    placed[position.get(&rowid).copied().unwrap_or(usize::MAX)] = Some(r);
+                match row {
+                    Ok(r) => {
+                        placed[position.get(&rowid).copied().unwrap_or(usize::MAX)] = Some(r);
+                    }
+                    Err(e) => {
+                        decode_err = Some(e);
+                        return false;
+                    }
                 }
             }
             true
         })?;
+        if let Some(e) = decode_err {
+            return Err(e);
+        }
         for row in placed.into_iter().flatten() {
             rows.push(row);
         }
@@ -20077,11 +20230,36 @@ fn exec_index_range_projected(
                 }
                 (Some(idxs), Some(res)) => {
                     if let LookupResult::Found(payload) = table_bt.lookup_table(rowid)? {
-                        if let Ok(mut full) = decode_row(&payload, n_cols, rowid, rowid_alias) {
-                            full.push(Value::Integer(rowid));
+                        let mut full = decode_row(&payload, n_cols, rowid, rowid_alias)?;
+                        full.push(Value::Integer(rowid));
+                        let keep = match eval_row_aff(
+                            res,
+                            &full,
+                            &eval_cols,
+                            &eval_affs,
+                            &params,
+                            &named_params,
+                        ) {
+                            Ok(v) => v.is_truthy(),
+                            Err(e) => {
+                                residual_err.set(Some(e));
+                                false
+                            }
+                        };
+                        full.pop();
+                        if keep {
+                            rows.push(project_row_from_full(Some(idxs), &full, rowid));
+                        }
+                    }
+                }
+                (None, res) => {
+                    if let LookupResult::Found(payload) = table_bt.lookup_table(rowid)? {
+                        let mut row = decode_row(&payload, n_cols, rowid, rowid_alias)?;
+                        if let Some(res) = res {
+                            row.push(Value::Integer(rowid));
                             let keep = match eval_row_aff(
                                 res,
-                                &full,
+                                &row,
                                 &eval_cols,
                                 &eval_affs,
                                 &params,
@@ -20093,39 +20271,12 @@ fn exec_index_range_projected(
                                     false
                                 }
                             };
-                            full.pop();
-                            if keep {
-                                rows.push(project_row_from_full(Some(idxs), &full, rowid));
+                            if !keep {
+                                continue;
                             }
+                            row.pop();
                         }
-                    }
-                }
-                (None, res) => {
-                    if let LookupResult::Found(payload) = table_bt.lookup_table(rowid)? {
-                        if let Ok(mut row) = decode_row(&payload, n_cols, rowid, rowid_alias) {
-                            if let Some(res) = res {
-                                row.push(Value::Integer(rowid));
-                                let keep = match eval_row_aff(
-                                    res,
-                                    &row,
-                                    &eval_cols,
-                                    &eval_affs,
-                                    &params,
-                                    &named_params,
-                                ) {
-                                    Ok(v) => v.is_truthy(),
-                                    Err(e) => {
-                                        residual_err.set(Some(e));
-                                        false
-                                    }
-                                };
-                                if !keep {
-                                    continue;
-                                }
-                                row.pop();
-                            }
-                            rows.push(row);
-                        }
+                        rows.push(row);
                     }
                 }
             }
@@ -22147,27 +22298,25 @@ fn exec_insert_one_row(
                 *current_root = bt.root;
                 ctx.set_table_root_lc(table_name_lc, *current_root);
                 if let Some(old_payload) = old_payload_opt {
-                    if let Ok(old_row) = decode_row(
+                    let old_row = decode_row(
                         &old_payload,
                         table.n_columns(),
                         existing_rowid,
                         table.rowid_alias,
-                    ) {
-                        for st in index_states.iter_mut() {
-                            // Multi-entry (gin/gist): delete every key the
-                            // old row contributed.
-                            let old_keys = crate::executor::index_am::index_entry_keys(
-                                &st.idx, table, &old_row,
-                            )?;
-                            let mut ibt = Btree::new(ctx.pager, st.root, true);
-                            for old_key in &old_keys {
-                                ibt.delete_index(old_key, existing_rowid)?;
-                            }
-                            if st.root != ibt.root {
-                                ctx.set_index_root(&st.idx.name, ibt.root);
-                            }
-                            st.root = ibt.root;
+                    )?;
+                    for st in index_states.iter_mut() {
+                        // Multi-entry (gin/gist): delete every key the
+                        // old row contributed.
+                        let old_keys =
+                            crate::executor::index_am::index_entry_keys(&st.idx, table, &old_row)?;
+                        let mut ibt = Btree::new(ctx.pager, st.root, true);
+                        for old_key in &old_keys {
+                            ibt.delete_index(old_key, existing_rowid)?;
                         }
+                        if st.root != ibt.root {
+                            ctx.set_index_root(&st.idx.name, ibt.root);
+                        }
+                        st.root = ibt.root;
                     }
                     // Statement journal: the replaced holder's payload, so
                     // a LATER failure in this statement re-inserts it (the
@@ -23128,14 +23277,13 @@ pub(crate) fn delete_rows_by_rowid_inner(
             let mut bt = Btree::new(ctx.pager, root, false);
             if let LookupResult::Found(payload) = bt.lookup_table(rowid)? {
                 pre_payload = Some(payload);
-                if let Ok(old_row) = decode_row(
+                let old_row = decode_row(
                     pre_payload.as_ref().unwrap(),
                     n_cols,
                     rowid,
                     table.rowid_alias,
-                ) {
-                    enforce_parent_delete_fks(ctx, table, &old_row, rowid, 0)?;
-                }
+                )?;
+                enforce_parent_delete_fks(ctx, table, &old_row, rowid, 0)?;
             }
         }
         if pre_payload.is_none() && fire_hook && crate::preupdate::events_needed() {
@@ -23170,10 +23318,9 @@ pub(crate) fn delete_rows_by_rowid_inner(
                 });
             }
             if !indexes.is_empty() {
-                if let Ok(row) = decode_row(&payload, n_cols, rowid, table.rowid_alias) {
-                    for idx in &indexes {
-                        delete_index_entry(ctx, idx, table, &row, rowid)?;
-                    }
+                let row = decode_row(&payload, n_cols, rowid, table.rowid_alias)?;
+                for idx in &indexes {
+                    delete_index_entry(ctx, idx, table, &row, rowid)?;
                 }
             }
             ctx.invalidate_max_rowid_if_deleted(&table_name_lc, rowid);
@@ -23265,10 +23412,9 @@ fn apply_rowid_alias_move(
         ctx.set_table_root_lc(&table.name.to_ascii_lowercase(), new_root);
         if let Some(payload) = old_payload {
             if !indexes.is_empty() {
-                if let Ok(row) = decode_row(&payload, table.n_columns(), rowid, table.rowid_alias) {
-                    for idx in &indexes {
-                        delete_index_entry(ctx, idx, table, &row, rowid)?;
-                    }
+                let row = decode_row(&payload, table.n_columns(), rowid, table.rowid_alias)?;
+                for idx in &indexes {
+                    delete_index_entry(ctx, idx, table, &row, rowid)?;
                 }
             }
             if let Some(t) = journal_arc.as_ref() {
@@ -23473,12 +23619,8 @@ fn buffer_index_ops_pre_pass(
             if !handled {
                 // Expression / partial index, or a structural fallback:
                 // the decode path (identical to the per-row loop's).
-                if decode_row_into(old_payload, n_cols, *rowid, alias, &mut old_row_buf).is_err()
-                    || decode_row_into(new_payload, n_cols, *rowid, alias, &mut new_row_buf)
-                        .is_err()
-                {
-                    continue;
-                }
+                decode_row_into(old_payload, n_cols, *rowid, alias, &mut old_row_buf)?;
+                decode_row_into(new_payload, n_cols, *rowid, alias, &mut new_row_buf)?;
                 let old_keys =
                     crate::executor::index_am::index_entry_keys(idx, table, &old_row_buf)?;
                 let new_keys =
@@ -23792,28 +23934,37 @@ pub(crate) fn read_sqlite_sequence(ctx: &ExecContext, table_name: &str) -> Resul
     let mut bt = Btree::new(ctx.pager, root, false);
     let mut out = None;
     let name_lc = table_name.to_ascii_lowercase();
+    let mut decode_err: Option<Error> = None;
     bt.scan_table_borrowed(|_rowid, payload| {
         if out.is_some() {
             return false; // found — stop early
         }
         // 2 columns: (name TEXT, seq INTEGER)
-        if let Ok(vals) = crate::storage::row_codec::decode_row(payload, 2, 0, None) {
-            if vals.len() == 2 {
-                let matches = match &vals[0] {
-                    crate::types::Value::Text(t) => t.as_str().to_ascii_lowercase() == name_lc,
-                    _ => false,
+        let vals = match crate::storage::row_codec::decode_row(payload, 2, 0, None) {
+            Ok(r) => r,
+            Err(e) => {
+                decode_err = Some(e);
+                return false;
+            }
+        };
+        if vals.len() == 2 {
+            let matches = match &vals[0] {
+                crate::types::Value::Text(t) => t.as_str().to_ascii_lowercase() == name_lc,
+                _ => false,
+            };
+            if matches {
+                out = match &vals[1] {
+                    crate::types::Value::Integer(i) => Some(*i),
+                    _ => None,
                 };
-                if matches {
-                    out = match &vals[1] {
-                        crate::types::Value::Integer(i) => Some(*i),
-                        _ => None,
-                    };
-                    return false;
-                }
+                return false;
             }
         }
         true
     })?;
+    if let Some(e) = decode_err {
+        return Err(e);
+    }
     Ok(out)
 }
 
@@ -23839,26 +23990,35 @@ pub(crate) fn bump_sqlite_sequence(
     let name_lc = table_name.to_ascii_lowercase();
     let mut bt = Btree::new(ctx.pager, root, false);
     let mut existing: Option<(i64, i64)> = None; // (rowid, seq)
+    let mut decode_err: Option<Error> = None;
     bt.scan_table_borrowed(|rowid, payload| {
         if existing.is_some() {
             return false;
         }
-        if let Ok(vals) = crate::storage::row_codec::decode_row(payload, 2, 0, None) {
-            if vals.len() == 2 {
-                let matches = match &vals[0] {
-                    crate::types::Value::Text(t) => t.as_str().to_ascii_lowercase() == name_lc,
-                    _ => false,
-                };
-                if matches {
-                    if let crate::types::Value::Integer(i) = &vals[1] {
-                        existing = Some((rowid, *i));
-                    }
-                    return false;
+        let vals = match crate::storage::row_codec::decode_row(payload, 2, 0, None) {
+            Ok(r) => r,
+            Err(e) => {
+                decode_err = Some(e);
+                return false;
+            }
+        };
+        if vals.len() == 2 {
+            let matches = match &vals[0] {
+                crate::types::Value::Text(t) => t.as_str().to_ascii_lowercase() == name_lc,
+                _ => false,
+            };
+            if matches {
+                if let crate::types::Value::Integer(i) = &vals[1] {
+                    existing = Some((rowid, *i));
                 }
+                return false;
             }
         }
         true
     })?;
+    if let Some(e) = decode_err {
+        return Err(e);
+    }
     // Only raise: SQLite never lowers the sequence on re-insert of a
     // smaller explicit rowid (the high-water is monotone until the user
     // edits the table).
@@ -23925,22 +24085,31 @@ pub(crate) fn delete_sqlite_sequence_row(ctx: &mut ExecContext, table_name: &str
     let name_lc = table_name.to_ascii_lowercase();
     let mut bt = Btree::new(ctx.pager, root, false);
     let mut victim: Option<i64> = None;
+    let mut decode_err: Option<Error> = None;
     bt.scan_table_borrowed(|rowid, payload| {
         if victim.is_some() {
             return false;
         }
-        if let Ok(vals) = crate::storage::row_codec::decode_row(payload, 2, 0, None) {
-            if vals.len() == 2 {
-                if let crate::types::Value::Text(t) = &vals[0] {
-                    if t.as_str().to_ascii_lowercase() == name_lc {
-                        victim = Some(rowid);
-                        return false;
-                    }
+        let vals = match crate::storage::row_codec::decode_row(payload, 2, 0, None) {
+            Ok(r) => r,
+            Err(e) => {
+                decode_err = Some(e);
+                return false;
+            }
+        };
+        if vals.len() == 2 {
+            if let crate::types::Value::Text(t) = &vals[0] {
+                if t.as_str().to_ascii_lowercase() == name_lc {
+                    victim = Some(rowid);
+                    return false;
                 }
             }
         }
         true
     })?;
+    if let Some(e) = decode_err {
+        return Err(e);
+    }
     if let Some(rowid) = victim {
         bt.delete_table(rowid)?;
     }
@@ -25219,10 +25388,7 @@ fn try_streaming_update(
                 // Decode + SET + constraints + encode, all before the page
                 // lock is released (payload borrowed, no copy).
                 row_buf.clear();
-                if decode_row_into(payload, n_cols, rowid, table.rowid_alias, &mut row_buf).is_err()
-                {
-                    return Ok(());
-                }
+                decode_row_into(payload, n_cols, rowid, table.rowid_alias, &mut row_buf)?;
                 new_row.clear();
                 new_row.extend_from_slice(&row_buf);
                 for (col_idx, expr) in assignments {
@@ -26053,16 +26219,10 @@ fn try_streaming_update(
                 continue;
             };
             ws_old.clear();
-            if decode_row_into(old_payload, n_cols, *rowid, table.rowid_alias, &mut ws_old).is_err()
-            {
-                continue;
-            }
+            decode_row_into(old_payload, n_cols, *rowid, table.rowid_alias, &mut ws_old)?;
             let new_payload = &update_arena[range.clone()];
             ws_new.clear();
-            if decode_row_into(new_payload, n_cols, *rowid, table.rowid_alias, &mut ws_new).is_err()
-            {
-                continue;
-            }
+            decode_row_into(new_payload, n_cols, *rowid, table.rowid_alias, &mut ws_new)?;
             ws.push((*rowid, ws_old.clone(), ws_new.clone()));
         }
         let ws_refs: Vec<(i64, &[Value], &[Value])> = ws
@@ -26254,25 +26414,22 @@ fn try_streaming_update(
         // from the payloads; the bulk pass above is skipped whenever
         // triggers exist, so every row here is per-row applied).
         if has_update_triggers {
-            if let (Some(op), Ok(new_r)) = (
-                old_payload_opt,
-                decode_row(new_payload, n_cols, *rowid, table.rowid_alias),
-            ) {
-                if let Ok(old_r) = decode_row(op, n_cols, *rowid, table.rowid_alias) {
-                    let changed_cols: Vec<String> = assignments
-                        .iter()
-                        .map(|(idx, _)| table.columns[*idx].name.clone())
-                        .collect();
-                    crate::executor::triggers::fire_triggers(
-                        ctx,
-                        table,
-                        &crate::sql::ast::TriggerEvent::Update(changed_cols.clone()),
-                        crate::sql::ast::TriggerWhen::Before,
-                        Some(&new_r),
-                        Some(&old_r),
-                        &table.col_names,
-                    )?;
-                }
+            if let Some(op) = old_payload_opt {
+                let new_r = decode_row(new_payload, n_cols, *rowid, table.rowid_alias)?;
+                let old_r = decode_row(op, n_cols, *rowid, table.rowid_alias)?;
+                let changed_cols: Vec<String> = assignments
+                    .iter()
+                    .map(|(idx, _)| table.columns[*idx].name.clone())
+                    .collect();
+                crate::executor::triggers::fire_triggers(
+                    ctx,
+                    table,
+                    &crate::sql::ast::TriggerEvent::Update(changed_cols.clone()),
+                    crate::sql::ast::TriggerWhen::Before,
+                    Some(&new_r),
+                    Some(&old_r),
+                    &table.col_names,
+                )?;
             }
         }
         let new_root;
@@ -26430,8 +26587,9 @@ fn try_streaming_update(
         // have the stash since needs_old_payload is true for them).
         if has_update_triggers {
             let old_row_v: Option<Vec<Value>> = old_payload_opt
-                .and_then(|op| decode_row(op, n_cols, *rowid, table.rowid_alias).ok());
-            let new_row_v = decode_row(new_payload, n_cols, *rowid, table.rowid_alias).ok();
+                .map(|op| decode_row(op, n_cols, *rowid, table.rowid_alias))
+                .transpose()?;
+            let new_row_v = Some(decode_row(new_payload, n_cols, *rowid, table.rowid_alias)?);
             if let (Some(old_r), Some(new_r)) = (old_row_v, new_row_v) {
                 let changed_cols: Vec<String> = assignments
                     .iter()
@@ -26802,27 +26960,25 @@ fn process_update_row(
                     // full rows — decode both sides from the payloads (cold
                     // path, only when a hook is installed).
                     if crate::preupdate::events_needed() {
-                        if let Ok(old_row) = crate::storage::row_codec::decode_row(
+                        let old_row = crate::storage::row_codec::decode_row(
                             payload,
                             n_cols,
                             rowid,
                             table.rowid_alias,
-                        ) {
-                            if let Ok(new_row) = crate::storage::row_codec::decode_row(
-                                &update_arena[start..update_arena.len()],
-                                n_cols,
-                                rowid,
-                                table.rowid_alias,
-                            ) {
-                                crate::preupdate::fire(
-                                    crate::preupdate::PreupdateOp::Update,
-                                    table,
-                                    rowid,
-                                    Some(&old_row),
-                                    Some(&new_row),
-                                );
-                            }
-                        }
+                        )?;
+                        let new_row = crate::storage::row_codec::decode_row(
+                            &update_arena[start..update_arena.len()],
+                            n_cols,
+                            rowid,
+                            table.rowid_alias,
+                        )?;
+                        crate::preupdate::fire(
+                            crate::preupdate::PreupdateOp::Update,
+                            table,
+                            rowid,
+                            Some(&old_row),
+                            Some(&new_row),
+                        );
                     }
                     updates.push((rowid, start..update_arena.len(), old_payload_stash));
                     return Ok(());
@@ -26834,9 +26990,7 @@ fn process_update_row(
         // Fall through — the generic path re-decodes the full row.
     }
     row_buf.clear();
-    if decode_row_into(payload, n_cols, rowid, table.rowid_alias, row_buf).is_err() {
-        return Ok(());
-    }
+    decode_row_into(payload, n_cols, rowid, table.rowid_alias, row_buf)?;
     // Rowid comes from the B+tree cell key (passed in by the caller).
     // Apply filter predicate (if any).
     if let Some(pred) = residual_pred {
@@ -27533,10 +27687,11 @@ fn try_streaming_delete(
                 |rowid, payload| {
                     if let Some(pred) = residual_pred {
                         row_buf.clear();
-                        if decode_row_into(payload, n_cols, rowid, table.rowid_alias, &mut row_buf)
-                            .is_err()
+                        if let Err(e) =
+                            decode_row_into(payload, n_cols, rowid, table.rowid_alias, &mut row_buf)
                         {
-                            return true; // skip undecodable rows, keep walking
+                            first_error = Some(e);
+                            return false;
                         }
                         match eval_row_aff(
                             pred,
@@ -27567,9 +27722,11 @@ fn try_streaming_delete(
         scan_table_rows(ctx, table, pred_may_reenter, |rowid, payload| {
             if let Some(pred) = residual_pred {
                 row_buf.clear();
-                if decode_row_into(payload, n_cols, rowid, table.rowid_alias, &mut row_buf).is_err()
+                if let Err(e) =
+                    decode_row_into(payload, n_cols, rowid, table.rowid_alias, &mut row_buf)
                 {
-                    return true;
+                    first_error = Some(e);
+                    return false;
                 }
                 match eval_row_aff(
                     pred,
@@ -27657,17 +27814,16 @@ fn try_streaming_delete(
         if has_delete_triggers {
             let mut bt = Btree::new(ctx.pager, new_root, false);
             if let LookupResult::Found(payload) = bt.lookup_table(rid)? {
-                if let Ok(old_row) = decode_row(&payload, n_cols, rid, table.rowid_alias) {
-                    crate::executor::triggers::fire_triggers(
-                        ctx,
-                        table,
-                        &crate::sql::ast::TriggerEvent::Delete,
-                        crate::sql::ast::TriggerWhen::Before,
-                        None,
-                        Some(&old_row),
-                        &table.col_names,
-                    )?;
-                }
+                let old_row = decode_row(&payload, n_cols, rid, table.rowid_alias)?;
+                crate::executor::triggers::fire_triggers(
+                    ctx,
+                    table,
+                    &crate::sql::ast::TriggerEvent::Delete,
+                    crate::sql::ast::TriggerWhen::Before,
+                    None,
+                    Some(&old_row),
+                    &table.col_names,
+                )?;
             }
         }
         // FOREIGN KEY (parent side): reject / cascade / set-null BEFORE the
@@ -27676,9 +27832,8 @@ fn try_streaming_delete(
         if ctx.pager.foreign_keys_enabled() {
             let mut bt = Btree::new(ctx.pager, new_root, false);
             if let LookupResult::Found(payload) = bt.lookup_table(rid)? {
-                if let Ok(old_row) = decode_row(&payload, n_cols, rid, table.rowid_alias) {
-                    enforce_parent_delete_fks(ctx, table, &old_row, rid, 0)?;
-                }
+                let old_row = decode_row(&payload, n_cols, rid, table.rowid_alias)?;
+                enforce_parent_delete_fks(ctx, table, &old_row, rid, 0)?;
             }
         }
         // One descent: find + delete, payload returned for maintenance.
