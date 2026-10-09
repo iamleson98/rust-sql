@@ -2843,6 +2843,25 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Expr> {
+        // SQLite's `%left COLLATE` binds LOOSER than the prefix operators
+        // (`MINUS expr [BITNOT]`): `-x COLLATE c` is `(-x) COLLATE c`, so
+        // `GROUP BY -2 COLLATE c` is an ordinal (the top COLLATE is
+        // skipped) while `GROUP BY +(-2 COLLATE c)` is a constant.
+        let mut e = self.parse_prefixed()?;
+        while self.peek().is_keyword("COLLATE") {
+            self.advance();
+            let c = self.parse_ident()?;
+            e = Expr::Collate {
+                expr: Box::new(e),
+                collation: c,
+            };
+        }
+        Ok(e)
+    }
+
+    /// A prefix-operator chain over a postfix expression, without a
+    /// trailing COLLATE (see [`Self::parse_unary`]).
+    fn parse_prefixed(&mut self) -> Result<Expr> {
         let t = self.peek();
         if t.is_op("-") {
             self.advance();
@@ -2861,12 +2880,10 @@ impl Parser {
             // non-literal `-x` is coded as `0 - x` (and `0 - 0.0` is +0.0).
             if let Token::Float(f) = &self.peek().token {
                 let f = *f;
-                if !self.peek_n(1).is_keyword("COLLATE") {
-                    self.advance();
-                    return Ok(Expr::Literal(Value::Real(-f)));
-                }
+                self.advance();
+                return Ok(Expr::Literal(Value::Real(-f)));
             }
-            let e = self.parse_unary()?;
+            let e = self.parse_prefixed()?;
             return Ok(Expr::Unary {
                 op: UnaryOp::Neg,
                 expr: Box::new(e),
@@ -2874,7 +2891,7 @@ impl Parser {
         }
         if t.is_op("+") {
             self.advance();
-            let e = self.parse_unary()?;
+            let e = self.parse_prefixed()?;
             return Ok(Expr::Unary {
                 op: UnaryOp::Pos,
                 expr: Box::new(e),
@@ -2882,7 +2899,7 @@ impl Parser {
         }
         if t.is_op("~") {
             self.advance();
-            let e = self.parse_unary()?;
+            let e = self.parse_prefixed()?;
             return Ok(Expr::Unary {
                 op: UnaryOp::BitNot,
                 expr: Box::new(e),
@@ -3011,14 +3028,7 @@ impl Parser {
     fn parse_postfix(&mut self) -> Result<Expr> {
         let mut e = self.parse_primary_expr()?;
         loop {
-            if self.peek().is_keyword("COLLATE") {
-                self.advance();
-                let c = self.parse_ident()?;
-                e = Expr::Collate {
-                    expr: Box::new(e),
-                    collation: c,
-                };
-            } else if self.peek().is_keyword("FILTER") {
+            if self.peek().is_keyword("FILTER") {
                 self.advance();
                 self.expect_punct('(')?;
                 self.expect_keyword("WHERE")?;

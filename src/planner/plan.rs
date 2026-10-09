@@ -344,8 +344,8 @@ pub struct AggExpr {
     pub func: String,
     pub arg: Option<Expr>,
     /// `agg(x ORDER BY …)` (SQLite 3.44): the order the aggregate reads
-    /// its group's rows in — the planner sorts the aggregate's input by
-    /// it (every ordered aggregate of a query shares one ORDER BY).
+    /// its group's rows in — the executor buffers each group's inputs
+    /// and replays them in this order (each aggregate has its own).
     pub order_by: Vec<crate::sql::ast::OrderTerm>,
     /// Per `order_by` term: its comparison collation (explicit COLLATE,
     /// else the column's declared one; `None` = BINARY).

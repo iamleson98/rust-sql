@@ -853,7 +853,7 @@ impl<'a> Statement<'a> {
             }
             let plan = Database::plan_for_statement(&self.db.catalog, inner)?;
             let rows = match plan {
-                Some(p) => crate::executor::explain::explain_plan_rows(&p),
+                Some(p) => crate::executor::explain::explain_plan_rows(&p, &self.db.catalog),
                 None => Vec::new(),
             };
             self.columns = Some(Arc::from(vec![

@@ -7964,7 +7964,7 @@ impl Database {
             }
             let plan = self.explain_plan_for_statement(inner)?;
             let rows = match plan {
-                Some(p) => crate::executor::explain::explain_plan_rows(&p),
+                Some(p) => crate::executor::explain::explain_plan_rows(&p, &self.catalog),
                 None => Vec::new(),
             };
             return Ok((Vec::new(), rows));
@@ -8441,7 +8441,7 @@ impl Database {
             }
             let plan = self.explain_plan_for_statement(inner)?;
             let rows = match plan {
-                Some(p) => crate::executor::explain::explain_plan_rows(&p),
+                Some(p) => crate::executor::explain::explain_plan_rows(&p, &self.catalog),
                 None => Vec::new(),
             };
             return Ok((
@@ -10639,7 +10639,10 @@ impl Database {
                 }
                 let plan = self.foreign_plan_for(inner, params)?;
                 Ok(match plan {
-                    Some(p) => (Vec::new(), crate::executor::explain::explain_plan_rows(&p)),
+                    Some(p) => (
+                        Vec::new(),
+                        crate::executor::explain::explain_plan_rows(&p, &self.catalog),
+                    ),
                     None => (Vec::new(), Vec::new()),
                 })
             }

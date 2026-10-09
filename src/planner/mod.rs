@@ -10333,26 +10333,34 @@ pub(crate) fn no_dp() -> bool {
 }
 
 /// An integer-constant ORDER BY / GROUP BY term (SQLite
-/// sqlite3ExprIsInteger after skipping COLLATE): `K`, `-K`, `+K`.
+/// sqlite3ExprIsInteger after sqlite3ExprSkipCollateAndLikely): `K`,
+/// `-K`, `+K`, each optionally under top-level COLLATEs.
 pub(crate) fn ordinal_term(e: &Expr) -> Option<i64> {
-    // sqlite3ExprIsInteger only recognizes values that fit a 32-bit int
-    // (EP_IntValue): `GROUP BY 4294967296` is a constant, not an ordinal.
-    // Unary `+` / `-` recurse (`- -3` is the ordinal 3, `+ -2` is -2 —
-    // out of range); COLLATE is transparent (this parser binds `-K
-    // COLLATE x` as `-(K COLLATE x)`; SQLite: `(-K) COLLATE x`, same
-    // ordinal).
+    // Only the TOP COLLATE is skipped: `-2 COLLATE c` (parsed as
+    // `(-2) COLLATE c`) is the ordinal -2, `+(-2 COLLATE c)` is not an
+    // integer at all (a constant term).
+    let mut e = e;
+    while let Expr::Collate { expr, .. } = e {
+        e = expr;
+    }
+    integer_value(e)
+}
+
+/// sqlite3ExprIsInteger: a literal fitting a 32-bit int (EP_IntValue —
+/// `GROUP BY 4294967296` is a constant, not an ordinal) through unary
+/// `+` / `-` (`- -3` is 3, `+ -2` is -2).
+fn integer_value(e: &Expr) -> Option<i64> {
     let fits = |k: i64| i32::try_from(k).is_ok();
     match e {
         Expr::Literal(Value::Integer(k)) if fits(*k) => Some(*k),
-        Expr::Collate { expr, .. } => ordinal_term(expr),
         Expr::Unary {
             op: crate::sql::ast::UnaryOp::Pos,
             expr,
-        } => ordinal_term(expr),
+        } => integer_value(expr),
         Expr::Unary {
             op: crate::sql::ast::UnaryOp::Neg,
             expr,
-        } => ordinal_term(expr)?.checked_neg().filter(|k| fits(*k)),
+        } => integer_value(expr)?.checked_neg().filter(|k| fits(*k)),
         _ => None,
     }
 }

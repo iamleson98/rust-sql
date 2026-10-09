@@ -1,15 +1,17 @@
 //! EXPLAIN QUERY PLAN rendering — SQLite-compatible row schema
 //! (id, parent, notused, detail), used by api::query.
 use crate::planner::plan::Plan;
+use crate::schema::Catalog;
+use crate::sql::ast::Expr;
 use crate::types::{Row, Value};
 
 /// Render a plan into EXPLAIN QUERY PLAN rows, mirroring SQLite's
 /// (id, parent, notused, detail) schema. Children of a node share the
 /// parent's id; sibling subtrees are emitted left-to-right.
-pub(crate) fn explain_plan_rows(plan: &Plan) -> Vec<Row> {
+pub(crate) fn explain_plan_rows(plan: &Plan, cat: &Catalog) -> Vec<Row> {
     let mut rows = Vec::new();
     let mut next_id: i64 = 1;
-    walk(plan, 0, &mut rows, &mut next_id);
+    walk(plan, 0, &mut rows, &mut next_id, cat);
     rows
 }
 
@@ -17,7 +19,7 @@ fn alias_of(alias: &Option<String>, table: &str) -> String {
     alias.clone().unwrap_or_else(|| table.to_string())
 }
 
-fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64) {
+fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64, cat: &Catalog) {
     match plan {
         Plan::TableFunction { name, args, alias } => {
             let a = alias_of(alias, name);
@@ -288,7 +290,7 @@ fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64) {
                     }
                 }
             }
-            walk(input, parent, rows, next_id)
+            walk(input, parent, rows, next_id, cat)
         }
         Plan::Project { input, columns } => {
             // Covering-index detection (SQLite's "USING COVERING INDEX"
@@ -297,12 +299,52 @@ fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64) {
             // exec_index_lookup_impl / exec_index_range_projected.
             match covering_index_detail(input, columns) {
                 Some(detail) => push_row(parent, rows, next_id, detail),
-                None => walk(input, parent, rows, next_id),
+                None => walk(input, parent, rows, next_id, cat),
             }
         }
-        Plan::Limit { input, .. } => walk(input, parent, rows, next_id),
+        Plan::Limit {
+            input,
+            count,
+            offset,
+        } => {
+            // exec_limit's index-order plan: the ORDER BY is read from an
+            // index (no temp b-tree) when the LIMIT / OFFSET fit its
+            // bounds — a bound parameter is shown as fitting.
+            let fits = |e: &Expr, min: i64| match e {
+                Expr::Literal(Value::Integer(k)) => (min..=1 << 16).contains(k),
+                Expr::Literal(_) => false,
+                _ => true,
+            };
+            let sorted = match input.as_ref() {
+                Plan::Sort { input, terms } => Some((input, terms)),
+                Plan::Project { input, .. } => match input.as_ref() {
+                    Plan::Sort { input, terms } => Some((input, terms)),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some((source, terms)) = sorted.filter(|_| fits(count, 0) && fits(offset, 0)) {
+                if let Some((index, _)) = crate::executor::index_order_source(cat, source, terms) {
+                    match source.as_ref() {
+                        Plan::Scan { table, alias, .. } => push_row(
+                            parent,
+                            rows,
+                            next_id,
+                            format!(
+                                "SCAN {} USING INDEX {}",
+                                alias_of(alias, &table.name),
+                                index.name
+                            ),
+                        ),
+                        range => walk(range, parent, rows, next_id, cat),
+                    }
+                    return;
+                }
+            }
+            walk(input, parent, rows, next_id, cat)
+        }
         Plan::Distinct { input } => {
-            walk(input, parent, rows, next_id);
+            walk(input, parent, rows, next_id, cat);
             push_row(
                 parent,
                 rows,
@@ -311,7 +353,7 @@ fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64) {
             );
         }
         Plan::Sort { input, .. } => {
-            walk(input, parent, rows, next_id);
+            walk(input, parent, rows, next_id, cat);
             push_row(
                 parent,
                 rows,
@@ -320,9 +362,30 @@ fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64) {
             );
         }
         Plan::Aggregate {
-            input, group_by, ..
+            input,
+            group_by,
+            aggregates,
         } => {
-            walk(input, parent, rows, next_id);
+            // The index min/max path seeks the index's first / last entry.
+            if let Some(index) =
+                crate::executor::explain_min_max_index(cat, input, group_by, aggregates)
+            {
+                match input.as_ref() {
+                    Plan::Scan { table, alias, .. } => push_row(
+                        parent,
+                        rows,
+                        next_id,
+                        format!(
+                            "SEARCH {} USING INDEX {}",
+                            alias_of(alias, &table.name),
+                            index.name
+                        ),
+                    ),
+                    range => walk(range, parent, rows, next_id, cat),
+                }
+                return;
+            }
+            walk(input, parent, rows, next_id, cat);
             if !group_by.is_empty() {
                 push_row(
                     parent,
@@ -333,12 +396,12 @@ fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64) {
             }
         }
         Plan::Window { input, .. } => {
-            walk(input, parent, rows, next_id);
+            walk(input, parent, rows, next_id, cat);
             push_row(parent, rows, next_id, "USE WINDOW FUNCTION".to_string());
         }
         Plan::Join { left, right, .. } => {
-            walk(left, parent, rows, next_id);
-            walk(right, parent, rows, next_id);
+            walk(left, parent, rows, next_id, cat);
+            walk(right, parent, rows, next_id, cat);
         }
         Plan::IndexNestedLoopJoin {
             outer,
@@ -348,7 +411,7 @@ fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64) {
             covering,
             ..
         } => {
-            walk(outer, parent, rows, next_id);
+            walk(outer, parent, rows, next_id, cat);
             let a = alias_of(inner_alias, &inner_table.name);
             let cols = index_columns_desc(inner_index, 1);
             // SQLite's wording distinguishes the index-only form.
@@ -366,7 +429,7 @@ fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64) {
         }
         Plan::Subquery { plan } => {
             // Give the subquery its own top-level id group, like SQLite.
-            walk(plan, parent, rows, next_id);
+            walk(plan, parent, rows, next_id, cat);
         }
         Plan::CteRows { .. } => {
             push_row(parent, rows, next_id, "SCAN CTE".to_string());
@@ -376,8 +439,8 @@ fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64) {
             push_row(parent, rows, next_id, "SCAN SUBQUERY WITH CTE".to_string());
         }
         Plan::Union { left, right, .. } => {
-            walk(left, parent, rows, next_id);
-            walk(right, parent, rows, next_id);
+            walk(left, parent, rows, next_id, cat);
+            walk(right, parent, rows, next_id, cat);
             push_row(
                 parent,
                 rows,
@@ -386,8 +449,8 @@ fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64) {
             );
         }
         Plan::Intersect { left, right } => {
-            walk(left, parent, rows, next_id);
-            walk(right, parent, rows, next_id);
+            walk(left, parent, rows, next_id, cat);
+            walk(right, parent, rows, next_id, cat);
             push_row(
                 parent,
                 rows,
@@ -396,8 +459,8 @@ fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64) {
             );
         }
         Plan::Except { left, right } => {
-            walk(left, parent, rows, next_id);
-            walk(right, parent, rows, next_id);
+            walk(left, parent, rows, next_id, cat);
+            walk(right, parent, rows, next_id, cat);
             push_row(
                 parent,
                 rows,
@@ -406,11 +469,11 @@ fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64) {
             );
         }
         Plan::Insert { source, table, .. } => {
-            walk(source, parent, rows, next_id);
+            walk(source, parent, rows, next_id, cat);
             let _ = table;
         }
-        Plan::Update { source, .. } => walk(source, parent, rows, next_id),
-        Plan::Delete { source, .. } => walk(source, parent, rows, next_id),
+        Plan::Update { source, .. } => walk(source, parent, rows, next_id, cat),
+        Plan::Delete { source, .. } => walk(source, parent, rows, next_id, cat),
     }
 }
 

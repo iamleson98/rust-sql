@@ -8210,6 +8210,105 @@ fn index_order_matches(
     Some(desc)
 }
 
+/// The ORDER BY term a `min(c)` / `max(c)` aggregate reads its index in
+/// (ASC for min, DESC for max, under the argument's COLLATE) and the
+/// column's name; `None` for any other aggregate, DISTINCT / FILTER, or a
+/// non-column argument.
+fn min_max_order_term(agg: &AggExpr) -> Option<(OrderTerm, &str)> {
+    let desc = match agg.func.as_str() {
+        "min" => false,
+        "max" => true,
+        _ => return None,
+    };
+    if agg.distinct || agg.filter.is_some() {
+        return None;
+    }
+    let arg = agg.arg.as_ref()?;
+    let col = match arg {
+        Expr::Collate { expr, .. } => expr.as_ref(),
+        e => e,
+    };
+    let Expr::Column { name, .. } = col else {
+        return None;
+    };
+    let term = OrderTerm {
+        expr: arg.clone(),
+        order: if desc { Order::Desc } else { Order::Asc },
+        nulls: NullsOrder::Default,
+    };
+    Some((term, name))
+}
+
+/// The aggregate list the index min/max path answers: no GROUP BY and
+/// every call the same `min(c)` / `max(c)` (SQLite's AggInfo dedups
+/// repeated calls). Returns that aggregate.
+fn min_max_aggregate<'p>(group_by: &[Expr], aggregates: &'p [AggExpr]) -> Option<&'p AggExpr> {
+    let first = aggregates.first()?;
+    let same = |a: &AggExpr| {
+        a.func == first.func
+            && a.distinct == first.distinct
+            && a.filter.is_none()
+            && format!("{:?}", a.arg) == format!("{:?}", first.arg)
+    };
+    (group_by.is_empty() && aggregates.iter().all(same)).then_some(first)
+}
+
+/// The index an `ORDER BY terms` over `sort_input` is read from in order
+/// — `sort_input`'s own index range, or an index of an unfiltered scan's
+/// table — and whether the walk runs backwards. Shared by the executor
+/// (index-order LIMIT, index min/max) and EXPLAIN QUERY PLAN, so the plan
+/// shown is the plan run.
+pub(crate) fn index_order_source(
+    catalog: &crate::schema::Catalog,
+    sort_input: &Plan,
+    terms: &[OrderTerm],
+) -> Option<(Arc<crate::schema::Index>, bool)> {
+    let (table, found) = match sort_input {
+        Plan::IndexRange {
+            table,
+            alias,
+            index,
+            ..
+        } => (
+            table,
+            index_order_matches(table, alias.as_deref(), index, terms)
+                .map(|d| (Arc::clone(index), d)),
+        ),
+        Plan::Scan {
+            table,
+            alias,
+            index: None,
+            predicate: None,
+        } => (
+            table,
+            catalog
+                .indexes_on_table(&table.name)
+                .into_iter()
+                .find_map(|ix| {
+                    index_order_matches(table, alias.as_deref(), &ix, terms).map(|d| (ix, d))
+                }),
+        ),
+        _ => return None,
+    };
+    if table.vtab.is_some() || table.without_rowid {
+        return None;
+    }
+    found
+}
+
+/// EXPLAIN's view of the index min/max path: the index a no-GROUP-BY
+/// `min(c)` / `max(c)` over `input` reads (see [`try_index_min_max`]).
+pub(crate) fn explain_min_max_index(
+    catalog: &crate::schema::Catalog,
+    input: &Plan,
+    group_by: &[Expr],
+    aggregates: &[AggExpr],
+) -> Option<Arc<crate::schema::Index>> {
+    let agg = min_max_aggregate(group_by, aggregates)?;
+    let (term, _) = min_max_order_term(agg)?;
+    index_order_source(catalog, input, std::slice::from_ref(&term)).map(|(ix, _)| ix)
+}
+
 /// `min(c)` / `max(c)` (no GROUP BY, no DISTINCT / FILTER) read from an
 /// index whose leading key is `c` under the aggregate's collation — the
 /// first (min) or last (max) non-NULL entry of the input's range whose
@@ -8222,27 +8321,7 @@ fn try_index_min_max(
     input: &Plan,
     agg: &AggExpr,
 ) -> Result<Option<ExecResult>> {
-    let desc = match agg.func.as_str() {
-        "min" => false,
-        "max" => true,
-        _ => return Ok(None),
-    };
-    if agg.distinct || agg.filter.is_some() {
-        return Ok(None);
-    }
-    let Some(arg) = agg.arg.as_ref() else {
-        return Ok(None);
-    };
-    let term = OrderTerm {
-        expr: arg.clone(),
-        order: if desc { Order::Desc } else { Order::Asc },
-        nulls: NullsOrder::Default,
-    };
-    let col = match arg {
-        Expr::Collate { expr, .. } => expr.as_ref(),
-        e => e,
-    };
-    let Expr::Column { name, .. } = col else {
+    let Some((term, name)) = min_max_order_term(agg) else {
         return Ok(None);
     };
     // The aggregate reads the input's rows: an unfiltered scan, or an
@@ -8267,25 +8346,15 @@ fn try_index_min_max(
     // already starts past them; an unfiltered scan does not).
     let res = match sort_input {
         Plan::Scan { table, alias, .. } => {
+            let Some((index, _)) =
+                index_order_source(ctx.catalog(), sort_input, std::slice::from_ref(&term))
+            else {
+                return Ok(None);
+            };
             let range = Plan::IndexRange {
                 table: Arc::clone(table),
                 alias: alias.clone(),
-                index: match ctx
-                    .catalog()
-                    .indexes_on_table(&table.name)
-                    .into_iter()
-                    .find(|ix| {
-                        index_order_matches(
-                            table,
-                            alias.as_deref(),
-                            ix,
-                            std::slice::from_ref(&term),
-                        )
-                        .is_some()
-                    }) {
-                    Some(ix) => ix,
-                    None => return Ok(None),
-                },
+                index,
                 start: None,
                 end: None,
                 residual: None,
@@ -8323,60 +8392,25 @@ fn try_index_order_limit(
     terms: &[OrderTerm],
     need: usize,
 ) -> Result<Option<ExecResult>> {
-    type Range<'a> = (
-        Option<&'a (Expr, bool)>,
-        Option<&'a (Expr, bool)>,
-        Option<&'a Expr>,
-    );
-    let (table, alias, index, desc, range): (
-        &Arc<Table>,
-        &Option<String>,
-        Arc<crate::schema::Index>,
-        bool,
-        Option<Range<'_>>,
-    ) = match sort_input {
+    let Some((index, desc)) = index_order_source(ctx.catalog(), sort_input, terms) else {
+        return Ok(None);
+    };
+    let (table, alias, range) = match sort_input {
         Plan::IndexRange {
             table,
             alias,
-            index,
             start,
             end,
             residual,
-        } => {
-            let Some(desc) = index_order_matches(table, alias.as_deref(), index, terms) else {
-                return Ok(None);
-            };
-            (
-                table,
-                alias,
-                Arc::clone(index),
-                desc,
-                Some((start.as_ref(), end.as_ref(), residual.as_ref())),
-            )
-        }
-        Plan::Scan {
+            ..
+        } => (
             table,
             alias,
-            index: None,
-            predicate: None,
-        } => {
-            let found = ctx
-                .catalog()
-                .indexes_on_table(&table.name)
-                .into_iter()
-                .find_map(|ix| {
-                    index_order_matches(table, alias.as_deref(), &ix, terms).map(|d| (ix, d))
-                });
-            let Some((index, desc)) = found else {
-                return Ok(None);
-            };
-            (table, alias, index, desc, None)
-        }
+            Some((start.as_ref(), end.as_ref(), residual.as_ref())),
+        ),
+        Plan::Scan { table, alias, .. } => (table, alias, None),
         _ => return Ok(None),
     };
-    if table.vtab.is_some() || table.without_rowid {
-        return Ok(None);
-    }
     // Output layout of exec_index_range: qualified columns, plus the
     // hidden rowid slot for alias-less rowid tables.
     let append_rowid = crate::planner::wants_rowid_slot(table);
@@ -13541,16 +13575,8 @@ fn exec_aggregate(
         // Repeated identical calls (`SELECT max(x), typeof(max(x))` plans two)
         // are one aggregate, as in SQLite's AggInfo: computed once, the value
         // fills every slot.
-        if group_by.is_empty()
-            && !aggregates.is_empty()
-            && aggregates.iter().all(|a| {
-                a.func == aggregates[0].func
-                    && a.distinct == aggregates[0].distinct
-                    && a.filter.is_none()
-                    && format!("{:?}", a.arg) == format!("{:?}", aggregates[0].arg)
-            })
-        {
-            if let Some(mut res) = try_index_min_max(ctx, input, &aggregates[0])? {
+        if let Some(agg) = min_max_aggregate(group_by, aggregates) {
+            if let Some(mut res) = try_index_min_max(ctx, input, agg)? {
                 if aggregates.len() > 1 {
                     let v = res.rows[0][0].clone();
                     res.columns = (0..aggregates.len())
@@ -14785,6 +14811,22 @@ fn agg_coll_at(aggregates: &[AggExpr], i: usize) -> Option<&str> {
     aggregates.get(i).and_then(|a| a.collation.as_deref())
 }
 
+/// SQLite's sumStep classification of a sum / total / avg argument
+/// (`sqlite3_value_numeric_type`, i.e. applyNumericAffinity without the
+/// integer squeeze): a TEXT that reads as an integer contributes EXACTLY
+/// (`'12'`, and `'1' || x'00…'` — the conversion stops at an embedded
+/// NUL); any other TEXT or BLOB contributes its numeric prefix as a REAL
+/// (`sqlite3_value_double`: 0.0 when there is none), which flips the
+/// accumulator to REAL mode.
+fn sum_step_arg(v: &Value) -> Value {
+    match v {
+        Value::Text(t) => crate::executor::expr::numeric_value(v)
+            .unwrap_or_else(|| Value::Real(crate::types::numeric::atof(t.as_bytes()).0)),
+        Value::Blob(b) => Value::Real(crate::types::numeric::atof(b).0),
+        other => other.clone(),
+    }
+}
+
 fn update_agg_state(
     state: &mut AggState,
     func: AggFunc,
@@ -14836,27 +14878,7 @@ fn update_agg_state(
         }
         AggFunc::Sum | AggFunc::Total => {
             if !v.is_null() {
-                // SQLite's sumStep classification (sqlite3_value_numeric_type):
-                // TEXT converts with INTEGER preference (a fully-integer
-                // text contributes exactly); any other TEXT/BLOB
-                // contributes its NUMERIC PREFIX as REAL (0.0 when
-                // non-numeric) — always REAL mode. BLOBs take the prefix
-                // path only (value_numeric_type applies affinity to TEXT
-                // alone, so a blob's bytes go through value_double).
-                let v: Value = match v {
-                    Value::Text(t) => {
-                        let trimmed = t.as_str().trim();
-                        if let Ok(i) = trimmed.parse::<i64>() {
-                            Value::Integer(i)
-                        } else {
-                            Value::Real(crate::types::value::parse_real_prefix(t.as_str()))
-                        }
-                    }
-                    Value::Blob(b) => Value::Real(crate::types::value::parse_real_prefix(
-                        &String::from_utf8_lossy(b),
-                    )),
-                    other => (*other).clone(),
-                };
+                let v = sum_step_arg(v);
                 // sumStep discipline: integers accumulate exactly in
                 // int_sum; the first REAL folds the integer partial into
                 // `sum` once and flips; every f64 add thereafter is a
@@ -14893,22 +14915,8 @@ fn update_agg_state(
             // partial into `sum` once and flips; finalize is the raw
             // r/cnt double — no rounding, matching SQLite bit-for-bit.
             if !v.is_null() {
-                // Same argument classification as Sum (TEXT with integer
-                // preference; BLOB bytes as a REAL numeric prefix).
-                let v: Value = match v {
-                    Value::Text(t) => {
-                        let trimmed = t.as_str().trim();
-                        if let Ok(i) = trimmed.parse::<i64>() {
-                            Value::Integer(i)
-                        } else {
-                            Value::Real(crate::types::value::parse_real_prefix(t.as_str()))
-                        }
-                    }
-                    Value::Blob(b) => Value::Real(crate::types::value::parse_real_prefix(
-                        &String::from_utf8_lossy(b),
-                    )),
-                    other => (*other).clone(),
-                };
+                // Same argument classification as Sum.
+                let v = sum_step_arg(v);
                 state.count += 1;
                 if matches!(v, Value::Real(_)) {
                     if state.sum_is_int {
@@ -16215,7 +16223,19 @@ fn compile_join_term(
                             }
                         },
                         JExpr::Param(_) => !matches!(aff, Some(A::Blob | A::None)),
-                        JExpr::LCol(_) | JExpr::RCol(_) => false,
+                        // Column vs column: a numeric-affinity column
+                        // converts the other side when that side is TEXT /
+                        // BLOB / untyped (`text_col > real_col` compares
+                        // numerically) — the compiled term compares raw
+                        // values, so decline (the general path applies the
+                        // affinities). An unknown affinity declines too.
+                        JExpr::LCol(_) | JExpr::RCol(_) => {
+                            let numeric = |a: A| matches!(a, A::Integer | A::Real | A::Numeric);
+                            match (aff, col_aff(other).flatten()) {
+                                (Some(x), Some(y)) => numeric(x) != numeric(y),
+                                _ => true,
+                            }
+                        }
                         _ => true,
                     }
                 };
