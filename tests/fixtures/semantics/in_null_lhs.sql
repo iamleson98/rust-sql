@@ -1,0 +1,23 @@
+-- `x IN (...)` with a NULL x still evaluates its right-hand side, as SQLite
+-- does (every list member: only a MATCH stops the member-by-member
+-- compare; a subquery is materialized first), so a raising member raises;
+-- an EMPTY subquery result decides FALSE before the NULL rule.
+SELECT NULL IN (9.2233720368547758e18, -0.0, abs(-9223372036854775808));
+SELECT NULL IN (1, abs(-9223372036854775808));
+SELECT NULL NOT IN (1, 2, 3, abs(-9223372036854775808));
+SELECT 1 IN (1, abs(-9223372036854775808));
+SELECT 1 IN (1, 2, abs(-9223372036854775808));
+SELECT 5 IN (1, abs(-9223372036854775808));
+SELECT NULL IN ();
+CREATE TABLE q(k, j);
+INSERT INTO q VALUES (NULL, 1), (2, 2);
+SELECT k IN (j, abs(-9223372036854775808)) FROM q;
+SELECT k FROM q WHERE k IN (j, abs(-9223372036854775808));
+SELECT (CASE WHEN 0 THEN 1 END) IN (k, abs(-9223372036854775808), k) FROM q;
+SELECT NULL IN (SELECT abs(-9223372036854775808));
+SELECT NULL IN (SELECT k FROM q WHERE abs(j - 9223372036854775807 - 3) > 0);
+SELECT k, NULL IN (SELECT j FROM q AS q2 WHERE q2.j = q.k) FROM q;
+SELECT x FROM (SELECT NULL AS x) WHERE x IN (1, 2);
+SELECT k, NULL NOT IN (SELECT j FROM q AS q2 WHERE q2.j = q.k) FROM q;
+SELECT k FROM q WHERE NULL NOT IN (SELECT j FROM q AS q2 WHERE q2.j = q.k + 100);
+SELECT NULL IN (SELECT 1 WHERE 0), NULL NOT IN (SELECT 1 WHERE 0);

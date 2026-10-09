@@ -1906,6 +1906,27 @@ fn evaluate_in(
         }
     }
     if v.is_null() {
+        // A NULL left operand never matches, but SQLite still evaluates
+        // the right-hand side: every list member (IN_INDEX_NOOP compares
+        // member by member and only a MATCH stops it; an all-constant list
+        // is materialized whole), and a subquery is materialized before
+        // the left operand is even tested (sqlite3FindInIndex codes the
+        // RHS first) — so a raising member raises:
+        // `NULL IN (1, abs(-9223372036854775808))` is "integer overflow".
+        match source {
+            InSource::List(list) => {
+                for e in list.iter() {
+                    evaluate(e, ctx)?;
+                }
+            }
+            InSource::Subquery(sel) => {
+                // An EMPTY result decides first (see above): FALSE.
+                if crate::executor::corr_exec_in_list(sel, ctx)?.is_empty() {
+                    return Ok(Value::Integer(i64::from(negated)));
+                }
+            }
+            InSource::Table(_) => {}
+        }
         return Ok(Value::Null);
     }
     let coll_ref = coll.as_deref();
