@@ -813,6 +813,14 @@ pub enum UnaryOp {
     Pos,
     Not,
     BitNot,
+    /// `x IS [NOT] TRUE` / `x IS [NOT] FALSE` (SQLite's TK_TRUTH): a
+    /// truth test under the WHERE truthiness rule, never NULL — distinct
+    /// from `x IS 1` (`'5' IS TRUE` is 1, `'5' IS 1` is 0). `truth` is the
+    /// keyword tested against; `negated` is the IS NOT form.
+    Truth {
+        truth: bool,
+        negated: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

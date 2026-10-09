@@ -967,6 +967,203 @@ fn simplified_and_or(e: &Expr) -> &Expr {
     e
 }
 
+/// SQLite's exprEvalRhsFirst: with a subquery only on the LEFT, the
+/// right operand of an AND / OR goes first.
+fn and_or_order<'a>(left: &'a Expr, right: &'a Expr) -> (&'a Expr, &'a Expr) {
+    if crate::executor::expr_has_subquery(left) && !crate::executor::expr_has_subquery(right) {
+        (right, left)
+    } else {
+        (left, right)
+    }
+}
+
+/// A condition — a WHERE / ON / HAVING term, an aggregate or window
+/// FILTER, a searched CASE's WHEN, a trigger WHEN, a partial-index WHERE,
+/// an upsert's WHERE: TRUE passes, FALSE and NULL do not
+/// (`sqlite3ExprIfFalse(…, SQLITE_JUMPIFNULL)`). AND / OR / NOT /
+/// `IS [NOT] TRUE|FALSE` / BETWEEN short-circuit here the way SQLite's
+/// jump code does; a value-context AND / OR (`evaluate`) computes both
+/// operands instead.
+pub fn evaluate_where(expr: &Expr, ctx: &EvalContext<'_>) -> Result<bool> {
+    Ok(!cond_if_false(expr, ctx, true)?)
+}
+
+/// A CHECK constraint: it fails only on FALSE — NULL passes
+/// (`sqlite3ExprIfTrue(…, SQLITE_JUMPIFNULL)` to the all-ok label).
+pub fn evaluate_check(expr: &Expr, ctx: &EvalContext<'_>) -> Result<bool> {
+    cond_if_true(expr, ctx, true)
+}
+
+/// sqlite3ExprIfFalse: does `e` take its FALSE exit — FALSE, or NULL when
+/// `jump_if_null`? Mirrors the jump code's evaluation order exactly: the
+/// operands a decided branch skips are never evaluated (so they cannot
+/// raise).
+fn cond_if_false(e: &Expr, ctx: &EvalContext<'_>, jump_if_null: bool) -> Result<bool> {
+    match e {
+        Expr::Binary {
+            op: op @ (BinaryOp::And | BinaryOp::Or),
+            left,
+            right,
+        } => {
+            let alt = simplified_and_or(e);
+            if !std::ptr::eq(alt, e) {
+                return cond_if_false(alt, ctx, jump_if_null);
+            }
+            let (first, second) = and_or_order(left, right);
+            if *op == BinaryOp::And {
+                Ok(cond_if_false(first, ctx, jump_if_null)?
+                    || cond_if_false(second, ctx, jump_if_null)?)
+            } else {
+                if cond_if_true(first, ctx, !jump_if_null)? {
+                    return Ok(false);
+                }
+                cond_if_false(second, ctx, jump_if_null)
+            }
+        }
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } => cond_if_true(expr, ctx, jump_if_null),
+        // TK_TRUTH never yields NULL: the operand's own NULL decides by
+        // the form (IS TRUE: NULL fails it; IS NOT FALSE: NULL passes).
+        Expr::Unary {
+            op: UnaryOp::Truth { truth, negated },
+            expr,
+        } => {
+            if *truth ^ *negated {
+                cond_if_false(expr, ctx, !*negated)
+            } else {
+                cond_if_true(expr, ctx, !*negated)
+            }
+        }
+        Expr::Between { negated: true, .. } => between_jump(e, ctx, true, jump_if_null),
+        Expr::Between { .. } => between_jump(e, ctx, false, jump_if_null),
+        _ => {
+            let v = evaluate(e, ctx)?;
+            Ok(if v.is_null() {
+                jump_if_null
+            } else {
+                !v.is_truthy()
+            })
+        }
+    }
+}
+
+/// sqlite3ExprIfTrue: does `e` take its TRUE exit — TRUE, or NULL when
+/// `jump_if_null`?
+fn cond_if_true(e: &Expr, ctx: &EvalContext<'_>, jump_if_null: bool) -> Result<bool> {
+    match e {
+        Expr::Binary {
+            op: op @ (BinaryOp::And | BinaryOp::Or),
+            left,
+            right,
+        } => {
+            let alt = simplified_and_or(e);
+            if !std::ptr::eq(alt, e) {
+                return cond_if_true(alt, ctx, jump_if_null);
+            }
+            let (first, second) = and_or_order(left, right);
+            if *op == BinaryOp::And {
+                if cond_if_false(first, ctx, !jump_if_null)? {
+                    return Ok(false);
+                }
+                cond_if_true(second, ctx, jump_if_null)
+            } else {
+                Ok(cond_if_true(first, ctx, jump_if_null)?
+                    || cond_if_true(second, ctx, jump_if_null)?)
+            }
+        }
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } => cond_if_false(expr, ctx, jump_if_null),
+        Expr::Unary {
+            op: UnaryOp::Truth { truth, negated },
+            expr,
+        } => {
+            if *truth ^ *negated {
+                cond_if_true(expr, ctx, *negated)
+            } else {
+                cond_if_false(expr, ctx, *negated)
+            }
+        }
+        // NOT BETWEEN parses as TK_NOT over TK_BETWEEN.
+        Expr::Between { negated: true, .. } => between_jump(e, ctx, false, jump_if_null),
+        Expr::Between { .. } => between_jump(e, ctx, true, jump_if_null),
+        _ => {
+            let v = evaluate(e, ctx)?;
+            Ok(if v.is_null() {
+                jump_if_null
+            } else {
+                v.is_truthy()
+            })
+        }
+    }
+}
+
+/// exprCodeBetween under a jump: `x BETWEEN lo AND hi` is `x >= lo AND
+/// x <= hi` with x computed once, the AND coded as a jump — the upper
+/// bound is never evaluated once `x >= lo` decides. `if_true` selects
+/// sqlite3ExprIfTrue (else IfFalse) over the un-negated BETWEEN.
+fn between_jump(
+    e: &Expr,
+    ctx: &EvalContext<'_>,
+    if_true: bool,
+    jump_if_null: bool,
+) -> Result<bool> {
+    let Expr::Between {
+        expr, low, high, ..
+    } = e
+    else {
+        unreachable!("between_jump on a non-BETWEEN");
+    };
+    let v = evaluate(expr, ctx)?;
+    let ge = between_bound(ctx, expr, &v, low, true)?;
+    // The AND's first comparison, under the jump flags of its position.
+    let first_jump_null = if if_true { !jump_if_null } else { jump_if_null };
+    let first_false = match ge {
+        None => first_jump_null,
+        Some(b) => !b,
+    };
+    if first_false {
+        // IfFalse: the AND is decided FALSE — take the jump. IfTrue: the
+        // AND's first operand jumped to the fall-through label.
+        return Ok(!if_true);
+    }
+    let le = between_bound(ctx, expr, &v, high, false)?;
+    Ok(match le {
+        None => jump_if_null,
+        Some(b) => b == if_true,
+    })
+}
+
+/// One desugared BETWEEN comparison — `v >= bound` (`lower`) or `v <=
+/// bound` — with that pair's comparison affinity and collation; `None`
+/// when either side is NULL.
+fn between_bound(
+    ctx: &EvalContext<'_>,
+    expr: &Expr,
+    v: &Value,
+    bound: &Expr,
+    lower: bool,
+) -> Result<Option<bool>> {
+    let b = evaluate(bound, ctx)?;
+    if v.is_null() || b.is_null() {
+        return Ok(None);
+    }
+    let (v, b) = coerce_comparison_operands(ctx, expr, v.clone(), bound, b);
+    let coll = resolve_collation(ctx.binary_comparison_collation(expr, bound))?;
+    let ord = match coll {
+        Some(c) => crate::plugin::compare_collated(&v, &b, c.as_ref()),
+        None => crate::executor::value_cmp_conn(&v, &b),
+    };
+    Ok(Some(if lower {
+        ord != std::cmp::Ordering::Less
+    } else {
+        ord != std::cmp::Ordering::Greater
+    }))
+}
+
 pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
     match expr {
         Expr::Literal(v) => Ok(v.clone()),
@@ -982,12 +1179,13 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
             }
         }
         Expr::Column { table, name } => Ok(ctx.lookup(table, name)),
-        // AND / OR short-circuit like SQLite's exprCodeTargetAndOr: the
-        // first operand decides alone when it is FALSE (AND) / TRUE (OR)
-        // — a NULL does not decide — and the other operand is then never
-        // evaluated (`0 AND abs(-9223372036854775808)` is 0, not an
-        // overflow error). The right operand goes first when only the
-        // left one holds a subquery (exprEvalRhsFirst).
+        // A VALUE-context AND / OR (a result column, an operand, an
+        // argument, a SET value) follows exprCodeTargetAndOr: BOTH
+        // operands are computed — `SELECT x > 0 OR abs(y)` raises on an
+        // overflowing y even when x > 0 — except that an operand holding
+        // a subquery is skipped when the other one decides (and goes
+        // second: exprEvalRhsFirst). Conditions short-circuit instead
+        // (`evaluate_where`).
         Expr::Binary {
             op: op @ (BinaryOp::And | BinaryOp::Or),
             left,
@@ -1002,15 +1200,9 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
                 let v = evaluate(alt, ctx)?;
                 return Ok(apply_binary(BinaryOp::And, &v, &v));
             }
-            let (first, second) = if crate::executor::expr_has_subquery(left)
-                && !crate::executor::expr_has_subquery(right)
-            {
-                (right, left)
-            } else {
-                (left, right)
-            };
+            let (first, second) = and_or_order(left, right);
             let a = evaluate(first, ctx)?;
-            if !a.is_null() {
+            if crate::executor::expr_has_subquery(second) && !a.is_null() {
                 let t = a.is_truthy();
                 if *op == BinaryOp::And && !t {
                     return Ok(Value::Integer(0));
@@ -1274,11 +1466,10 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
                     if eq.is_truthy() {
                         return evaluate(val, ctx);
                     }
-                } else {
-                    let c = evaluate(cond, ctx)?;
-                    if c.is_truthy() {
-                        return evaluate(val, ctx);
-                    }
+                } else if evaluate_where(cond, ctx)? {
+                    // The searched form's WHEN is a jump
+                    // (sqlite3ExprIfFalse, SQLITE_JUMPIFNULL).
+                    return evaluate(val, ctx);
                 }
             }
             if let Some(e) = else_ {
@@ -1528,7 +1719,7 @@ fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext<'_>) -> Result
     // conjunction, term by term, stopping at the first FALSE/NULL.
     if name == crate::planner::CONST_WHERE_FN {
         for a in args {
-            if !evaluate(a, ctx)?.is_truthy() {
+            if !evaluate_where(a, ctx)? {
                 return Ok(Value::Integer(0));
             }
         }
@@ -1552,7 +1743,7 @@ fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext<'_>) -> Result
         "iif" | "if" if args.len() >= 2 => {
             let mut k = 0;
             while k + 1 < args.len() {
-                if evaluate(&args[k], ctx)?.is_truthy() {
+                if evaluate_where(&args[k], ctx)? {
                     return evaluate(&args[k + 1], ctx);
                 }
                 k += 2;
@@ -3177,6 +3368,13 @@ pub fn apply_unary(op: UnaryOp, v: &Value) -> Value {
             } else {
                 Value::Integer(!v.as_integer())
             }
+        }
+        // OP_IsTrue: sqlite3VdbeBooleanValue(x, NULL-as) ^ negated, where a
+        // NULL counts as the OPPOSITE of the keyword tested (`NULL IS
+        // FALSE` is 0, `NULL IS NOT TRUE` is 1).
+        UnaryOp::Truth { truth, negated } => {
+            let b = if v.is_null() { !truth } else { v.is_truthy() };
+            Value::Integer(i64::from((b == truth) ^ negated))
         }
     }
 }

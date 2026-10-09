@@ -73,7 +73,7 @@ pub fn index_entry_keys(index: &Index, table: &Table, row: &[Value]) -> Result<V
     match &index.kind {
         IndexKind::Btree => {
             // The ordinary single-key path (collation folding included).
-            Ok(vec![crate::executor::encode_index_key(index, table, row)])
+            Ok(vec![crate::executor::encode_index_key(index, table, row)?])
         }
         IndexKind::Inverted => {
             let v = indexed_value(index, table, row)?;

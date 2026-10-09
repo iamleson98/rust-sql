@@ -29,7 +29,7 @@ pub mod trgm;
 pub(crate) mod triggers;
 pub(crate) mod vtab_exec;
 
-pub use expr::{apply_binary, evaluate, EvalContext};
+pub use expr::{apply_binary, evaluate, evaluate_check, evaluate_where, EvalContext};
 
 // ============================================================================
 // Correlated subqueries — evaluate-time execution bridge
@@ -2253,26 +2253,41 @@ pub(crate) fn eval_row(
     evaluate(expr, &ctx)
 }
 
-/// `eval_row` with the table's column-affinity map attached — the
+/// `eval_row` for a CONDITION (a WHERE / ON / HAVING / FILTER term, a
+/// partial-index or upsert WHERE): whether the row passes, with SQLite's
+/// jump-code short-circuiting (`evaluate_where`).
+pub(crate) fn eval_row_where(
+    expr: &Expr,
+    row: &[Value],
+    col_names: &[String],
+    params: &[Value],
+    named_params: &HashMap<String, Value>,
+) -> Result<bool> {
+    let ctx = EvalContext::new(row, col_names, params, named_params);
+    evaluate_where(expr, &ctx)
+}
+
+/// `eval_row_where` with the table's column-affinity map attached — the
 /// comparison-affinity rules (`text_col > 0` compares TEXT-to-TEXT,
 /// `num_col > '5'` converts) need it. `col_names` must be the table's
 /// own (qualified or bare) list, parallel to `affinities`; callers with
-/// combined/join rows keep plain `eval_row`.
-pub(crate) fn eval_row_aff(
+/// combined/join rows keep plain `eval_row_where`.
+pub(crate) fn eval_row_aff_where(
     expr: &Expr,
     row: &[Value],
     col_names: &[String],
     affinities: &[crate::types::Affinity],
     params: &[Value],
     named_params: &HashMap<String, Value>,
-) -> Result<Value> {
+) -> Result<bool> {
     let ctx =
         EvalContext::new(row, col_names, params, named_params).with_affinities(Some(affinities));
-    evaluate(expr, &ctx)
+    evaluate_where(expr, &ctx)
 }
 
-/// Crate-public wrapper around `eval_row` — used by api.rs for index
-/// backfill (partial-index WHERE clause evaluation against existing rows).
+/// Crate-public wrapper around `eval_row` — used by api.rs for VALUE
+/// expressions (an INSTEAD OF trigger's view row, ALTER defaults);
+/// conditions go through `eval_row_where`.
 pub(crate) fn eval_row_public(
     expr: &Expr,
     row: &[Value],
@@ -2322,21 +2337,14 @@ fn enforce_row_constraints(
         // '' >= '-1000000' TEXT-to-TEXT (FALSE) and rejects the row, while
         // a plain affinity-less evaluation would class-order TEXT above
         // INTEGER and wrongly PASS it.
-        let v = eval_row_aff(
-            expr,
-            row,
-            &table.col_names,
-            &table.col_affinities,
-            params,
-            named_params,
-        )?;
-        // SQLite CHECK semantics: the constraint fails ONLY on a FALSE
-        // (numeric-zero) result — NULL and every other value PASS
-        // ("satisfied if it evaluates to anything other than FALSE").
-        // The old `!is_truthy()` also failed NULL results, wrongly
-        // rejecting NULL-bearing rows (stateful-fuzz divergence).
-        let fails = matches!(v, Value::Integer(0)) || matches!(v, Value::Real(f) if f == 0.0);
-        if fails {
+        let ctx = EvalContext::new(row, &table.col_names, params, named_params)
+            .with_affinities(Some(&table.col_affinities));
+        // SQLite CHECK semantics: the constraint fails ONLY on FALSE —
+        // NULL passes — under the WHERE truthiness rule ('0', 'abc' and
+        // x'30' are FALSE; '0.5' is TRUE), as a jump
+        // (sqlite3ExprIfTrue, SQLITE_JUMPIFNULL): `CHECK (x OR f(y))`
+        // never evaluates f(y) once x is TRUE or NULL.
+        if !evaluate_check(expr, &ctx)? {
             return Err(Error::constraint(format!(
                 "CHECK constraint failed: {}",
                 table.name
@@ -2751,7 +2759,7 @@ fn insert_index_entry_replace(
     rowid: i64,
 ) -> Result<()> {
     if index.unique {
-        let key_bytes = encode_index_key(index, table, row);
+        let key_bytes = encode_index_key(index, table, row)?;
         let root = ctx.index_root(index);
         let conflicts: Vec<i64> = {
             let mut bt = Btree::new(ctx.pager, root, true);
@@ -5732,7 +5740,7 @@ fn exec_filter(ctx: &mut ExecContext<'_>, input: &Plan, predicate: &Expr) -> Res
     };
     for row in inner.rows {
         let v = match scan_affinities {
-            Some(aff) => eval_row_aff(
+            Some(aff) => eval_row_aff_where(
                 predicate,
                 &row,
                 &inner.columns,
@@ -5740,7 +5748,7 @@ fn exec_filter(ctx: &mut ExecContext<'_>, input: &Plan, predicate: &Expr) -> Res
                 &ctx.params,
                 &ctx.named_params,
             )?,
-            None => eval_row(
+            None => eval_row_where(
                 predicate,
                 &row,
                 &inner.columns,
@@ -5748,7 +5756,7 @@ fn exec_filter(ctx: &mut ExecContext<'_>, input: &Plan, predicate: &Expr) -> Res
                 &ctx.named_params,
             )?,
         };
-        if v.is_truthy() {
+        if v {
             rows.push(row);
         }
     }
@@ -5788,7 +5796,7 @@ fn scan_eval_filter_limit(
             if append_rowid {
                 row.push(Value::Integer(rowid));
             }
-            match eval_row_aff(
+            match eval_row_aff_where(
                 predicate,
                 &row,
                 &columns,
@@ -5796,7 +5804,7 @@ fn scan_eval_filter_limit(
                 &ctx.params,
                 &ctx.named_params,
             ) {
-                Ok(v) if v.is_truthy() => rows.push(row),
+                Ok(true) => rows.push(row),
                 Ok(_) => {}
                 Err(e) => {
                     err = Some(e);
@@ -6486,6 +6494,15 @@ fn render_expr_canonical(e: &Expr, _nested: bool) -> String {
                 p.clone()
             }
         }
+        Expr::Unary {
+            op: crate::sql::ast::UnaryOp::Truth { truth, negated },
+            expr,
+        } => format!(
+            "{} IS {}{}",
+            render_expr_canonical(expr, true),
+            if *negated { "NOT " } else { "" },
+            if *truth { "TRUE" } else { "FALSE" }
+        ),
         Expr::Unary { op, expr } => format!(
             "{}{}",
             render_unary_op(op),
@@ -6721,6 +6738,8 @@ fn render_unary_op(op: &crate::sql::ast::UnaryOp) -> &'static str {
         Pos => "+",
         Not => "NOT ",
         BitNot => "~",
+        // Postfix — rendered by the caller (`x IS [NOT] TRUE|FALSE`).
+        Truth { .. } => "",
     }
 }
 
@@ -7889,7 +7908,7 @@ fn const_where_holds(ctx: &ExecContext<'_>, terms: &[Expr]) -> Result<bool> {
     let empty_cols: Vec<String> = Vec::new();
     let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
     for t in terms {
-        if !evaluate(t, &eval_ctx)?.is_truthy() {
+        if !evaluate_where(t, &eval_ctx)? {
             return Ok(false);
         }
     }
@@ -10659,8 +10678,8 @@ pub(crate) fn scan_groupby_grouper(
                     let keep = if let Some(cp) = &compiled_filter {
                         cp.eval(&wide, &identity, params)
                     } else {
-                        match eval_row(pred, &wide, &columns, params, named_params) {
-                            Ok(v) => v.is_truthy(),
+                        match eval_row_where(pred, &wide, &columns, params, named_params) {
+                            Ok(v) => v,
                             Err(e) => {
                                 scan_err = Some(e);
                                 return false;
@@ -10739,8 +10758,8 @@ pub(crate) fn scan_groupby_grouper(
                 let keep = if let Some(cp) = &compiled_filter {
                     cp.eval(&row_buf, identity_ref, params)
                 } else {
-                    match eval_row(pred, &row_buf, &columns, params, named_params) {
-                        Ok(v) => v.is_truthy(),
+                    match eval_row_where(pred, &row_buf, &columns, params, named_params) {
+                        Ok(v) => v,
                         Err(e) => {
                             scan_err = Some(e);
                             return false;
@@ -10771,8 +10790,8 @@ pub(crate) fn scan_groupby_grouper(
                 // Per-aggregate FILTER (WHERE ...): only rows passing
                 // the predicate contribute to THIS aggregate.
                 if let Some(f) = &agg.filter {
-                    let pass = match eval_row(f, &row_buf, &columns, params, named_params) {
-                        Ok(v) => v.is_truthy(),
+                    let pass = match eval_row_where(f, &row_buf, &columns, params, named_params) {
+                        Ok(v) => v,
                         Err(e) => {
                             scan_err = Some(e);
                             return false;
@@ -12527,9 +12546,9 @@ fn exec_aggregate_no_group_by(
                         full_row_buf[col_idx] = sel_buf[i].clone();
                     }
                 }
-                match eval_row(pred, &full_row_buf, cols, &params, &named_params) {
+                match eval_row_where(pred, &full_row_buf, cols, &params, &named_params) {
                     Ok(v) => {
-                        if !v.is_truthy() {
+                        if !v {
                             return true;
                         }
                     }
@@ -12600,9 +12619,9 @@ fn exec_aggregate_no_group_by(
             // Apply the filter predicate inline (if any).
             if let Some(pred) = filter_predicate {
                 let cols = columns_ref.expect("columns were built because predicate is Some");
-                match eval_row(pred, &row_buf, cols, &params, &named_params) {
+                match eval_row_where(pred, &row_buf, cols, &params, &named_params) {
                     Ok(v) => {
-                        if !v.is_truthy() {
+                        if !v {
                             return true;
                         }
                     }
@@ -12620,8 +12639,8 @@ fn exec_aggregate_no_group_by(
                 if let Some(f) = &agg.filter {
                     let cols =
                         columns_ref.expect("columns built when per-aggregate FILTER present");
-                    let pass = match eval_row(f, &row_buf, cols, &params, &named_params) {
-                        Ok(v) => v.is_truthy(),
+                    let pass = match eval_row_where(f, &row_buf, cols, &params, &named_params) {
+                        Ok(v) => v,
                         Err(e) => {
                             scan_err = Some(e);
                             return false;
@@ -13632,7 +13651,7 @@ fn exec_aggregate(
             for (i, agg) in aggregates.iter().enumerate() {
                 // Per-aggregate FILTER over materialized inputs.
                 if let Some(f) = &agg.filter {
-                    let pass = eval_row(f, row, &inner.columns, params, named_params)?.is_truthy();
+                    let pass = eval_row_where(f, row, &inner.columns, params, named_params)?;
                     if !pass {
                         continue;
                     }
@@ -14646,9 +14665,7 @@ fn exec_one_window(
             Some(f) => Some(
                 sorted
                     .iter()
-                    .map(|&ri| {
-                        eval_row(f, &rows[ri], columns, params, named_params).map(|v| v.is_truthy())
-                    })
+                    .map(|&ri| eval_row_where(f, &rows[ri], columns, params, named_params))
                     .collect::<Result<_>>()?,
             ),
             None => None,
@@ -15560,6 +15577,27 @@ fn join_key_pair_mixed(
         || matches!(ra, Integer | Real | Numeric) && matches!(la, Text | Blob | None)
 }
 
+/// The inner (right) side of a join. When the outer side came back
+/// EMPTY, SQLite's nested loop never reaches the inner one: its scan
+/// never runs and its terms never evaluate — `t1 JOIN t2 ON t1.a < 0
+/// AND abs(t2.d) > 0` cannot raise when no t1 row passes. Only the
+/// column names are needed then (an empty-input copy of the plan
+/// supplies them); RIGHT / FULL joins read the inner side regardless.
+fn exec_join_inner_side(
+    ctx: &mut ExecContext<'_>,
+    right: &Plan,
+    join_type: crate::sql::ast::JoinType,
+    outer_empty: bool,
+) -> Result<ExecResult> {
+    use crate::sql::ast::JoinType;
+    if outer_empty && !matches!(join_type, JoinType::Right | JoinType::Full) {
+        if let Some(empty) = empty_input_plan(right) {
+            return execute(&empty, ctx);
+        }
+    }
+    execute(right, ctx)
+}
+
 fn exec_join(
     ctx: &mut ExecContext<'_>,
     left: &Plan,
@@ -15568,7 +15606,7 @@ fn exec_join(
     condition: &Option<Expr>,
 ) -> Result<ExecResult> {
     let left_res = execute(left, ctx)?;
-    let right_res = execute(right, ctx)?;
+    let right_res = exec_join_inner_side(ctx, right, join_type, left_res.rows.is_empty())?;
     let affs: Option<Vec<crate::types::Affinity>> =
         match (plan_output_affinities(left), plan_output_affinities(right)) {
             (Some(mut l), Some(r)) => {
@@ -15689,8 +15727,8 @@ fn exec_join_rows(
             let mut combined = left_row.clone();
             combined.extend(right_row.clone());
             let ok = if let Some(cond) = condition {
-                let v = match affinities {
-                    Some(affs) => eval_row_aff(
+                match affinities {
+                    Some(affs) => eval_row_aff_where(
                         cond,
                         &combined,
                         &combined_cols,
@@ -15698,9 +15736,10 @@ fn exec_join_rows(
                         &params,
                         &named_params,
                     )?,
-                    None => eval_row(cond, &combined, &combined_cols, &params, &named_params)?,
-                };
-                v.is_truthy()
+                    None => {
+                        eval_row_where(cond, &combined, &combined_cols, &params, &named_params)?
+                    }
+                }
             } else {
                 true
             };
@@ -16909,7 +16948,7 @@ fn exec_hash_join(
         }
     }
     let left_res = execute(left, ctx)?;
-    let right_res = execute(right, ctx)?;
+    let right_res = exec_join_inner_side(ctx, right, join_type, left_res.rows.is_empty())?;
     let mut combined_cols: Vec<String> = left_res.columns.to_vec();
     combined_cols.extend(right_res.columns.iter().cloned());
     let n_left = left_res.columns.len();
@@ -17244,8 +17283,8 @@ fn exec_hash_join(
                         combined.extend_from_slice(build_row);
                         combined.extend_from_slice(probe_row);
                     }
-                    let v = eval_row(res, &combined, &combined_cols, &params, &named_params)?;
-                    if v.is_truthy() {
+                    let v = eval_row_where(res, &combined, &combined_cols, &params, &named_params)?;
+                    if v {
                         emit_row(
                             &mut out_rows,
                             proj_indices,
@@ -18329,8 +18368,8 @@ fn exec_rowid_in(
         {
             // Residual predicate (e.g. `id IN (...) AND name = 'x'`).
             if let Some(pred) = residual {
-                let v = eval_row(pred, &row, &out_cols, &ctx.params, &ctx.named_params)?;
-                if !v.is_truthy() {
+                let v = eval_row_where(pred, &row, &out_cols, &ctx.params, &ctx.named_params)?;
+                if !v {
                     continue;
                 }
             }
@@ -18408,8 +18447,8 @@ fn exec_index_in(
                 .lookup_table_with(rowid, |payload| decode_row(payload, n_cols, rowid, alias))?
             {
                 if let Some(pred) = residual {
-                    let pv = eval_row(pred, &row, &out_cols, &ctx.params, &ctx.named_params)?;
-                    if !pv.is_truthy() {
+                    let pv = eval_row_where(pred, &row, &out_cols, &ctx.params, &ctx.named_params)?;
+                    if !pv {
                         continue;
                     }
                 }
@@ -18447,7 +18486,7 @@ fn fetch_candidate_rows(
             .lookup_table_with(*rowid, |payload| decode_row(payload, n_cols, *rowid, alias))?
         {
             if let Some(pred) = residual {
-                let pv = eval_row_aff(
+                let pv = eval_row_aff_where(
                     pred,
                     &row,
                     &table.col_names,
@@ -18455,7 +18494,7 @@ fn fetch_candidate_rows(
                     &ctx.params,
                     &ctx.named_params,
                 )?;
-                if !pv.is_truthy() {
+                if !pv {
                     continue;
                 }
             }
@@ -18523,7 +18562,7 @@ fn exec_inverted_index_scan(
                     }
                 };
                 if let Some(pred) = residual {
-                    if let Ok(pv) = eval_row_aff(
+                    match eval_row_aff_where(
                         pred,
                         &row,
                         &table.col_names,
@@ -18531,11 +18570,14 @@ fn exec_inverted_index_scan(
                         &ctx.params,
                         &ctx.named_params,
                     ) {
-                        if !pv.is_truthy() {
-                            return true;
+                        Ok(true) => {}
+                        Ok(false) => return true,
+                        // A raising residual fails the statement (it used to
+                        // drop the row silently).
+                        Err(e) => {
+                            decode_err = Some(e);
+                            return false;
                         }
-                    } else {
-                        return true;
                     }
                 }
                 if append_rowid {
@@ -18676,7 +18718,7 @@ fn exec_spatial_knn(
                 }
             };
             if let Some(pred) = residual {
-                if let Ok(pv) = eval_row_aff(
+                match eval_row_aff_where(
                     pred,
                     &row,
                     &table.col_names,
@@ -18684,11 +18726,14 @@ fn exec_spatial_knn(
                     &ctx.params,
                     &ctx.named_params,
                 ) {
-                    if !pv.is_truthy() {
-                        return true;
+                    Ok(true) => {}
+                    Ok(false) => return true,
+                    // A raising residual fails the statement (it used to
+                    // drop the row silently).
+                    Err(e) => {
+                        decode_err = Some(e);
+                        return false;
                     }
-                } else {
-                    return true;
                 }
             }
             if append_rowid {
@@ -18755,7 +18800,7 @@ fn exec_spatial_knn(
                     decode_row(payload, n_cols, rowid, ralias)
                 })? {
                     if let Some(pred) = residual {
-                        let passed = eval_row_aff(
+                        let passed = eval_row_aff_where(
                             pred,
                             &row,
                             &table.col_names,
@@ -18763,7 +18808,7 @@ fn exec_spatial_knn(
                             &ctx.params,
                             &ctx.named_params,
                         )?;
-                        if !passed.is_truthy() {
+                        if !passed {
                             continue;
                         }
                     }
@@ -19001,14 +19046,20 @@ fn exec_rowid_range(
             };
             if let Some(res) = residual_expr {
                 row.push(Value::Integer(rowid));
-                let keep =
-                    match eval_row_aff(res, &row, &eval_cols, &eval_affs, params, named_params) {
-                        Ok(v) => v.is_truthy(),
-                        Err(e) => {
-                            residual_err.set(Some(e));
-                            false
-                        }
-                    };
+                let keep = match eval_row_aff_where(
+                    res,
+                    &row,
+                    &eval_cols,
+                    &eval_affs,
+                    params,
+                    named_params,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        residual_err.set(Some(e));
+                        false
+                    }
+                };
                 if !keep {
                     return true;
                 }
@@ -19240,7 +19291,7 @@ fn exec_rowid_range_projected_impl(
                         }
                     };
                     full.push(Value::Integer(rowid));
-                    let keep = match eval_row_aff(
+                    let keep = match eval_row_aff_where(
                         res,
                         &full,
                         &eval_cols,
@@ -19248,7 +19299,7 @@ fn exec_rowid_range_projected_impl(
                         params,
                         named_params,
                     ) {
-                        Ok(v) => v.is_truthy(),
+                        Ok(v) => v,
                         Err(e) => {
                             residual_err.set(Some(e));
                             false
@@ -19277,7 +19328,7 @@ fn exec_rowid_range_projected_impl(
                     };
                     if let Some(res) = residual {
                         row.push(Value::Integer(rowid));
-                        let keep = match eval_row_aff(
+                        let keep = match eval_row_aff_where(
                             res,
                             &row,
                             &eval_cols,
@@ -19285,7 +19336,7 @@ fn exec_rowid_range_projected_impl(
                             params,
                             named_params,
                         ) {
-                            Ok(v) => v.is_truthy(),
+                            Ok(v) => v,
                             Err(e) => {
                                 residual_err.set(Some(e));
                                 false
@@ -19860,13 +19911,15 @@ fn exec_index_range(
                     row.push(Value::Integer(rowid));
                 }
                 let keep = match residual_pred {
-                    Some(pred) => match eval_row(pred, &row, eval_list, &params, &named_params) {
-                        Ok(v) => v.is_truthy(),
-                        Err(e) => {
-                            scan_err = Some(e);
-                            return false;
+                    Some(pred) => {
+                        match eval_row_where(pred, &row, eval_list, &params, &named_params) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                scan_err = Some(e);
+                                return false;
+                            }
                         }
-                    },
+                    }
                     None => true,
                 };
                 if keep {
@@ -19904,7 +19957,7 @@ fn exec_index_range(
                     if append_rowid {
                         row.push(Value::Integer(rowid));
                     }
-                    let v = eval_row(
+                    let v = eval_row_where(
                         pred,
                         &row,
                         if eval_names.is_empty() {
@@ -19915,7 +19968,7 @@ fn exec_index_range(
                         &ctx.params,
                         &ctx.named_params,
                     )?;
-                    if !v.is_truthy() {
+                    if !v {
                         continue;
                     }
                     // (The slot is pushed only when it belongs in the
@@ -20163,7 +20216,7 @@ fn exec_index_range_projected(
                         }
                     };
                     full.push(Value::Integer(rowid));
-                    let k = match eval_row_aff(
+                    let k = match eval_row_aff_where(
                         res,
                         &full,
                         &eval_cols,
@@ -20171,7 +20224,7 @@ fn exec_index_range_projected(
                         &params,
                         &named_params,
                     ) {
-                        Ok(v) => v.is_truthy(),
+                        Ok(v) => v,
                         Err(e) => {
                             residual_err.set(Some(e));
                             false
@@ -20232,7 +20285,7 @@ fn exec_index_range_projected(
                     if let LookupResult::Found(payload) = table_bt.lookup_table(rowid)? {
                         let mut full = decode_row(&payload, n_cols, rowid, rowid_alias)?;
                         full.push(Value::Integer(rowid));
-                        let keep = match eval_row_aff(
+                        let keep = match eval_row_aff_where(
                             res,
                             &full,
                             &eval_cols,
@@ -20240,7 +20293,7 @@ fn exec_index_range_projected(
                             &params,
                             &named_params,
                         ) {
-                            Ok(v) => v.is_truthy(),
+                            Ok(v) => v,
                             Err(e) => {
                                 residual_err.set(Some(e));
                                 false
@@ -20257,7 +20310,7 @@ fn exec_index_range_projected(
                         let mut row = decode_row(&payload, n_cols, rowid, rowid_alias)?;
                         if let Some(res) = res {
                             row.push(Value::Integer(rowid));
-                            let keep = match eval_row_aff(
+                            let keep = match eval_row_aff_where(
                                 res,
                                 &row,
                                 &eval_cols,
@@ -20265,7 +20318,7 @@ fn exec_index_range_projected(
                                 &params,
                                 &named_params,
                             ) {
-                                Ok(v) => v.is_truthy(),
+                                Ok(v) => v,
                                 Err(e) => {
                                     residual_err.set(Some(e));
                                     false
@@ -20368,7 +20421,7 @@ impl IndexMaintState {
     /// the stored key matches probe keys. BINARY (the default) borrows
     /// the value with no clone.
     #[inline]
-    pub fn encode_key(&mut self, row: &[Value]) -> &[u8] {
+    pub fn encode_key(&mut self, row: &[Value]) -> Result<&[u8]> {
         self.key_buf.clear();
         for (i, &pos) in self.cols.iter().enumerate() {
             let ic = match self.idx.columns.get(i) {
@@ -20385,7 +20438,7 @@ impl IndexMaintState {
                 match (&ic.expr, &self.col_names) {
                     (Some(e), Some(names)) => {
                         let named: HashMap<String, Value> = HashMap::new();
-                        expr_value = eval_row(e, row, names, &[], &named).unwrap_or(Value::Null);
+                        expr_value = eval_row(e, row, names, &[], &named)?;
                         &expr_value
                     }
                     // Dropped/renamed column (no expression): a NULL key
@@ -20404,7 +20457,7 @@ impl IndexMaintState {
                     .encode_order_key_into(&mut self.key_buf);
             }
         }
-        &self.key_buf
+        Ok(&self.key_buf)
     }
 }
 
@@ -22219,7 +22272,7 @@ fn exec_insert_one_row(
         // indexed at all (SQLite) — exempt from uniqueness. The
         // `is_none` gate keeps the hot (non-partial) path branch-only.
         if st.idx.partial_expr.is_some()
-            && !index_row_matches_partial(&st.idx, table, full_row, &ctx.params, &ctx.named_params)
+            && !index_row_matches_partial(&st.idx, table, full_row, &ctx.params, &ctx.named_params)?
         {
             continue;
         }
@@ -22235,7 +22288,7 @@ fn exec_insert_one_row(
         // append hint may go stale — drop it (it re-pins on the next
         // plain insert).
         st.hint = None;
-        let key_bytes = st.encode_key(full_row).to_vec();
+        let key_bytes = st.encode_key(full_row)?.to_vec();
         let idx_root = st.root;
         let mut ibt = Btree::new(ctx.pager, idx_root, true);
         let matches = ibt.lookup_index(&key_bytes)?;
@@ -22523,15 +22576,34 @@ fn exec_insert_one_row(
         *current_root = bt.root;
         ctx.set_table_root_lc(table_name_lc, *current_root);
     }
+    // Statement journal (here rather than in the callers so the GENERIC
+    // loop and the literal fast path both journal): this row has LANDED
+    // in the table. It is journaled BEFORE index maintenance, which can
+    // raise (an expression key, a partial-index predicate) — a failure
+    // there, or in a later row, takes the row back out via the api
+    // layer's reverse replay (SQLite's statement-journal atomicity; the
+    // replay tolerates index entries that were never written). A rowid
+    // REPLACE journals the displaced row first, so the replay restores it.
+    if let Some(old) = &old_payload_opt {
+        ctx.stmt_undo.push(StmtUndoEntry::Deleted {
+            table: std::sync::Arc::clone(table),
+            rowid,
+            payload: old.clone(),
+        });
+    }
+    ctx.stmt_undo.push(StmtUndoEntry::Inserted {
+        table: std::sync::Arc::clone(table),
+        rowid,
+    });
     // On conflict: delete the old row's index entries first.
     // Partial indexes only ever held the old row when it matched their
     // predicate — delete only then (deleting a never-inserted key is a
     // no-op on the B+tree, but the gate keeps the invariant explicit).
     if let Some(old_payload) = old_payload_opt {
         if !index_states.is_empty() {
-            if let Ok(old_row) =
-                decode_row(&old_payload, table.n_columns(), rowid, table.rowid_alias)
             {
+                let old_row =
+                    decode_row(&old_payload, table.n_columns(), rowid, table.rowid_alias)?;
                 for st in index_states.iter_mut() {
                     if st.idx.partial_expr.is_some()
                         && !index_row_matches_partial(
@@ -22540,7 +22612,7 @@ fn exec_insert_one_row(
                             &old_row,
                             &ctx.params,
                             &ctx.named_params,
-                        )
+                        )?
                     {
                         continue;
                     }
@@ -22578,7 +22650,7 @@ fn exec_insert_one_row(
             );
         }
         if st.idx.partial_expr.is_some()
-            && !index_row_matches_partial(&st.idx, table, full_row, &ctx.params, &ctx.named_params)
+            && !index_row_matches_partial(&st.idx, table, full_row, &ctx.params, &ctx.named_params)?
         {
             continue;
         }
@@ -22607,7 +22679,7 @@ fn exec_insert_one_row(
         // (eligibility excludes them), so the partial gate above has
         // already passed.
         if st.op_buf.is_some() {
-            let key_bytes = st.encode_key(full_row);
+            let key_bytes = st.encode_key(full_row)?;
             let key = key_bytes.to_vec();
             if let Some(buf) = st.op_buf.as_mut() {
                 buf.1.push((key, rowid));
@@ -22618,7 +22690,7 @@ fn exec_insert_one_row(
         // borrow of `st` for as long as `key_bytes` is live.
         let root = st.root;
         let hint = st.hint.take();
-        let key_bytes = st.encode_key(full_row);
+        let key_bytes = st.encode_key(full_row)?;
         let mut ibt = Btree::new(ctx.pager, root, true);
         let new_hint = ibt.insert_index_append_hinted(key_bytes, rowid, hint)?;
         st.hint = new_hint;
@@ -22659,14 +22731,6 @@ fn exec_insert_one_row(
     } else {
         ctx.raise_max_rowid_lc(table_name_lc, rowid);
     }
-    // Statement journal (here rather than in the callers so the GENERIC
-    // loop and the literal fast path both journal): this row has LANDED.
-    // If a later row of the owning statement fails, the api layer's
-    // reverse replay deletes it — SQLite's statement-journal atomicity.
-    ctx.stmt_undo.push(StmtUndoEntry::Inserted {
-        table: std::sync::Arc::clone(table),
-        rowid,
-    });
     Ok((InsertOutcome::Inserted, rowid))
 }
 
@@ -22762,8 +22826,8 @@ fn exec_upsert_row(
             // WHERE guard: if false, the conflict is left in place (no-op).
             // Column refs bind to the PRE-update row (SQLite semantics).
             if let Some(w) = where_clause {
-                let v = eval_row(w, &comb_row, &comb_names, &ctx.params, &ctx.named_params)?;
-                if !v.is_truthy() {
+                let v = eval_row_where(w, &comb_row, &comb_names, &ctx.params, &ctx.named_params)?;
+                if !v {
                     return Ok((InsertOutcome::Skipped, existing_rowid));
                 }
             }
@@ -22812,7 +22876,7 @@ fn exec_upsert_row(
                     &new_row,
                     &ctx.params,
                     &ctx.named_params,
-                );
+                )?;
                 if !new_in {
                     continue;
                 }
@@ -22971,14 +23035,16 @@ pub(crate) fn encode_index_key(
     index: &crate::schema::Index,
     table: &Table,
     row: &[Value],
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
     let mut key_bytes = Vec::new();
     for col in &index.columns {
         // Expression index key: evaluate per row (SQLite 3.9+). The
-        // expression references columns by bare name; no params.
+        // expression references columns by bare name; no params. A key
+        // that RAISES fails the write, as in SQLite (it used to be stored
+        // as a NULL key).
         let v = if let Some(e) = &col.expr {
             let named: HashMap<String, Value> = HashMap::new();
-            eval_row(e, row, &table.col_names, &[], &named).unwrap_or(Value::Null)
+            eval_row(e, row, &table.col_names, &[], &named)?
         } else if let Some(pos) = table.find_column(&col.name) {
             row.get(pos).cloned().unwrap_or(Value::Null)
         } else {
@@ -22988,7 +23054,7 @@ pub(crate) fn encode_index_key(
         // collation so probe keys and stored keys agree.
         crate::plugin::collation_fold_key(&col.collation, &v).encode_order_key_into(&mut key_bytes);
     }
-    key_bytes
+    Ok(key_bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -23009,19 +23075,18 @@ pub(crate) struct UpdateConflictPlan {
 /// True when `row` belongs in a partial index (its WHERE predicate
 /// holds). Rows failing the predicate are never indexed (SQLite:
 /// partial indexes only contain matching rows), so they are exempt
-/// from that index's uniqueness enforcement.
+/// from that index's uniqueness enforcement. A predicate that RAISES
+/// fails the write, as in SQLite (it used to read as "not indexed").
 pub(crate) fn index_row_matches_partial(
     index: &crate::schema::Index,
     table: &Table,
     row: &[Value],
     params: &[Value],
     named_params: &HashMap<String, Value>,
-) -> bool {
+) -> Result<bool> {
     match &index.partial_expr {
-        None => true,
-        Some(pred) => eval_row(pred, row, &table.col_names, params, named_params)
-            .map(|v| v.is_truthy())
-            .unwrap_or(false),
+        None => Ok(true),
+        Some(pred) => eval_row_where(pred, row, &table.col_names, params, named_params),
     }
 }
 
@@ -23076,14 +23141,14 @@ fn partial_membership_pair(
     new_row: &[Value],
     params: &[Value],
     named_params: &HashMap<String, Value>,
-) -> (bool, bool) {
+) -> Result<(bool, bool)> {
     if index.partial_expr.is_none() {
-        (true, true)
+        Ok((true, true))
     } else {
-        (
-            index_row_matches_partial(index, table, old_row, params, named_params),
-            index_row_matches_partial(index, table, new_row, params, named_params),
-        )
+        Ok((
+            index_row_matches_partial(index, table, old_row, params, named_params)?,
+            index_row_matches_partial(index, table, new_row, params, named_params)?,
+        ))
     }
 }
 
@@ -23124,10 +23189,10 @@ pub(crate) fn simulate_update_unique(
                 new_row,
                 &ctx.params,
                 &ctx.named_params,
-            );
+            )?;
             keys.push((
-                encode_index_key(idx, table, old_row),
-                encode_index_key(idx, table, new_row),
+                encode_index_key(idx, table, old_row)?,
+                encode_index_key(idx, table, new_row)?,
                 old_in,
                 new_in,
             ));
@@ -23632,7 +23697,7 @@ fn buffer_index_ops_pre_pass(
                     &new_row_buf,
                     params,
                     named_params,
-                );
+                )?;
                 if old_keys == new_keys && old_in == new_in {
                     continue;
                 }
@@ -24538,8 +24603,8 @@ fn exec_update(
         // and the UPDATE doesn't touch `val`).
         for idx in &indexes {
             // Compute the old and new index keys.
-            let old_key = encode_index_key(idx, &table, &row);
-            let new_key = encode_index_key(idx, &table, &new_row);
+            let old_key = encode_index_key(idx, &table, &row)?;
+            let new_key = encode_index_key(idx, &table, &new_row)?;
             if old_key == new_key {
                 // No change to this index's key — skip maintenance.
                 continue;
@@ -24676,8 +24741,9 @@ fn exec_update_from(
             combined.extend(row.iter().cloned());
             combined.extend(frow.iter().cloned());
             if let Some(w) = &uf.where_clause {
-                let keep = eval_row(w, &combined, &combined_cols, &ctx.params, &ctx.named_params)?;
-                if !keep.is_truthy() {
+                let keep =
+                    eval_row_where(w, &combined, &combined_cols, &ctx.params, &ctx.named_params)?;
+                if !keep {
                     continue;
                 }
             }
@@ -24822,10 +24888,16 @@ fn exec_update_from(
         }
         ctx.set_table_root(&table.name, new_root);
         for idx in &indexes {
-            let old_key = encode_index_key(idx, table, &row);
-            let new_key = encode_index_key(idx, table, &new_row);
-            let (old_in, new_in) =
-                partial_membership_pair(idx, table, &row, &new_row, &ctx.params, &ctx.named_params);
+            let old_key = encode_index_key(idx, table, &row)?;
+            let new_key = encode_index_key(idx, table, &new_row)?;
+            let (old_in, new_in) = partial_membership_pair(
+                idx,
+                table,
+                &row,
+                &new_row,
+                &ctx.params,
+                &ctx.named_params,
+            )?;
             if old_key == new_key && old_in == new_in {
                 continue;
             }
@@ -26520,7 +26592,7 @@ fn try_streaming_update(
                         &new_row,
                         &params,
                         &named_params,
-                    );
+                    )?;
                     if old_keys == new_keys && old_in == new_in {
                         continue;
                     }
@@ -27002,7 +27074,7 @@ fn process_update_row(
             cp.eval(row_buf, positions, params)
         } else {
             {
-                let v = eval_row_aff(
+                let v = eval_row_aff_where(
                     pred,
                     row_buf,
                     col_names,
@@ -27010,7 +27082,7 @@ fn process_update_row(
                     params,
                     named_params,
                 )?;
-                v.is_truthy()
+                v
             }
         };
         if !keep {
@@ -27528,7 +27600,7 @@ fn try_streaming_delete(
                             continue;
                         }
                         if let Some(pred) = residual_pred {
-                            match eval_row_aff(
+                            match eval_row_aff_where(
                                 pred,
                                 &row_buf,
                                 &col_names,
@@ -27536,7 +27608,7 @@ fn try_streaming_delete(
                                 &params,
                                 &named_params,
                             ) {
-                                Ok(v) if v.is_truthy() => {}
+                                Ok(true) => {}
                                 Ok(_) => continue,
                                 Err(e) => {
                                     first_error = Some(e);
@@ -27587,7 +27659,7 @@ fn try_streaming_delete(
                             continue;
                         }
                         if let Some(pred) = residual_pred {
-                            match eval_row_aff(
+                            match eval_row_aff_where(
                                 pred,
                                 &row_buf,
                                 &col_names,
@@ -27595,7 +27667,7 @@ fn try_streaming_delete(
                                 &params,
                                 &named_params,
                             ) {
-                                Ok(v) if v.is_truthy() => {}
+                                Ok(true) => {}
                                 Ok(_) => continue,
                                 Err(e) => {
                                     first_error = Some(e);
@@ -27693,7 +27765,7 @@ fn try_streaming_delete(
                             first_error = Some(e);
                             return false;
                         }
-                        match eval_row_aff(
+                        match eval_row_aff_where(
                             pred,
                             &row_buf,
                             &col_names,
@@ -27701,7 +27773,7 @@ fn try_streaming_delete(
                             &params,
                             &named_params,
                         ) {
-                            Ok(v) if v.is_truthy() => {}
+                            Ok(true) => {}
                             Ok(_) => return true,
                             Err(e) => {
                                 first_error = Some(e);
@@ -27728,7 +27800,7 @@ fn try_streaming_delete(
                     first_error = Some(e);
                     return false;
                 }
-                match eval_row_aff(
+                match eval_row_aff_where(
                     pred,
                     &row_buf,
                     &col_names,
@@ -27736,7 +27808,7 @@ fn try_streaming_delete(
                     &params,
                     &named_params,
                 ) {
-                    Ok(v) if v.is_truthy() => {}
+                    Ok(true) => {}
                     Ok(_) => return true,
                     Err(e) => {
                         first_error = Some(e);

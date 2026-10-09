@@ -2671,15 +2671,13 @@ impl Parser {
                 self.advance();
                 self.expect_keyword("FROM")?;
                 negated = !negated;
-                let right = self.parse_binary(PREC_IS + 1)?;
-                return Ok(is_expr(left, right, negated));
+                return self.parse_is_right(left, negated);
             }
             if self.peek().is_keyword("NULL") {
                 self.advance();
                 Ok(is_null_expr(left, negated))
             } else {
-                let right = self.parse_binary(PREC_IS + 1)?;
-                Ok(is_expr(left, right, negated))
+                self.parse_is_right(left, negated)
             }
         } else if self.peek().is_keyword("ISNULL") {
             self.advance();
@@ -2694,6 +2692,36 @@ impl Parser {
             self.advance();
             Ok(is_null_expr(left, true))
         }
+    }
+
+    /// The right operand of `X IS [NOT] Y`. SQLite's resolver turns the
+    /// form whose Y is the bare TRUE / FALSE keyword — parentheses are
+    /// transparent, a quoted "true" is a name — into the truth test
+    /// TK_TRUTH (`'5' IS TRUE` is 1 where `'5' IS 1` is 0).
+    fn parse_is_right(&mut self, left: Expr, negated: bool) -> Result<Expr> {
+        let start = self.pos;
+        let right = self.parse_binary(PREC_IS + 1)?;
+        let mut toks = &self.toks[start..self.pos];
+        while toks.len() >= 3 && toks[0].is_punct('(') && toks[toks.len() - 1].is_punct(')') {
+            toks = &toks[1..toks.len() - 1];
+        }
+        let truth = match toks {
+            [t] => match &t.token {
+                Token::Keyword(k) if k.eq_ignore_ascii_case("TRUE") => Some(true),
+                Token::Keyword(k) if k.eq_ignore_ascii_case("FALSE") => Some(false),
+                Token::Ident(k) if k.eq_ignore_ascii_case("TRUE") => Some(true),
+                Token::Ident(k) if k.eq_ignore_ascii_case("FALSE") => Some(false),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let (Some(truth), Expr::Literal(Value::Integer(_))) = (truth, &right) {
+            return Ok(Expr::Unary {
+                op: UnaryOp::Truth { truth, negated },
+                expr: Box::new(left),
+            });
+        }
+        Ok(is_expr(left, right, negated))
     }
 
     fn try_binary_op(&self) -> Option<BinaryOp> {

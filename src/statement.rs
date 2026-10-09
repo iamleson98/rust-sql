@@ -2594,8 +2594,14 @@ impl Driver for ScanDriver {
                     row.push(Value::Integer(rowid));
                 }
                 if let Some(pred) = predicate {
-                    match crate::executor::eval_row(pred, &row, &col_names, &params_owned, named) {
-                        Ok(v) if v.is_truthy() => {}
+                    match crate::executor::eval_row_where(
+                        pred,
+                        &row,
+                        &col_names,
+                        &params_owned,
+                        named,
+                    ) {
+                        Ok(true) => {}
                         Err(e) => {
                             pull_err = Some(e);
                             return false;
@@ -3171,8 +3177,14 @@ impl Driver for RangeDriver {
                     row.push(Value::Integer(rowid));
                 }
                 if let Some(pred) = residual {
-                    match crate::executor::eval_row(pred, &row, &col_names, &params_owned, named) {
-                        Ok(v) if v.is_truthy() => {}
+                    match crate::executor::eval_row_where(
+                        pred,
+                        &row,
+                        &col_names,
+                        &params_owned,
+                        named,
+                    ) {
+                        Ok(true) => {}
                         Err(e) => {
                             pull_err = Some(e);
                             return false;
@@ -3351,14 +3363,14 @@ impl Driver for FilterDriver {
                 // A raising predicate fails the step (it used to drop the
                 // row silently — the materialized path raised): rows
                 // matched before it are delivered first.
-                let keep = match crate::executor::eval_row(
+                let keep = match crate::executor::eval_row_where(
                     &self.predicate,
                     &row,
                     &col_names,
                     &params_owned,
                     named,
                 ) {
-                    Ok(v) => v.is_truthy(),
+                    Ok(v) => v,
                     Err(e) => {
                         if matched.is_empty() {
                             return Err(e);

@@ -1016,7 +1016,15 @@ fn eval_when_guard(
     };
     substitute_new_old_expr(&mut e, &lookup)?;
     let _ = (combined, names);
-    let vs = eval_exprs_at_parent(db, std::slice::from_ref(&e), params)?;
+    // The guard is a CONDITION (sqlite3ExprIfFalse): evaluated as a
+    // searched CASE's WHEN, whose jump semantics a bare select-list
+    // expression (a value context) would not have.
+    let guard = Expr::Case {
+        operand: None,
+        whens: vec![(e, Expr::Literal(Value::Integer(1)))],
+        else_: Some(Box::new(Expr::Literal(Value::Integer(0)))),
+    };
+    let vs = eval_exprs_at_parent(db, std::slice::from_ref(&guard), params)?;
     Ok(vs.into_iter().next().unwrap_or(Value::Null))
 }
 

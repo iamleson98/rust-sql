@@ -9963,14 +9963,14 @@ impl Database {
             }
             // WHERE against the view row (view-column names + params).
             if let Some(w) = &upd.where_clause {
-                let v = crate::executor::eval_row_public(
+                let v = crate::executor::eval_row_where(
                     w,
                     &old_view,
                     view_cols,
                     &ctx.params,
                     &ctx.named_params,
                 )?;
-                if !v.is_truthy() {
+                if !v {
                     continue;
                 }
             }
@@ -10029,14 +10029,14 @@ impl Database {
                 }
             }
             if let Some(w) = &del.where_clause {
-                let v = crate::executor::eval_row_public(
+                let v = crate::executor::eval_row_where(
                     w,
                     &old_view,
                     view_cols,
                     &ctx.params,
                     &ctx.named_params,
                 )?;
-                if !v.is_truthy() {
+                if !v {
                     continue;
                 }
             }
@@ -10104,7 +10104,7 @@ impl Database {
                         view_cols,
                         &ctx,
                     )?;
-                    if !v.is_truthy() {
+                    if !v {
                         continue;
                     }
                 }
@@ -12665,8 +12665,8 @@ impl Database {
             };
             // Partial index: only rows matching the predicate.
             if let Some(p) = &index.partial_expr {
-                match Self::analyze_eval_expr(p, &row, &named, &params, &named_params) {
-                    Ok(v) if v.is_truthy() => {}
+                match crate::executor::eval_row_where(p, &row, &named, &params, &named_params) {
+                    Ok(true) => {}
                     _ => return true,
                 }
             }
@@ -13539,15 +13539,21 @@ impl Database {
                                 return false;
                             }
                             if let Some(pred) = &partial {
-                                match crate::executor::eval_row_public(
+                                match crate::executor::eval_row_where(
                                     pred,
                                     &row_buf,
                                     &col_names,
                                     &ctx.params,
                                     &ctx.named_params,
                                 ) {
-                                    Ok(v) if v.is_truthy() => {}
-                                    _ => return true,
+                                    Ok(true) => {}
+                                    Ok(false) => return true,
+                                    // A raising predicate fails CREATE
+                                    // INDEX (it used to skip the row).
+                                    Err(e) => {
+                                        backfill_err = Some(e);
+                                        return false;
+                                    }
                                 }
                             }
                             let has_null_key = index.columns.iter().any(|c| {
@@ -13640,15 +13646,21 @@ impl Database {
                             }
                             // Partial index: only rows matching the WHERE clause.
                             if let Some(pred) = &partial {
-                                match crate::executor::eval_row_public(
+                                match crate::executor::eval_row_where(
                                     pred,
                                     &row_buf,
                                     &col_names,
                                     &ctx.params,
                                     &ctx.named_params,
                                 ) {
-                                    Ok(v) if v.is_truthy() => {}
-                                    _ => return true,
+                                    Ok(true) => {}
+                                    Ok(false) => return true,
+                                    // A raising predicate fails CREATE
+                                    // INDEX (it used to skip the row).
+                                    Err(e) => {
+                                        backfill_err = Some(e);
+                                        return false;
+                                    }
                                 }
                             }
                             // NULLs are distinct: rows with ANY NULL among
@@ -16439,6 +16451,14 @@ pub(crate) fn expr_to_sql(e: &Expr) -> String {
                 Pos => "+",
                 Not => "NOT ",
                 BitNot => "~",
+                Truth { truth, negated } => {
+                    return format!(
+                        "({} IS {}{})",
+                        expr_to_sql(expr),
+                        if *negated { "NOT " } else { "" },
+                        if *truth { "TRUE" } else { "FALSE" }
+                    );
+                }
             };
             format!("{}{}", sym, expr_to_sql(expr))
         }
@@ -17461,7 +17481,13 @@ fn rebuild_without_rowid_pk_index(
                 build_err = Some(e);
                 return false;
             }
-            let key = crate::executor::encode_index_key(&index, &table, &row_buf);
+            let key = match crate::executor::encode_index_key(&index, &table, &row_buf) {
+                Ok(k) => k,
+                Err(e) => {
+                    build_err = Some(e);
+                    return false;
+                }
+            };
             if let Err(e) = index_bt.insert_index(&key, rowid) {
                 build_err = Some(e);
                 return false;

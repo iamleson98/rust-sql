@@ -154,8 +154,8 @@ pub(crate) fn fire_triggers(
         // WHEN guard: evaluate with NEW/OLD bound as a combined row
         // (with the channel armed — the guard may read attached tables).
         if let Some(w) = &trig.when_clause {
-            let v = eval_with_new_old(w, new_row, old_row, col_names, ctx)?;
-            if !v.is_truthy() {
+            let fires = eval_with_new_old(w, new_row, old_row, col_names, ctx)?;
+            if !fires {
                 if armed_channel {
                     ctx.foreign = None;
                 }
@@ -238,16 +238,18 @@ pub(crate) fn fire_triggers(
     Ok(())
 }
 
-/// Evaluate an expression with NEW/OLD row references bound: the evaluation
-/// row is `[new_row..., old_row...]` with column names `["new.c"...,
-/// "old.c"...]`, so `NEW.c` resolves by qualified lookup.
+/// Evaluate a trigger's WHEN guard with NEW/OLD row references bound:
+/// the evaluation row is `[new_row..., old_row...]` with column names
+/// `["new.c"..., "old.c"...]`, so `NEW.c` resolves by qualified lookup.
+/// The guard is a condition (sqlite3ExprIfFalse, SQLITE_JUMPIFNULL):
+/// true when the trigger fires.
 pub(crate) fn eval_with_new_old_pub(
     expr: &Expr,
     new_row: Option<&Row>,
     old_row: Option<&Row>,
     col_names: &[String],
     ctx: &ExecContext<'_>,
-) -> crate::error::Result<Value> {
+) -> crate::error::Result<bool> {
     eval_with_new_old(expr, new_row, old_row, col_names, ctx)
 }
 
@@ -257,7 +259,7 @@ fn eval_with_new_old(
     old_row: Option<&Row>,
     col_names: &[String],
     ctx: &ExecContext<'_>,
-) -> crate::error::Result<Value> {
+) -> crate::error::Result<bool> {
     let mut combined: Row = Vec::new();
     let mut names: Vec<String> = Vec::new();
     if let Some(n) = new_row {
@@ -268,7 +270,7 @@ fn eval_with_new_old(
         combined.extend(o.iter().cloned());
         names.extend(col_names.iter().map(|c| format!("old.{}", c)));
     }
-    crate::executor::eval_row_public(expr, &combined, &names, &ctx.params, &ctx.named_params)
+    crate::executor::eval_row_where(expr, &combined, &names, &ctx.params, &ctx.named_params)
 }
 
 /// True when the table has at least one trigger for this event (lets hot

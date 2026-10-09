@@ -129,6 +129,14 @@ fn semantics_battery_matches_sqlite() {
         .expect("fixtures dir")
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "sql"))
+        // SEMANTICS_FIXTURE=<substring> narrows a local run to matching
+        // fixture files (CI sets nothing and runs them all).
+        .filter(|p| match std::env::var("SEMANTICS_FIXTURE") {
+            Ok(want) => p
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().contains(&want)),
+            Err(_) => true,
+        })
         .collect();
     files.sort();
     assert!(!files.is_empty(), "no fixtures found in {}", dir.display());

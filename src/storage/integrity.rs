@@ -527,7 +527,9 @@ fn check_index_tree(
                     vals,
                     &[],
                     &std::collections::HashMap::new(),
-                ) {
+                )
+                .unwrap_or(false)
+                {
                     set.insert(*rid);
                 }
             }

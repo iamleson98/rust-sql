@@ -323,6 +323,9 @@ fn fold_unary(op: UnaryOp, expr: &mut Expr) -> Option<Expr> {
             (UnaryOp::BitNot, Value::Null) => {
                 return Some(Expr::Literal(Value::Null));
             }
+            (UnaryOp::Truth { .. }, v) => {
+                return Some(Expr::Literal(crate::executor::expr::apply_unary(op, v)));
+            }
             _ => {}
         }
     }

@@ -572,12 +572,24 @@ pub(crate) fn scan_vtab(
         let params: &[Value] = &ctx.params;
         let named_params = &ctx.named_params;
         let col_names: Vec<String> = columns.iter().cloned().collect();
-        out.retain(
-            |(_, row)| match eval_row(pred, row, &col_names, params, named_params) {
-                Ok(v) => v.is_truthy(),
-                Err(_) => false,
-            },
-        );
+        // A raising residual fails the statement (it used to drop the
+        // row silently).
+        let mut residual_err = None;
+        out.retain(|(_, row)| {
+            if residual_err.is_some() {
+                return false;
+            }
+            match eval_row_where(pred, row, &col_names, params, named_params) {
+                Ok(v) => v,
+                Err(e) => {
+                    residual_err = Some(e);
+                    false
+                }
+            }
+        });
+        if let Some(e) = residual_err {
+            return Err(e);
+        }
     }
     Ok((columns, out))
 }
