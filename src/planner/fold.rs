@@ -148,6 +148,32 @@ pub(crate) fn literal_truthy(v: &Value) -> bool {
 pub(crate) fn fold_expr(e: &mut Expr) {
     // Children first.
     match e {
+        Expr::Binary {
+            op: BinaryOp::And | BinaryOp::Or,
+            left,
+            right,
+        } => {
+            // SQLite drops an AND / OR operand only next to a LITERAL
+            // integer (sqlite3ExprSimplifiedAndOr: `x AND 0`, `x OR 1`);
+            // a constant that merely FOLDS to one (`x AND ('%' = 5)`)
+            // still has both operands evaluated, so an `x` that can raise
+            // raises. Keep such an operand unfolded when its sibling is
+            // impure, so the evaluator's literal-only simplification
+            // cannot skip the sibling.
+            let keep = |side: &Expr, other: &Expr| {
+                (!is_truth_literal(side) && !expr_is_pure(other)).then(|| side.clone())
+            };
+            let (left_src, right_src) = (keep(left, right), keep(right, left));
+            fold_expr(left);
+            fold_expr(right);
+            let int_lit = |x: &Expr| matches!(x, Expr::Literal(Value::Integer(_)));
+            if let Some(src) = left_src.filter(|_| int_lit(left)) {
+                **left = src;
+            }
+            if let Some(src) = right_src.filter(|_| int_lit(right)) {
+                **right = src;
+            }
+        }
         Expr::Binary { left, right, .. } => {
             fold_expr(left);
             fold_expr(right);
@@ -281,6 +307,14 @@ fn fold_binary(op: BinaryOp, left: &mut Expr, right: &mut Expr) -> Option<Expr> 
         return Some(Expr::Literal(apply_binary(op, l, r)));
     }
     None
+}
+
+/// An operand SQLite marks EP_IsTrue / EP_IsFalse — the only ones its
+/// AND / OR simplification drops a sibling for: an integer literal that
+/// fits 32 bits (sqlite3ExprAlloc's EP_IntValue; TRUE / FALSE parse to
+/// these). `+0`, `-0` and `4294967296` are not.
+pub(crate) fn is_truth_literal(e: &Expr) -> bool {
+    matches!(e, Expr::Literal(Value::Integer(i)) if i32::try_from(*i).is_ok())
 }
 
 fn lit_truthy(e: &Expr) -> bool {

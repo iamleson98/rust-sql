@@ -964,7 +964,11 @@ fn simplified_and_or(e: &Expr) -> &Expr {
     {
         let r = simplified_and_or(right);
         let l = simplified_and_or(left);
-        let always = |x: &Expr, truth: bool| matches!(x, Expr::Literal(Value::Integer(n)) if (*n != 0) == truth);
+        // EP_IsTrue / EP_IsFalse: a 32-bit integer literal only.
+        let always = |x: &Expr, truth: bool| {
+            crate::planner::fold::is_truth_literal(x)
+                && matches!(x, Expr::Literal(Value::Integer(n)) if (*n != 0) == truth)
+        };
         if always(l, true) || always(r, false) {
             return if *op == BinaryOp::And { r } else { l };
         }
