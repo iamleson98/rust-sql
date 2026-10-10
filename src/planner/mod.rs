@@ -978,7 +978,14 @@ impl<'a> Planner<'a> {
 
         // Apply WHERE — with predicate pushdown and index/rowid lookup optimization.
         if let Some(pred) = &where_effective {
-            plan = self.apply_where(plan, pred);
+            let col_use = match from_owned.as_ref().or(s.from.as_ref()) {
+                Some(TableExpression::Table { name, .. }) => match self.catalog.get_table(name) {
+                    Some(t) => ScanColumnUse::of_select(&t, s, order_terms),
+                    None => ScanColumnUse::default(),
+                },
+                _ => ScanColumnUse::default(),
+            };
+            plan = self.apply_where(plan, pred, &col_use);
         }
 
         // Inner-join reordering: flatten maximal INNER/CROSS join spines
@@ -1239,13 +1246,13 @@ impl<'a> Planner<'a> {
     ///   `IndexLookup`.
     /// - Otherwise, push the predicate into the scan as a `Filter` (which
     ///   the executor evaluates per row).
-    fn apply_where(&self, plan: Plan, predicate: &Expr) -> Plan {
+    fn apply_where(&self, plan: Plan, predicate: &Expr, col_use: &ScanColumnUse) -> Plan {
         // Delegate to the free function so that plan_update / plan_delete in
         // api.rs can share the exact same predicate-matching logic without
         // needing a `Planner` instance. This fixes a critical perf bug where
         // `UPDATE t SET ... WHERE id = ?` was falling through to a full
         // table scan instead of a RowidLookup.
-        pushdown_filter(self.catalog, plan, predicate)
+        pushdown_filter_with_use(self.catalog, plan, predicate, col_use)
     }
 
     /// Provide the materialized CTE map for this statement (api.rs).
@@ -3591,6 +3598,18 @@ fn estimate_eq_stat4(
 }
 
 pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> Plan {
+    apply_where_for_scan_with_use(catalog, plan, predicate, &ScanColumnUse::default())
+}
+
+/// [`apply_where_for_scan`] with the statement's column usage of the
+/// scanned table (the covering-index input of SQLite's access-path cost
+/// model — see [`ScanColumnUse`]).
+pub fn apply_where_for_scan_with_use(
+    catalog: &Catalog,
+    plan: Plan,
+    predicate: &Expr,
+    col_use: &ScanColumnUse,
+) -> Plan {
     // Access-path bounds (rowid lookups / ranges / IN seeks, index
     // lookups / ranges) are evaluated ONCE, with no current row. A
     // conjunct whose "value" side reads the scanned table's own columns
@@ -3610,12 +3629,12 @@ pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> 
             let inner = if sargable.is_empty() {
                 plan
             } else {
-                apply_where_for_scan_inner(catalog, plan, &combine_and(&sargable))
+                apply_where_for_scan_inner(catalog, plan, &combine_and(&sargable), col_use)
             };
             return attach_residual(inner, combine_and(&row_dependent));
         }
     }
-    apply_where_for_scan_inner(catalog, plan, predicate)
+    apply_where_for_scan_inner(catalog, plan, predicate, col_use)
 }
 
 /// AND `pred` into an access path's own residual (scan predicate /
@@ -3750,7 +3769,12 @@ fn conjunct_bound_reads_row(c: &Expr, catalog: &Catalog, table: &Table, qual: &s
     false
 }
 
-fn apply_where_for_scan_inner(catalog: &Catalog, plan: Plan, predicate: &Expr) -> Plan {
+fn apply_where_for_scan_inner(
+    catalog: &Catalog,
+    plan: Plan,
+    predicate: &Expr,
+    col_use: &ScanColumnUse,
+) -> Plan {
     if let Plan::Scan { table, .. } = &plan {
         // Virtual tables have NO B+tree: the rowid lookup/range/in plans
         // below would btree-seek the vtab's non-existent root (garbage
@@ -3769,7 +3793,37 @@ fn apply_where_for_scan_inner(catalog: &Catalog, plan: Plan, predicate: &Expr) -
         let conjuncts = split_and_chain(predicate);
         // Try to construct a RowidRange from conjuncts that reference the
         // rowid-alias column. Returns (start, end, residual_conjuncts).
-        if let Some((start, end, residual)) = try_rowid_range(&conjuncts, table) {
+        let rowid_range = try_rowid_range(&conjuncts, table);
+        let alias_name = table
+            .rowid_alias
+            .and_then(|idx| table.columns.get(idx))
+            .map(|c| c.name.clone());
+        let rowid_eq = conjuncts.iter().any(|c| {
+            extract_eq_predicate(c).map_or(false, |(col, _)| is_rowid_col(&col, &alias_name))
+        });
+        // Rowid IN-list: `WHERE id IN (v1, v2, ...)` — a batched
+        // multi-seek instead of a full scan + per-row IN evaluation (which
+        // previously cost a 10k-row table scan for 10 literal rowids).
+        // It beats a rowid RANGE (SQLite's cost model: nIn seeks vs a
+        // walk over a quarter of the table per bound) — and the choice
+        // is semantic, not just speed: only the DRIVING IN runs under
+        // seek semantics, so `id IN (5, -2^63.0) AND id >= i64::MIN`
+        // keeps just row 5 in SQLite (the IN drives; its boundary REAL
+        // seeks nothing). A rowid equality still wins (one seek).
+        if !rowid_eq {
+            if let Some((in_plan, residual_conjuncts)) =
+                try_rowid_in(catalog, &conjuncts, table, alias, col_use)
+            {
+                if residual_conjuncts.is_empty() {
+                    return in_plan;
+                }
+                return Plan::Filter {
+                    input: Box::new(in_plan),
+                    predicate: combine_and(&residual_conjuncts),
+                };
+            }
+        }
+        if let Some((start, end, residual)) = rowid_range {
             // If we have a single equality `id = ?`, RowidLookup is preferable
             // (one B+tree seek vs a range walk).
             if let (Some(s), Some(e)) = (&start, &end) {
@@ -3803,19 +3857,6 @@ fn apply_where_for_scan_inner(catalog: &Catalog, plan: Plan, predicate: &Expr) -
                 start,
                 end,
                 residual,
-            };
-        }
-        // Rowid IN-list: `WHERE id IN (v1, v2, ...)` — a batched
-        // multi-seek instead of a full scan + per-row IN evaluation (which
-        // previously cost a 10k-row table scan for 10 literal rowids).
-        if let Some((in_plan, residual_conjuncts)) = try_rowid_in(catalog, &conjuncts, table, alias)
-        {
-            if residual_conjuncts.is_empty() {
-                return in_plan;
-            }
-            return Plan::Filter {
-                input: Box::new(in_plan),
-                predicate: combine_and(&residual_conjuncts),
             };
         }
         // GIN-style inverted index (PostgreSQL's `USING gin`, borrowed):
@@ -4135,6 +4176,729 @@ fn try_index_in(
     None
 }
 
+/// What a single-table statement asks of its scanned table — the inputs
+/// SQLite's access-path choice reads beyond the WHERE terms (see
+/// [`sqlite_rowid_in_seeks`]): the columns referenced (`SrcItem::colUsed`,
+/// the covering-index test), whether the loop is a one-pass DML scan
+/// (`WHERE_ONEPASS_DESIRED`: UPDATE/DELETE never take a covering
+/// full-index scan), and the ordering the WHERE loop is planned against
+/// with the sorter-cost inputs.
+#[derive(Clone, Debug, Default)]
+pub struct ScanColumnUse {
+    /// Lower-cased columns referenced besides the rowid (a reference to
+    /// the INTEGER PRIMARY KEY codes as the rowid and sets no colUsed
+    /// bit). `None` = unknown: every column.
+    pub cols: Option<Vec<String>>,
+    pub one_pass: bool,
+    /// SQLite's `pOrderBy` for the WHERE loop — the GROUP BY, a DISTINCT
+    /// turned GROUP BY, the min()/max() key, else the ORDER BY: per term
+    /// the lower-cased bare column, `None` for an expression term.
+    pub order: Vec<Option<String>>,
+    /// Result-set width (whereSortingCost's column-count factor).
+    pub n_result_cols: usize,
+    /// WHERE_WANT_DISTINCT (a DISTINCT the sorter de-duplicates).
+    pub distinct: bool,
+    /// WHERE_ORDERBY_MIN/MAX (a lone min()/max()): IN constraints count as
+    /// equalities for the ordering, so a unique-key IN-loop is "ordered".
+    pub min_max: bool,
+}
+
+impl ScanColumnUse {
+    /// Usage of `table` by the given expressions (subqueries — whose
+    /// correlated references are not tracked here — make it unknown).
+    pub fn of_exprs<'a>(
+        table: &Table,
+        exprs: impl IntoIterator<Item = &'a Expr>,
+        one_pass: bool,
+    ) -> Self {
+        let alias = table
+            .rowid_alias
+            .map(|i| table.columns[i].name.to_ascii_lowercase());
+        let mut cols: Vec<String> = Vec::new();
+        for e in exprs {
+            if crate::executor::expr_has_subquery(e) {
+                return Self {
+                    one_pass,
+                    ..Self::default()
+                };
+            }
+            for (_, name) in collect_column_refs(e) {
+                let lc = name.to_ascii_lowercase();
+                // `count(*)` parses its star as a pseudo-column: no read.
+                if lc == "*"
+                    || alias.as_deref() == Some(lc.as_str())
+                    || (is_rowid_spelling(&lc) && table.find_column(&lc).is_none())
+                {
+                    continue;
+                }
+                if !cols.contains(&lc) {
+                    cols.push(lc);
+                }
+            }
+        }
+        Self {
+            cols: Some(cols),
+            one_pass,
+            ..Self::default()
+        }
+    }
+
+    /// A single-table SELECT body's usage: result columns, WHERE, GROUP
+    /// BY, HAVING, window definitions and ORDER BY (`*` reads everything),
+    /// plus the ordering sqlite3Select hands the WHERE planner.
+    fn of_select(table: &Table, s: &SimpleSelect, order_terms: &[OrderTerm]) -> Self {
+        let mut exprs: Vec<&Expr> = Vec::new();
+        let mut star = false;
+        for c in &s.columns {
+            match c {
+                ResultColumn::Expr { expr, .. } => exprs.push(expr),
+                _ => star = true,
+            }
+        }
+        exprs.extend(s.where_clause.iter());
+        exprs.extend(s.group_by.iter());
+        exprs.extend(s.having.iter());
+        for w in &s.window {
+            exprs.extend(w.partition_by.iter());
+            exprs.extend(w.order_by.iter().map(|t| &t.expr));
+        }
+        exprs.extend(order_terms.iter().map(|t| &t.expr));
+        let mut out = Self::of_exprs(table, exprs, false);
+        if star {
+            out.cols = None;
+        }
+        out.n_result_cols = if star {
+            table.columns.len()
+        } else {
+            s.columns.len()
+        };
+        let key = |e: &Expr| -> Option<String> {
+            match e {
+                Expr::Column { name, .. } => Some(name.to_ascii_lowercase()),
+                Expr::Collate { expr, .. } => match expr.as_ref() {
+                    Expr::Column { name, .. } => Some(name.to_ascii_lowercase()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        // ORDER BY terms resolve positional references against the
+        // result list (`ORDER BY 1`).
+        let resolved_order: Vec<Option<String>> = order_terms
+            .iter()
+            .map(|t| match &t.expr {
+                Expr::Literal(Value::Integer(n)) if *n >= 1 => match s.columns.get(*n as usize - 1) {
+                    Some(ResultColumn::Expr { expr, .. }) => key(expr),
+                    _ => None,
+                },
+                e => key(e),
+            })
+            .collect();
+        let result_keys: Vec<Option<String>> = s
+            .columns
+            .iter()
+            .map(|c| match c {
+                ResultColumn::Expr { expr, .. } => key(expr),
+                _ => None,
+            })
+            .collect();
+        let is_agg = s.columns.iter().any(|c| match c {
+            ResultColumn::Expr { expr, .. } => expr_has_aggregate(expr),
+            _ => false,
+        });
+        if !s.group_by.is_empty() {
+            out.order = s.group_by.iter().map(key).collect();
+        } else if is_agg {
+            // minMaxQuery: a lone min(col)/max(col) plans against that key.
+            if let [ResultColumn::Expr {
+                expr: Expr::Function { name, args, .. },
+                ..
+            }] = s.columns.as_slice()
+            {
+                if (name.eq_ignore_ascii_case("min") || name.eq_ignore_ascii_case("max"))
+                    && args.len() == 1
+                {
+                    out.order = vec![key(&args[0])];
+                    out.min_max = true;
+                }
+            }
+        } else if s.distinct
+            && !star
+            && !resolved_order.is_empty()
+            && resolved_order.len() == result_keys.len()
+            && resolved_order
+                .iter()
+                .zip(&result_keys)
+                .all(|(a, b)| a.is_some() && a == b)
+        {
+            // DISTINCT whose ORDER BY is the result list runs as a GROUP
+            // BY over it (select.c's DISTINCT -> GROUP BY rewrite).
+            out.order = result_keys;
+        } else if s.distinct && !star && resolved_order.is_empty() {
+            // A bare DISTINCT plans against its result set (WHERE_DISTINCTBY:
+            // the sorter de-duplicates) — unless the rowid in the result
+            // makes it redundant (isDistinctRedundant).
+            let alias = table
+                .rowid_alias
+                .map(|i| table.columns[i].name.to_ascii_lowercase());
+            let redundant = result_keys.iter().any(|k| match k {
+                Some(k) => {
+                    alias.as_deref() == Some(k.as_str())
+                        || (is_rowid_spelling(k) && table.find_column(k).is_none())
+                }
+                None => false,
+            });
+            if !redundant {
+                out.order = result_keys;
+                out.distinct = true;
+            }
+        } else {
+            out.order = resolved_order;
+            out.distinct = s.distinct;
+        }
+        out
+    }
+}
+
+/// sqlite3LogEst: 10*log2(x) in SQLite's integer approximation.
+fn log_est(x: u64) -> i32 {
+    const A: [i32; 8] = [0, 2, 3, 5, 6, 7, 8, 9];
+    let mut x = x;
+    let mut y: i32 = 40;
+    if x < 8 {
+        if x < 2 {
+            return 0;
+        }
+        while x < 8 {
+            y -= 10;
+            x <<= 1;
+        }
+    } else {
+        let i = 60 - x.leading_zeros() as i32;
+        y += i * 10;
+        x >>= i;
+    }
+    A[(x & 7) as usize] + y - 10
+}
+
+/// sqlite3LogEstAdd: the LogEst of the sum of two LogEst quantities.
+fn log_est_add(a: i32, b: i32) -> i32 {
+    const X: [i32; 32] = [
+        10, 10, 9, 9, 8, 8, 7, 7, 7, 6, 6, 6, 5, 5, 5, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2,
+        2, 2, 2,
+    ];
+    let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
+    if hi > lo + 49 {
+        hi
+    } else if hi > lo + 31 {
+        hi + 1
+    } else {
+        hi + X[(hi - lo) as usize]
+    }
+}
+
+/// where.c estLog: the LogEst of log2 of a LogEst row count.
+fn est_log(n: i32) -> i32 {
+    if n <= 10 {
+        0
+    } else {
+        log_est(n as u64) - 33
+    }
+}
+
+/// Column::szEst (sqlite3AddColumn / sqlite3AffinityType): the field-size
+/// estimate in units of an integer's size.
+fn column_sz_est(declared_type: &str) -> i32 {
+    let t = declared_type.trim();
+    if t.is_empty() {
+        return 1;
+    }
+    // The standard type names (exact, case-insensitive): ANY/INT/INTEGER/
+    // REAL weigh 1, BLOB/TEXT 5.
+    for (name, sz) in [
+        ("ANY", 1),
+        ("BLOB", 5),
+        ("INT", 1),
+        ("INTEGER", 1),
+        ("REAL", 1),
+        ("TEXT", 5),
+    ] {
+        if t.eq_ignore_ascii_case(name) {
+            return sz;
+        }
+    }
+    // sqlite3AffinityType's rolling 4-byte hash over the declared type.
+    let bytes = t.as_bytes();
+    let mut h: u32 = 0;
+    let mut text_or_blob = false;
+    let mut size_from: Option<usize> = None;
+    let mut real = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        h = (h << 8).wrapping_add(b.to_ascii_lowercase() as u32);
+        let tail = |s: &[u8; 4]| h == u32::from_be_bytes(*s);
+        if tail(b"char") {
+            text_or_blob = true;
+            size_from = Some(i + 1);
+        } else if tail(b"clob") || tail(b"text") {
+            text_or_blob = true;
+        } else if tail(b"blob") && !text_or_blob {
+            text_or_blob = true;
+            if bytes.get(i + 1) == Some(&b'(') {
+                size_from = Some(i + 1);
+            }
+        } else if (tail(b"real") || tail(b"floa") || tail(b"doub")) && !text_or_blob {
+            real = true;
+        } else if h & 0x00FF_FFFF == u32::from_be_bytes(*b"\0int") {
+            return 1;
+        }
+    }
+    let _ = real;
+    let v: i64 = if text_or_blob {
+        match size_from {
+            Some(from) => {
+                let digits: String = t[from..]
+                    .chars()
+                    .skip_while(|c| !c.is_ascii_digit())
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                digits.parse::<i64>().unwrap_or(0)
+            }
+            None => 16,
+        }
+    } else {
+        0
+    };
+    (v / 4 + 1).min(255) as i32
+}
+
+/// Table::szTabRow (estimateTableWidth).
+fn table_width_logest(table: &Table) -> i32 {
+    let mut w: i64 = table
+        .columns
+        .iter()
+        .map(|c| column_sz_est(&c.declared_type) as i64)
+        .sum();
+    if table.rowid_alias.is_none() {
+        w += 1;
+    }
+    log_est((w * 4) as u64)
+}
+
+/// Index::szIdxRow (estimateIndexWidth): the key columns plus the rowid.
+fn index_width_logest(table: &Table, idx: &crate::schema::Index) -> i32 {
+    let mut w: i64 = 1;
+    for ic in &idx.columns {
+        w += table
+            .find_column(&ic.name)
+            .map(|i| column_sz_est(&table.columns[i].declared_type) as i64)
+            .unwrap_or(1);
+    }
+    log_est((w * 4) as u64)
+}
+
+/// Table::nRowLogEst as SQLite holds it: the sqlite_stat1 row count
+/// (a table-level row, or any non-partial index's), 200 (~1M rows) when
+/// unanalyzed — and raised to at least 99 (1000 rows) whenever an index
+/// of the table carries no stat1 data (sqlite3DefaultRowEst's floor,
+/// applied at CREATE INDEX and at every stats reload).
+fn sqlite_table_row_logest(catalog: &Catalog, table: &Table) -> i32 {
+    let indexes = catalog.indexes_on_table(&table.name);
+    let analyzed = catalog
+        .index_stats(&table.name)
+        .map(|s| s.rows)
+        .or_else(|| {
+            indexes
+                .iter()
+                .filter(|i| i.partial_expr.is_none())
+                .find_map(|i| catalog.index_stats(&i.name).map(|s| s.rows))
+        });
+    let mut x = match analyzed {
+        Some(n) => log_est(n.max(0) as u64),
+        None => 200,
+    };
+    if indexes.iter().any(|i| catalog.index_stats(&i.name).is_none()) {
+        x = x.max(99);
+    }
+    x
+}
+
+/// SQLite's access-path choice for `rowid-alias IN (list of n members)`
+/// on a single table — whereLoopAddBtree / whereLoopAddBtreeIndex's loop
+/// costs fed through wherePathSolver, LogEst units: true when the
+/// INTEGER PRIMARY KEY IN-loop (seek semantics) is the chosen path; false
+/// when a full table scan or a COVERING index wins (an IN-loop on an index
+/// led by the alias column, or a covering full-index scan for a SELECT) —
+/// the IN then evaluates with the general comparison.
+///
+/// Loop costs (`rRun`) and row estimates (`nOut`):
+/// * IPK IN-loop: `LogEstAdd(estLog(N), 16) + LogEst(n)`, nOut LogEst(n)
+///   (the IPK probe has no stat1, so the IN-vs-scan heuristic never drops
+///   it);
+/// * full scan: `N + 16` (`N + 14` once the table has STAT4 samples),
+///   nOut N - 1 (the unused IN term's truth-probability guess);
+/// * covering index IN-loop: `LogEstAdd(estLog(N_i), nOut_i + 1 +
+///   15*szIdx/szTab) + LogEst(n)` — a non-covering probe adds the table
+///   lookups and can never undercut the IPK seek;
+/// * covering full-index scan (not for one-pass DML): `N_i + 1 +
+///   15*szIdx/szTab`.
+///
+/// The solver costs a path `LogEstAdd(rRun, 0)`; with an ordering
+/// requirement a second pass adds `LogEstAdd(cost, sortCost) + 3` to the
+/// unordered paths (the sort cost sized by the first pass's row
+/// estimate), first disabling unconstrained loops when the first pass
+/// chose a constrained one (whereInterstageHeuristic). Ties break on
+/// nOut, then on the unsorted cost, then on insertion order (scan, IPK,
+/// indexes) — verified against the bundled SQLite's WHERETRACE.
+fn sqlite_rowid_in_seeks(
+    catalog: &Catalog,
+    table: &Table,
+    n_members: usize,
+    n_other_terms: usize,
+    col_use: &ScanColumnUse,
+) -> bool {
+    #[derive(Clone)]
+    struct Loop {
+        run: i32,
+        n_out: i32,
+        /// wherePathSatisfiesOrderBy's isOrdered: how many leading terms
+        /// of the ordering the path already emits in order.
+        sorted: usize,
+        ipk: bool,
+        constrained: bool,
+        /// WhereLoop::iSortIdx: loops compete for the same slot only when
+        /// equal (1 = the IPK probe, 2.. = the indexes, when the probe
+        /// might help the ordering; else 0).
+        sort_idx: usize,
+        /// WHERE_INDEXED loops (not the IPK probe, not the table scan):
+        /// (index position, nEq, terms used, covering).
+        indexed: Option<(usize, u8, u8, bool)>,
+    }
+    // whereLoopCheaperProperSubset(x, y).
+    fn cheaper_subset(x: &Loop, y: &Loop) -> bool {
+        let (Some((xi, xeq, xterms, xcov)), Some((yi, yeq, yterms, ycov))) = (x.indexed, y.indexed)
+        else {
+            return false;
+        };
+        if x.run > y.run && x.n_out > y.n_out {
+            return false;
+        }
+        if xeq < yeq && xi == yi {
+            return true;
+        }
+        if xterms >= yterms {
+            return false;
+        }
+        // Every term x uses is the single IN term (or none), which y uses.
+        !(xcov && !ycov)
+    }
+    // whereLoopInsert: whereLoopAdjustCost against the indexed loops, then
+    // whereLoopFindLesser — a template no better than a same-slot loop
+    // (cost AND rows) is dropped; one at least as good as a loop replaces
+    // it (and every later loop it also dominates).
+    fn insert(loops: &mut Vec<Loop>, mut t: Loop) {
+        if t.indexed.is_some() {
+            for p in loops.iter() {
+                if cheaper_subset(p, &t) {
+                    t.run = t.run.min(p.run);
+                    t.n_out = t.n_out.min(p.n_out - 1);
+                } else if cheaper_subset(&t, p) {
+                    t.run = t.run.max(p.run);
+                    t.n_out = t.n_out.max(p.n_out + 1);
+                }
+            }
+        }
+        for j in 0..loops.len() {
+            let p = &loops[j];
+            if p.sort_idx != t.sort_idx {
+                continue;
+            }
+            if p.run <= t.run && p.n_out <= t.n_out {
+                return;
+            }
+            if p.run >= t.run && p.n_out >= t.n_out {
+                let mut k = j + 1;
+                while k < loops.len() {
+                    let q = &loops[k];
+                    if q.sort_idx == t.sort_idx {
+                        if q.run <= t.run && q.n_out <= t.n_out {
+                            break;
+                        }
+                        if q.run >= t.run && q.n_out >= t.n_out {
+                            loops.remove(k);
+                            continue;
+                        }
+                    }
+                    k += 1;
+                }
+                loops[j] = t;
+                return;
+            }
+        }
+        loops.push(t);
+    }
+    let others = n_other_terms as i32;
+    let r_size = sqlite_table_row_logest(catalog, table);
+    let n_in = log_est(n_members as u64);
+    let indexes = catalog.indexes_on_table(&table.name);
+    let has_stat4 = indexes.iter().any(|i| {
+        catalog
+            .index_stats(&i.name)
+            .is_some_and(|s| !s.samples.is_empty())
+    });
+    let alias = table.rowid_alias.map(|i| table.columns[i].name.to_ascii_lowercase());
+    let is_rowid_key = |k: &Option<String>| match k {
+        Some(k) => {
+            alias.as_deref() == Some(k.as_str())
+                || (is_rowid_spelling(k) && table.find_column(k).is_none())
+        }
+        None => false,
+    };
+    // Paths that emit rowid order satisfy an ordering led by the rowid
+    // (unique: the remaining terms are then moot).
+    let rowid_ordered = col_use.order.first().is_some_and(is_rowid_key);
+    let full = col_use.order.len();
+    let rowid_sorted = if rowid_ordered { full } else { 0 };
+    // indexMightHelpWithOrderBy for the IPK probe: any rowid term.
+    let pk_sort_idx = if col_use.order.iter().any(is_rowid_key) {
+        1
+    } else {
+        0
+    };
+    let mut loops: Vec<Loop> = Vec::new();
+    insert(
+        &mut loops,
+        Loop {
+            run: r_size + if has_stat4 { 14 } else { 16 },
+            n_out: r_size - 1 - others,
+            sorted: rowid_sorted,
+            ipk: false,
+            constrained: false,
+            sort_idx: pk_sort_idx,
+            indexed: None,
+        },
+    );
+    insert(
+        &mut loops,
+        Loop {
+            run: log_est_add(est_log(r_size), 16) + n_in,
+            n_out: n_in - others,
+            // min/max planning treats the IN as `rowid = ?`: one row per
+            // key, so any ordering is trivially met.
+            sorted: if rowid_ordered || col_use.min_max {
+                full
+            } else {
+                0
+            },
+            ipk: true,
+            constrained: true,
+            sort_idx: pk_sort_idx,
+            indexed: None,
+        },
+    );
+    {
+        let sz_tab = table_width_logest(table);
+        for (pos, idx) in indexes.iter().enumerate() {
+            if idx.partial_expr.is_some() || idx.columns.iter().any(|c| c.expr.is_some()) {
+                continue;
+            }
+            let covering = col_use.cols.as_ref().is_some_and(|cols| {
+                cols.iter()
+                    .all(|c| idx.columns.iter().any(|ic| ic.name.eq_ignore_ascii_case(c)))
+            });
+            let stats = catalog.index_stats(&idx.name);
+            let a0 = match &stats {
+                Some(s) => log_est(s.rows.max(0) as u64),
+                None => r_size.max(99),
+            };
+            let sz_idx = index_width_logest(table, idx);
+            let k = (15 * sz_idx) / sz_tab;
+            let leads_alias = alias
+                .as_deref()
+                .is_some_and(|a| idx.columns[0].name.eq_ignore_ascii_case(a));
+            // Index order: the key columns, then the rowid — the leading
+            // ordering terms it meets; a rowid term (or a UNIQUE index's
+            // full key) fixes everything after it.
+            let index_sorted = {
+                let mut n = 0;
+                for (i, o) in col_use.order.iter().enumerate() {
+                    match idx.columns.get(i) {
+                        Some(ic) if o.as_deref().is_some_and(|o| ic.name.eq_ignore_ascii_case(o)) => {
+                            n += 1
+                        }
+                        None if is_rowid_key(o) => {
+                            n = full;
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+                if idx.unique && n >= idx.columns.len() {
+                    full
+                } else {
+                    n
+                }
+            };
+            let helps_order = col_use.order.iter().any(|o| {
+                is_rowid_key(o)
+                    || o.as_deref().is_some_and(|o| {
+                        idx.columns.iter().any(|ic| ic.name.eq_ignore_ascii_case(o))
+                    })
+            });
+            let sort_idx = if helps_order { pos + 2 } else { 0 };
+            if !covering {
+                // A non-covering index competes only as an ORDERED full
+                // scan (indexMightHelpWithOrderBy): its rows plus a table
+                // lookup each, less one per leading WHERE term the index
+                // itself answers — the rowid IN always is. Its IN-loops
+                // pay lookups too and never undercut the IPK seek.
+                if helps_order {
+                    let lookups = a0 + 16 - if others == 0 { 1 } else { 0 };
+                    insert(
+                        &mut loops,
+                        Loop {
+                            run: log_est_add(a0 + 1 + k, lookups),
+                            n_out: a0 - 1 - others,
+                            sorted: index_sorted,
+                            ipk: false,
+                            constrained: false,
+                            sort_idx,
+                            indexed: Some((pos, 0, 0, false)),
+                        },
+                    );
+                }
+                continue;
+            }
+            // Full covering-index scan first (whereLoopAddBtree's order),
+            // then the IN-loops on an alias-led index.
+            if (helps_order || !col_use.one_pass) && sz_idx < sz_tab {
+                insert(
+                    &mut loops,
+                    Loop {
+                        run: a0 + 1 + k,
+                        n_out: a0 - 1 - others,
+                        sorted: if leads_alias && rowid_ordered {
+                            full
+                        } else {
+                            index_sorted
+                        },
+                        ipk: false,
+                        constrained: false,
+                        sort_idx,
+                        indexed: Some((pos, 0, 0, true)),
+                    },
+                );
+            }
+            if leads_alias {
+                // nOut before the IN multiplier: one row per key (stat1's
+                // "N 1", or the STAT4 per-member estimate on unique keys).
+                let n_out = match stats.as_ref().and_then(|s| s.distinct_prefix.first()) {
+                    Some(&d) => log_est(d.max(0) as u64),
+                    None if idx.unique && idx.columns.len() == 1 => 0,
+                    None => 33,
+                };
+                // Ordering (verified ASC/DESC/UNIQUE against WHERETRACE):
+                // the nEq=1 IN-loop walks the alias column in key order,
+                // so a rowid-led ORDER BY is met (reverse scan for DESC);
+                // the nEq=2 loop, IN on both the key and the trailing
+                // rowid, never is — index IN terms count as equalities
+                // only for ORDER BY-LIMIT and min/max planning.
+                let min_max_unique = col_use.min_max && idx.unique && idx.columns.len() == 1;
+                let eq1 = Loop {
+                    run: log_est_add(est_log(a0), n_out + 1 + k) + n_in,
+                    n_out: n_out + n_in - others,
+                    sorted: if rowid_ordered || min_max_unique { full } else { 0 },
+                    ipk: false,
+                    constrained: true,
+                    sort_idx,
+                    indexed: Some((pos, 1, 1, true)),
+                };
+                insert(&mut loops, eq1.clone());
+                // The index's trailing rowid column takes the same IN term
+                // (nEq=2): costlier raw, then cost-adjusted under its nEq=1
+                // subset — one row fewer at the same cost.
+                // The IN-vs-scan heuristic (analyzed index, rLogSize >= 10):
+                // with M = aiRowLogEst[nEq], an IN whose `M + logK + 10 <
+                // nIn + rLogSize` is dropped once an earlier IN multiplied
+                // the loop (nInMul >= 2; the first IN degrades to a
+                // seek-scan with unchanged costs instead).
+                let in_kept = |m: i32| {
+                    stats.is_none()
+                        || est_log(a0) < 10
+                        || m + est_log(n_in) + 10 - (n_in + est_log(a0)) >= 0
+                };
+                let settled = loops
+                    .iter()
+                    .find(|l| l.indexed == Some((pos, 1, 1, true)))
+                    .cloned()
+                    .unwrap_or(eq1);
+                if in_kept(n_out) {
+                    insert(
+                        &mut loops,
+                        Loop {
+                            run: settled.run + n_in,
+                            n_out: 2 * n_in - others,
+                            sorted: if min_max_unique { full } else { 0 },
+                            indexed: Some((pos, 2, 2, true)),
+                            ..settled
+                        },
+                    );
+                }
+            }
+        }
+    }
+    // wherePathSolver: (rCost, nRow, rUnsort) lexicographic, first wins
+    // ties; `sort` (cost of sorting given n leading terms already in
+    // order) is None for the unordered first pass.
+    let solve = |loops: &[Loop],
+                 sort: Option<&dyn Fn(usize) -> i32>,
+                 allow: &dyn Fn(&Loop) -> bool|
+     -> usize {
+        let mut best: Option<(usize, i32, i32, i32)> = None;
+        for (i, l) in loops.iter().enumerate() {
+            if !allow(l) {
+                continue;
+            }
+            let unsorted = log_est_add(l.run, 0);
+            let (cost, r_unsort) = match sort {
+                Some(s) if l.sorted < full => (log_est_add(unsorted, s(l.sorted)) + 3, unsorted),
+                _ => (unsorted, unsorted - 2),
+            };
+            let better = match best {
+                None => true,
+                Some((_, c, n, u)) => (cost, l.n_out, r_unsort) < (c, n, u),
+            };
+            if better {
+                best = Some((i, cost, l.n_out, r_unsort));
+            }
+        }
+        best.map(|b| b.0).unwrap_or(0)
+    };
+    let first = solve(&loops, None, &|_| true);
+    if col_use.order.is_empty() {
+        return loops[first].ipk;
+    }
+    // whereSortingCost over the first pass's row estimate; a partially
+    // ordered path block-sorts only the unordered tail.
+    let n_row_est = loops[first].n_out + 1;
+    let n_col = log_est(((col_use.n_result_cols.max(1) + 59) / 30) as u64);
+    let sort_cost = |n_sorted: usize| -> i32 {
+        let mut cost = n_row_est + n_col;
+        if n_sorted > 0 {
+            cost += log_est(((full - n_sorted) * 100 / full) as u64) - 66;
+        }
+        let mut n_row = n_row_est;
+        if col_use.distinct && n_row > 10 {
+            n_row -= 10;
+        }
+        cost + est_log(n_row)
+    };
+    let first_constrained = loops[first].constrained;
+    let second = solve(&loops, Some(&sort_cost), &|l: &Loop| {
+        !first_constrained || l.constrained
+    });
+    loops[second].ipk
+}
+
 /// Detect `rowid-alias-col IN (list-of-expressions)` among the conjuncts.
 /// Returns the RowidIn plan plus the remaining conjuncts (for a residual
 /// Filter). Only handles the positive (non-negated) form; `NOT IN` keeps
@@ -4144,7 +4908,16 @@ fn try_rowid_in(
     conjuncts: &[Expr],
     table: &Arc<Table>,
     alias: &Option<String>,
+    col_use: &ScanColumnUse,
 ) -> Option<(Plan, Vec<Expr>)> {
+    // Several rowid-IN conjuncts: SQLite drives the loop with the CHEAPEST
+    // one — the fewest members (each member is one seek, nOut ~ nIn) —
+    // ties going to the earliest term. Only the driving term runs under
+    // seek semantics; every other rowid-IN conjunct stays a residual
+    // filter evaluated with the general numeric comparison (`id IN (1,
+    // 5, i64::MIN) AND id IN ('x', -2^63.0)` is EMPTY in SQLite: the
+    // two-member list drives and its boundary REAL seeks nothing).
+    let mut best: Option<(usize, &Arc<Vec<Expr>>)> = None;
     for (i, conjunct) in conjuncts.iter().enumerate() {
         if let Expr::In {
             expr,
@@ -4160,50 +4933,65 @@ fn try_rowid_in(
                 let is_rowid_pseudo = name.eq_ignore_ascii_case("rowid")
                     || name.eq_ignore_ascii_case("_rowid_")
                     || name.eq_ignore_ascii_case("oid");
-                if is_rowid_alias || is_rowid_pseudo {
-                    // SQLite's rowid-IN seek applies the SeekRowid
-                    // conversion per member (a BLOB/TEXT member just
-                    // never matches; a boundary REAL -2^63 is rejected —
-                    // ticket #3922). That is the plan SQLite chooses
-                    // UNANALYZED (verified: blob/text members still
-                    // seek, boundary REALs miss). With sqlite_stat1 the
-                    // costs are real: for a small analyzed table SQLite
-                    // prefers a full scan / a serving alias-index probe
-                    // — the GENERAL numeric comparison, where the
-                    // boundary REAL MATCHES the i64::MIN rowid
-                    // (stateful-fuzz seed 777023 case 28: analyzed
-                    // 28-row audit, `id IN (blob, text, -2^63e18)`
-                    // matched the i64::MIN row). Decline the seek plan
-                    // in that shape so the IN evaluates numerically.
-                    let has_unconvertible_literal = list.iter().any(|e| match e {
-                        Expr::Literal(v) => crate::executor::rowid_seek_value(v).is_none(),
-                        _ => false,
-                    });
-                    if has_unconvertible_literal
-                        && table_rows_hint(catalog, table) <= 64 * list.len().max(1) as i64
-                    {
-                        return None;
-                    }
-                    let others: Vec<Expr> = conjuncts
-                        .iter()
-                        .enumerate()
-                        .filter(|(j, _)| *j != i)
-                        .map(|(_, c)| c.clone())
-                        .collect();
-                    return Some((
-                        Plan::RowidIn {
-                            table: table.clone(),
-                            alias: alias.clone(),
-                            values: list.clone(),
-                            residual: None,
-                        },
-                        others,
-                    ));
+                if (is_rowid_alias || is_rowid_pseudo)
+                    && best.map_or(true, |(_, b)| list.len() < b.len())
+                {
+                    best = Some((i, list));
                 }
             }
         }
     }
-    None
+    let (i, list) = best?;
+    // SQLite's rowid-IN seek applies the SeekRowid conversion per member
+    // (a BLOB/TEXT member just never matches; a boundary REAL -2^63 is
+    // rejected — ticket #3922). Whether SQLite seeks at all is its cost
+    // model's call (`sqlite_rowid_in_seeks`): a full scan or a covering
+    // probe of an index on the alias column evaluates the IN with the
+    // GENERAL numeric comparison instead, where the boundary REAL
+    // MATCHES the i64::MIN rowid (stateful-fuzz seeds 777023 case 28 and
+    // 3003 case 1 matched it; seed 6006 case 30, an 11-row table, did
+    // not). The two semantics differ ONLY on that boundary member, so the
+    // seek still serves the scan's answer once each literal member is
+    // replaced by the rowid it numerically equals. (Declining the seek
+    // here instead left the IN to the compiled scan predicate, which
+    // applies seek semantics to any rowid-alias IN — the SELECT/UPDATE
+    // paths then missed the row the DELETE path's generic evaluator
+    // matched.)
+    let numeric_member = |e: &Expr| match e {
+        Expr::Literal(lit) if crate::executor::rowid_seek_value(lit).is_none() => {
+            crate::executor::numeric_rowid_key(lit)
+        }
+        _ => None,
+    };
+    let values = if list.iter().any(|e| numeric_member(e).is_some())
+        && !sqlite_rowid_in_seeks(catalog, table, list.len(), conjuncts.len() - 1, col_use)
+    {
+        Arc::new(
+            list.iter()
+                .map(|e| match numeric_member(e) {
+                    Some(k) => Expr::Literal(Value::Integer(k)),
+                    None => e.clone(),
+                })
+                .collect::<Vec<Expr>>(),
+        )
+    } else {
+        list.clone()
+    };
+    let others: Vec<Expr> = conjuncts
+        .iter()
+        .enumerate()
+        .filter(|(j, _)| *j != i)
+        .map(|(_, c)| c.clone())
+        .collect();
+    Some((
+        Plan::RowidIn {
+            table: table.clone(),
+            alias: alias.clone(),
+            values,
+            residual: None,
+        },
+        others,
+    ))
 }
 
 /// Try to build a RowidRange (start, end, residual) from a list of conjuncts
@@ -7124,6 +7912,18 @@ fn push_on_conjuncts_into_sides(
 }
 
 pub fn pushdown_filter(catalog: &Catalog, plan: Plan, predicate: &Expr) -> Plan {
+    pushdown_filter_with_use(catalog, plan, predicate, &ScanColumnUse::default())
+}
+
+/// [`pushdown_filter`] carrying the single-table statement's column usage
+/// (consulted only when `plan` is that table's scan; join sides plan with
+/// the unknown default).
+pub fn pushdown_filter_with_use(
+    catalog: &Catalog,
+    plan: Plan,
+    predicate: &Expr,
+    col_use: &ScanColumnUse,
+) -> Plan {
     let conjuncts = split_and_chain(predicate);
 
     // If the plan is a Join, try to split conjuncts into left-only / right-only
@@ -7294,7 +8094,7 @@ pub fn pushdown_filter(catalog: &Catalog, plan: Plan, predicate: &Expr) -> Plan 
     } else {
         // Not a Join — let apply_where_for_scan handle the Scan + index path,
         // or wrap in a Filter for other plan shapes.
-        apply_where_for_scan(catalog, plan, &combine_and(&conjuncts))
+        apply_where_for_scan_with_use(catalog, plan, &combine_and(&conjuncts), col_use)
     }
 }
 

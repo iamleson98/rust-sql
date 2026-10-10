@@ -956,6 +956,17 @@ enum ParamSlot {
 /// (SQLite-compatible constraint messages) plus the error taxonomy.
 fn engine_err_code(e: &rustqlite::Error) -> c_int {
     let msg = e.to_string();
+    // SQLITE_FULL: an exhausted rowid space (AUTOINCREMENT at i64::MAX,
+    // the random-rowid lottery) or a write that hit ENOSPC.
+    if msg == "database or disk is full" {
+        return SQLITE_FULL;
+    }
+    if let rustqlite::Error::Io(io) = e {
+        let disk_full: &[i32] = if cfg!(windows) { &[112, 39] } else { &[28] };
+        if io.raw_os_error().is_some_and(|c| disk_full.contains(&c)) {
+            return SQLITE_FULL;
+        }
+    }
     if msg.contains("UNIQUE constraint failed") {
         return SQLITE_CONSTRAINT_UNIQUE;
     }
@@ -2810,11 +2821,22 @@ fn run_once(stmt: &mut Stmt) -> c_int {
         // Identity arming: same rationale as the tx-control arm above —
         // concurrent owners/joiners and their reads key on it.
         let before = engine.total_changes();
-        let result = {
+        let (result, txn_ended) = {
             let _id = rustqlite::ConnIdentityGuard::arm(conn.id as u64);
             let mut w = engine.db.write();
-            w.execute(&sql, binds)
+            let r = w.execute(&sql, binds);
+            // A failed statement can END the transaction engine-side
+            // (SQLITE_FULL without a statement journal rolls the whole
+            // transaction back — sqlite3VdbeHalt's special-error arm).
+            let ended = r.is_err() && w.is_autocommit();
+            (r, ended)
         };
+        if txn_ended && conn.state.in_tx.load(Ordering::Acquire) {
+            release_tx_hold(&engine, &conn);
+            conn.state.in_tx.store(false, Ordering::Release);
+            metrics::bump(&metrics::TX_ROLLED_BACK);
+            fire_rollback_hook(&conn);
+        }
         match result {
             Ok(()) => {
                 let after = engine.total_changes();

@@ -1738,6 +1738,21 @@ impl Pager {
     /// hasn't seen this page yet. Called from get_page (both hit and
     /// insert paths) — the bytes at fetch time are the pre-mutation state
     /// because every mutation locks the page through get_page first.
+    /// Savepoint pre-image for a page about to be MUTATED through a handle
+    /// that did not come from `get_page` — an advisory leaf hint kept
+    /// across statements (see `Btree::update_table_inner`). Capture-at-
+    /// fetch never saw that page under the savepoint levels opened since
+    /// the hint was cached, so without this a later ROLLBACK [TO] left the
+    /// in-place patch standing: `SELECT .. WHERE id = 3; BEGIN; UPDATE ..
+    /// WHERE id IN (2, 3); ROLLBACK` kept the update. Not gated on the
+    /// pure-read suspension — this is a write.
+    #[inline]
+    pub(crate) fn capture_before_handle_write(&self, id: PageId, page: &PageRef) {
+        if self.savepoint_depth.load(Ordering::Relaxed) > 0 {
+            self.capture_savepoint_undo(id, page);
+        }
+    }
+
     fn capture_savepoint_undo(&self, id: PageId, page: &PageRef) {
         // Range fast path: pages allocated after EVERY level's base need
         // no pre-image (see the loop below) — a bulk-INSERT transaction

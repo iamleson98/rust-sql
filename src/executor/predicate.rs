@@ -1146,15 +1146,31 @@ pub(crate) fn compile_predicate(
     table: &crate::schema::Table,
     prefix: &str,
 ) -> Option<CompiledPredicate> {
+    compile_predicate_at(e, table, prefix, true)
+}
+
+/// `seekable`: `e` sits where SQLite could drive an IN-loop with it — an
+/// AND-conjunct of the WHERE, not under NOT. A rowid-alias IN runs seek
+/// membership only there (see `CompiledPredicate::InList::rowid_seek`);
+/// under NOT the IN is evaluated as an expression, the general numeric
+/// comparison (`NOT (id IN (-2^63.0))` excludes the i64::MIN row). OR
+/// branches keep the seek: SQLite's multi-index OR plan seeks each
+/// indexable branch, and the rowid branch always is.
+fn compile_predicate_at(
+    e: &Expr,
+    table: &crate::schema::Table,
+    prefix: &str,
+    seekable: bool,
+) -> Option<CompiledPredicate> {
     match e {
         Expr::Binary { op, left, right } => match op {
             BinaryOp::And => Some(CompiledPredicate::And(
-                Box::new(compile_predicate(left, table, prefix)?),
-                Box::new(compile_predicate(right, table, prefix)?),
+                Box::new(compile_predicate_at(left, table, prefix, seekable)?),
+                Box::new(compile_predicate_at(right, table, prefix, seekable)?),
             )),
             BinaryOp::Or => Some(CompiledPredicate::Or(
-                Box::new(compile_predicate(left, table, prefix)?),
-                Box::new(compile_predicate(right, table, prefix)?),
+                Box::new(compile_predicate_at(left, table, prefix, seekable)?),
+                Box::new(compile_predicate_at(right, table, prefix, seekable)?),
             )),
             op if is_cmp_op(*op) => {
                 let lhs = bind_operand(left, table, prefix)?;
@@ -1191,8 +1207,8 @@ pub(crate) fn compile_predicate(
         Expr::Unary { op, expr } => {
             // NOT expr
             if matches!(op, crate::sql::ast::UnaryOp::Not) {
-                Some(CompiledPredicate::Not(Box::new(compile_predicate(
-                    expr, table, prefix,
+                Some(CompiledPredicate::Not(Box::new(compile_predicate_at(
+                    expr, table, prefix, false,
                 )?)))
             } else {
                 None
@@ -1385,7 +1401,9 @@ pub(crate) fn compile_predicate(
                 vals: bound,
                 negated: *negated,
                 int_set,
-                rowid_seek: table.rowid_alias == Some(col),
+                // NOT IN never drives a seek: SQLite evaluates it as an
+                // expression (`id NOT IN (-2^63.0)` excludes i64::MIN).
+                rowid_seek: seekable && !*negated && table.rowid_alias == Some(col),
             })
         }
         Expr::Like {

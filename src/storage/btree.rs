@@ -4903,6 +4903,10 @@ impl<'a> Btree<'a> {
                     if overflow_local_len_for(old_plen, psz) != old_plen {
                         return Ok(false);
                     }
+                    // The hinted page bypassed get_page's savepoint
+                    // capture: journal its pre-image before either patch.
+                    self.pager
+                        .capture_before_handle_write(page_id_now, &page_ref);
                     if old_plen == new_payload.len() {
                         let mut borrowed = page_ref.lock();
                         if payload_off + new_payload.len() <= borrowed.data.len() {

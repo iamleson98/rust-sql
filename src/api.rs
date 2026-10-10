@@ -6156,7 +6156,57 @@ impl Database {
     /// mutations go through interior mutability so the body could in principle
     /// be `&self`. We keep `&mut self` for API clarity (writers serialize).
     pub fn execute<P: Params>(&mut self, sql: &str, params: P) -> Result<()> {
-        self.execute_stmt(sql, params)
+        let result = self.execute_stmt(sql, params);
+        if let Err(e) = &result {
+            if is_sqlite_full(e) {
+                self.widen_special_error_rollback(sql);
+            }
+        }
+        result
+    }
+
+    /// `sqlite3_get_autocommit`: true when no transaction is open on this
+    /// connection (neither a plain BEGIN nor this caller's BEGIN
+    /// CONCURRENT). An error can END a transaction (see
+    /// [`Self::execute`]'s SQLITE_FULL handling), so callers that mirror
+    /// the transaction state must re-read it after a failed statement.
+    pub fn is_autocommit(&self) -> bool {
+        !self.in_transaction.load(Ordering::Acquire) && self.concurrent_txn_for_caller().is_none()
+    }
+
+    /// sqlite3VdbeHalt's special-error arm: SQLITE_FULL rolls back only
+    /// the failing statement when it ran with a statement journal
+    /// (`isMultiWrite && mayAbort`, modeled by
+    /// [`crate::executor::stmt_journal`]); otherwise SQLite rolls back the
+    /// WHOLE transaction and returns to autocommit — the rows earlier
+    /// statements of the transaction wrote vanish and a following COMMIT
+    /// fails with "cannot commit - no transaction is active" (stateful-
+    /// fuzz seeds 4004/5005: a multi-row INSERT into an AUTOINCREMENT
+    /// table at i64::MAX inside BEGIN). The statement itself was already
+    /// undone by the row-level statement journal.
+    fn widen_special_error_rollback(&mut self, sql: &str) {
+        if self.is_autocommit() {
+            return;
+        }
+        // A `;`-script recursed through `execute` per statement: the
+        // failing part was handled there.
+        if sql.as_bytes().contains(&b';') && crate::sql::parser::split_script(sql).len() > 1 {
+            return;
+        }
+        let Ok(stmt) = crate::sql::parser::parse(sql) else {
+            return;
+        };
+        if crate::executor::stmt_journal::uses_stmt_journal(
+            &self.catalog,
+            &stmt,
+            self.foreign_keys_enabled(),
+            self.pager.recursive_triggers_enabled(),
+        ) {
+            return;
+        }
+        if let Err(e) = self.execute_stmt("ROLLBACK", ()) {
+            eprintln!("transaction rollback after SQLITE_FULL failed: {e}");
+        }
     }
 
     /// [`Self::execute`]'s body (the wrapper handles delta-journal
@@ -12474,7 +12524,14 @@ impl Database {
                 upd.alias.clone().unwrap_or_else(|| upd.table.clone()),
             )];
             let rewritten = crate::planner::rewrite_column_collations(catalog, pred, &coll_scope);
-            crate::planner::apply_where_for_scan(catalog, scan, &rewritten)
+            // colUsed of the WHERE loop: the WHERE alone — the row is
+            // re-read through the table cursor before the SET evaluates,
+            // so SQLite's covering test never sees the SET's reads
+            // (verified: `SET b = b || 'x' WHERE id IN (..)` still takes
+            // a covering index on id).
+            let col_use =
+                crate::planner::ScanColumnUse::of_exprs(&table, std::iter::once(pred), true);
+            crate::planner::apply_where_for_scan_with_use(catalog, scan, &rewritten, &col_use)
         } else {
             scan
         };
@@ -12606,7 +12663,9 @@ impl Database {
                 del.alias.clone().unwrap_or_else(|| del.from.clone()),
             )];
             let rewritten = crate::planner::rewrite_column_collations(catalog, pred, &coll_scope);
-            crate::planner::apply_where_for_scan(catalog, scan, &rewritten)
+            let col_use =
+                crate::planner::ScanColumnUse::of_exprs(&table, std::iter::once(pred), true);
+            crate::planner::apply_where_for_scan_with_use(catalog, scan, &rewritten, &col_use)
         } else {
             scan
         };
@@ -17917,6 +17976,22 @@ struct BoundDeletePlan {
     /// Param position (0-based) of the rowid-alias equality value.
     rowid_pos: usize,
     n_params: usize,
+}
+
+/// SQLITE_FULL — "database or disk is full": OP_NewRowid's exhausted
+/// rowid space (AUTOINCREMENT at i64::MAX, the 100-draw random-rowid
+/// lottery) or a write that hit ENOSPC.
+pub(crate) fn is_sqlite_full(e: &Error) -> bool {
+    match e {
+        Error::Constraint(m) => m == "database or disk is full",
+        // ENOSPC (28 on Linux and macOS); Windows ERROR_DISK_FULL (112)
+        // / ERROR_HANDLE_DISK_FULL (39).
+        Error::Io(io) => {
+            let disk_full: &[i32] = if cfg!(windows) { &[112, 39] } else { &[28] };
+            io.raw_os_error().is_some_and(|c| disk_full.contains(&c))
+        }
+        _ => false,
+    }
 }
 
 /// Scanner for `DELETE FROM <table> WHERE <col> = ?` — nothing else.
