@@ -16614,11 +16614,17 @@ fn exec_join_rows(
                     &params,
                     &named_params,
                 )?;
-                let mut table: HashMap<Vec<u8>, Vec<u32>, crate::api::FxHashBuild> =
+                // Chained table on the 64-bit key hash (a collision only
+                // adds a candidate — every pair is re-tested): `heads`
+                // holds each hash's first right row, `next` the rest, in
+                // ascending row order (built back to front).
+                const NONE: u32 = u32::MAX;
+                let mut heads: HashMap<u64, u32, crate::api::FxHashBuild> =
                     HashMap::with_capacity_and_hasher(right_res.rows.len(), Default::default());
-                for (ri, k) in right_keys.into_iter().enumerate() {
-                    if let Some(k) = k {
-                        table.entry(k).or_default().push(ri as u32);
+                let mut next: Vec<u32> = vec![NONE; right_res.rows.len()];
+                for (ri, k) in right_keys.iter().enumerate().rev() {
+                    if let Some(h) = k {
+                        next[ri] = heads.insert(*h, ri as u32).unwrap_or(NONE);
                     }
                 }
                 let left_keys = join_side_keys(
@@ -16636,8 +16642,11 @@ fn exec_join_rows(
                 let p: &[Value] = &params;
                 for (left_row, key) in left_res.rows.iter().zip(left_keys) {
                     let mut matched = false;
-                    if let Some(cands) = key.as_ref().and_then(|k| table.get(k)) {
-                        for &ri in cands {
+                    let mut cand = key.and_then(|h| heads.get(&h).copied()).unwrap_or(NONE);
+                    while cand != NONE {
+                        let ri = cand;
+                        cand = next[ri as usize];
+                        {
                             let right_row = &right_res.rows[ri as usize];
                             let ok = match &compiled {
                                 Some(jt) => jt.truthy(left_row, right_row, p),
@@ -16972,10 +16981,11 @@ pub(crate) fn join_operand_keyable(e: &Expr) -> bool {
     }
 }
 
-/// Each row's composite join key over `exprs` (`None` when any part is
-/// NULL — `=` never matches it). Bare columns read their slot; other
-/// operands evaluate against the side's own row and affinities, as the
-/// full condition does.
+/// Each row's composite join-key HASH over `exprs` (`None` when any part
+/// is NULL — `=` never matches it). Bare columns read their slot,
+/// arithmetic / concatenation over columns runs compiled; anything else
+/// evaluates against the side's own row and affinities, as the full
+/// condition does.
 fn join_side_keys(
     exprs: &[&Expr],
     rows: &[Row],
@@ -16983,22 +16993,60 @@ fn join_side_keys(
     affs: Option<&[crate::types::Affinity]>,
     params: &[Value],
     named_params: &HashMap<String, Value>,
-) -> Result<Vec<Option<Vec<u8>>>> {
-    let slots: Vec<Option<usize>> = exprs
+) -> Result<Vec<Option<u64>>> {
+    use std::hash::BuildHasher;
+    enum KeySrc<'e> {
+        Slot(usize),
+        Compiled(crate::executor::predicate::CompiledExpr),
+        Eval(&'e Expr),
+    }
+    fn compile(e: &Expr, cols: &[String]) -> Option<crate::executor::predicate::CompiledExpr> {
+        use crate::executor::predicate::CompiledExpr as C;
+        Some(match e {
+            Expr::Column { table, name } => {
+                C::Col(resolve_column_index(cols, table.as_deref(), name)?)
+            }
+            Expr::Literal(v) => C::Literal(v.clone()),
+            Expr::Unary { op, expr } => C::Unary(*op, Box::new(compile(expr, cols)?)),
+            Expr::Binary { op, left, right }
+                if matches!(
+                    op,
+                    BinaryOp::Add
+                        | BinaryOp::Sub
+                        | BinaryOp::Mul
+                        | BinaryOp::Div
+                        | BinaryOp::Mod
+                        | BinaryOp::Concat
+                ) =>
+            {
+                C::Binary(
+                    *op,
+                    Box::new(compile(left, cols)?),
+                    Box::new(compile(right, cols)?),
+                )
+            }
+            _ => return None,
+        })
+    }
+    let srcs: Vec<KeySrc> = exprs
         .iter()
         .map(|e| match e {
-            Expr::Column { table, name } => resolve_column_index(cols, table.as_deref(), name),
-            _ => None,
+            Expr::Column { table, name } => resolve_column_index(cols, table.as_deref(), name)
+                .map_or(KeySrc::Eval(e), KeySrc::Slot),
+            _ => compile(e, cols).map_or(KeySrc::Eval(e), KeySrc::Compiled),
         })
         .collect();
+    let hasher = crate::api::FxHashBuild;
+    let mut buf = Vec::with_capacity(32);
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        let mut buf = Vec::with_capacity(16);
+        buf.clear();
         let mut null = false;
-        for (e, slot) in exprs.iter().zip(&slots) {
-            let ok = match slot {
-                Some(i) => push_join_value_key(&row[*i], &mut buf),
-                None => {
+        for src in &srcs {
+            let ok = match src {
+                KeySrc::Slot(i) => push_join_value_key(&row[*i], &mut buf),
+                KeySrc::Compiled(c) => push_join_value_key(&c.eval(row, params), &mut buf),
+                KeySrc::Eval(e) => {
                     let ctx =
                         EvalContext::new(row, cols, params, named_params).with_affinities(affs);
                     push_join_value_key(&evaluate(e, &ctx)?, &mut buf)
@@ -17009,7 +17057,7 @@ fn join_side_keys(
                 break;
             }
         }
-        out.push((!null).then_some(buf));
+        out.push((!null).then(|| hasher.hash_one(buf.as_slice())));
     }
     Ok(out)
 }
