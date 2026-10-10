@@ -473,26 +473,30 @@ impl Clone for Trigger {
     }
 }
 
+/// A catalog name map: the fast string hasher (every statement resolves
+/// its tables / indexes here; SipHash was a measurable per-INSERT cost).
+type NameMap<V> = HashMap<String, V, crate::api::FxHashBuild>;
+
 /// The in-memory catalog: maps names to tables, indexes, views, triggers.
 /// `Clone` is cheap (maps of `Arc`s) — a transaction snapshots it before
 /// its first DDL statement so ROLLBACK can restore it.
 #[derive(Default, Clone)]
 pub struct Catalog {
-    tables: HashMap<String, Arc<Table>>,
-    indexes: HashMap<String, Arc<Index>>,
-    views: HashMap<String, Arc<View>>,
-    triggers: HashMap<String, Arc<Trigger>>,
+    tables: NameMap<Arc<Table>>,
+    indexes: NameMap<Arc<Index>>,
+    views: NameMap<Arc<View>>,
+    triggers: NameMap<Arc<Trigger>>,
     /// Table creation sequence (name-lc -> order of addition). The
     /// HashMap above iterates in arbitrary hash order; this preserves
     /// DDL order for anything whose observable behavior depends on it
     /// (SQLite's FK actions fire in REVERSE declaration order — pinned
     /// by the preupdate differential suite).
-    table_seq: HashMap<String, u64>,
+    table_seq: NameMap<u64>,
     next_table_seq: u64,
     /// Indexes grouped by table name (for fast lookup during query planning).
-    indexes_by_table: HashMap<String, Vec<Arc<Index>>>,
+    indexes_by_table: NameMap<Vec<Arc<Index>>>,
     /// Triggers grouped by table name.
-    triggers_by_table: HashMap<String, Vec<Arc<Trigger>>>,
+    triggers_by_table: NameMap<Vec<Arc<Trigger>>>,
     /// Schema cookie — bumped whenever the schema changes.
     pub schema_cookie: u32,
     /// `sqlite_stat1` rows, keyed by index name (lowercase) — the
@@ -500,7 +504,7 @@ pub struct Catalog {
     /// stat1-bearing database opens). Written by ANALYZE's refresh and
     /// by `load_schema`'s stat-table walk; read on every indexed lookup
     /// plan decision.
-    stat1: HashMap<String, IndexStats>,
+    stat1: NameMap<IndexStats>,
     /// TEMP-object names (lowercased) — `CREATE TEMP TABLE/INDEX/VIEW/
     /// TRIGGER` (and indexes/triggers on temp tables). Connection-scoped
     /// exactly like SQLite's temp schema: fully usable this session,

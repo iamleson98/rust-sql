@@ -614,6 +614,14 @@ pub struct Database {
     /// Memoized bound PK-DELETE plan (`DELETE FROM t WHERE id = ?`) —
     /// same discipline as the bound-UPDATE memo.
     bound_delete_memo: Mutex<Option<BoundDeletePlan>>,
+    /// Memoized SHAPE of the last bound single-row INSERT the fast scanner
+    /// accepted (`INSERT INTO t (a, b) VALUES (?, ?)`): the exact text and
+    /// the byte ranges of its table and column names. A repeat of the same
+    /// text skips the scan (explicit-rowid inserts never arm the INSERT
+    /// chain, so they re-scanned on every call). Pure function of the
+    /// text — the table itself is resolved per call — so it needs no
+    /// invalidation.
+    fast_insert_memo: Mutex<Option<FastInsertShape>>,
     /// Advisory fast-path flag for [`Database::break_insert_chain`]: true
     /// while a chain might be hot. Cold (the overwhelmingly common state
     /// for read-heavy workloads) the break costs ONE relaxed atomic load
@@ -2573,6 +2581,7 @@ impl Database {
             insert_chain: Mutex::new(None),
             bound_update_memo: Mutex::new(None),
             bound_delete_memo: Mutex::new(None),
+            fast_insert_memo: Mutex::new(None),
             insert_chain_hot: AtomicBool::new(false),
             plugins: RwLock::new(std::sync::Arc::new(
                 crate::plugin::PluginRegistry::with_builtins(),
@@ -2975,6 +2984,7 @@ impl Database {
             insert_chain: Mutex::new(None),
             bound_update_memo: Mutex::new(None),
             bound_delete_memo: Mutex::new(None),
+            fast_insert_memo: Mutex::new(None),
             insert_chain_hot: AtomicBool::new(false),
             plugins: RwLock::new(std::sync::Arc::new(
                 crate::plugin::PluginRegistry::with_builtins(),
@@ -6353,7 +6363,41 @@ impl Database {
                         self.note_pending_write()?;
                         return Ok(());
                     }
-                    if let Some(fi) = try_fast_insert_parse(sql, params.as_slice()) {
+                    // Memo hit: the same bound INSERT text as last time.
+                    let memo_fi = params.as_slice().and_then(|p| {
+                        let m = self.fast_insert_memo.lock();
+                        let m = m.as_ref()?;
+                        (m.sql.as_ref() == sql && m.n_params == p.len()).then(|| FastInsert {
+                            table: &sql[m.table.0..m.table.1],
+                            columns: m.columns.iter().map(|&(a, b)| &sql[a..b]).collect(),
+                            values: vec![p.to_vec()],
+                            bound: true,
+                        })
+                    });
+                    let parsed = match memo_fi {
+                        Some(fi) => Some(fi),
+                        None => {
+                            let fi = try_fast_insert_parse(sql, params.as_slice());
+                            // Remember a BOUND single-row shape (its row IS
+                            // the parameter list).
+                            if let (Some(fi), Some(p)) = (&fi, params.as_slice()) {
+                                if fi.bound {
+                                    let off = |s: &str| {
+                                        let a = s.as_ptr() as usize - sql.as_ptr() as usize;
+                                        (a, a + s.len())
+                                    };
+                                    *self.fast_insert_memo.lock() = Some(FastInsertShape {
+                                        sql: sql.into(),
+                                        table: off(fi.table),
+                                        columns: fi.columns.iter().map(|c| off(c)).collect(),
+                                        n_params: p.len(),
+                                    });
+                                }
+                            }
+                            fi
+                        }
+                    };
+                    if let Some(fi) = parsed {
                         let fast = self.exec_fast_insert(fi);
                         if fast.is_err() {
                             self.recover_failed_autocommit_fastpath(dirty_at_start);
@@ -18356,6 +18400,14 @@ impl Database {
     }
 }
 
+/// See `Database::fast_insert_memo`.
+struct FastInsertShape {
+    sql: Box<str>,
+    table: (usize, usize),
+    columns: Vec<(usize, usize)>,
+    n_params: usize,
+}
+
 struct FastInsert<'a> {
     /// Table name as written (matched case-insensitively).
     table: &'a str,
@@ -18363,6 +18415,9 @@ struct FastInsert<'a> {
     columns: Vec<&'a str>,
     /// Literal values in order — one Vec per VALUES row.
     values: Vec<Vec<Value>>,
+    /// The single row was a list of `?` placeholders (its values ARE the
+    /// bound parameters).
+    bound: bool,
 }
 
 /// Ultra-lightweight scanner for the single hottest statement shape in
@@ -18623,6 +18678,7 @@ fn try_fast_insert_parse<'a>(sql: &'a str, params: Option<&'a [Value]>) -> Optio
     // the general path's parser also rejects the whole statement before
     // any row is executed).
     let mut values: Vec<Vec<Value>> = Vec::new();
+    let mut bound = false;
     loop {
         if i >= b.len() || b[i] != b'(' {
             return None;
@@ -18668,6 +18724,7 @@ fn try_fast_insert_parse<'a>(sql: &'a str, params: Option<&'a [Value]>) -> Optio
                     return None; // bound row followed by more rows: cold path
                 }
                 values.push(row);
+                bound = true;
                 break;
             }
         }
@@ -18709,6 +18766,7 @@ fn try_fast_insert_parse<'a>(sql: &'a str, params: Option<&'a [Value]>) -> Optio
         table,
         columns,
         values,
+        bound,
     })
 }
 

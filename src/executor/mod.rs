@@ -1328,8 +1328,10 @@ impl<'a> ExecContext<'a> {
     /// (borrowed lookup) and only pay the `to_ascii_lowercase()` String
     /// allocation for mixed-case names.
     pub fn table_root(&self, table: &Table) -> u32 {
-        if let Some(&r) = self.root_overrides.get(&table.name) {
-            return self.fold_moved_root(r);
+        if !self.root_overrides.is_empty() {
+            if let Some(&r) = self.root_overrides.get(&table.name) {
+                return self.fold_moved_root(r);
+            }
         }
         if let Some(&r) = self.shared.roots.get(&table.name) {
             return self.fold_moved_root(r);
@@ -1448,7 +1450,9 @@ impl<'a> ExecContext<'a> {
         }
         // Skip when the value already matches either the local overlay or
         // the shared snapshot (roots only move on B+tree splits).
-        if self.root_overrides.get(table_name_lc) == Some(&root)
+        // (The overlay is usually empty: skip hashing the name for it.)
+        if (!self.root_overrides.is_empty()
+            && self.root_overrides.get(table_name_lc) == Some(&root))
             || self.shared.roots.get(table_name_lc) == Some(&root)
         {
             return;
@@ -1670,11 +1674,25 @@ impl<'a> ExecContext<'a> {
     /// entry must stay missing — typically it is missing precisely because
     /// the move's own delete-of-max just invalidated it.
     pub fn raise_max_rowid_lc(&mut self, table_name_lc: &str, rowid: i64) {
-        if self.max_rowids.contains_key(table_name_lc)
-            || self.shared.max_rowids.contains_key(table_name_lc)
+        // An entry exists (local overlay or shared): a pure monotonic
+        // raise. The local overlay is updated in place; a shared entry
+        // goes through the setter only when it actually rises (one
+        // lookup per row for the common below-max explicit rowid).
+        if !self.max_rowids.is_empty() {
+            if let Some(v) = self.max_rowids.get_mut(table_name_lc) {
+                if rowid > *v {
+                    *v = rowid;
+                    self.max_rowids_changed = true;
+                }
+                return;
+            }
+        }
+        if self
+            .shared
+            .max_rowids
+            .get(table_name_lc)
+            .is_some_and(|&m| rowid > m)
         {
-            // An entry exists (local overlay or shared): the plain setter
-            // is a pure monotonic raise — exactly the wanted semantics.
             self.set_max_rowid_lc(table_name_lc, rowid);
         }
         // No entry anywhere: leave the cache missing. The next

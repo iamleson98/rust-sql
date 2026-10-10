@@ -918,6 +918,45 @@ fn decode_index_cell(buf: &[u8], interior: bool, page_size: u32) -> Option<Index
     }
 }
 
+/// `(cell.key, cell.rowid) < (key, rowid)` for the index cell at the front
+/// of `buf`, WITHOUT decoding the cell's rowid unless the keys tie (it sits
+/// before the key: only its length is walked). The hot binary searches of
+/// index inserts and descents call this per probe — the full
+/// `decode_index_cell` decoded a rowid varint and built a tuple for every
+/// probe. `None`: a corrupt cell; `Some(None)`: an overflow cell (the
+/// caller's full-key path decides).
+#[inline]
+fn index_cell_lt(
+    buf: &[u8],
+    interior: bool,
+    page_size: u32,
+    key: &[u8],
+    rowid: i64,
+) -> Option<Option<bool>> {
+    let rb = if interior { buf.get(4..)? } else { buf };
+    // Skip the rowid varint (1-9 bytes; the 9th carries 8 bits).
+    let mut rlen = 0;
+    loop {
+        let b = *rb.get(rlen)?;
+        rlen += 1;
+        if b < 0x80 || rlen == 9 {
+            break;
+        }
+    }
+    let rest = &rb[rlen..];
+    let (raw_len, m) = varint::decode(rest)?;
+    let (key_len, local_len, _) = index_cell_split(raw_len, page_size as usize);
+    if local_len != key_len {
+        return Some(None);
+    }
+    let ck = rest.get(m..m + key_len)?;
+    Some(Some(match ck.cmp(key) {
+        std::cmp::Ordering::Less => true,
+        std::cmp::Ordering::Greater => false,
+        std::cmp::Ordering::Equal => varint::decode_signed(rb)?.0 < rowid,
+    }))
+}
+
 /// Read the separator key of a table-interior cell without allocating.
 /// Layout: [be_u32: left_child][varint: key].
 fn decode_table_interior_key(buf: &[u8]) -> Option<i64> {
@@ -1118,6 +1157,21 @@ impl<'a> Btree<'a> {
             // usize arithmetic: a corrupt n_cells can push lo+hi past u16::MAX.
             let mid = ((lo as usize + hi as usize) / 2) as u16;
             let ptr = cell_pointer(mid) as usize;
+            // Fast probe: key bytes first, the rowid only on a tie.
+            match data
+                .get(ptr..)
+                .and_then(|c| index_cell_lt(c, true, page_size, key, rowid))
+            {
+                Some(Some(true)) => {
+                    lo = mid + 1;
+                    continue;
+                }
+                Some(Some(false)) => {
+                    hi = mid;
+                    continue;
+                }
+                _ => {} // corrupt or overflow: the full decode below
+            }
             // Corrupt cell pointer: out-of-range offsets must yield a miss,
             // never a slice panic (SQLite policy: corrupt -> SQLITE_CORRUPT).
             let Some(v) = data
@@ -4341,14 +4395,13 @@ impl<'a> Btree<'a> {
             let (mut lo, mut hi) = (1u16, n - 1);
             while lo < hi {
                 let mid = lo + (hi - lo) / 2;
-                let v = view(mid)?;
-                if v.overflow != 0 {
-                    return Ok(None);
-                }
-                if (v.key, v.rowid) < (key, rowid) {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
+                let ptr = b.cell_pointer(mid) as usize;
+                match index_cell_lt(b.cell_slice_checked(ptr)?, false, page_size, key, rowid) {
+                    Some(Some(true)) => lo = mid + 1,
+                    Some(Some(false)) => hi = mid,
+                    // An overflow cell inside the range: the general insert.
+                    Some(None) => return Ok(None),
+                    None => return Err(Error::corruption("truncated index cell in placed insert")),
                 }
             }
             lo
@@ -5867,9 +5920,20 @@ impl<'a> Btree<'a> {
                 while lo < hi {
                     let mid = (lo + hi) / 2;
                     let cell_ptr = borrowed.cell_pointer(mid) as usize;
-                    let Some(v) =
-                        decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, interior, psz)
-                    else {
+                    let stored = borrowed.cell_slice_checked(cell_ptr)?;
+                    // Fast probe (no rowid decode unless keys tie).
+                    match index_cell_lt(stored, interior, psz, nk, nr) {
+                        Some(Some(true)) => {
+                            lo = mid + 1;
+                            continue;
+                        }
+                        Some(Some(false)) => {
+                            hi = mid;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    let Some(v) = decode_index_cell(stored, interior, psz) else {
                         return Err(Error::corruption("truncated index cell in search"));
                     };
                     // Stored overflow cells: reassemble the full key (rare —
@@ -10127,9 +10191,20 @@ impl<'a> Btree<'a> {
                     while lo < hi {
                         let mid = (lo + hi) / 2;
                         let cell_ptr = borrowed.cell_pointer(mid) as usize;
-                        let Some(v) =
-                            decode_index_cell(borrowed.cell_slice_checked(cell_ptr)?, false, psz)
-                        else {
+                        let cell = borrowed.cell_slice_checked(cell_ptr)?;
+                        // Fast probe (no rowid decode unless keys tie).
+                        match index_cell_lt(cell, false, psz, key, rowid) {
+                            Some(Some(true)) => {
+                                lo = mid + 1;
+                                continue;
+                            }
+                            Some(Some(false)) => {
+                                hi = mid;
+                                continue;
+                            }
+                            _ => {}
+                        }
+                        let Some(v) = decode_index_cell(cell, false, psz) else {
                             return Err(Error::corruption("truncated index leaf cell"));
                         };
                         // Total order: overflow cells compare by full key.
