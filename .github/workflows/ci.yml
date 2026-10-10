@@ -178,11 +178,11 @@ jobs:
           # run as a separate invocation (default config only, once).
           case "${{ matrix.config }}" in
             default)
-              cargo test --lib --tests
-              cargo test --doc
+              .github/scripts/annotate_failure.sh "test default" cargo test --lib --tests
+              .github/scripts/annotate_failure.sh "doc-tests" cargo test --doc
               ;;
-            sqlx)        cargo test --lib --tests --features sqlx ;;
-            no-default)  cargo test --lib --tests --no-default-features ;;
+            sqlx)        .github/scripts/annotate_failure.sh "test sqlx" cargo test --lib --tests --features sqlx ;;
+            no-default)  .github/scripts/annotate_failure.sh "test no-default" cargo test --lib --tests --no-default-features ;;
           esac
 
   # The consolidation experiment is over: the single sequential job measured
@@ -222,9 +222,9 @@ jobs:
       - name: cargo test (${{ matrix.config }})
         run: |
           case "${{ matrix.config }}" in
-            default)     cargo test --lib --tests ;;
-            sqlx)        cargo test --lib --tests --features sqlx ;;
-            no-default)  cargo test --lib --tests --no-default-features ;;
+            default)     .github/scripts/annotate_failure.sh "test default" cargo test --lib --tests ;;
+            sqlx)        .github/scripts/annotate_failure.sh "test sqlx" cargo test --lib --tests --features sqlx ;;
+            no-default)  .github/scripts/annotate_failure.sh "test no-default" cargo test --lib --tests --no-default-features ;;
           esac
 
   test-macos:
@@ -252,13 +252,13 @@ jobs:
         run: |
           FAIL=0
           echo "::group::cargo test (default)"
-          cargo test --lib --tests || FAIL=1
+          .github/scripts/annotate_failure.sh "macos default" cargo test --lib --tests || FAIL=1
           echo "::endgroup::"
           echo "::group::cargo test (sqlx)"
-          cargo test --lib --tests --features sqlx || FAIL=1
+          .github/scripts/annotate_failure.sh "macos sqlx" cargo test --lib --tests --features sqlx || FAIL=1
           echo "::endgroup::"
           echo "::group::cargo test (no-default)"
-          cargo test --lib --tests --no-default-features || FAIL=1
+          .github/scripts/annotate_failure.sh "macos no-default" cargo test --lib --tests --no-default-features || FAIL=1
           echo "::endgroup::"
           if [ "$FAIL" -ne 0 ]; then
             echo "One or more feature configs failed on macos-latest."
@@ -694,7 +694,7 @@ jobs:
         with:
           shared-key: test-oom
           cache-on-failure: true
-      - run: cargo test --lib --tests --no-default-features --features oom-injection
+      - run: .github/scripts/annotate_failure.sh "oom-injection" cargo test --lib --tests --no-default-features --features oom-injection
 
   # The C-ABI compatibility layer (sqlite3_* symbols over the rustqlite
   # engine) — its own differential/ABI test suite.
@@ -712,7 +712,7 @@ jobs:
         with:
           shared-key: test-compat
           cache-on-failure: true
-      - run: cargo test --lib --tests -p rustqlite-compat
+      - run: .github/scripts/annotate_failure.sh "compat ABI" cargo test --lib --tests -p rustqlite-compat
 
   # ------------------------------------------------------------- BENCH GATE --
   # rustqlite must beat (or tie) SQLite on EVERY row, on EVERY OS.
