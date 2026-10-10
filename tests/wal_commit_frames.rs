@@ -58,3 +58,61 @@ fn header_page_is_logged_only_when_it_changes() {
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A handle that opened EARLY and closes LAST folds the WAL with a stale
+/// in-memory page count: the writer allocated pages after it opened. The
+/// fold copies the newest header (claiming the larger count) and must size
+/// the main file by it — sizing by the stale count left the header
+/// claiming more pages than the file held, and the next open refused it
+/// ("file size 8192 < expected 16384").
+#[test]
+fn late_closing_stale_handle_sizes_the_file_by_the_folded_header() {
+    let dir = std::env::temp_dir().join(format!(
+        "rsql-stalefold-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("f.db");
+    let mut writer = Database::open(&path).unwrap();
+    writer.execute("PRAGMA journal_mode=WAL", []).unwrap();
+    writer
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+        .unwrap();
+    writer
+        .execute("INSERT INTO t (v) VALUES ('a')", [])
+        .unwrap();
+    // The reader opens while the file is small...
+    let reader = Database::open(&path).unwrap();
+    assert_eq!(
+        reader.query("SELECT COUNT(*) FROM t", []).unwrap()[0][0].as_integer(),
+        1
+    );
+    // ...the writer then allocates many more pages and closes first (its
+    // close-time fold defers: the reader is still open).
+    for i in 0..200 {
+        writer
+            .execute(
+                "INSERT INTO t (v) VALUES (?)",
+                [Value::Text(format!("{:0>500}", i).into())],
+            )
+            .unwrap();
+    }
+    drop(writer);
+    // The reader closes last: it folds the log.
+    drop(reader);
+    let db = Database::open(&path).unwrap();
+    assert_eq!(
+        db.query("SELECT COUNT(*) FROM t", []).unwrap()[0][0].as_integer(),
+        201
+    );
+    assert_eq!(
+        db.query("PRAGMA integrity_check", []).unwrap(),
+        vec![vec![Value::Text("ok".into())]]
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}

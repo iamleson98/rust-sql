@@ -1930,6 +1930,13 @@ impl Drop for Pager {
                 // cannot see another handle's later frames) and adopt
                 // both the recovered map and the handle. A bounded scan
                 // (O(frames)) paid once at close.
+                // The fold serves pages CACHE-FIRST (see
+                // checkpoint_wal_locked): when the refreshed map holds
+                // frames this handle never saw, its cached pages are OLD
+                // versions of them — folding those over the newer frames
+                // lost the other handle's rows. Drop the stale cache then
+                // (a close: nothing here is dirty or reused).
+                let mut stale_cache = false;
                 {
                     let mut g = self.wal.write();
                     if let Some(state) = g.as_mut() {
@@ -1938,12 +1945,18 @@ impl Drop for Pager {
                                 crate::storage::wal::Wal::open(&self.path, self.page_size())
                             {
                                 if let Ok(map) = fresh.committed_page_map() {
+                                    let map: HashMap<PageId, u64> = map.into_iter().collect();
+                                    stale_cache = map.len() != state.map.len()
+                                        || map.iter().any(|(k, v)| state.map.get(k) != Some(v));
                                     state.map = map.into_iter().collect();
                                     state.wal = fresh;
                                 }
                             }
                         }
                     }
+                }
+                if stale_cache {
+                    self.cache.write().clear();
                 }
                 // SOLE-GATED FOLD + REMOVAL (storage::xlock): the
                 // main-file writes of the fold must not race another
@@ -5640,11 +5653,18 @@ impl Pager {
         // Header (page 0) LAST (crash safety — see flush_inner_delete's
         // ordering contract): the n_pages-bearing header commit lands
         // after every other page.
+        // The page count the folded header commits to: the file must
+        // cover it. (A checkpointing process's own `n_pages` can be STALE —
+        // a reader folding at close never saw the writer's later page
+        // allocations — and sizing the file by it left a header claiming
+        // 4 pages over an 8 KiB file: the next open refused it as corrupt.)
+        let mut folded_pages: u32 = 0;
         if let Some(&offset) = state.map.get(&0) {
             if trunc == 0 {
                 let mut buf = vec![0u8; psz as usize];
                 state.wal.read_frame_at(offset, &mut buf)?;
                 self.write_file_at(0, &buf)?;
+                folded_pages = FileHeader::db_size_pages(&buf);
             } else {
                 // The header carries the truncation's new page count —
                 // write it even when a truncation is armed (it is the
@@ -5674,7 +5694,7 @@ impl Pager {
         // may be shorter than the committed page count — new pages live
         // only in the WAL until now), and apply any armed mass-delete
         // truncation (the file tail reclaims with the commit).
-        let want_len = self.n_pages.load(Ordering::Acquire) as u64 * psz as u64;
+        let want_len = self.n_pages.load(Ordering::Acquire).max(folded_pages) as u64 * psz as u64;
         let cur_len = self.store.read().len()?;
         if want_len != cur_len {
             self.store.write().set_len(want_len)?;
