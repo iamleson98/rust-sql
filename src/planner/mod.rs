@@ -11418,6 +11418,17 @@ fn rewrite_rowid_in_expr_inner(
 /// (order-preserving) plan `input`. `input` must itself emit rowid order
 /// (bare table scan / rowid range / Project or Filter over one of those).
 fn sort_terms_are_rowid_order(terms: &[OrderTerm], input: &Plan) -> bool {
+    // A WITHOUT ROWID scan walks the table in PRIMARY KEY order (its
+    // storage order in SQLite): an ORDER BY over a prefix of the key in
+    // the key's own directions and collations sorts nothing. Sorting
+    // anyway evaluated the WHERE on every row before a LIMIT could stop
+    // the scan — `WHERE abs(l) ORDER BY pk LIMIT 3` raised integer
+    // overflow on a row SQLite never reaches (strict-fuzz seed 675930).
+    if let Some((table, alias)) = scan_table_of(input) {
+        if table.without_rowid {
+            return sort_terms_are_wr_pk_order(terms, &table, alias.as_deref());
+        }
+    }
     if terms.len() != 1 {
         return false;
     }
@@ -11467,6 +11478,47 @@ fn sort_terms_are_rowid_order(terms: &[OrderTerm], input: &Plan) -> bool {
                     .any(|c| c.name.eq_ignore_ascii_case(name))
         }
     }
+}
+
+/// `terms` are a prefix of the WITHOUT ROWID table's PRIMARY KEY, each in
+/// the key column's declared direction and under the key's collation (an
+/// explicit PK COLLATE, else the column's) — the order a scan emits.
+fn sort_terms_are_wr_pk_order(terms: &[OrderTerm], table: &Table, alias: Option<&str>) -> bool {
+    let pk = crate::schema::without_rowid_pk_columns(table);
+    if terms.is_empty() || terms.len() > pk.len() {
+        return false;
+    }
+    let effective = alias.unwrap_or(&table.name);
+    for (t, p) in terms.iter().zip(pk.iter()) {
+        if t.order != p.order {
+            return false;
+        }
+        let (col_expr, explicit) = match &t.expr {
+            Expr::Collate { expr, collation } => (expr.as_ref(), Some(collation.as_str())),
+            e => (e, None),
+        };
+        let Expr::Column { table: qual, name } = col_expr else {
+            return false;
+        };
+        if qual
+            .as_deref()
+            .is_some_and(|q| !q.eq_ignore_ascii_case(effective))
+        {
+            return false;
+        }
+        if !name.eq_ignore_ascii_case(&p.name) {
+            return false;
+        }
+        let Some(col) = table.find_column(name).map(|i| &table.columns[i]) else {
+            return false;
+        };
+        let term_coll = explicit.unwrap_or(&col.collation);
+        let key_coll = p.collation.as_deref().unwrap_or(&col.collation);
+        if !term_coll.eq_ignore_ascii_case(key_coll) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Find the (table, alias) of the single bare table scan feeding `input`,

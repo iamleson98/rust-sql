@@ -30831,6 +30831,20 @@ fn exec_delete(
     } else {
         None
     };
+    // WITHOUT ROWID: the engine-internal PK index maps each source row's
+    // PRIMARY KEY to its storage rowid (the UPDATE path's mapping). This
+    // path used to refuse them — a WITHOUT ROWID DELETE whose WHERE took
+    // this generic route (`DELETE FROM t3 WHERE j LIKE '1%' AND …`,
+    // strict-fuzz seed 683935) failed as "unsupported".
+    let wr_pk_index = if table.without_rowid {
+        ctx.catalog()
+            .indexes_on_table(&table.name)
+            .into_iter()
+            .find(|i| i.origin == crate::schema::IndexOrigin::WithoutRowidPk)
+    } else {
+        None
+    };
+    let n_cols = table.n_columns();
     let mut targets: Vec<(i64, &Row)> = Vec::with_capacity(source_res.rows.len());
     for row in &source_res.rows {
         let rowid: i64 = if let Some(idx) = table.rowid_alias {
@@ -30841,6 +30855,17 @@ fn exec_delete(
                 _ => {
                     return Err(Error::Unsupported(
                         "DELETE on a table without INTEGER PRIMARY KEY",
+                    ))
+                }
+            }
+        } else if let Some(pk) = wr_pk_index.as_ref() {
+            let key = encode_index_key(pk, &table, &row[..n_cols.min(row.len())])?;
+            let mut ibt = Btree::new(ctx.pager, ctx.index_root(pk), true);
+            match ibt.lookup_index(&key)?.first() {
+                Some(&r) => r,
+                None => {
+                    return Err(Error::corruption(
+                        "WITHOUT ROWID row missing from its PK index",
                     ))
                 }
             }

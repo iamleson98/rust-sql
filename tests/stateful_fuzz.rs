@@ -1326,7 +1326,7 @@ fn stateful_fuzz_fresh_seed_pins() {
     // Found by the alias-MAX spread generator (cases now run their full
     // 500 ops instead of arming SQLite's random-rowid lottery early).
     SPREAD_ALIAS_MAX.with(|c| c.set(true));
-    let spread_pins: [(u64, usize, usize); 8] = [
+    let spread_pins: [(u64, usize, usize); 9] = [
         (6006, 19, 500),   // rowid IN: a later equal REAL member drops i64::MIN
         (48048, 13, 500),  // same, through UPDATE ... WHERE pk IN (...)
         (74074, 48, 500),  // an OR IGNOREd row still raises AUTOINCREMENT
@@ -1335,6 +1335,7 @@ fn stateful_fuzz_fresh_seed_pins() {
         (67067, 48, 500),  // same, surfacing through a later UPDATE
         (136136, 20, 500), // empty-leaf split: separator i64::MIN - 1 wrapped
         (174174, 58, 500), // same, with index entries orphaned
+        (293293, 25, 500), // a failed statement's rescanned max rowid survived
     ];
     let r = spread_pins
         .iter()
