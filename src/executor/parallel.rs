@@ -1018,6 +1018,36 @@ pub(crate) fn merge_agg_state(
         AggFunc::Count => {
             dst.count = dst.count.saturating_add(src.count);
         }
+        AggFunc::GroupConcat
+            if src.cold().is_some_and(|c| c.concat_blob.is_some())
+                || dst.cold().is_some_and(|c| c.concat_blob.is_some()) =>
+        {
+            // A side in BYTE mode (raw text terms — see the step): merge
+            // as bytes, dst moving to byte mode too.
+            let src_bytes: Option<Vec<u8>> = src.cold().and_then(|c| {
+                c.concat_blob
+                    .clone()
+                    .or_else(|| c.concat.clone().map(String::into_bytes))
+            });
+            if let Some(b) = src_bytes {
+                let c = dst.cold_mut();
+                let joiner = c
+                    .concat_sep
+                    .clone()
+                    .or_else(|| sep.map(|s| s.to_string()))
+                    .unwrap_or_else(|| ",".to_string());
+                let had_terms = c.concat.is_some() || c.concat_blob.is_some();
+                let prior = c.concat.take();
+                let buf = c
+                    .concat_blob
+                    .get_or_insert_with(|| prior.map(String::into_bytes).unwrap_or_default());
+                if had_terms {
+                    buf.extend_from_slice(joiner.as_bytes());
+                    c.concat_sep = Some(joiner);
+                }
+                buf.extend_from_slice(&b);
+            }
+        }
         AggFunc::GroupConcat => {
             // dst ++ sep ++ src — chunk/range order preserves scan order
             // (all of dst's rows precede all of src's for one key).

@@ -1028,7 +1028,7 @@ fn value_span(bytes: &[u8]) -> Option<usize> {
         0x06 => Some(9),
         0x04 => Some(5),
         0x05 => Some(9),
-        0x07 | 0x08 => {
+        0x07 | 0x08 | 0x0B => {
             let (len, n) = crate::storage::btree::varint::decode(&bytes[1..])?;
             Some(1 + n + len as usize)
         }

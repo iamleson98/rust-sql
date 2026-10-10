@@ -783,7 +783,7 @@ fn row_tag_name(tag: u8) -> &'static str {
         0x00 => "null",
         0x01..=0x05 => "int",
         0x06 | 0x0A => "real",
-        0x07 => "text",
+        0x07 | 0x0B => "text",
         0x08 => "blob",
         0x09 => "rowid-marker",
         _ => "unknown",

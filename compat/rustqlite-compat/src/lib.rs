@@ -3391,8 +3391,13 @@ pub unsafe extern "C" fn sqlite3_bind_text64(
     }
     let len = len as usize;
     let bytes = std::slice::from_raw_parts(val as *const u8, len);
-    let text = String::from_utf8_lossy(bytes).into_owned();
-    bind_value(stmt, idx, Value::Text(text.into()))
+    // TEXT keeps the caller's bytes (SQLite stores them as given, valid
+    // UTF-8 or not).
+    bind_value(
+        stmt,
+        idx,
+        Value::Text(rustqlite::types::text::Text::from_bytes(bytes)),
+    )
 }
 
 #[no_mangle]
@@ -3767,14 +3772,14 @@ pub unsafe extern "C" fn sqlite3_column_text(stmt: *mut sqlite3_stmt, i: c_int) 
     let Some(s) = (stmt as *mut Stmt).as_mut() else {
         return std::ptr::null();
     };
-    let text = match stmt_value(s, i as usize) {
-        Some(Value::Text(t)) => t.as_str().to_string(),
-        Some(Value::Integer(n)) => n.to_string(),
-        Some(Value::Real(f)) => f.to_string(),
+    // The stored TEXT bytes; numbers in SQLite's rendering (%!.15g).
+    let text: Vec<u8> = match stmt_value(s, i as usize) {
+        Some(Value::Text(t)) => t.as_bytes().to_vec(),
+        Some(v @ (Value::Integer(_) | Value::Real(_))) => v.as_text().into_bytes(),
         _ => return std::ptr::null(),
     };
     s.text_buf.clear();
-    s.text_buf.extend_from_slice(text.as_bytes());
+    s.text_buf.extend_from_slice(&text);
     s.text_buf.push(0);
     s.text_buf.as_ptr() as *const u_uchar
 }
@@ -3865,16 +3870,15 @@ pub unsafe extern "C" fn sqlite3_value_text(v: *const sqlite3_value) -> *const u
     thread_local! {
         static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
-    let text = match value_of(v) {
-        Some(Value::Text(t)) => t.as_str().to_string(),
-        Some(Value::Integer(n)) => n.to_string(),
-        Some(Value::Real(f)) => f.to_string(),
+    let text: Vec<u8> = match value_of(v) {
+        Some(Value::Text(t)) => t.as_bytes().to_vec(),
+        Some(v @ (Value::Integer(_) | Value::Real(_))) => v.as_text().into_bytes(),
         _ => return std::ptr::null(),
     };
     SCRATCH.with(|s| {
         let mut b = s.borrow_mut();
         b.clear();
-        b.extend_from_slice(text.as_bytes());
+        b.extend_from_slice(&text);
         b.push(0);
         b.as_ptr()
     })

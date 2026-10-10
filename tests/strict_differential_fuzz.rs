@@ -817,7 +817,7 @@ fn from_ours(v: &Value) -> V {
         Value::Null => V::Null,
         Value::Integer(i) => V::Int(*i),
         Value::Real(r) => V::Real(real_bits(*r)),
-        Value::Text(t) => V::Text(t.as_str().as_bytes().to_vec()),
+        Value::Text(t) => V::Text(t.as_bytes().to_vec()),
         Value::Blob(b) => V::Blob(b.clone()),
     }
 }

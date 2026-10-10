@@ -185,7 +185,9 @@ fn cast_value(v: Value, type_name: &str) -> Value {
         },
         Affinity::Text => match v {
             Value::Null => Value::Null,
-            other => Value::Text(other.as_text().into()),
+            // BLOB bytes become TEXT bytes as they are (`CAST(x'c3' AS
+            // TEXT)` keeps the byte, as in SQLite).
+            other => Value::Text(other.to_text()),
         },
         Affinity::Blob => match v {
             Value::Null => Value::Null,
@@ -197,11 +199,12 @@ fn cast_value(v: Value, type_name: &str) -> Value {
                 // encoding rides the statement-entry TLS (see
                 // executor::conn_enc); parallel workers never evaluate
                 // CAST, so the tag is always current here.
-                let text = other.as_text();
                 let enc = crate::executor::conn_enc::current();
                 if enc == crate::storage::sqlitefmt::record::TextEnc::Utf8 {
-                    Value::Blob(text.into_bytes())
+                    // The stored bytes (a raw text's original ones).
+                    Value::Blob(other.text_bytes().into_owned())
                 } else {
+                    let text = other.as_text();
                     Value::Blob(crate::storage::sqlitefmt::record::text_encoded_bytes(
                         text.as_str(),
                         enc,
@@ -2447,48 +2450,41 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
         // 'é', `upper('ß')` is 'ß').
         "lower" => match args.first() {
             Some(Value::Null) | None => Value::Null,
+            Some(v) if v.has_raw_text() => Value::Text(crate::types::text::Text::from_bytes(
+                &v.text_bytes().to_ascii_lowercase(),
+            )),
             Some(v) => Value::Text(v.as_text().to_ascii_lowercase().into()),
         },
         "upper" => match args.first() {
             Some(Value::Null) | None => Value::Null,
+            Some(v) if v.has_raw_text() => Value::Text(crate::types::text::Text::from_bytes(
+                &v.text_bytes().to_ascii_uppercase(),
+            )),
             Some(v) => Value::Text(v.as_text().to_ascii_uppercase().into()),
         },
-        // TRIM(x) / TRIM(x, chars) — strip (chars, default whitespace)
-        // from both ends / left / right. The char set is UTF-8 code points.
-        "trim" => match (args.first(), args.get(1)) {
-            (Some(Value::Null) | None, _) => Value::Null,
-            (Some(v), None) => Value::Text(v.as_text().trim().to_string().into()),
-            (Some(v), Some(cs)) if !cs.is_null() => {
-                let set: Vec<char> = cs.as_text().chars().collect();
-                let s: String = v.as_text().chars().collect();
-                Value::Text(s.trim_matches(|c| set.contains(&c)).to_string().into())
+        // func.c trimFunc, byte for byte: without a set only SPACES are
+        // stripped (not tabs / newlines); a set is split into characters
+        // by SQLITE_SKIP_UTF8 (up to its first NUL) and each end loses
+        // whole matching characters; a NULL set is NULL. Works on the
+        // stored bytes (a raw text or BLOB keeps the rest as is).
+        "trim" | "ltrim" | "rtrim" => {
+            let flags: u8 = match fname.as_str() {
+                "ltrim" => 1,
+                "rtrim" => 2,
+                _ => 3,
+            };
+            match (args.first(), args.get(1)) {
+                (Some(Value::Null) | None, _) | (_, Some(Value::Null)) => Value::Null,
+                (Some(v), set) => {
+                    let set_bytes = set.map(|c| c.text_bytes());
+                    Value::Text(crate::types::text::Text::from_bytes(&sqlite_trim(
+                        &v.text_bytes(),
+                        set_bytes.as_deref(),
+                        flags,
+                    )))
+                }
             }
-            (Some(v), Some(_)) => Value::Text(v.as_text().trim().to_string().into()),
-        },
-        "ltrim" => match (args.first(), args.get(1)) {
-            (Some(Value::Null) | None, _) => Value::Null,
-            (Some(v), None) => Value::Text(v.as_text().trim_start().to_string().into()),
-            (Some(v), Some(cs)) if !cs.is_null() => {
-                let set: Vec<char> = cs.as_text().chars().collect();
-                let s: String = v.as_text().chars().collect();
-                Value::Text(
-                    s.trim_start_matches(|c| set.contains(&c))
-                        .to_string()
-                        .into(),
-                )
-            }
-            (Some(v), Some(_)) => Value::Text(v.as_text().trim_start().to_string().into()),
-        },
-        "rtrim" => match (args.first(), args.get(1)) {
-            (Some(Value::Null) | None, _) => Value::Null,
-            (Some(v), None) => Value::Text(v.as_text().trim_end().to_string().into()),
-            (Some(v), Some(cs)) if !cs.is_null() => {
-                let set: Vec<char> = cs.as_text().chars().collect();
-                let s: String = v.as_text().chars().collect();
-                Value::Text(s.trim_end_matches(|c| set.contains(&c)).to_string().into())
-            }
-            (Some(v), Some(_)) => Value::Text(v.as_text().trim_end().to_string().into()),
-        },
+        }
         // LIKELY(x) / UNLIKELY(x) — query-planner no-ops, identity.
         "likely" | "unlikely" => match args.first() {
             Some(v) => v.clone(),
@@ -2502,16 +2498,42 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
             if args.len() != 3 || args[0].is_null() || args[1].is_null() {
                 Value::Null
             } else {
-                let s = args[0].as_text();
-                let from = args[1].as_text();
+                // Bytes throughout (replaceFunc's memcmp scan): a raw text
+                // or BLOB operand keeps bytes that are not valid UTF-8.
+                let s = args[0].text_bytes();
+                let from = args[1].text_bytes();
                 // `zPattern[0]==0`: a pattern whose text STARTS with a NUL
                 // byte (x'00...') reads as empty in C.
-                if from.is_empty() || from.starts_with('\0') {
-                    Value::Text(s.into())
+                if from.is_empty() || from[0] == 0 {
+                    Value::Text(crate::types::text::Text::from_bytes(&s))
                 } else if args[2].is_null() {
                     Value::Null
                 } else {
-                    Value::Text(s.replace(&from, &args[2].as_text()).into())
+                    let to = args[2].text_bytes();
+                    let mut out = Vec::with_capacity(s.len());
+                    let mut i = 0;
+                    while i < s.len() {
+                        // Jump to the next candidate (the pattern's first
+                        // byte), then compare the whole pattern there.
+                        match s[i..].iter().position(|&b| b == from[0]) {
+                            None => {
+                                out.extend_from_slice(&s[i..]);
+                                break;
+                            }
+                            Some(p) => {
+                                out.extend_from_slice(&s[i..i + p]);
+                                i += p;
+                                if s[i..].starts_with(&from) {
+                                    out.extend_from_slice(&to);
+                                    i += from.len();
+                                } else {
+                                    out.push(s[i]);
+                                    i += 1;
+                                }
+                            }
+                        }
+                    }
+                    Value::Text(crate::types::text::Text::from_bytes(&out))
                 }
             }
         }
@@ -2540,6 +2562,26 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
                         },
                     );
                     return Ok(Value::Blob(b[begin as usize..end as usize].to_vec()));
+                }
+                // A TEXT holding invalid UTF-8: substrFunc's byte walk
+                // (SQLITE_SKIP_UTF8 steps), whose cut can split or keep
+                // stray bytes exactly as SQLite does.
+                if let Value::Text(t) = &args[0] {
+                    if t.is_raw() {
+                        let b = t.as_bytes();
+                        let b = &b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())];
+                        let offs = crate::types::text::sqlite_char_offsets(b);
+                        let z = if args.len() == 3 {
+                            args[2].as_integer()
+                        } else {
+                            1_000_000_000
+                        };
+                        let (begin, end) =
+                            substr_range((offs.len() - 1) as i64, args[1].as_integer(), z);
+                        return Ok(Value::Text(crate::types::text::Text::from_bytes(
+                            &b[offs[begin as usize]..offs[end as usize]],
+                        )));
+                    }
                 }
                 let s = args[0].as_text();
                 // func.c substrFunc walks sqlite3_value_text() as a C
@@ -2706,8 +2748,8 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
             let out = match args.first() {
                 Some(Value::Blob(b)) => b.iter().map(|x| format!("{:02X}", x)).collect::<String>(),
                 Some(v) => v
-                    .as_text()
-                    .bytes()
+                    .text_bytes()
+                    .iter()
                     .map(|b| format!("{:02X}", b))
                     .collect::<String>(),
                 None => String::new(),
@@ -2739,7 +2781,24 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
         "sqlite_version" => Value::Text(SQLITE_COMPAT_VERSION.into()),
         "quote" => {
             let v = args.first().cloned().unwrap_or(Value::Null);
-            Value::Text(quote_value(&v).into())
+            match &v {
+                // `%Q` copies the TEXT bytes as they are (up to a NUL).
+                Value::Text(t) if t.is_raw() => {
+                    let b = t.as_bytes();
+                    let b = &b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())];
+                    let mut out = Vec::with_capacity(b.len() + 2);
+                    out.push(b'\'');
+                    for &c in b {
+                        out.push(c);
+                        if c == b'\'' {
+                            out.push(b'\'');
+                        }
+                    }
+                    out.push(b'\'');
+                    Value::Text(crate::types::text::Text::from_bytes(&out))
+                }
+                _ => Value::Text(quote_value(&v).into()),
+            }
         }
         // INSTR(s, sub) — returns the 1-indexed position of `sub` in `s`,
         // or 0 if not found. NULL inputs return NULL.
@@ -2761,14 +2820,8 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
                         .map_or(0, |p| p as i64 + 1),
                 ));
             }
-            let hay: Vec<u8> = match &args[0] {
-                Value::Blob(b) => b.clone(),
-                v => v.as_text().into_bytes(),
-            };
-            let needle: Vec<u8> = match &args[1] {
-                Value::Blob(b) => b.clone(),
-                v => v.as_text().into_bytes(),
-            };
+            let hay: Vec<u8> = args[0].text_bytes().into_owned();
+            let needle: Vec<u8> = args[1].text_bytes().into_owned();
             if needle.is_empty() {
                 return Ok(Value::Integer(1));
             }
@@ -3417,6 +3470,39 @@ pub(crate) fn is_builtin_scalar(name: &str) -> bool {
     ];
     let lowered = name.to_ascii_lowercase();
     BUILTIN.binary_search(&lowered.as_str()).is_ok()
+}
+
+/// func.c trimFunc over bytes (see the `trim` arm).
+fn sqlite_trim(x: &[u8], set: Option<&[u8]>, flags: u8) -> Vec<u8> {
+    let chars: Vec<&[u8]> = match set {
+        None => vec![b" ".as_slice()],
+        Some(set) => {
+            let set = &set[..set.iter().position(|&c| c == 0).unwrap_or(set.len())];
+            let offs = crate::types::text::sqlite_char_offsets(set);
+            offs.windows(2).map(|w| &set[w[0]..w[1]]).collect()
+        }
+    };
+    let (mut lo, mut hi) = (0usize, x.len());
+    if chars.is_empty() {
+        return x.to_vec();
+    }
+    if flags & 1 != 0 {
+        while lo < hi {
+            match chars.iter().find(|c| x[lo..hi].starts_with(c)) {
+                Some(c) => lo += c.len(),
+                None => break,
+            }
+        }
+    }
+    if flags & 2 != 0 {
+        while lo < hi {
+            match chars.iter().find(|c| x[lo..hi].ends_with(c)) {
+                Some(c) => hi -= c.len(),
+                None => break,
+            }
+        }
+    }
+    x[lo..hi].to_vec()
 }
 
 fn quote_value(v: &Value) -> String {

@@ -5689,7 +5689,7 @@ fn exec_scan(
                     row.push(Value::Real(f64::from_le_bytes(b)));
                     pos += 9;
                 }
-                0x07 | 0x08 => match crate::types::value::decode_uvarint(rest) {
+                0x07 | 0x08 | 0x0B => match crate::types::value::decode_uvarint(rest) {
                     Ok((len, n)) => {
                         let len = len as usize;
                         if rest.len() < n + len {
@@ -5705,6 +5705,10 @@ fn exec_scan(
                                     break;
                                 }
                             }
+                        } else if tag == 0x0B {
+                            row.push(Value::Text(crate::types::text::Text::from_invalid_bytes(
+                                body,
+                            )));
                         } else {
                             row.push(Value::Blob(body.to_vec()));
                         }
@@ -12528,7 +12532,7 @@ fn payload_text_at(payload: &[u8], n_cols: usize, col: usize) -> Option<&[u8]> {
                 let (_, n) = crate::types::value::decode_uvarint(&payload[pos + 1..]).ok()?;
                 1 + n
             }
-            0x07 | 0x08 => {
+            0x07 | 0x08 | 0x0B => {
                 let (len, n) = crate::types::value::decode_uvarint(&payload[pos + 1..]).ok()?;
                 1 + n + len as usize
             }
@@ -12659,7 +12663,7 @@ fn fused_value_size(buf: &[u8], pos: usize) -> Option<usize> {
         0x03 => 3,
         0x04 => 5,
         0x05 | 0x06 => 9,
-        0x07 | 0x08 | 0x0A => {
+        0x07 | 0x08 | 0x0A | 0x0B => {
             // uvarint length (or zigzag payload for 0x0A) after the tag.
             let mut i = pos + 1;
             let mut shift = 0u32;
@@ -15063,7 +15067,27 @@ fn update_agg_state(
             // groupConcatStep: a separator precedes every term but the
             // FIRST — an empty-string term is still a term (`''`, `''`,
             // `''` concatenate to ",,").
-            let first_term = c.concat.is_none();
+            let first_term = c.concat.is_none() && c.concat_blob.is_none();
+            // A term whose text is not valid UTF-8 (a raw TEXT, a BLOB's
+            // bytes) moves the group to a BYTE accumulator (`concat_blob`)
+            // so the result keeps those bytes, as SQLite's does.
+            if c.concat_blob.is_some() || v.has_raw_text() {
+                let prior = c.concat.take();
+                let buf = c
+                    .concat_blob
+                    .get_or_insert_with(|| prior.map(String::into_bytes).unwrap_or_default());
+                if !first_term {
+                    match sep_next {
+                        Some(s) => {
+                            buf.extend_from_slice(s.as_bytes());
+                            c.concat_sep = Some(s);
+                        }
+                        None => buf.push(b','),
+                    }
+                }
+                buf.extend_from_slice(&v.text_bytes());
+                return;
+            }
             let buf = c.concat.get_or_insert_with(|| String::with_capacity(16));
             if !first_term {
                 if let Some(s) = sep_next {
@@ -15225,11 +15249,17 @@ pub(crate) fn finalize_agg(state: &AggState, func: &str) -> Result<Value> {
             .unwrap_or(Value::Null)),
         // No (non-NULL) term at all → NULL (groupConcatFinalize never
         // set a result), not the empty string.
-        "group_concat" | "string_agg" => Ok(state
-            .cold()
-            .and_then(|c| c.concat.clone())
-            .map(|s| Value::Text(s.into()))
-            .unwrap_or(Value::Null)),
+        "group_concat" | "string_agg" => Ok(match state.cold() {
+            Some(c) if c.concat_blob.is_some() => Value::Text(
+                crate::types::text::Text::from_bytes(c.concat_blob.as_deref().unwrap_or_default()),
+            ),
+            Some(c) => c
+                .concat
+                .clone()
+                .map(|s| Value::Text(s.into()))
+                .unwrap_or(Value::Null),
+            None => Value::Null,
+        }),
         "json_group_array" => Ok(Value::Text(
             format!(
                 "[{}]",

@@ -339,9 +339,7 @@ unsafe extern "C" fn tramp_result_double(ctx: *mut RqlContext, v: f64) {
 unsafe extern "C" fn tramp_result_text(ctx: *mut RqlContext, s: *const c_char, len: c_int) {
     let bytes = cstr_or_len(s, len);
     with_ctx_ptr(ctx, |c| {
-        c.out = Some(Value::Text(
-            String::from_utf8_lossy(&bytes).into_owned().into(),
-        ))
+        c.out = Some(Value::Text(crate::types::text::Text::from_bytes(&bytes)))
     });
 }
 
@@ -1547,9 +1545,7 @@ pub fn api_result_null(ctx: *mut RqlContext) {
 pub unsafe fn api_result_text(ctx: *mut RqlContext, s: *const c_char, len: c_int) {
     let bytes = cstr_or_len(s, len);
     let _ = with_ctx_ptr(ctx, |c| {
-        c.out = Some(Value::Text(
-            String::from_utf8_lossy(&bytes).into_owned().into(),
-        ))
+        c.out = Some(Value::Text(crate::types::text::Text::from_bytes(&bytes)))
     });
 }
 

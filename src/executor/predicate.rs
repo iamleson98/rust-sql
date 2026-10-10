@@ -688,7 +688,8 @@ impl CompiledPredicate {
 
 /// Rebuild a Text from a leaked byte slice (LikeSubstr needle storage).
 fn needle_text(b: &[u8]) -> crate::types::text::Text {
-    crate::types::text::Text::new(unsafe { std::str::from_utf8_unchecked(b) })
+    // The pattern's bytes as they are (a raw text pattern keeps them).
+    crate::types::text::Text::from_bytes(b)
 }
 
 /// Bind a leaf expression (literal / positional parameter / bare column).

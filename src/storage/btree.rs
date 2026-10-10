@@ -9031,6 +9031,26 @@ impl<'a> Btree<'a> {
                 }
                 Ok(Value::Blob(v))
             }
+            0x0B => {
+                // TEXT holding invalid UTF-8 (the value codec's raw tag).
+                let (len, n) = decode_uvarint(rest)
+                    .map_err(|e| Error::corruption(format!("lazy text header: {}", e)))?;
+                let body_start = off + 1 + n;
+                let body_end = body_start + len as usize;
+                if body_end > total {
+                    return Err(Error::corruption("lazy text body past payload end"));
+                }
+                let mut v = Vec::with_capacity(len as usize);
+                self.gather_payload_range_append(
+                    local, total, chain, body_start, body_end, &mut v,
+                )?;
+                if v.len() != len as usize {
+                    return Err(Error::corruption("lazy text gather short"));
+                }
+                Ok(Value::Text(crate::types::text::Text::from_invalid_bytes(
+                    &v,
+                )))
+            }
             0x07 => {
                 // Text: same single-copy gather, then UTF-8 validation
                 // (String::from_utf8 reuses the buffer — no second copy).

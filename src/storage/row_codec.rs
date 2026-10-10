@@ -197,7 +197,7 @@ pub fn encode_row_spill_prefix_into(
                     encode_uvarint(b.len() as u64, out);
                 }
                 Value::Text(t) => {
-                    out.push(0x07);
+                    out.push(if t.is_raw() { 0x0B } else { 0x07 });
                     encode_uvarint(t.as_bytes().len() as u64, out);
                 }
                 _ => v.encode_into(out),
@@ -577,7 +577,7 @@ pub(crate) fn value_encoded_len(buf: &[u8]) -> Result<usize> {
                 .map_err(crate::error::Error::corruption)?;
             1 + n
         }
-        0x07 | 0x08 => {
+        0x07 | 0x08 | 0x0B => {
             // Text / Blob: 1 (tag) + varint length + body.
             let rest = &buf[1..];
             let (len, n) = crate::types::value::decode_uvarint(rest)
@@ -873,7 +873,7 @@ pub fn column_spans_local(
                     })?;
                 (n, 0)
             }
-            0x07 | 0x08 => {
+            0x07 | 0x08 | 0x0B => {
                 let (len, n) =
                     crate::types::value::decode_uvarint(&local[pos + 1..]).map_err(|_| {
                         LazyError::Corrupt(crate::error::Error::corruption(
@@ -991,7 +991,7 @@ fn encoded_span(bytes: &[u8]) -> Option<usize> {
         0x03 => Some(3),
         0x04 => Some(5),
         0x05 | 0x06 => Some(9),
-        0x07 | 0x08 => {
+        0x07 | 0x08 | 0x0B => {
             let (len, n) = crate::types::value::decode_uvarint(&bytes[1..]).ok()?;
             Some(1 + n + len as usize)
         }

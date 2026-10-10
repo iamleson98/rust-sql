@@ -235,14 +235,17 @@ fn decode_value(payload: &[u8], body: &mut usize, st: u64, enc: TextEnc) -> Resu
             if end > payload.len() {
                 return Err("truncated text body".into());
             }
-            // SQLite text is arbitrary bytes in the FILE's encoding; the
-            // engine's TEXT is UTF-8. Invalid sequences (bad UTF-8,
-            // unpaired surrogates, odd UTF-16 length) are repaired with a
-            // lossy conversion (matching the engine's in-memory semantics
-            // for imported text).
-            let s = decode_text_bytes(&payload[*body..end], enc);
+            // SQLite text is arbitrary bytes in the FILE's encoding. A
+            // UTF-8 file's bytes import as they are (invalid sequences
+            // included — the engine keeps them, as SQLite does); UTF-16
+            // text is transcoded (unpaired surrogates become U+FFFD, an
+            // odd trailing byte is dropped).
+            let t = match enc {
+                TextEnc::Utf8 => crate::types::text::Text::from_bytes(&payload[*body..end]),
+                _ => decode_text_bytes(&payload[*body..end], enc).into(),
+            };
             *body = end;
-            Ok(Value::Text(s.into()))
+            Ok(Value::Text(t))
         }
         _ => Err(format!("invalid serial type {st}")),
     }
@@ -327,7 +330,7 @@ fn serial_type_and_size(v: &Value, enc: TextEnc) -> (u64, usize) {
         }
         Value::Text(t) => {
             let n = match enc {
-                TextEnc::Utf8 => t.as_str().len(),
+                TextEnc::Utf8 => t.as_bytes().len(),
                 TextEnc::Utf16Le | TextEnc::Utf16Be => t.as_str().encode_utf16().count() * 2,
             };
             (13 + 2 * n as u64, n)
@@ -377,7 +380,7 @@ fn write_header_and_body(values: &[Value], out: &mut Vec<u8>, enc: TextEnc) {
                 }
             }
             Value::Text(t) => match enc {
-                TextEnc::Utf8 => out.extend_from_slice(t.as_str().as_bytes()),
+                TextEnc::Utf8 => out.extend_from_slice(t.as_bytes()),
                 TextEnc::Utf16Le | TextEnc::Utf16Be => {
                     out.extend_from_slice(&encode_text_bytes(t.as_str(), enc))
                 }

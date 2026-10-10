@@ -400,8 +400,12 @@ pub unsafe extern "C" fn rustqlite_bind_text(
     } else {
         unsafe { std::slice::from_raw_parts(s as *const u8, len as usize) }.to_vec()
     };
-    let text = String::from_utf8_lossy(&bytes).into_owned();
-    let rc = bind_value(stmt, idx, Value::Text(text.into()));
+    // TEXT keeps the caller's bytes (SQLite stores them as given).
+    let rc = bind_value(
+        stmt,
+        idx,
+        Value::Text(crate::types::text::Text::from_bytes(&bytes)),
+    );
     if let Some(d) = destructor {
         if !s.is_null() {
             unsafe { d(s as *mut c_void) };
@@ -587,7 +591,16 @@ pub unsafe extern "C" fn rustqlite_column_text(stmt: *mut RqlStmt, i: c_int) -> 
     let Some(handle) = (unsafe { stmt.as_mut() }) else {
         return std::ptr::null();
     };
-    let text = handle.stmt.as_ref().and_then(|s| s.column_text(i as usize));
+    // The stored TEXT bytes (invalid UTF-8 included), as a C string.
+    let text = handle
+        .stmt
+        .as_ref()
+        .and_then(|s| s.column_value(i as usize))
+        .map(|v| {
+            let b = v.text_bytes();
+            let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+            b[..end].to_vec()
+        });
     match text {
         Some(t) => {
             let cs = CString::new(t).unwrap_or_default();

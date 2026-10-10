@@ -275,6 +275,37 @@ impl Value {
         }
     }
 
+    /// The value's TEXT bytes exactly as SQLite holds them: a TEXT's
+    /// stored bytes (a raw text's original ones), a BLOB's bytes, a
+    /// number's rendering. `as_text` is the `String` (masked) view.
+    pub fn text_bytes(&self) -> std::borrow::Cow<'_, [u8]> {
+        match self {
+            Value::Text(t) => std::borrow::Cow::Borrowed(t.as_bytes()),
+            Value::Blob(b) => std::borrow::Cow::Borrowed(b.as_slice()),
+            other => std::borrow::Cow::Owned(other.as_text().into_bytes()),
+        }
+    }
+
+    /// Coerce to a TEXT value, keeping bytes that are not valid UTF-8 (a
+    /// BLOB's, a raw text's) as SQLite does (`CAST(x'c3' AS TEXT)`).
+    pub fn to_text(&self) -> Text {
+        match self {
+            Value::Text(t) => t.clone(),
+            Value::Blob(b) => Text::from_bytes(b),
+            other => other.as_text().into(),
+        }
+    }
+
+    /// Does this value's text form hold bytes that are not valid UTF-8?
+    #[inline]
+    pub(crate) fn has_raw_text(&self) -> bool {
+        match self {
+            Value::Text(t) => t.is_raw(),
+            Value::Blob(b) => std::str::from_utf8(b).is_err(),
+            _ => false,
+        }
+    }
+
     /// Coerce to text.
     pub fn as_text(&self) -> String {
         match self {
@@ -297,7 +328,7 @@ impl Value {
             Value::Text(s) => {
                 let b = s.as_bytes();
                 let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
-                b[..end].iter().filter(|&&c| c & 0xc0 != 0x80).count() as i64
+                crate::types::text::sqlite_char_count(&b[..end]) as i64
             }
             Value::Blob(b) => b.len() as i64,
         }
@@ -324,12 +355,19 @@ impl Value {
     /// Concatenate two values as text (SQLite `||` operator, OP_Concat):
     /// NULL on either side is NULL; otherwise BOTH operands are rendered
     /// as text and the result is ALWAYS TEXT — `typeof(x'41' || x'42')` is
-    /// 'text' ('AB') in SQLite. (BLOB bytes are taken as UTF-8 text;
-    /// invalid sequences cannot be represented in a Rust string and are
-    /// replaced.)
+    /// 'text' ('AB') in SQLite. BLOB / raw-text bytes concatenate as bytes
+    /// (`x'c3' || x'a9'` is 'é'; a lone `x'c3'` stays that byte).
     pub fn concat(&self, other: &Value) -> Value {
         if self.is_null() || other.is_null() {
             return Value::Null;
+        }
+        if self.has_raw_text() || other.has_raw_text() {
+            let a = self.text_bytes();
+            let b = other.text_bytes();
+            let mut v = Vec::with_capacity(a.len() + b.len());
+            v.extend_from_slice(&a);
+            v.extend_from_slice(&b);
+            return Value::Text(Text::from_bytes(&v));
         }
         Value::Text(format!("{}{}", self.as_text(), other.as_text()).into())
     }
@@ -372,6 +410,8 @@ impl Value {
     ///                9 bytes -> 2-3 for scores/amounts/prices that happen
     ///                to be whole numbers)
     ///   Text      -> [0x07] + uvarint(len) + bytes
+    ///                [0x0B] + uvarint(len) + bytes   when the bytes are not
+    ///                valid UTF-8 (SQLite keeps TEXT bytes as given)
     ///   Blob      -> [0x08] + uvarint(len) + bytes
     ///   RowidRef  -> [0x09]                           (1 byte; row-level
     ///                marker for the rowid-alias column — decoded from the
@@ -461,7 +501,10 @@ impl Value {
                 }
             }
             Value::Text(s) => {
-                out.push(0x07);
+                // 0x0B: TEXT whose bytes are not valid UTF-8 (SQLite keeps
+                // TEXT bytes as given — see `Text::from_bytes`). A
+                // separate tag keeps the 0x07 decode free of validation.
+                out.push(if s.is_raw() { 0x0B } else { 0x07 });
                 encode_uvarint(s.len() as u64, out);
                 out.extend_from_slice(s.as_bytes());
             }
@@ -740,6 +783,16 @@ impl Value {
                     return Err("truncated blob body");
                 }
                 Ok((Value::Blob(rest[n..n + len].to_vec()), 1 + n + len))
+            }
+            // TEXT holding invalid UTF-8 (see `encode_into`).
+            0x0B => {
+                let (len, n) = decode_uvarint(rest)?;
+                let len = len as usize;
+                if rest.len() < n + len {
+                    return Err("truncated text body");
+                }
+                let t = Text::from_invalid_bytes(&rest[n..n + len]);
+                Ok((Value::Text(t), 1 + n + len))
             }
             // Rowid-alias marker: NULL at the Value level; the row decoder
             // replaces it with the cell's rowid.

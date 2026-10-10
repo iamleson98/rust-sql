@@ -37,6 +37,60 @@ pub const INLINE_CAP: usize = 23;
 /// Byte #23 doubles as the discriminant: top bit set = heap variant.
 const HEAP_MARKER: u8 = 0x80;
 
+/// Heap variant holding TEXT that is NOT valid UTF-8 (SQLite stores TEXT
+/// bytes as given: `CAST(x'c3' AS TEXT)`, `x'c3' || x'a9'`, a C caller's
+/// `sqlite3_bind_text` of Latin-1 bytes). The allocation is `2 * len`
+/// bytes: the raw bytes, then a same-length MASKED copy in which every
+/// byte of an invalid sequence is U+001A (ASCII SUBSTITUTE). `as_bytes`
+/// serves the raw bytes (storage, comparison, quote/hex, the C API);
+/// `as_str` serves the masked copy — valid UTF-8 with the SAME length and
+/// byte offsets, so code mixing `len`, `as_str` slicing and `as_bytes`
+/// stays consistent.
+const RAW_MARKER: u8 = 0x81;
+
+/// The mask byte for invalid UTF-8 in a raw text's `as_str` view.
+pub const RAW_MASK: u8 = 0x1A;
+
+/// SQLite's character count over TEXT bytes (`SQLITE_SKIP_UTF8`): a lead
+/// byte (0xC0 or above) starts a character that absorbs the continuation
+/// bytes after it; every other byte — ASCII, or a stray continuation byte
+/// — is a character of its own. For valid UTF-8 this is the code-point
+/// count.
+pub fn sqlite_char_count(bytes: &[u8]) -> usize {
+    let mut n = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let lead = bytes[i];
+        i += 1;
+        if lead >= 0xC0 {
+            while i < bytes.len() && bytes[i] & 0xC0 == 0x80 {
+                i += 1;
+            }
+        }
+        n += 1;
+    }
+    n
+}
+
+/// Byte offset of each character start under `sqlite_char_count`'s
+/// stepping, plus the end offset (`len + 1` entries for `len` chars).
+pub fn sqlite_char_offsets(bytes: &[u8]) -> Vec<usize> {
+    let mut out = Vec::with_capacity(bytes.len() + 1);
+    let mut i = 0;
+    while i < bytes.len() {
+        out.push(i);
+        let lead = bytes[i];
+        i += 1;
+        if lead >= 0xC0 {
+            while i < bytes.len() && bytes[i] & 0xC0 == 0x80 {
+                i += 1;
+            }
+        }
+    }
+    out.push(bytes.len());
+    out
+}
+
 #[repr(C)]
 pub struct Text {
     repr: Repr,
@@ -107,6 +161,69 @@ impl Text {
         }
     }
 
+    /// Build from arbitrary bytes, as SQLite stores TEXT: valid UTF-8 is an
+    /// ordinary text; anything else keeps its bytes (the raw variant).
+    #[inline]
+    pub fn from_bytes(bytes: &[u8]) -> Text {
+        match std::str::from_utf8(bytes) {
+            // SAFETY: just validated.
+            Ok(_) => unsafe { Text::from_utf8_unchecked(bytes) },
+            Err(_) => Text::from_invalid_bytes(bytes),
+        }
+    }
+
+    /// The raw variant for bytes known NOT to be valid UTF-8 (the storage
+    /// codec's raw-text tag). Valid input still works (it is re-checked).
+    pub fn from_invalid_bytes(bytes: &[u8]) -> Text {
+        let len = bytes.len();
+        if len == 0 || std::str::from_utf8(bytes).is_ok() {
+            // SAFETY: valid UTF-8.
+            return unsafe { Text::from_utf8_unchecked(bytes) };
+        }
+        // SAFETY: 2 * len > 0, alignment 1.
+        let layout = unsafe { std::alloc::Layout::from_size_align_unchecked(2 * len, 1) };
+        // SAFETY: global allocator, non-zero size.
+        let ptr = unsafe { std::alloc::alloc(layout) };
+        assert!(!ptr.is_null(), "Text: out of memory");
+        // SAFETY: ptr is valid for 2 * len writes.
+        let buf = unsafe { std::slice::from_raw_parts_mut(ptr, 2 * len) };
+        buf[..len].copy_from_slice(bytes);
+        let masked = &mut buf[len..];
+        masked.copy_from_slice(bytes);
+        let mut at = 0;
+        while at < len {
+            match std::str::from_utf8(&masked[at..]) {
+                Ok(_) => break,
+                Err(e) => {
+                    let bad_start = at + e.valid_up_to();
+                    let bad_len = e.error_len().unwrap_or(len - bad_start);
+                    for b in &mut masked[bad_start..bad_start + bad_len] {
+                        *b = RAW_MASK;
+                    }
+                    at = bad_start + bad_len;
+                }
+            }
+        }
+        Text {
+            repr: Repr {
+                heap: std::mem::ManuallyDrop::new(HeapRepr {
+                    ptr: std::ptr::NonNull::new(ptr).unwrap(),
+                    len: len as u64,
+                    _pad: [0; 7],
+                    marker: RAW_MARKER,
+                }),
+            },
+        }
+    }
+
+    /// Is this TEXT holding bytes that are not valid UTF-8 (see
+    /// `RAW_MARKER`)? Its `as_str` is then a masked view.
+    #[inline]
+    pub fn is_raw(&self) -> bool {
+        // SAFETY: the u8 view of the union is valid for any bit pattern.
+        unsafe { self.repr.inline[23] == RAW_MARKER }
+    }
+
     /// Build from UTF-8 bytes, copying short strings inline with ZERO
     /// allocation. This is the row-codec decode hot path.
     #[inline]
@@ -166,10 +283,12 @@ impl Text {
         unsafe { self.repr.inline[23] & HEAP_MARKER == 0 }
     }
 
-    /// Borrow the string contents.
+    /// Borrow the string contents (for a raw text: its masked view — see
+    /// `RAW_MARKER`).
     #[inline]
     pub fn as_str(&self) -> &str {
-        // SAFETY: every constructor stores valid UTF-8 in both variants.
+        // SAFETY: inline and plain heap variants store valid UTF-8; the raw
+        // variant's second half is its masked (valid UTF-8) copy.
         unsafe {
             if self.is_inline() {
                 let len = self.repr.inline[23] as usize;
@@ -177,16 +296,31 @@ impl Text {
                 std::str::from_utf8_unchecked(bytes)
             } else {
                 let h = &self.repr.heap;
-                let bytes = std::slice::from_raw_parts(h.ptr.as_ptr(), h.len as usize);
+                let off = if h.marker == RAW_MARKER {
+                    h.len as usize
+                } else {
+                    0
+                };
+                let bytes = std::slice::from_raw_parts(h.ptr.as_ptr().add(off), h.len as usize);
                 std::str::from_utf8_unchecked(bytes)
             }
         }
     }
 
-    /// Borrow the raw bytes.
+    /// Borrow the bytes exactly as stored (a raw text's original bytes).
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
-        self.as_str().as_bytes()
+        // SAFETY: both variants expose `len` initialized bytes at their
+        // base pointer.
+        unsafe {
+            if self.is_inline() {
+                let len = self.repr.inline[23] as usize;
+                std::slice::from_raw_parts(self.repr.inline.as_ptr(), len)
+            } else {
+                let h = &self.repr.heap;
+                std::slice::from_raw_parts(h.ptr.as_ptr(), h.len as usize)
+            }
+        }
     }
 
     /// Consume and convert to a heap `String`. Short strings allocate
@@ -194,6 +328,10 @@ impl Text {
     #[inline]
     pub fn into_string(self) -> String {
         let inline = self.is_inline();
+        if self.is_raw() {
+            // The masked view (a String cannot hold the raw bytes).
+            return self.as_str().to_owned();
+        }
         if inline {
             let s = self.as_str().to_owned();
             // Prevent the Drop impl from running on the (inline) repr.
@@ -225,17 +363,20 @@ impl Text {
             Text {
                 repr: Repr { inline: buf },
             }
+        } else if self.is_raw() {
+            Text::from_invalid_bytes(self.as_bytes())
         } else {
             Text::from_bytes_heap(self.as_bytes())
         }
     }
 
-    /// Heap allocation layout matching what `from_bytes_heap` created.
+    /// Heap allocation layout matching what `from_bytes_heap` (or, for the
+    /// raw variant, `from_invalid_bytes`: twice the length) created.
     #[inline]
-    fn heap_layout(len: usize) -> std::alloc::Layout {
-        // SAFETY: heap variants always have len > INLINE_CAP > 0 and
-        // len < isize::MAX.
-        unsafe { std::alloc::Layout::from_size_align_unchecked(len, 1) }
+    fn heap_layout(len: usize, raw: bool) -> std::alloc::Layout {
+        let size = if raw { 2 * len } else { len };
+        // SAFETY: heap variants always have len > 0 and size < isize::MAX.
+        unsafe { std::alloc::Layout::from_size_align_unchecked(size, 1) }
     }
 }
 
@@ -254,7 +395,10 @@ impl Drop for Text {
             // allocator with exactly this layout.
             unsafe {
                 let h = &self.repr.heap;
-                std::alloc::dealloc(h.ptr.as_ptr(), Self::heap_layout(h.len as usize));
+                std::alloc::dealloc(
+                    h.ptr.as_ptr(),
+                    Self::heap_layout(h.len as usize, h.marker == RAW_MARKER),
+                );
             }
         }
     }
@@ -326,10 +470,13 @@ impl From<char> for Text {
     }
 }
 
+// Equality and order are on the stored BYTES (SQLite's BINARY memcmp; for
+// valid UTF-8 that is exactly `str` order). Hash stays the `str` hash of
+// the `as_str` view (`Borrow<str>` lookups): equal bytes give equal views.
 impl PartialEq for Text {
     #[inline]
     fn eq(&self, other: &Text) -> bool {
-        self.as_str() == other.as_str()
+        self.as_bytes() == other.as_bytes()
     }
 }
 
@@ -338,21 +485,21 @@ impl Eq for Text {}
 impl PartialEq<str> for Text {
     #[inline]
     fn eq(&self, other: &str) -> bool {
-        self.as_str() == other
+        self.as_bytes() == other.as_bytes()
     }
 }
 
 impl PartialEq<&str> for Text {
     #[inline]
     fn eq(&self, other: &&str) -> bool {
-        self.as_str() == *other
+        self.as_bytes() == other.as_bytes()
     }
 }
 
 impl PartialEq<String> for Text {
     #[inline]
     fn eq(&self, other: &String) -> bool {
-        self.as_str() == other.as_str()
+        self.as_bytes() == other.as_bytes()
     }
 }
 
@@ -373,7 +520,7 @@ impl PartialOrd for Text {
 impl Ord for Text {
     #[inline]
     fn cmp(&self, other: &Text) -> Ordering {
-        self.as_str().cmp(other.as_str())
+        self.as_bytes().cmp(other.as_bytes())
     }
 }
 
@@ -397,8 +544,15 @@ impl Default for Text {
 }
 
 impl Text {
-    /// Concatenate (used by `||`). Stays inline when the result fits.
+    /// Concatenate (used by `||`). Stays inline when the result fits. A raw
+    /// operand concatenates its BYTES (`x'c3' || x'a9'` is the valid 'é').
     pub fn concat(&self, other: &Text) -> Text {
+        if self.is_raw() || other.is_raw() {
+            let mut v = Vec::with_capacity(self.len() + other.len());
+            v.extend_from_slice(self.as_bytes());
+            v.extend_from_slice(other.as_bytes());
+            return Text::from_bytes(&v);
+        }
         let a = self.as_str();
         let b = other.as_str();
         if a.len() + b.len() <= INLINE_CAP {
@@ -439,6 +593,31 @@ impl Text {
     }
     pub fn from_utf8_lossy(bytes: &[u8]) -> Text {
         Text(String::from_utf8_lossy(bytes).into_owned())
+    }
+    /// (Non-64-bit fallback: invalid bytes are masked, not kept.)
+    pub fn from_bytes(bytes: &[u8]) -> Text {
+        Text::from_invalid_bytes(bytes)
+    }
+    pub fn from_invalid_bytes(bytes: &[u8]) -> Text {
+        let mut v = bytes.to_vec();
+        let mut at = 0;
+        while at < v.len() {
+            match std::str::from_utf8(&v[at..]) {
+                Ok(_) => break,
+                Err(e) => {
+                    let s = at + e.valid_up_to();
+                    let n = e.error_len().unwrap_or(v.len() - s);
+                    for b in &mut v[s..s + n] {
+                        *b = RAW_MASK;
+                    }
+                    at = s + n;
+                }
+            }
+        }
+        Text(String::from_utf8(v).unwrap_or_default())
+    }
+    pub fn is_raw(&self) -> bool {
+        false
     }
     pub fn len(&self) -> usize {
         self.0.len()
@@ -655,6 +834,40 @@ mod tests {
         let t2 = Text::new("");
         assert!(t2.is_inline());
         assert!(t2.is_empty());
+    }
+
+    #[test]
+    fn raw_bytes_round_trip_with_a_same_length_view() {
+        for bytes in [
+            &[0xc3u8][..],
+            &[b'a', 0xff, b'b'],
+            &[0xe2, 0x82],
+            &[b'x'; 40]
+                .iter()
+                .copied()
+                .chain([0xc3])
+                .collect::<Vec<u8>>()[..],
+        ] {
+            let t = Text::from_bytes(bytes);
+            assert!(t.is_raw());
+            assert_eq!(t.as_bytes(), bytes);
+            assert_eq!(t.len(), bytes.len());
+            assert_eq!(t.as_str().len(), bytes.len());
+            assert!(t.as_str().bytes().all(|b| b == RAW_MASK || b.is_ascii()));
+            let c = t.clone();
+            assert!(c.is_raw());
+            assert_eq!(c, t);
+            assert_eq!(c.as_bytes(), bytes);
+        }
+        // Valid input is an ordinary text.
+        assert!(!Text::from_bytes("é".as_bytes()).is_raw());
+        // Raw concatenation re-validates the bytes.
+        let e = Text::from_bytes(&[0xc3]).concat(&Text::from_bytes(&[0xa9]));
+        assert!(!e.is_raw());
+        assert_eq!(e.as_str(), "é");
+        // Different invalid bytes stay distinct (equality is on bytes).
+        assert_ne!(Text::from_bytes(&[0xc3]), Text::from_bytes(&[0xff]));
+        assert!(Text::from_bytes(&[0xc3]) < Text::from_bytes(&[0xff]));
     }
 
     #[test]

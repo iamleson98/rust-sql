@@ -164,23 +164,27 @@ impl Collation for NoCaseCollation {
         "NOCASE"
     }
     fn compare(&self, a: &str, b: &str) -> Ordering {
-        // main.c nocaseCollatingFunc, verbatim: sqlite3StrNICmp over the
-        // shorter length — a C-string walk that STOPS at a NUL in the
-        // left operand — then the byte lengths decide. Raw bytes with
-        // ASCII-only folding (multi-byte UTF-8 keeps byte order).
-        let (a, b) = (a.as_bytes(), b.as_bytes());
-        let n = a.len().min(b.len());
-        let mut i = 0;
-        while i < n && a[i] != 0 && a[i].eq_ignore_ascii_case(&b[i]) {
-            i += 1;
-        }
-        let r = if i == n {
-            Ordering::Equal
-        } else {
-            a[i].to_ascii_lowercase().cmp(&b[i].to_ascii_lowercase())
-        };
-        r.then(a.len().cmp(&b.len()))
+        nocase_compare_bytes(a.as_bytes(), b.as_bytes())
     }
+}
+
+/// NOCASE over raw TEXT bytes (a raw text's original bytes included).
+pub fn nocase_compare_bytes(a: &[u8], b: &[u8]) -> Ordering {
+    // main.c nocaseCollatingFunc, verbatim: sqlite3StrNICmp over the
+    // shorter length — a C-string walk that STOPS at a NUL in the
+    // left operand — then the byte lengths decide. Raw bytes with
+    // ASCII-only folding (multi-byte UTF-8 keeps byte order).
+    let n = a.len().min(b.len());
+    let mut i = 0;
+    while i < n && a[i] != 0 && a[i].eq_ignore_ascii_case(&b[i]) {
+        i += 1;
+    }
+    let r = if i == n {
+        Ordering::Equal
+    } else {
+        a[i].to_ascii_lowercase().cmp(&b[i].to_ascii_lowercase())
+    };
+    r.then(a.len().cmp(&b.len()))
 }
 
 /// `RTRIM`: compares as BINARY but ignores trailing spaces.
@@ -191,10 +195,14 @@ impl Collation for RTrimCollation {
         "RTRIM"
     }
     fn compare(&self, a: &str, b: &str) -> Ordering {
-        let a = a.trim_end_matches(' ');
-        let b = b.trim_end_matches(' ');
-        a.as_bytes().cmp(b.as_bytes())
+        rtrim_compare_bytes(a.as_bytes(), b.as_bytes())
     }
+}
+
+/// RTRIM over raw TEXT bytes.
+pub fn rtrim_compare_bytes(a: &[u8], b: &[u8]) -> Ordering {
+    let trim = |s: &[u8]| -> usize { s.len() - s.iter().rev().take_while(|&&c| c == b' ').count() };
+    a[..trim(a)].cmp(&b[..trim(b)])
 }
 
 /// Compare two [`Value`]s with a collation applied to TEXT comparison.
@@ -203,6 +211,18 @@ impl Collation for RTrimCollation {
 /// < blob`); only text-text pairs route through the collation.
 pub fn compare_collated(a: &Value, b: &Value, coll: &dyn Collation) -> Ordering {
     match (a, b) {
+        // A raw text (invalid UTF-8) compares by its BYTES under the
+        // built-in collations; a plugin collation sees the masked view.
+        (Value::Text(x), Value::Text(y)) if x.is_raw() || y.is_raw() => {
+            let name = coll.name();
+            if name.eq_ignore_ascii_case("NOCASE") {
+                nocase_compare_bytes(x.as_bytes(), y.as_bytes())
+            } else if name.eq_ignore_ascii_case("RTRIM") {
+                rtrim_compare_bytes(x.as_bytes(), y.as_bytes())
+            } else {
+                coll.compare(x.as_str(), y.as_str())
+            }
+        }
         (Value::Text(x), Value::Text(y)) => coll.compare(x.as_str(), y.as_str()),
         _ => a.cmp(b),
     }
@@ -227,6 +247,30 @@ pub fn compare_collated(a: &Value, b: &Value, coll: &dyn Collation) -> Ordering 
 pub fn collation_fold_key_ref<'a>(collation: &str, v: &'a Value) -> std::borrow::Cow<'a, Value> {
     if collation.eq_ignore_ascii_case("BINARY") || !matches!(v, Value::Text(_)) {
         return std::borrow::Cow::Borrowed(v);
+    }
+    if let Value::Text(t) = v {
+        if t.is_raw() {
+            // The folds over the raw bytes (same shapes as below).
+            let b = t.as_bytes();
+            let folded: Vec<u8> = if collation.eq_ignore_ascii_case("NOCASE") {
+                match b.iter().position(|&c| c == 0) {
+                    Some(z) => {
+                        let mut f = b[..z].to_ascii_lowercase();
+                        f.push(0);
+                        f.extend_from_slice(b.len().to_string().as_bytes());
+                        f
+                    }
+                    None => b.to_ascii_lowercase(),
+                }
+            } else if collation.eq_ignore_ascii_case("RTRIM") {
+                b[..b.len() - b.iter().rev().take_while(|&&c| c == b' ').count()].to_vec()
+            } else {
+                return std::borrow::Cow::Borrowed(v);
+            };
+            return std::borrow::Cow::Owned(Value::Text(crate::types::text::Text::from_bytes(
+                &folded,
+            )));
+        }
     }
     if collation.eq_ignore_ascii_case("NOCASE") {
         if let Value::Text(t) = v {
