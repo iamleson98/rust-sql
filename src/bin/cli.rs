@@ -2116,15 +2116,16 @@ fn restore_from_file(runner: &mut Runner, file: &str, out: &mut ShellOut) -> Res
             "SELECT type, name, sql FROM __restore_src.sqlite_master \
              WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY rowid",
         )?;
-        // Tables first (FKs and triggers reference them), then the rest.
-        for pass in 0..2 {
+        // Tables first, then their rows, then indexes / views / triggers:
+        // SQLite's .restore copies pages, so no trigger may fire on the
+        // copied rows (an INSERT ... SELECT fires INSERT triggers).
+        let create = |runner: &mut Runner, tables: bool| -> Result<(), String> {
             for row in &schema {
                 let kind = match row.first() {
                     Some(Value::Text(t)) => t.as_str().to_string(),
                     _ => continue,
                 };
-                let is_table = kind == "table";
-                if (pass == 0) != is_table {
+                if (kind == "table") != tables {
                     continue;
                 }
                 let sql = match row.get(2) {
@@ -2133,7 +2134,9 @@ fn restore_from_file(runner: &mut Runner, file: &str, out: &mut ShellOut) -> Res
                 };
                 runner.execute(&sql)?;
             }
-        }
+            Ok(())
+        };
+        create(runner, true)?;
         // Copy rows table by table.
         let (_, tables) = runner.query(
             "SELECT name FROM __restore_src.sqlite_master \
@@ -2151,6 +2154,7 @@ fn restore_from_file(runner: &mut Runner, file: &str, out: &mut ShellOut) -> Res
             ))?;
             copied += 1;
         }
+        create(runner, false)?;
         writeln!(out, "restored: {} tables from {}", copied, file).unwrap();
         Ok(())
     })();

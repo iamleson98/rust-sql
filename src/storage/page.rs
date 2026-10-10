@@ -342,6 +342,12 @@ impl Page {
     }
 
     /// Cell pointer at the given index (0-based).
+    /// Byte offset of the cell-pointer array.
+    #[inline]
+    pub fn cell_pointer_base(&self) -> usize {
+        self.header_offset() as usize + PAGE_HEADER_SIZE as usize
+    }
+
     pub fn cell_pointer(&self, idx: u16) -> u16 {
         let base = self.header_offset() as usize + PAGE_HEADER_SIZE as usize;
         let off = base + idx as usize * 2;

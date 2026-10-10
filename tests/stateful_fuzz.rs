@@ -489,9 +489,22 @@ fn gen_lit_for(rng: &mut Rng, ty: &str) -> String {
 fn gen_lit_for_col(rng: &mut Rng, t: &Table, i: usize) -> String {
     let lit = gen_lit_for(rng, t.cols[i].ty);
     if Some(i) == t.alias_pk && lit == i64::MAX.to_string() {
+        // MAX - 1 arms the lottery after ONE implicit-rowid insert (which
+        // takes MAX): most 500-op cases ended within ~150 ops that way.
+        // Exploration keeps MAX - 1 as a rare edge and otherwise stays far
+        // below it.
+        if SPREAD_ALIAS_MAX.with(|c| c.get()) && !rng.chance(10) {
+            return (i64::MAX - (1 << 20)).to_string();
+        }
         return (i64::MAX - 1).to_string();
     }
     lit
+}
+
+thread_local! {
+    /// Exploration mode of `gen_lit_for_col`'s alias MAX literal. Off for
+    /// the pins: they replay the original generator stream byte for byte.
+    static SPREAD_ALIAS_MAX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn gen_any_lit(rng: &mut Rng) -> String {
@@ -1228,6 +1241,10 @@ fn stateful_random_workload_matches_sqlite() {
     let cases = env_u64("RUSTQLITE_STATEFUL_CASES", 6);
     let n_ops = env_u64("RUSTQLITE_STATEFUL_OPS", 140);
     let seed = env_u64("RUSTQLITE_STATEFUL_SEED", 0x00C0_FFEE_F00D_BA5E);
+    // RUSTQLITE_STATEFUL_LEGACY_GEN=1 replays seeds explored before the
+    // alias-MAX spread (the pins' generator).
+    let legacy = env_u64("RUSTQLITE_STATEFUL_LEGACY_GEN", 0) != 0;
+    SPREAD_ALIAS_MAX.with(|c| c.set(!legacy));
     let start = std::time::Instant::now();
     // Wall-clock guard: dev-profile CI runners can be 10x slower than a
     // laptop; the contract needs coverage, not a specific iteration count.
@@ -1305,5 +1322,25 @@ fn stateful_fuzz_fresh_seed_pins() {
         if let Err(msg) = run_case(seed, case, ops) {
             panic!("seed {seed} case {case}: {msg}");
         }
+    }
+    // Found by the alias-MAX spread generator (cases now run their full
+    // 500 ops instead of arming SQLite's random-rowid lottery early).
+    SPREAD_ALIAS_MAX.with(|c| c.set(true));
+    let spread_pins: [(u64, usize, usize); 8] = [
+        (6006, 19, 500),   // rowid IN: a later equal REAL member drops i64::MIN
+        (48048, 13, 500),  // same, through UPDATE ... WHERE pk IN (...)
+        (74074, 48, 500),  // an OR IGNOREd row still raises AUTOINCREMENT
+        (84084, 75, 500),  // INSERT ... SELECT fired no triggers
+        (21021, 29, 500),  // rowid move filed a non-member in a partial index
+        (67067, 48, 500),  // same, surfacing through a later UPDATE
+        (136136, 20, 500), // empty-leaf split: separator i64::MIN - 1 wrapped
+        (174174, 58, 500), // same, with index entries orphaned
+    ];
+    let r = spread_pins
+        .iter()
+        .find_map(|&(seed, case, ops)| run_case(seed, case, ops).err().map(|m| (seed, case, m)));
+    SPREAD_ALIAS_MAX.with(|c| c.set(false));
+    if let Some((seed, case, msg)) = r {
+        panic!("seed {seed} case {case} (spread generator): {msg}");
     }
 }

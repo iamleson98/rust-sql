@@ -465,3 +465,45 @@ fn prepared_statements_are_atomic_like_sqlite() {
     }
     assert_eq!(ours_rows(&mut db, "PRAGMA integrity_check"), vec!["Tok"]);
 }
+
+/// changes() / total_changes() belong to the CONNECTION (they used to be
+/// per thread): two connections interleaved on one thread each see their
+/// own counts — through the API, through the SQL functions, and from
+/// another thread.
+#[test]
+fn change_counters_are_per_connection() {
+    let mut a = Database::open_in_memory().unwrap();
+    let mut b = Database::open_in_memory().unwrap();
+    for db in [&mut a, &mut b] {
+        db.execute("CREATE TABLE t (x)", []).unwrap();
+    }
+    a.execute("INSERT INTO t VALUES (1), (2), (3)", []).unwrap();
+    b.execute("INSERT INTO t VALUES (1)", []).unwrap();
+    assert_eq!((a.changes(), a.total_changes()), (3, 3));
+    assert_eq!((b.changes(), b.total_changes()), (1, 1));
+    assert_eq!(
+        ours_rows(&mut a, "SELECT changes(), total_changes()"),
+        vec!["I3|I3"]
+    );
+    assert_eq!(
+        ours_rows(&mut b, "SELECT changes(), total_changes()"),
+        vec!["I1|I1"]
+    );
+    a.execute("UPDATE t SET x = x + 1 WHERE x > 1", []).unwrap();
+    assert_eq!(
+        ours_rows(&mut b, "SELECT changes(), total_changes()"),
+        vec!["I1|I1"]
+    );
+    assert_eq!(
+        ours_rows(&mut a, "SELECT changes(), total_changes()"),
+        vec!["I2|I5"]
+    );
+    let a = std::thread::spawn(move || (a.changes(), a.total_changes(), a))
+        .join()
+        .unwrap();
+    assert_eq!((a.0, a.1), (2, 5));
+    let mut a = a.2;
+    a.execute("DELETE FROM t", []).unwrap();
+    assert_eq!((a.changes(), a.total_changes()), (3, 8));
+    assert_eq!((b.changes(), b.total_changes()), (1, 1));
+}

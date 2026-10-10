@@ -1,0 +1,15 @@
+-- A leaf emptied row by row keeps a stale content start, so its free space
+-- under-reports. Inserting i64::MIN there used to SPLIT the empty leaf: the
+-- new right page took the row and the separator became i64::MIN - 1, which
+-- wrapped to i64::MAX — every later key routed into the empty left page, so
+-- -1 landed before i64::MIN (corrupt order; stateful seeds 136136, 139139,
+-- 174174). The empty leaf's content area is now reset instead.
+CREATE TABLE a (id INTEGER PRIMARY KEY, note TEXT);
+CREATE TABLE gone (id INTEGER);
+CREATE TRIGGER td AFTER DELETE ON a BEGIN INSERT INTO gone VALUES (OLD.id); END;
+WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 60) INSERT INTO a SELECT i, 'LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL' FROM c;
+DELETE FROM a WHERE id <= 30;
+INSERT INTO a (id, note) VALUES (-9223372036854775808, 'LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL'), (-1, 'x'), (9223372036854775806, NULL);
+/*ordered*/ SELECT rowid FROM a ORDER BY rowid LIMIT 3;
+SELECT count(*) FROM a WHERE rowid < 0;
+PRAGMA integrity_check;

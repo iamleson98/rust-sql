@@ -399,8 +399,9 @@ pub struct Database {
     /// inside a transaction: `execute` rolls the transaction back.
     halt_rollback: std::sync::atomic::AtomicBool,
     /// This connection's `changes()` / `total_changes()` counters (see
-    /// `change_counters::ConnScope`).
-    pub(crate) change_counts: Arc<[std::sync::atomic::AtomicI64; 2]>,
+    /// `change_counters::ConnScope`). Shared with every ATTACHed engine:
+    /// SQLite counts per connection, across all its databases.
+    pub(crate) change_counts: Arc<crate::executor::change_counters::ConnCounts>,
     /// True when the open transaction was started by SAVEPOINT (not
     /// BEGIN) — releasing the outermost savepoint then COMMITS.
     savepoint_txn: AtomicBool,
@@ -2596,10 +2597,7 @@ impl Database {
             savepoint_catalogs: Mutex::new(Vec::new()),
             catalog_restore_pending: Mutex::new(None),
             halt_rollback: std::sync::atomic::AtomicBool::new(false),
-            change_counts: Arc::new([
-                std::sync::atomic::AtomicI64::new(0),
-                std::sync::atomic::AtomicI64::new(0),
-            ]),
+            change_counts: Default::default(),
             savepoint_txn: AtomicBool::new(false),
             preupdate_hook: crate::preupdate::HookSlot::new(None),
             has_preupdate_hook: AtomicBool::new(false),
@@ -3004,10 +3002,7 @@ impl Database {
             savepoint_catalogs: Mutex::new(Vec::new()),
             catalog_restore_pending: Mutex::new(None),
             halt_rollback: std::sync::atomic::AtomicBool::new(false),
-            change_counts: Arc::new([
-                std::sync::atomic::AtomicI64::new(0),
-                std::sync::atomic::AtomicI64::new(0),
-            ]),
+            change_counts: Default::default(),
             savepoint_txn: AtomicBool::new(false),
             preupdate_hook: crate::preupdate::HookSlot::new(None),
             has_preupdate_hook: AtomicBool::new(false),
@@ -5055,7 +5050,7 @@ impl Database {
         // storms (the chain is allocation-light, but its pages still
         // wake the deferred-free queue).
         self.set_last_insert_rowid(rowid);
-        crate::executor::change_counters::record(1);
+        crate::executor::change_counters::record(&self.change_counts, 1);
         self.pager.note_rows_modified(1);
         self.note_alloc_burst(1, 0);
         // Auto-commit flush, exactly like `exec_fast_insert`'s tail.
@@ -5407,11 +5402,6 @@ impl Database {
             // Constraint-level ON CONFLICT clauses resolve per constraint
             // (the general path's conflict_policy); this path is ABORT-only.
             || crate::executor::table_conflict_clauses(&table)
-            || self
-                .catalog
-                .indexes_on_table(&table.name)
-                .iter()
-                .any(|i| i.on_conflict.is_some())
         {
             return Ok(None);
         }
@@ -5601,10 +5591,10 @@ impl Database {
             self.clear_vtab_shadow_flight();
         }
         if result.is_err() {
-            crate::executor::change_counters::record_outcome(false, 0, 0);
+            crate::executor::change_counters::record_outcome(&self.change_counts, false, 0, 0);
         }
         if let Ok(n) = result {
-            crate::executor::change_counters::record(n);
+            crate::executor::change_counters::record(&self.change_counts, n);
             self.pager.note_rows_modified(n);
             // Auto-commit bulk INSERT: one implicit transaction.
             if n > 0 && !ctx.in_transaction {
@@ -6307,8 +6297,7 @@ impl Database {
         // `last_insert_rowid()` (SQLite: the value is per-connection; the
         // evaluator reads the TLS, which every statement entry refreshes).
         crate::executor::change_counters::note_conn_rowid(self.last_rowid.load(Ordering::Acquire));
-        let counts = Arc::clone(&self.change_counts);
-        let _counts = crate::executor::change_counters::ConnScope::enter(&counts);
+        let _counts = crate::executor::change_counters::ConnScope::enter(&self.change_counts);
         // Statement boundary: any aux-function TLS (bm25/highlight/
         // snippet bound to a previous statement's vtab scan) is stale.
         crate::executor::vtab_exec::aux_tls_clear();
@@ -6876,6 +6865,7 @@ impl Database {
                 self.set_last_insert_rowid(ctx.last_insert_rowid);
                 *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
                 crate::executor::change_counters::record_outcome(
+                    &self.change_counts,
                     res.is_ok(),
                     ctx.changes,
                     ctx.trigger_changes,
@@ -7372,6 +7362,7 @@ impl Database {
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
         ) {
             crate::executor::change_counters::record_outcome(
+                &self.change_counts,
                 result.is_ok() || keep_partial,
                 ctx.changes,
                 ctx.trigger_changes,
@@ -8030,8 +8021,7 @@ impl Database {
         };
         // Per-connection snapshot for `last_insert_rowid()` (see execute).
         crate::executor::change_counters::note_conn_rowid(self.last_rowid.load(Ordering::Acquire));
-        let counts = Arc::clone(&self.change_counts);
-        let _counts = crate::executor::change_counters::ConnScope::enter(&counts);
+        let _counts = crate::executor::change_counters::ConnScope::enter(&self.change_counts);
         // File text encoding for value ordering / CAST (RAII restore).
         let _conn_enc_guard = crate::executor::ConnEncGuard::install(self.conn_text_enc());
         // A hot INSERT chain owns the table's live root / max-rowid while
@@ -8373,6 +8363,7 @@ impl Database {
                 // the query path must feed changes()/total_changes() and
                 // the engine-wide observability aggregates too.
                 crate::executor::change_counters::record_outcome(
+                    &self.change_counts,
                     true,
                     ctx.changes,
                     ctx.trigger_changes,
@@ -8492,13 +8483,13 @@ impl Database {
     /// Running total of rows modified by all statements on this thread
     /// (SQLite's `sqlite3_total_changes`).
     pub fn total_changes(&self) -> i64 {
-        self.change_counts[1].load(Ordering::Relaxed)
+        self.change_counts.total_changes()
     }
 
     /// Rows modified by the most recent statement (SQLite's
     /// `sqlite3_changes`).
     pub fn changes(&self) -> i64 {
-        self.change_counts[0].load(Ordering::Relaxed)
+        self.change_counts.changes()
     }
 
     /// Output names for a SELECT, seeing through compound bodies (the
@@ -8616,8 +8607,7 @@ impl Database {
         // refresh it from THIS connection's atomic — a routed ATTACH
         // statement may have updated it through another engine).
         crate::executor::change_counters::note_conn_rowid(self.last_rowid.load(Ordering::Acquire));
-        let counts = Arc::clone(&self.change_counts);
-        let _counts = crate::executor::change_counters::ConnScope::enter(&counts);
+        let _counts = crate::executor::change_counters::ConnScope::enter(&self.change_counts);
         let _rbd = ReadBurstDrain {
             db: self,
             sql_len: sql.len(),
@@ -10469,6 +10459,7 @@ impl Database {
             vtab: None,
             pk_conflict: None,
             check_labels: Vec::new(),
+            conflict_clauses: false,
         };
         for (new_row, old_row) in &rows {
             // WHEN guard + body per trigger (INSTEAD OF semantics =
@@ -10542,7 +10533,7 @@ impl Database {
             .store(ctx.in_transaction, Ordering::Release);
         self.set_last_insert_rowid(ctx.last_insert_rowid);
         *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
-        crate::executor::change_counters::record(ctx.changes);
+        crate::executor::change_counters::record(&self.change_counts, ctx.changes);
         self.pager.note_rows_modified(ctx.changes);
         if ctx.roots_changed {
             let shared = Arc::make_mut(&mut ctx.shared);
@@ -10729,8 +10720,8 @@ impl Database {
     }
 
     /// Merge a routed DML's connection-visible effects. changes() /
-    /// total_changes() are thread-wide (the attached engine's machinery
-    /// records them through the same thread-locals); last_insert_rowid()
+    /// total_changes() need nothing (an attached engine records into the
+    /// parent's shared `change_counts`); last_insert_rowid()
     /// is per-CONNECTION and must travel to the parent after a routed
     /// INSERT (SQLite's value spans every attached database).
     fn merge_routed_dml_counters(&self, was_insert: bool, last_rowid: i64) {
@@ -11133,6 +11124,7 @@ impl Database {
                 | crate::planner::plan::Plan::Delete { .. }
         ) {
             crate::executor::change_counters::record_outcome(
+                &self.change_counts,
                 true,
                 ctx.changes,
                 ctx.trigger_changes,
@@ -11216,6 +11208,7 @@ impl Database {
             crate::planner::plan::Plan::Update { .. } | crate::planner::plan::Plan::Delete { .. }
         ) {
             crate::executor::change_counters::record_outcome(
+                &self.change_counts,
                 true,
                 ctx.changes,
                 ctx.trigger_changes,
@@ -11528,8 +11521,8 @@ impl Database {
             aux.exec_with_injected_channel(&rewritten, params, channel)
                 .map_err(|e| crate::attach::qualify_routed_error(e, &target_lc))?
         };
-        // changes() / total_changes() are thread-wide and the target's
-        // machinery recorded them through the same thread-locals; an
+        // changes() / total_changes(): the target recorded them into the
+        // shared `change_counts`; an
         // UPDATE/DELETE moves no last-insert rowid.
         self.merge_routed_dml_counters(false, 0);
         Ok(out)
@@ -18454,7 +18447,7 @@ impl Database {
             self.clear_vtab_shadow_flight();
         }
         if result.is_ok() {
-            crate::executor::change_counters::record(changed);
+            crate::executor::change_counters::record(&self.change_counts, changed);
             self.pager.note_rows_modified(changed);
             self.note_alloc_burst(changed.unsigned_abs(), 0);
             if changed > 0 && !ctx.in_transaction {
@@ -18602,7 +18595,7 @@ impl Database {
             self.clear_vtab_shadow_flight();
         }
         if result.is_ok() {
-            crate::executor::change_counters::record(changed);
+            crate::executor::change_counters::record(&self.change_counts, changed);
             self.pager.note_rows_modified(changed);
             self.note_alloc_burst(changed.unsigned_abs(), 0);
             if changed > 0 && !ctx.in_transaction {

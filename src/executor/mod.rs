@@ -1243,6 +1243,18 @@ pub struct ExecContext<'a> {
     /// this statement: `total_changes()` counts them, `changes()` does not
     /// (`fire_triggers` moves each body's rows here from `changes`).
     pub trigger_changes: i64,
+    /// AUTOINCREMENT high-water marks raised during a top-level INSERT (by
+    /// it or its trigger programs) but not yet written to
+    /// `sqlite_sequence`: written at its successful end, as
+    /// sqlite3AutoincrementEnd does. Nested statements read them, sharing
+    /// the register like SQLite's toplevel `pAinc`.
+    pub autoinc_pending: Vec<(String, i64)>,
+    /// A top-level INSERT is running: AUTOINCREMENT raises go to
+    /// `autoinc_pending` instead of straight to `sqlite_sequence`.
+    pub autoinc_defer: bool,
+    /// The (table, root) pair an INSERT of this statement last recorded in
+    /// the root maps (see `exec_insert_one_row`).
+    pub root_noted: Option<(usize, u32)>,
     /// Marker to keep the lifetime.
     _marker: std::marker::PhantomData<&'a crate::schema::Catalog>,
 }
@@ -1282,6 +1294,9 @@ impl<'a> ExecContext<'a> {
             firing_or: None,
             halt_action: None,
             trigger_changes: 0,
+            autoinc_pending: Vec::new(),
+            autoinc_defer: false,
+            root_noted: None,
             explain_stats: None,
             explain_depth: 0,
             _marker: std::marker::PhantomData,
@@ -1332,6 +1347,9 @@ impl<'a> ExecContext<'a> {
             firing_or: None,
             halt_action: None,
             trigger_changes: 0,
+            autoinc_pending: Vec::new(),
+            autoinc_defer: false,
+            root_noted: None,
             explain_stats: None,
             explain_depth: 0,
             _marker: std::marker::PhantomData,
@@ -1791,15 +1809,59 @@ impl ExecResult {
 /// thread at a time (writers hold `&mut self`; readers never modify).
 pub mod change_counters {
     use std::cell::Cell;
-    thread_local! {
-        static LAST: Cell<i64> = const { Cell::new(0) };
-        static TOTAL: Cell<i64> = const { Cell::new(0) };
-        static LAST_ROWID: Cell<i64> = const { Cell::new(0) };
+    /// The thread's view of the RUNNING connection: its `changes()` /
+    /// `total_changes()` (for the SQL functions), its last insert rowid,
+    /// which connection that is, and how many statement scopes are open.
+    /// One thread-local for all of it: each access is a TLS lookup.
+    struct Slot {
+        owner: Cell<u64>,
+        last: Cell<i64>,
+        total: Cell<i64>,
+        rowid: Cell<i64>,
+        depth: Cell<u32>,
     }
-    /// Record a completed statement's change count.
-    pub fn record(changes: i64) {
-        LAST.with(|c| c.set(changes));
-        TOTAL.with(|t| t.set(t.get() + changes));
+    thread_local! {
+        static SLOT: Slot = const {
+            Slot {
+                owner: Cell::new(0),
+                last: Cell::new(0),
+                total: Cell::new(0),
+                rowid: Cell::new(0),
+                depth: Cell::new(0),
+            }
+        };
+    }
+    /// One connection's `changes()` / `total_changes()` (`v[0]`, `v[1]`)
+    /// and a never-reused id tagging the thread slot that mirrors them.
+    /// Recorders write through to both, so `Database::changes()` reads the
+    /// connection's values from any thread.
+    pub struct ConnCounts {
+        id: u64,
+        v: [std::sync::atomic::AtomicI64; 2],
+    }
+    impl Default for ConnCounts {
+        fn default() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            ConnCounts {
+                id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                v: [
+                    std::sync::atomic::AtomicI64::new(0),
+                    std::sync::atomic::AtomicI64::new(0),
+                ],
+            }
+        }
+    }
+    impl ConnCounts {
+        pub fn changes(&self) -> i64 {
+            self.v[0].load(std::sync::atomic::Ordering::Relaxed)
+        }
+        pub fn total_changes(&self) -> i64 {
+            self.v[1].load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+    /// Record a completed statement's change count (all rows its own).
+    pub fn record(conn: &ConnCounts, changes: i64) {
+        record_outcome(conn, true, changes, 0);
     }
     /// A finished INSERT / UPDATE / DELETE (sqlite3VdbeHalt's change
     /// accounting): `changes()` is the statement's own rows (`direct`),
@@ -1807,63 +1869,70 @@ pub mod change_counters {
     /// (`nested`). A statement that failed and was rolled back counts
     /// nothing and leaves `changes()` at 0; one that `kept` its rows (a
     /// FAIL conflict) counts them.
-    pub fn record_outcome(kept: bool, direct: i64, nested: i64) {
-        if kept {
-            LAST.with(|c| c.set(direct));
-            TOTAL.with(|t| t.set(t.get() + direct + nested));
+    pub fn record_outcome(conn: &ConnCounts, kept: bool, direct: i64, nested: i64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (last_v, add) = if kept {
+            (direct, direct + nested)
         } else {
-            LAST.with(|c| c.set(0));
-        }
-    }
-    /// A connection's counters while one of its statements runs: entry
-    /// loads them into this thread (the SQL functions read the thread
-    /// slot), drop writes them back and restores whatever was loaded
-    /// before — SQLite's counters are per CONNECTION, and a re-entrant
-    /// statement on another connection must not leak into this one.
-    pub struct ConnScope<'a> {
-        conn: &'a [std::sync::atomic::AtomicI64; 2],
-        /// The thread slot's previous owner and values (None when this
-        /// connection already owned it — a nested statement of the same
-        /// connection, e.g. one part of a `;` script).
-        prev: Option<(usize, i64, i64)>,
-    }
-    thread_local! {
-        static OWNER: Cell<usize> = const { Cell::new(0) };
-    }
-    impl<'a> ConnScope<'a> {
-        pub fn enter(conn: &'a [std::sync::atomic::AtomicI64; 2]) -> Self {
-            use std::sync::atomic::Ordering::Relaxed;
-            let me = conn as *const _ as usize;
-            let owner = OWNER.with(|o| o.get());
-            if owner == me {
-                return ConnScope { conn, prev: None };
+            (0, 0)
+        };
+        conn.v[0].store(last_v, Relaxed);
+        let total_v = conn.v[1].fetch_add(add, Relaxed) + add;
+        SLOT.with(|s| {
+            if s.owner.get() == conn.id {
+                s.last.set(last_v);
+                s.total.set(total_v);
             }
-            let prev = Some((owner, last(), total()));
-            OWNER.with(|o| o.set(me));
-            LAST.with(|c| c.set(conn[0].load(Relaxed)));
-            TOTAL.with(|t| t.set(conn[1].load(Relaxed)));
-            ConnScope { conn, prev }
+        });
+    }
+    /// The thread slot holds the running connection's counters for the
+    /// `changes()` / `total_changes()` SQL functions. Entering a statement
+    /// of the connection that already owns the slot costs one TLS lookup;
+    /// a different connection loads its values, and when it nests inside
+    /// another connection's open scope (re-entrant use on this thread) the
+    /// drop gives the slot back. A slot left by a finished scope is simply
+    /// taken over.
+    pub struct ConnScope {
+        prev: Option<(u64, i64, i64)>,
+    }
+    impl ConnScope {
+        #[inline]
+        pub fn enter(conn: &ConnCounts) -> Self {
+            SLOT.with(|s| {
+                let depth = s.depth.get();
+                s.depth.set(depth + 1);
+                let owner = s.owner.get();
+                if owner == conn.id {
+                    return ConnScope { prev: None };
+                }
+                let prev = (depth > 0).then(|| (owner, s.last.get(), s.total.get()));
+                s.owner.set(conn.id);
+                s.last.set(conn.changes());
+                s.total.set(conn.total_changes());
+                ConnScope { prev }
+            })
         }
     }
-    impl Drop for ConnScope<'_> {
+    impl Drop for ConnScope {
         fn drop(&mut self) {
-            use std::sync::atomic::Ordering::Relaxed;
-            self.conn[0].store(last(), Relaxed);
-            self.conn[1].store(total(), Relaxed);
-            if let Some((owner, l, t)) = self.prev {
-                OWNER.with(|o| o.set(owner));
-                LAST.with(|c| c.set(l));
-                TOTAL.with(|tt| tt.set(t));
-            }
+            let prev = self.prev.take();
+            SLOT.with(|s| {
+                s.depth.set(s.depth.get().saturating_sub(1));
+                if let Some((owner, l, t)) = prev {
+                    s.owner.set(owner);
+                    s.last.set(l);
+                    s.total.set(t);
+                }
+            });
         }
     }
     /// Rows modified by the most recent statement.
     pub fn last() -> i64 {
-        LAST.with(|c| c.get())
+        SLOT.with(|s| s.last.get())
     }
     /// Running total across all statements.
     pub fn total() -> i64 {
-        TOTAL.with(|t| t.get())
+        SLOT.with(|s| s.total.get())
     }
     /// Rowid of the most recent successful INSERT on the CURRENT
     /// connection (SQLite's `last_insert_rowid()` is per-connection, so
@@ -1871,11 +1940,11 @@ pub mod change_counters {
     /// every statement entry — cross-connection interleaves on one
     /// thread each observe their own value).
     pub fn note_conn_rowid(rowid: i64) {
-        LAST_ROWID.with(|r| r.set(rowid));
+        SLOT.with(|s| s.rowid.set(rowid));
     }
     /// The current connection's most recent insert rowid (0 = none).
     pub fn conn_rowid() -> i64 {
-        LAST_ROWID.with(|r| r.get())
+        SLOT.with(|s| s.rowid.get())
     }
 }
 
@@ -2467,7 +2536,7 @@ pub(crate) fn eval_row_public(
 /// `Index::on_conflict`): with no OR clause, its constraints then resolve
 /// differently from plain ABORT.
 pub(crate) fn table_conflict_clauses(table: &Table) -> bool {
-    table.pk_conflict.is_some() || table.columns.iter().any(|c| c.not_null_conflict.is_some())
+    table.conflict_clauses
 }
 
 /// The conflict resolution one constraint applies (SQLite's
@@ -20183,8 +20252,18 @@ fn exec_rowid_in(
     // Evaluate the list ONCE (not per row — this is the whole point: the
     // old full-scan + Filter path evaluated the IN predicate 10k times).
     let mut rowids: Vec<i64> = Vec::with_capacity(values.len());
+    let mut min_seeks: Option<bool> = None;
     for e in values {
         let v = evaluate(e, &eval_ctx)?;
+        // SQLite loads the list into an ephemeral index, where a member
+        // EQUAL to an earlier one overwrites it (OP_IdxInsert on an equal
+        // key). The one equal pair that seeks differently is
+        // Integer(i64::MIN) and the boundary Real(-2^63) (OP_SeekRowid
+        // cannot convert it): the later of the two decides.
+        if numeric_rowid_key(&v) == Some(i64::MIN) {
+            min_seeks = Some(rowid_seek_value(&v).is_some());
+            continue;
+        }
         // Members fold through the ROWID-ALIAS affinity (SQLite's
         // `rowid IN (...)` semantics — same conversion as the equality
         // seek): integral REALs ('1.000' → 1.0 → 1) and numeric TEXT
@@ -20195,6 +20274,9 @@ fn exec_rowid_in(
         if let Some(i) = rowid_seek_value(&v) {
             rowids.push(i);
         }
+    }
+    if min_seeks == Some(true) {
+        rowids.push(i64::MIN);
     }
     rowids.sort_unstable();
     rowids.dedup();
@@ -22790,7 +22872,17 @@ fn exec_insert(
     upsert: Option<&crate::sql::ast::UpsertClause>,
     returning: Option<&[crate::sql::ast::ResultColumn]>,
 ) -> Result<ExecResult> {
-    exec_insert_inner(ctx, table, source, columns, on_conflict, upsert, returning)
+    if ctx.trigger_depth > 0 || ctx.autoinc_defer {
+        return exec_insert_inner(ctx, table, source, columns, on_conflict, upsert, returning);
+    }
+    // A top-level INSERT owns the AUTOINCREMENT registers: its own raises
+    // and its trigger programs' stay pending until it completes (see
+    // `autoinc_end`); a halted statement drops them.
+    ctx.autoinc_defer = true;
+    let r = exec_insert_inner(ctx, table, source, columns, on_conflict, upsert, returning);
+    ctx.autoinc_defer = false;
+    ctx.autoinc_pending.clear();
+    r
 }
 
 fn exec_insert_inner(
@@ -22865,8 +22957,14 @@ fn exec_insert_inner(
     // the sequence (`INSERT INTO t(c) VALUES (-8)` then an auto row
     // lands at 1, not -7 — pinned by the stateful fuzz). i64::MIN here
     // made the first auto id negative on negative-only tables.
+    // The statement's high-water register (SQLite's memMax): the stored
+    // sequence, or a raise still pending in the enclosing top-level INSERT
+    // when this one runs inside its trigger program.
     let mut seq_floor: i64 = if is_autoinc {
-        read_sqlite_sequence(ctx, &table.name)?.unwrap_or(0).max(0)
+        read_sqlite_sequence(ctx, &table.name)?
+            .unwrap_or(0)
+            .max(0)
+            .max(autoinc_pending_of(ctx, &table.name))
     } else {
         i64::MIN
     };
@@ -23088,6 +23186,9 @@ fn exec_insert_inner(
                     // cannot have moved except by this loop's own
                     // monotonic appends.
                     let eff = if ctx.triggers_fired_epoch > 0 {
+                        if is_autoinc {
+                            seq_floor = seq_floor.max(autoinc_pending_of(ctx, &table.name));
+                        }
                         max_rowid.max(ctx.get_or_scan_max_rowid_opt(&table)?)
                     } else {
                         max_rowid
@@ -23106,6 +23207,9 @@ fn exec_insert_inner(
                     full_row[idx] = Value::Integer(r);
                     rowid_autogen = true;
                 }
+            }
+            if is_autoinc {
+                autoinc_step(ctx, &table, &full_row, &mut seq_floor)?;
             }
 
             // NOT NULL + CHECK constraints. Always enforced: the NOT NULL
@@ -23134,35 +23238,14 @@ fn exec_insert_inner(
                 &table,
                 &crate::sql::ast::TriggerEvent::Insert,
             ) {
-                crate::executor::triggers::fire_triggers(
+                fire_insert_triggers_resync(
                     ctx,
                     &table,
-                    &crate::sql::ast::TriggerEvent::Insert,
                     crate::sql::ast::TriggerWhen::Before,
-                    Some(&full_row),
-                    None,
-                    &table.col_names,
+                    &full_row,
+                    &mut index_states,
+                    &mut current_root,
                 )?;
-                // Triggers may execute arbitrary SQL against this table
-                // through the generic path (which doesn't know about our
-                // append hints) — the pinned leaves may have split or been
-                // freed. Invalidate every hint; they re-pin on next use.
-                for st in index_states.iter_mut() {
-                    st.clear_hints();
-                }
-                ctx.table_append_hint = None;
-                // The trigger body's writes run through the GENERIC path:
-                // a nested insert may have SPLIT this table's root (and
-                // every index's root). Our statement-local current_root /
-                // index-state roots are now STALE — re-read them from the
-                // ctx overrides, or the next row of this statement splits
-                // the OLD root page again and orphans the first split's
-                // pages (the stateful-fuzz "one row missing after a
-                // trigger-cascade page split" class).
-                current_root = ctx.table_root(&table);
-                for st in index_states.iter_mut() {
-                    st.root = ctx.index_root(&st.idx);
-                }
             }
             let (outcome, landed_rowid) = exec_insert_one_row(
                 ctx,
@@ -23193,19 +23276,6 @@ fn exec_insert_inner(
                     // (The statement-journal Inserted entry is pushed inside
                     // exec_insert_one_row, covering both this generic loop
                     // and the literal fast path.)
-                    // AUTOINCREMENT: raise the sequence high-water to the
-                    // landed rowid (SQLite bumps on every insert that
-                    // exceeds it — auto-allocated or explicit).
-                    if is_autoinc {
-                        if let Some(alias) = table.rowid_alias {
-                            if let Some(crate::types::Value::Integer(r)) = full_row.get(alias) {
-                                if *r > seq_floor {
-                                    seq_floor = *r;
-                                    bump_sqlite_sequence(ctx, &table.name, *r)?;
-                                }
-                            }
-                        }
-                    }
                     if let Some(ret) = returning {
                         returning_rows.push(project_returning_row(
                             ret,
@@ -23243,32 +23313,14 @@ fn exec_insert_inner(
                     &crate::sql::ast::TriggerEvent::Insert,
                 )
             {
-                crate::executor::triggers::fire_triggers(
+                fire_insert_triggers_resync(
                     ctx,
                     &table,
-                    &crate::sql::ast::TriggerEvent::Insert,
                     crate::sql::ast::TriggerWhen::After,
-                    Some(&full_row),
-                    None,
-                    &table.col_names,
+                    &full_row,
+                    &mut index_states,
+                    &mut current_root,
                 )?;
-                // Same hint invalidation as BEFORE triggers.
-                for st in index_states.iter_mut() {
-                    st.clear_hints();
-                }
-                ctx.table_append_hint = None;
-                // The trigger body's writes run through the GENERIC path:
-                // a nested insert may have SPLIT this table's root (and
-                // every index's root). Our statement-local current_root /
-                // index-state roots are now STALE — re-read them from the
-                // ctx overrides, or the next row of this statement splits
-                // the OLD root page again and orphans the first split's
-                // pages (the stateful-fuzz "one row missing after a
-                // trigger-cascade page split" class).
-                current_root = ctx.table_root(&table);
-                for st in index_states.iter_mut() {
-                    st.root = ctx.index_root(&st.idx);
-                }
             }
         }
         // NOTE: this epilogue deliberately writes NOTHING back. Every split
@@ -23287,6 +23339,7 @@ fn exec_insert_inner(
         // (error paths above dropped them un-flushed — the journal
         // handles those rows; see `flush_insert_index_bufs`).
         flush_insert_index_bufs(ctx, &mut index_states)?;
+        autoinc_end(ctx)?;
         if !ctx.in_transaction && !ctx.deferred_flush {
             ctx.pager.flush()?;
         }
@@ -23418,18 +23471,31 @@ fn exec_insert_inner(
                 // AUTOINCREMENT: the sequence floor applies here exactly as
                 // in the VALUES loop — a deleted top rowid must never be
                 // reused (INSERT..SELECT previously allocated plain
-                // max+1, violating the AUTOINCREMENT contract).
+                // max+1, violating the AUTOINCREMENT contract). Rows that
+                // earlier rows' triggers landed on this table count too
+                // (the VALUES loop's overlay consult).
+                let eff = if ctx.triggers_fired_epoch > 0 {
+                    if is_autoinc {
+                        seq_floor = seq_floor.max(autoinc_pending_of(ctx, &table.name));
+                    }
+                    max_rowid.max(ctx.get_or_scan_max_rowid_opt(&table)?)
+                } else {
+                    max_rowid
+                };
                 let r = next_auto_rowid(
                     ctx.pager,
                     current_root,
-                    max_rowid.unwrap_or(0).max(seq_floor),
+                    eff.unwrap_or(0).max(seq_floor),
                     is_autoinc,
                 )?;
                 // A random overflow-lottery rowid lands BELOW the max.
-                max_rowid = Some(max_rowid.map_or(r, |m| m.max(r)));
+                max_rowid = Some(eff.map_or(r, |m| m.max(r)));
                 full_row[idx] = Value::Integer(r);
                 rowid_autogen = true;
             }
+        }
+        if is_autoinc {
+            autoinc_step(ctx, &table, &full_row, &mut seq_floor)?;
         }
 
         // NOT NULL + CHECK constraints (see the VALUES path): OR IGNORE
@@ -23438,6 +23504,18 @@ fn exec_insert_inner(
             continue;
         }
         enforce_child_fks(ctx, &table, &full_row)?;
+        // BEFORE INSERT triggers fire per source row exactly as for a
+        // VALUES row (INSERT ... SELECT used to fire no triggers at all).
+        if has_insert_triggers {
+            fire_insert_triggers_resync(
+                ctx,
+                &table,
+                crate::sql::ast::TriggerWhen::Before,
+                &full_row,
+                &mut index_states,
+                &mut current_root,
+            )?;
+        }
 
         let (outcome, landed_rowid) = exec_insert_one_row(
             ctx,
@@ -23456,21 +23534,6 @@ fn exec_insert_inner(
         match outcome {
             InsertOutcome::Inserted | InsertOutcome::UpdatedExisting => {
                 inserted += 1;
-                // AUTOINCREMENT: raise the sequence high-water to the
-                // landed rowid (identical to the VALUES loop's bump —
-                // INSERT..SELECT previously never bumped sqlite_sequence,
-                // so the next auto id could REUSE ids the SELECT rows had
-                // just landed; found by the PK stress suite).
-                if is_autoinc {
-                    if let Some(alias) = table.rowid_alias {
-                        if let Some(crate::types::Value::Integer(r)) = full_row.get(alias) {
-                            if *r > seq_floor {
-                                seq_floor = *r;
-                                bump_sqlite_sequence(ctx, &table.name, *r)?;
-                            }
-                        }
-                    }
-                }
                 if let Some(ret) = returning {
                     returning_rows.push(project_returning_row(
                         ret,
@@ -23484,6 +23547,18 @@ fn exec_insert_inner(
                 }
             }
             InsertOutcome::Skipped => {}
+        }
+        // AFTER INSERT triggers: the Inserted outcome only (an upsert's DO
+        // UPDATE fired the UPDATE pair instead — see the VALUES loop).
+        if has_insert_triggers && matches!(outcome, InsertOutcome::Inserted) {
+            fire_insert_triggers_resync(
+                ctx,
+                &table,
+                crate::sql::ast::TriggerWhen::After,
+                &full_row,
+                &mut index_states,
+                &mut current_root,
+            )?;
         }
     }
     // NOTE: this epilogue deliberately writes NOTHING back. Every split
@@ -23500,6 +23575,7 @@ fn exec_insert_inner(
     // write-back reverted the root and lost 106 entries.
     // Buffered index sweeps land before the commit/scratch epilogue.
     flush_insert_index_bufs(ctx, &mut index_states)?;
+    autoinc_end(ctx)?;
     if !ctx.in_transaction && !ctx.deferred_flush {
         ctx.pager.flush()?;
     }
@@ -24219,7 +24295,13 @@ fn exec_insert_one_row(
     // never probed, and without a UNIQUE index the write below probes it
     // anyway — the early probe runs only when the order matters.
     let rowid_policy = conflict_policy(stmt_or, table.pk_conflict);
-    let unique_order = sqlite_unique_check_order(index_states, stmt_or);
+    // No UNIQUE index: nothing to order (and no per-row allocation on the
+    // plain bulk-insert path).
+    let unique_order = if index_states.iter().any(|st| st.idx.unique) {
+        sqlite_unique_check_order(index_states, stmt_or)
+    } else {
+        Vec::new()
+    };
     let rowid_checkable =
         !table.without_rowid && !rowid_was_autogenerated && !rowid_is_fresh_beyond_max;
     let early_rowid = rowid_checkable
@@ -24231,7 +24313,7 @@ fn exec_insert_one_row(
         Rowid,
         Index(usize),
     }
-    let mut checks: Vec<Check> = Vec::with_capacity(unique_order.len() + 1);
+    let mut checks: Vec<Check> = Vec::new();
     match upsert_target {
         UpsertTarget::Index(t) if upsert.is_some() => {
             checks.push(Check::Index(t));
@@ -24569,9 +24651,19 @@ fn exec_insert_one_row(
                 }
             }
         }
-        // Track the (possibly new) root page.
+        // Track the root page when a split moved it (the maps already hold
+        // `*current_root`: it was read from them and is written back on
+        // every move).
         *current_root = bt.root;
-        ctx.set_table_root_lc(table_name_lc, *current_root);
+        // Record the root once per statement and again whenever it moves:
+        // a repeat of the pair this statement already recorded is a no-op
+        // lookup (while no trigger has fired — a trigger body may move
+        // the root behind this loop).
+        let noted = (Arc::as_ptr(table) as usize, bt.root);
+        if ctx.triggers_fired_epoch > 0 || ctx.root_noted != Some(noted) {
+            ctx.set_table_root_lc(table_name_lc, bt.root);
+            ctx.root_noted = Some(noted);
+        }
     }
     // Statement journal (here rather than in the callers so the GENERIC
     // loop and the literal fast path both journal): this row has LANDED
@@ -24730,9 +24822,12 @@ fn exec_insert_one_row(
     // statement, and the true max is unknown without a rescan.
     if rowid_was_autogenerated || rowid_is_fresh_beyond_max {
         ctx.set_max_rowid_lc(table_name_lc, rowid);
-    } else {
+    } else if ctx.triggers_fired_epoch > 0 || true_max.map_or(true, |m| rowid > m) {
         ctx.raise_max_rowid_lc(table_name_lc, rowid);
     }
+    // Otherwise the rowid is at most the statement's max, which the cache
+    // entry (filled from it, raised with every row, and lowered only by a
+    // trigger's delete) already covers: the raise is a no-op lookup.
     Ok((InsertOutcome::Inserted, rowid))
 }
 
@@ -25155,18 +25250,32 @@ fn exec_upsert_row(
                         crate::executor::index_am::index_entry_keys(&st.idx, table, &old_row)?;
                     let new_keys =
                         crate::executor::index_am::index_entry_keys(&st.idx, table, &new_row)?;
-                    if old_keys == new_keys {
+                    // Partial indexes hold member rows only: a membership
+                    // change with the same key still moves the entry.
+                    let (old_in, new_in) = partial_membership_pair(
+                        &st.idx,
+                        table,
+                        &old_row,
+                        &new_row,
+                        &ctx.params,
+                        &ctx.named_params,
+                    )?;
+                    if old_keys == new_keys && old_in == new_in {
                         continue;
                     }
                     // The tree shape changes here — drop any append hint.
                     st.clear_hints();
                     let mut ibt = Btree::new(ctx.pager, st.root, true);
-                    for old_key in &old_keys {
-                        ibt.delete_index(old_key, existing_rowid)?;
+                    if old_in {
+                        for old_key in &old_keys {
+                            ibt.delete_index(old_key, existing_rowid)?;
+                        }
                     }
                     let mut ibt = Btree::new(ctx.pager, ibt.root, true);
-                    for new_key in &new_keys {
-                        ibt.insert_index(new_key, existing_rowid)?;
+                    if new_in {
+                        for new_key in &new_keys {
+                            ibt.insert_index(new_key, existing_rowid)?;
+                        }
                     }
                     if st.root != ibt.root {
                         ctx.set_index_root(&st.idx.name, ibt.root);
@@ -26040,7 +26149,7 @@ fn insert_index_entry(
     row: &[Value],
     rowid: i64,
 ) -> Result<()> {
-    let keys = crate::executor::index_am::index_entry_keys(index, table, row)?;
+    let keys = index_member_keys(index, table, row)?;
     if keys.is_empty() {
         return Ok(());
     }
@@ -26063,6 +26172,25 @@ fn insert_index_entry(
     Ok(())
 }
 
+/// The index keys `row` contributes: none when it fails a partial index's
+/// WHERE predicate (SQLite indexes member rows only). Every entry helper
+/// goes through here, so no write path — a rowid move, an FK child move,
+/// a key-change UPDATE — can file a non-member row (a moved row with a
+/// NULL `note` used to land in `... WHERE note IS NOT NULL`, and its stray
+/// entry outlived the row).
+fn index_member_keys(
+    index: &crate::schema::Index,
+    table: &Table,
+    row: &[Value],
+) -> Result<Vec<Vec<u8>>> {
+    if index.partial_expr.is_some()
+        && !index_row_matches_partial(index, table, row, &[], &HashMap::new())?
+    {
+        return Ok(Vec::new());
+    }
+    crate::executor::index_am::index_entry_keys(index, table, row)
+}
+
 /// [`insert_index_entry`] but IDEMPOTENT — an already-present entry
 /// (same (key, rowid) pair) is left untouched. The statement-undo
 /// replay re-inserts OLD index entries on rollback, and with
@@ -26079,7 +26207,7 @@ fn insert_index_entry_if_absent(
     row: &[Value],
     rowid: i64,
 ) -> Result<()> {
-    let keys = crate::executor::index_am::index_entry_keys(index, table, row)?;
+    let keys = index_member_keys(index, table, row)?;
     if keys.is_empty() {
         return Ok(());
     }
@@ -26110,7 +26238,7 @@ fn delete_index_entry(
     row: &[Value],
     rowid: i64,
 ) -> Result<()> {
-    let keys = crate::executor::index_am::index_entry_keys(index, table, row)?;
+    let keys = index_member_keys(index, table, row)?;
     if keys.is_empty() {
         return Ok(());
     }
@@ -26223,6 +26351,97 @@ pub(crate) fn read_sqlite_sequence(ctx: &ExecContext, table_name: &str) -> Resul
         return Err(e);
     }
     Ok(out)
+}
+
+/// Fire the table's `when` INSERT triggers for `full_row`, then re-sync
+/// the statement's cached state: a trigger body runs arbitrary SQL through
+/// the generic path, so pinned append hints may name split or freed leaves
+/// (invalidated; they re-pin on next use), and a nested insert may have
+/// SPLIT this table's or an index's root — the statement-local roots are
+/// re-read, or the next row splits the OLD root again and orphans the
+/// first split's pages (the stateful-fuzz "one row missing after a
+/// trigger-cascade page split" class).
+fn fire_insert_triggers_resync(
+    ctx: &mut ExecContext,
+    table: &Arc<Table>,
+    when: crate::sql::ast::TriggerWhen,
+    full_row: &Vec<Value>,
+    index_states: &mut [IndexMaintState],
+    current_root: &mut u32,
+) -> Result<()> {
+    crate::executor::triggers::fire_triggers(
+        ctx,
+        table,
+        &crate::sql::ast::TriggerEvent::Insert,
+        when,
+        Some(full_row),
+        None,
+        &table.col_names,
+    )?;
+    for st in index_states.iter_mut() {
+        st.clear_hints();
+    }
+    ctx.table_append_hint = None;
+    *current_root = ctx.table_root(table);
+    for st in index_states.iter_mut() {
+        st.root = ctx.index_root(&st.idx);
+    }
+    Ok(())
+}
+
+/// An enclosing statement's not-yet-written AUTOINCREMENT high-water for
+/// `table_name` (0 when none).
+fn autoinc_pending_of(ctx: &ExecContext, table_name: &str) -> i64 {
+    ctx.autoinc_pending
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(table_name))
+        .map_or(0, |(_, v)| *v)
+}
+
+/// SQLite's autoIncStep (OP_MemMax): every rowid an INSERT computes raises
+/// the AUTOINCREMENT register — before any constraint check, so a row that
+/// OR IGNORE then drops still advances the sequence. Under a top-level
+/// INSERT the raise stays pending (`autoinc_end` writes it); an INSERT run
+/// by an UPDATE / DELETE trigger writes at once.
+fn autoinc_step(
+    ctx: &mut ExecContext,
+    table: &Table,
+    full_row: &[Value],
+    seq_floor: &mut i64,
+) -> Result<()> {
+    let Some(Value::Integer(r)) = table.rowid_alias.and_then(|a| full_row.get(a)) else {
+        return Ok(());
+    };
+    if *r <= *seq_floor {
+        return Ok(());
+    }
+    *seq_floor = *r;
+    if !ctx.autoinc_defer {
+        return bump_sqlite_sequence(ctx, &table.name, *r);
+    }
+    match ctx
+        .autoinc_pending
+        .iter_mut()
+        .find(|(n, _)| n.eq_ignore_ascii_case(&table.name))
+    {
+        Some((_, v)) => *v = (*v).max(*r),
+        None => ctx.autoinc_pending.push((table.name.clone(), *r)),
+    }
+    Ok(())
+}
+
+/// sqlite3AutoincrementEnd: a top-level INSERT that ran to completion
+/// stores every high-water it and its trigger programs raised. A statement
+/// halted by FAIL / ABORT / ROLLBACK never gets here, so it writes nothing
+/// — even the rows FAIL keeps leave the sequence alone.
+fn autoinc_end(ctx: &mut ExecContext) -> Result<()> {
+    if ctx.trigger_depth > 0 || ctx.autoinc_pending.is_empty() {
+        return Ok(());
+    }
+    for (name, seq) in std::mem::take(&mut ctx.autoinc_pending) {
+        bump_sqlite_sequence(ctx, &name, seq)?;
+    }
+    Ok(())
 }
 
 /// AUTOINCREMENT high-water write: upsert `table_name` -> `seq` in
@@ -27286,14 +27505,7 @@ fn try_streaming_update(
     // the general path (`check_row_constraints`, simulate_update_unique).
     let plain_abort = match stmt_or {
         Some(o) => o == ConflictResolution::Abort,
-        None => {
-            !table_conflict_clauses(table)
-                && !ctx
-                    .catalog()
-                    .indexes_on_table(&table.name)
-                    .iter()
-                    .any(|i| i.on_conflict.is_some())
-        }
+        None => !table_conflict_clauses(table),
     };
     if !plain_abort {
         return Ok(None);

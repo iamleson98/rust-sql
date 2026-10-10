@@ -248,11 +248,21 @@ fn in_linear(
     } else {
         None
     };
+    // i64::MIN under rowid-seek membership: SQLite's ephemeral IN index
+    // keeps the LAST of equal members, and the boundary Real(-2^63) equals
+    // Integer(i64::MIN) yet seeks nothing — the later of the two decides.
+    let mut min_seeks: Option<bool> = None;
     for cand in vals {
         let c = cand.eval(row, positions, params);
         if matches!(&*c, Value::Null) {
             saw_null = true;
         } else if let Some(r) = v_rowid {
+            if r == i64::MIN {
+                if super::numeric_rowid_key(&c) == Some(i64::MIN) {
+                    min_seeks = Some(super::rowid_seek_value(&c).is_some());
+                }
+                continue;
+            }
             // Rowid-SEEK membership (SQLite's IN-loop plan drives rowid
             // seeks with the members): OP_SeekRowid's conversion per
             // member — `id IN (-2^63.0, '5')` matches only rowid 5 (the
@@ -265,6 +275,9 @@ fn in_linear(
             found = true;
             break;
         }
+    }
+    if min_seeks == Some(true) {
+        found = true;
     }
     (found, saw_null)
 }

@@ -87,7 +87,14 @@ fn main() {
     let text = std::fs::read_to_string(path).unwrap();
     let mut ours = Database::open_in_memory().unwrap();
     let sq = rusqlite::Connection::open_in_memory().unwrap();
-    for (i, line) in text.lines().enumerate() {
+    // RAW=1: statements are separated by U+001E, so string literals keep
+    // their embedded newlines byte for byte.
+    let stmts: Vec<&str> = if std::env::var("RAW").is_ok() {
+        text.split('\u{1e}').collect()
+    } else {
+        text.lines().collect()
+    };
+    for (i, line) in stmts.into_iter().enumerate() {
         let sql = line.trim();
         if sql.is_empty() || sql.starts_with("--") {
             continue;

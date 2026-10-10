@@ -621,6 +621,7 @@ pub(crate) fn vtab_columns_to_schema(
         vtab: None,
         pk_conflict: None,
         check_labels: Vec::new(),
+        conflict_clauses: false,
     };
     for (name, ty) in cols {
         let affinity = crate::types::Affinity::from_declared_type(ty);

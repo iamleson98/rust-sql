@@ -727,9 +727,34 @@ thread_local! {
     static WRITER_SCOPE: Cell<Option<(u64, u64)>> = const { Cell::new(None) };
 }
 
+/// Threads (process-wide) whose `WRITER_SCOPE` slot is `Some`. A thread
+/// that armed its own slot always observes its own increment (same-thread
+/// coherence on one atomic, and every thread's decrement follows its
+/// increment in the modification order), so a zero read proves THIS
+/// thread's slot is `None`: the plain regime skips the TLS lookup.
+static WRITER_SCOPES_LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Current armed scope (instance, txn) — `None` when not armed.
 pub(crate) fn writer_scope() -> Option<(u64, u64)> {
+    if WRITER_SCOPES_LIVE.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
     WRITER_SCOPE.with(|c| c.get())
+}
+
+/// Replace this thread's writer scope, keeping `WRITER_SCOPES_LIVE` exact.
+fn replace_writer_scope(new: Option<(u64, u64)>) -> Option<(u64, u64)> {
+    let old = WRITER_SCOPE.with(|c| c.replace(new));
+    match (old.is_some(), new.is_some()) {
+        (false, true) => {
+            WRITER_SCOPES_LIVE.fetch_add(1, Ordering::Relaxed);
+        }
+        (true, false) => {
+            WRITER_SCOPES_LIVE.fetch_sub(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+    old
 }
 
 thread_local! {
@@ -903,7 +928,7 @@ impl Drop for WriterScopeGuard<'_> {
         if self.noop {
             return;
         }
-        WRITER_SCOPE.with(|c| c.set(self.prev.take()));
+        replace_writer_scope(self.prev.take());
         self.pager.concurrent.note_scope_dropped();
         self.pager.refresh_concurrent_gate();
     }
@@ -977,7 +1002,7 @@ impl Pager {
     /// commit/rollback paths) or replaced by the next arm of a
     /// different transaction.
     pub fn arm_writer_scope(&self, txn_id: u64) -> WriterScopeGuard<'_> {
-        let cur = WRITER_SCOPE.with(|c| c.get());
+        let cur = writer_scope();
         if cur == Some((self.instance_id, txn_id)) {
             return WriterScopeGuard {
                 prev: None,
@@ -985,7 +1010,7 @@ impl Pager {
                 noop: true,
             };
         }
-        let prev = WRITER_SCOPE.with(|c| c.replace(Some((self.instance_id, txn_id))));
+        let prev = replace_writer_scope(Some((self.instance_id, txn_id)));
         self.concurrent.note_scope_armed();
         // Kill this thread's table-leaf hints: a hint recorded by a
         // PREVIOUS statement (or another connection sharing this thread —
@@ -1013,14 +1038,10 @@ impl Pager {
     /// transaction). No-op when this thread serves a different
     /// transaction or none.
     pub fn disarm_writer_scope_if(&self, txn_id: u64) {
-        let matched = WRITER_SCOPE.with(|c| {
-            if c.get() == Some((self.instance_id, txn_id)) {
-                c.set(None);
-                true
-            } else {
-                false
-            }
-        });
+        let matched = writer_scope() == Some((self.instance_id, txn_id));
+        if matched {
+            replace_writer_scope(None);
+        }
         if matched {
             self.concurrent.note_scope_dropped();
             self.refresh_concurrent_gate();

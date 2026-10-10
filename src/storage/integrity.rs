@@ -88,6 +88,15 @@ impl RowidSet {
         }
     }
 
+    /// Number of members.
+    fn len(&self) -> usize {
+        self.bits
+            .iter()
+            .map(|w| w.count_ones() as usize)
+            .sum::<usize>()
+            + self.tail.len()
+    }
+
     /// Iterate every member (bitset words then tail — order is
     /// irrelevant to the difference/containment uses here).
     fn iter(&self) -> impl Iterator<Item = i64> + '_ {
@@ -201,6 +210,8 @@ pub fn integrity_check(
     let mut table_rowids: Vec<(String, std::sync::Arc<RowidSet>)> =
         Vec::with_capacity(tables.len());
     let mut table_rows: Vec<(String, RowidRows)> = Vec::new();
+    // Each table's walked root (the index checks rescan the owner rows).
+    let mut table_roots: Vec<(String, u32)> = Vec::with_capacity(tables.len());
     // Every b-tree root walked (page accounting below): the schema tree
     // plus each table and index.
     let mut all_roots: Vec<u32> = vec![0];
@@ -226,6 +237,7 @@ pub fn integrity_check(
         if table.vtab.is_none() && root != 0 {
             all_roots.push(root);
         }
+        table_roots.push((name.clone(), root));
         let capture = partial_owners.contains(&name.to_ascii_lowercase());
         let (rowids, rows) = check_table_tree(pager, table, root, &mut p, capture);
         table_rowids.push((name.clone(), std::sync::Arc::new(rowids)));
@@ -268,6 +280,10 @@ pub fn integrity_check(
                 .iter()
                 .find(|(t, _)| t.eq_ignore_ascii_case(&idx.table))
                 .map(|(_, tbl)| tbl.as_ref());
+            let owner_root = table_roots
+                .iter()
+                .find(|(t, _)| t.eq_ignore_ascii_case(&idx.table))
+                .map(|(_, r)| *r);
             check_index_tree(
                 pager,
                 idx,
@@ -275,6 +291,7 @@ pub fn integrity_check(
                 owner.as_deref(),
                 partial_rows,
                 table_desc,
+                owner_root,
                 &mut p,
             );
         }
@@ -464,6 +481,7 @@ fn check_table_tree(
 /// (SQLite semantics: predicate-excluded rows are legitimately absent).
 /// `partial_rows` carries the owning table's decoded rows for predicate
 /// evaluation (present only when the index is partial).
+#[allow(clippy::too_many_arguments)]
 fn check_index_tree(
     pager: &Pager,
     idx: &Index,
@@ -471,12 +489,17 @@ fn check_index_tree(
     owner_rowids: Option<&RowidSet>,
     partial_rows: Option<&[(i64, Vec<Value>)]>,
     table: Option<&Table>,
+    owner_root: Option<u32>,
     p: &mut Problems,
 ) {
     let mut prev: Option<(Vec<u8>, i64)> = None;
     let mut index_rowids = RowidSet::default();
+    let mut n_entries = 0usize;
+    let mut fingerprint = 0u64;
     let mut bt = Btree::new(pager, root, true);
     let scan = bt.scan_index(|rowid, key| {
+        n_entries += 1;
+        fingerprint = fingerprint.wrapping_add(entry_hash(key, rowid));
         if let Some((pk, pr)) = &prev {
             if key <= pk.as_slice() && rowid <= *pr {
                 p.push(format!(
@@ -508,6 +531,15 @@ fn check_index_tree(
                 idx.name, r, idx.table
             ));
         }
+    }
+    // Table -> index, key-exact (SQLite seeks every row's computed key):
+    // an ordinary b-tree index must hold exactly the (key, rowid) entry
+    // each member row computes — a rowid-level match misses an entry
+    // filed under a STALE key.
+    if let (crate::schema::IndexKind::Btree, Some(t), Some(troot)) = (&idx.kind, table, owner_root)
+    {
+        check_index_keys(pager, idx, t, troot, root, n_entries, fingerprint, owner, p);
+        return;
     }
     // Table -> index: every live row must have an index entry — except
     // rows a partial index's WHERE predicate excludes (those are
@@ -572,6 +604,97 @@ fn check_index_tree(
                 missing_count, idx.name
             ));
         }
+    }
+}
+
+/// Order-independent fingerprint term of one index entry.
+fn entry_hash(key: &[u8], rowid: i64) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    rowid.hash(&mut h);
+    h.finish()
+}
+
+/// The key-exact half of [`check_index_tree`] for an ordinary b-tree
+/// index (SQLite's per-row OP_Found probe, at O(1) memory): rescan the
+/// owner, compute each member row's key, and compare the multiset of
+/// (key, rowid) pairs with the index's through `fingerprint`. Only a
+/// mismatch pays for a second pass that names the rows whose entry is
+/// missing. The entry count is compared for non-partial indexes only,
+/// exactly as SQLite does ("wrong # of entries in index").
+#[allow(clippy::too_many_arguments)]
+fn check_index_keys(
+    pager: &Pager,
+    idx: &Index,
+    table: &Table,
+    table_root: u32,
+    index_root: u32,
+    n_entries: usize,
+    fingerprint: u64,
+    owner: &RowidSet,
+    p: &mut Problems,
+) {
+    let n_cols = table.n_columns();
+    let alias = table.rowid_alias;
+    let no_params = std::collections::HashMap::new();
+    // Each member row's computed (key, rowid) term; `None` = not indexed.
+    let expected_term = |rowid: i64, payload: &[u8]| -> Option<u64> {
+        let row = crate::storage::row_codec::decode_row(payload, n_cols, rowid, alias).ok()?;
+        if idx.partial_expr.is_some()
+            && !crate::executor::index_row_matches_partial(idx, table, &row, &[], &no_params)
+                .unwrap_or(false)
+        {
+            return None;
+        }
+        let key = crate::executor::encode_index_key(idx, table, &row).ok()?;
+        Some(entry_hash(&key, rowid))
+    };
+    let mut expected_fp = 0u64;
+    let mut n_expected = 0usize;
+    let mut tbt = Btree::new(pager, table_root, false);
+    let _ = tbt.scan_table(|rowid, payload| {
+        if let Some(h) = expected_term(rowid, payload) {
+            expected_fp = expected_fp.wrapping_add(h);
+            n_expected += 1;
+        }
+        true
+    });
+    if expected_fp != fingerprint || n_expected != n_entries {
+        // Name the rows whose computed entry is absent.
+        let mut present: std::collections::HashSet<u64> =
+            std::collections::HashSet::with_capacity(n_entries);
+        let mut ibt = Btree::new(pager, index_root, true);
+        let _ = ibt.scan_index(|rowid, key| {
+            present.insert(entry_hash(key, rowid));
+            true
+        });
+        let mut missing_count = 0usize;
+        let mut missing_first: Vec<i64> = Vec::new();
+        let mut tbt = Btree::new(pager, table_root, false);
+        let _ = tbt.scan_table(|rowid, payload| {
+            if let Some(h) = expected_term(rowid, payload) {
+                if !present.contains(&h) {
+                    missing_count += 1;
+                    if missing_first.len() < 5 {
+                        missing_first.push(rowid);
+                    }
+                }
+            }
+            true
+        });
+        for r in &missing_first {
+            p.push(format!("row {} missing from index {}", r, idx.name));
+        }
+        if missing_count > 5 {
+            p.push(format!(
+                "{} rows missing from index {} (showing first 5)",
+                missing_count, idx.name
+            ));
+        }
+    }
+    if idx.partial_expr.is_none() && n_entries != owner.len() {
+        p.push(format!("wrong # of entries in index {}", idx.name));
     }
 }
 
@@ -721,4 +844,82 @@ pub(crate) fn check_page_accounting(pager: &Pager, roots: &[u32]) -> Vec<String>
         }
     }
     problems
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::storage::btree::Btree;
+    use crate::types::Value;
+    use crate::Database;
+
+    fn verdict(db: &Database) -> Vec<String> {
+        db.query("PRAGMA integrity_check", ())
+            .unwrap()
+            .into_iter()
+            .map(|r| r[0].as_text().to_string())
+            .collect()
+    }
+
+    fn index_root(db: &Database, name: &str) -> u32 {
+        let live = db.maps.read().index_roots.get(name).copied();
+        live.unwrap_or_else(|| db.catalog.get_index(name).unwrap().root_page)
+    }
+
+    /// Re-file `rowid`'s entry in `index` from `from`'s key to `to`'s
+    /// (`from = None`: add a stray entry).
+    fn refile(db: &Database, index: &str, rowid: i64, from: Option<&[Value]>, to: &[Value]) {
+        let table = db.catalog.get_table("t").unwrap();
+        let idx = db.catalog.get_index(index).unwrap();
+        let mut bt = Btree::new(&db.pager, index_root(db, index), true);
+        if let Some(from) = from {
+            let k = crate::executor::encode_index_key(&idx, &table, from).unwrap();
+            bt.delete_index(&k, rowid).unwrap();
+        }
+        let k = crate::executor::encode_index_key(&idx, &table, to).unwrap();
+        bt.insert_index(&k, rowid).unwrap();
+        assert_eq!(
+            bt.root,
+            index_root(db, index),
+            "no root split in this fixture"
+        );
+    }
+
+    /// Index entries are verified key-exactly (SQLite probes each row's
+    /// computed key, not just its rowid), with SQLite's entry-count rule:
+    /// a non-partial index must hold one entry per row, while a partial
+    /// index's count is not compared — SQLite reports a stray entry there
+    /// as `ok`, and so do we.
+    #[test]
+    fn index_entries_are_checked_key_exactly() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n TEXT)", [])
+            .unwrap();
+        db.execute("CREATE INDEX ix ON t(n)", []).unwrap();
+        db.execute("CREATE INDEX px ON t(n) WHERE n IS NOT NULL", [])
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a'), (2, NULL), (3, 'c')", [])
+            .unwrap();
+        assert_eq!(verdict(&db), vec!["ok"]);
+        let row = |id: i64, n: Option<&str>| {
+            vec![
+                Value::Integer(id),
+                n.map_or(Value::Null, |s| Value::Text(s.into())),
+            ]
+        };
+
+        // A partial index's stray entry for a non-member row: SQLite's
+        // verdict is ok (no entry count for partial indexes).
+        refile(&db, "px", 2, None, &row(2, None));
+        assert_eq!(verdict(&db), vec!["ok"]);
+
+        // Row 1's entry filed under a stale key: rowid-level checks see
+        // it, the key-exact probe does not.
+        refile(&db, "ix", 1, Some(&row(1, Some("a"))), &row(1, Some("zz")));
+        assert_eq!(verdict(&db), vec!["row 1 missing from index ix"]);
+        refile(&db, "ix", 1, Some(&row(1, Some("zz"))), &row(1, Some("a")));
+
+        // A second entry for row 3 in a non-partial index.
+        refile(&db, "ix", 3, None, &row(3, Some("q")));
+        assert_eq!(verdict(&db), vec!["wrong # of entries in index ix"]);
+    }
 }

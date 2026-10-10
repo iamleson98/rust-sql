@@ -114,14 +114,17 @@ impl Database {
         // Open the engine. ':memory:' (and the anonymous '' form) is an
         // in-memory database; anything else is a file (created when
         // missing — SQLite's ATTACH default is read-write-create).
-        let engine: Arc<RwLock<Database>> = if file.is_empty()
+        let mut db = if file.is_empty()
             || file.eq_ignore_ascii_case(":memory:")
             || file.eq_ignore_ascii_case("file::memory:")
         {
-            Arc::new(RwLock::new(Database::open_in_memory()?))
+            Database::open_in_memory()?
         } else {
-            Arc::new(RwLock::new(Database::open(file)?))
+            Database::open(file)?
         };
+        // One connection, one set of change counters across its databases.
+        db.change_counts = Arc::clone(&self.change_counts);
+        let engine: Arc<RwLock<Database>> = Arc::new(RwLock::new(db));
         // ATTACH inside a transaction: the new database joins the
         // transaction (SQLite journals its writes with the rest).
         if self

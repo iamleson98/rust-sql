@@ -1363,11 +1363,21 @@ fn table_leaf_search(
     borrowed: &crate::storage::page::Page,
     rowid: i64,
 ) -> Result<std::result::Result<u16, u16>> {
-    let (mut lo, mut hi) = (0u16, borrowed.n_cells());
+    // The pointer array's base and bounds once, then plain slice reads
+    // per probe (the per-probe header-offset + range checks of
+    // `cell_pointer` / `cell_slice_checked` were a third of the search).
+    let n = borrowed.n_cells();
+    let data = borrowed.data.as_slice();
+    let base = borrowed.cell_pointer_base();
+    if base + n as usize * 2 > data.len() {
+        return Err(Error::corruption("cell pointer array overruns the page"));
+    }
+    let (mut lo, mut hi) = (0u16, n);
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        let ptr = borrowed.cell_pointer(mid) as usize;
-        let Some((r, _)) = decode_rowid_only(borrowed.cell_slice_checked(ptr)?) else {
+        let o = base + mid as usize * 2;
+        let ptr = u16::from_be_bytes([data[o], data[o + 1]]) as usize;
+        let Some((r, _)) = data.get(ptr..).and_then(decode_rowid_only) else {
             return Err(Error::corruption("truncated leaf rowid in search"));
         };
         match r.cmp(&rowid) {
@@ -2111,6 +2121,60 @@ pub struct AppendHint {
     /// that resumes after a scattered prefix re-engages the fast path
     /// within `APPEND_PROBE_EVERY` rows.
     pub probe_in: u16,
+    /// The pinned leaf's PARENT as the right-edge walk saw it (0 = none
+    /// known — the leaf is the root, or the walk took a degenerate edge),
+    /// pinned by its own `(serial, epoch)`: the splice target of
+    /// `quick_append_split`.
+    parent: PageId,
+    parent_serial: u64,
+    parent_epoch: u32,
+}
+
+/// Encoded size of a local table-leaf cell: varint rowid + varint
+/// payload length + payload.
+#[inline]
+fn local_table_leaf_cell_size(rowid: i64, payload_len: usize) -> usize {
+    let mut buf = [0u8; 9];
+    varint::encode_signed(rowid, &mut buf)
+        + varint::encode(payload_len as u64, &mut buf)
+        + payload_len
+}
+
+/// Write the local table-leaf cell `(rowid, payload)` as cell `n`, the
+/// page's last, straight into the page bytes. The caller has checked the
+/// key order and `free_space() >= size + 2`. `false` (nothing written)
+/// when the header's content start leaves no room — a corrupt page.
+fn append_table_leaf_cell(
+    b: &mut crate::storage::page::Page,
+    page_id: PageId,
+    n: u16,
+    rowid: i64,
+    payload: &[u8],
+) -> bool {
+    let mut rid_buf = [0u8; 9];
+    let n_rid = varint::encode_signed(rowid, &mut rid_buf);
+    let mut plen_buf = [0u8; 9];
+    let n_plen = varint::encode(payload.len() as u64, &mut plen_buf);
+    let size = n_rid + n_plen + payload.len();
+    let start = b.cell_content_start() as usize;
+    if start < size || start > b.data.len() {
+        return false;
+    }
+    let off = start - size;
+    b.data[off..off + n_rid].copy_from_slice(&rid_buf[..n_rid]);
+    b.data[off + n_rid..off + n_rid + n_plen].copy_from_slice(&plen_buf[..n_plen]);
+    b.data[off + n_rid + n_plen..off + size].copy_from_slice(payload);
+    b.set_cell_content_start(off as u32);
+    let header_offset = if page_id == 0 {
+        crate::storage::page::DB_HEADER_SIZE as usize
+    } else {
+        0
+    };
+    let dst = header_offset + PAGE_HEADER_SIZE as usize + n as usize * 2;
+    b.data[dst..dst + 2].copy_from_slice(&(off as u16).to_be_bytes());
+    b.set_n_cells(n + 1);
+    b.touch();
+    true
 }
 
 /// Out-of-order declines after which the append attempt is suppressed.
@@ -2129,7 +2193,21 @@ impl AppendHint {
             scope: None,
             miss_streak: 0,
             probe_in: 0,
+            parent: 0,
+            parent_serial: 0,
+            parent_epoch: 0,
         }
+    }
+
+    /// This pin with the leaf's parent pinned too.
+    #[inline]
+    fn with_parent(mut self, parent: Option<(PageId, u64, u32)>) -> Self {
+        if let Some((p, s, e)) = parent {
+            self.parent = p;
+            self.parent_serial = s;
+            self.parent_epoch = e;
+        }
+        self
     }
 
     /// Carry the stream state onto a re-pinned leaf (structural
@@ -2143,6 +2221,9 @@ impl AppendHint {
             scope: self.scope,
             miss_streak: other.miss_streak,
             probe_in: other.probe_in,
+            parent: self.parent,
+            parent_serial: self.parent_serial,
+            parent_epoch: self.parent_epoch,
         }
     }
 }
@@ -3778,6 +3859,12 @@ impl<'a> Btree<'a> {
                     return Ok(Some(h));
                 }
                 AppendTry::Declined => {
+                    // Full right-most leaf under a pinned parent: SQLite's
+                    // balance_quick — a new right sibling holding just this
+                    // row, spliced into the parent without a descent.
+                    if let Some(nh) = self.quick_append_split(&h, rowid, payload)? {
+                        return Ok(Some(nh.carry_stream_state_from(&h)));
+                    }
                     // Stale pin / full leaf (a split is incoming): the
                     // general insert places the row, and the right edge
                     // genuinely moved — re-establish the hint. The
@@ -3821,6 +3908,9 @@ impl<'a> Btree<'a> {
                 Ok(Some(leaf_pin))
             }
             AppendTry::Declined => {
+                if let Some(nh) = self.quick_append_split(&leaf_pin, rowid, payload)? {
+                    return Ok(Some(nh));
+                }
                 // Not an append / full leaf — the normal insert path
                 // handles splitting + propagation.
                 self.insert_table(rowid, payload)?;
@@ -3829,6 +3919,105 @@ impl<'a> Btree<'a> {
                 Ok(Some(self.right_most_leaf_hinted()?))
             }
         }
+    }
+
+    /// SQLite's balance_quick for an append stream: the pinned right-most
+    /// leaf is full and `rowid` lies past its last cell, so the row starts
+    /// a NEW right sibling (just that cell — the old leaf stays untouched,
+    /// as in `append_split`) and the pinned parent takes the separator
+    /// `(old leaf, rowid - 1)` with its right-most pointer moved to the new
+    /// leaf — no root-to-leaf descent, no re-pinning walk. `Ok(None)`
+    /// whenever any precondition fails (stale pin, parent full, overflow
+    /// payload, concurrent regime): the general path then splits as usual.
+    fn quick_append_split(
+        &mut self,
+        h: &AppendHint,
+        rowid: i64,
+        payload: &[u8],
+    ) -> Result<Option<AppendHint>> {
+        // Plain regime only: the concurrent regime's decision reads and
+        // shadow stamps live in the general split path.
+        if h.parent == 0 || h.scope.is_some() || self.pager.concurrent_scope_armed() {
+            return Ok(None);
+        }
+        if payload.len() > self.max_cell_payload() {
+            return Ok(None);
+        }
+        let Ok(leaf) = self.pager.get_page(h.page) else {
+            return Ok(None);
+        };
+        {
+            let b = leaf.lock();
+            if !matches!(b.page_type(), Ok(PageType::LeafTable)) || !h.still_pins(&b) {
+                return Ok(None);
+            }
+            let n = b.n_cells();
+            if n == 0 {
+                return Ok(None);
+            }
+            let last_ptr = b.cell_pointer(n - 1) as usize;
+            let Ok(cell) = b.cell_slice_checked(last_ptr) else {
+                return Ok(None);
+            };
+            match varint::decode_signed(cell) {
+                Some((last, _)) if last < rowid => {}
+                _ => return Ok(None),
+            }
+        }
+        let Ok(parent) = self.pager.get_page(h.parent) else {
+            return Ok(None);
+        };
+        let sep = Cell::TableInterior {
+            left_child: h.page,
+            key: rowid - 1,
+        };
+        let sep_size = sep.encoded_size() as u32;
+        {
+            let b = parent.lock();
+            if !matches!(b.page_type(), Ok(PageType::InteriorTable))
+                || b.serial != h.parent_serial
+                || b.epoch != h.parent_epoch
+                || b.right_most_pointer() != h.page
+                || b.free_space() < sep_size + 2
+            {
+                return Ok(None);
+            }
+        }
+        // The new right leaf holds just this row.
+        let new_id = self.pager.allocate_page()?;
+        let (serial, epoch) = {
+            let np = self.pager.get_page(new_id)?;
+            let mut b = np.lock();
+            b.init_leaf_table();
+            if !append_table_leaf_cell(&mut b, new_id, 0, rowid, payload) {
+                return Err(Error::corruption("fresh leaf cannot hold a local cell"));
+            }
+            (b.serial, b.epoch)
+        };
+        // Parent: append the separator cell and retarget the right edge
+        // (the `[parent:rm]` splice of the general path).
+        let parent = self.pager.get_page(h.parent)?;
+        let (parent_serial, parent_epoch) = {
+            let mut b = parent.lock();
+            let n_now = b.n_cells();
+            let start = b.cell_content_start() - sep_size;
+            let mut buf = Vec::with_capacity(sep_size as usize);
+            sep.encode(&mut buf);
+            let off = start as usize;
+            b.data[off..off + sep_size as usize].copy_from_slice(&buf);
+            b.set_cell_content_start(start);
+            // `h.parent != 0`: never the header page, no DB header offset.
+            let dst = PAGE_HEADER_SIZE as usize + n_now as usize * 2;
+            b.data[dst..dst + 2].copy_from_slice(&(start as u16).to_be_bytes());
+            b.set_n_cells(n_now + 1);
+            b.set_right_most_pointer(new_id);
+            b.touch();
+            (b.serial, b.epoch)
+        };
+        self.pager.note_dirty(h.parent);
+        Ok(Some(AppendHint::fresh(new_id, serial, epoch).with_parent(
+            Some((h.parent, parent_serial, parent_epoch)),
+        )))
     }
 
     /// Try to append `rowid -> payload` directly into the leaf pinned by
@@ -3858,30 +4047,9 @@ impl<'a> Btree<'a> {
             Ok(p) => p,
             Err(_) => return Ok(AppendTry::Declined),
         };
-        // Cell bytes: varint rowid + varint payload len + payload. Typical
-        // rows are well under 256 bytes — build in a stack buffer and only
-        // fall back to the heap when genuinely large (avoids a per-insert
-        // `Vec::with_capacity` allocation for the common case).
-        let mut cell_stack = [0u8; 256];
-        let mut cell_heap: Vec<u8>;
-        let mut rid_buf = [0u8; 9];
-        let n_rid = varint::encode_signed(rowid, &mut rid_buf);
-        let mut plen_buf = [0u8; 9];
-        let n_plen = varint::encode(payload.len() as u64, &mut plen_buf);
-        let cell_len = n_rid + n_plen + payload.len();
-        let cell: &[u8] = if cell_len <= cell_stack.len() {
-            cell_stack[..n_rid].copy_from_slice(&rid_buf[..n_rid]);
-            cell_stack[n_rid..n_rid + n_plen].copy_from_slice(&plen_buf[..n_plen]);
-            cell_stack[n_rid + n_plen..cell_len].copy_from_slice(payload);
-            &cell_stack[..cell_len]
-        } else {
-            cell_heap = Vec::with_capacity(cell_len);
-            cell_heap.extend_from_slice(&rid_buf[..n_rid]);
-            cell_heap.extend_from_slice(&plen_buf[..n_plen]);
-            cell_heap.extend_from_slice(payload);
-            &cell_heap
-        };
-        let cell_size = cell.len() as u32;
+        // Cell bytes: varint rowid + varint payload len + payload, written
+        // straight into the page below (no staging copy of the payload).
+        let cell_size = local_table_leaf_cell_size(rowid, payload.len()) as u32;
 
         let mut borrowed = page.lock();
         // Stale-pin tolerance: a hint that crossed a ROLLBACK / failed
@@ -3935,33 +4103,15 @@ impl<'a> Btree<'a> {
         }
 
         // Append: write cell at the new content start, write pointer at end.
-        {
-            let new_content_start = borrowed.cell_content_start().saturating_sub(cell_size);
-            let off = new_content_start as usize;
-            if off + cell_size as usize > borrowed.data.len() {
-                // Corrupt page header (content start out of range): refuse
-                // the append instead of slicing out of bounds.
-                return Ok(AppendTry::Declined);
-            }
-            borrowed.data[off..off + cell_size as usize].copy_from_slice(cell);
-            borrowed.set_cell_content_start(new_content_start);
-
-            // Append the cell pointer at position `n` (end).
-            let header_offset = if leaf_id == 0 {
-                crate::storage::page::DB_HEADER_SIZE as usize
-            } else {
-                0
-            };
-            let ptr_array_start = header_offset + PAGE_HEADER_SIZE as usize;
-            let dst = ptr_array_start + n as usize * 2;
-            borrowed.data[dst..dst + 2].copy_from_slice(&(new_content_start as u16).to_be_bytes());
-            borrowed.set_n_cells(n + 1);
-            borrowed.touch();
-            let new_hint = AppendHint::fresh(leaf_id, borrowed.serial, borrowed.epoch);
-            drop(borrowed);
-            self.pager.note_dirty(leaf_id);
-            Ok(AppendTry::Appended(new_hint))
+        if !append_table_leaf_cell(&mut borrowed, leaf_id, n, rowid, payload) {
+            // Corrupt page header (content start out of range): refuse
+            // the append instead of slicing out of bounds.
+            return Ok(AppendTry::Declined);
         }
+        let new_hint = AppendHint::fresh(leaf_id, borrowed.serial, borrowed.epoch);
+        drop(borrowed);
+        self.pager.note_dirty(leaf_id);
+        Ok(AppendTry::Appended(new_hint))
     }
 
     /// Cheap upper-bound row estimate for parallel-scan eligibility: the
@@ -4042,6 +4192,8 @@ impl<'a> Btree<'a> {
     /// stale hint) re-established the right edge.
     fn right_most_leaf_hinted(&self) -> Result<AppendHint> {
         let mut page_id = self.root;
+        // The interior whose right-most pointer led to `page_id`.
+        let mut parent: Option<(PageId, u64, u32)> = None;
         loop {
             // The right-edge walk routes an append: every page traversed
             // is a decision read (a stale view would append into a leaf
@@ -4055,14 +4207,18 @@ impl<'a> Btree<'a> {
             let guard = page.lock();
             match guard.page_type()? {
                 PageType::LeafTable => {
-                    return Ok(AppendHint::fresh(page_id, guard.serial, guard.epoch));
+                    return Ok(
+                        AppendHint::fresh(page_id, guard.serial, guard.epoch).with_parent(parent)
+                    );
                 }
                 PageType::InteriorTable => {
                     let right = guard.right_most_pointer();
                     if right != 0 {
+                        parent = Some((page_id, guard.serial, guard.epoch));
                         page_id = right;
                         continue;
                     }
+                    parent = None;
                     // right=0: mirror right_most_leaf's degenerate-tree
                     // handling — pin the last cell's de-facto right-most
                     // child (this interior itself when it is empty, page
@@ -5800,13 +5956,9 @@ impl<'a> Btree<'a> {
                                 borrowed.init_interior_table();
                             }
                         }
-                        for c in &cells[..mid] {
-                            self.insert_cell_into_page(page_id, c)?;
-                        }
+                        self.write_ordered_cells(page_id, &cells[..mid])?;
                         // Right page gets cells[mid..] and the old right_most.
-                        for c in &cells[mid..] {
-                            self.insert_cell_into_page(new_interior, c)?;
-                        }
+                        self.write_ordered_cells(new_interior, &cells[mid..])?;
                         self.pager
                             .get_page(new_interior)?
                             .lock()
@@ -5830,14 +5982,56 @@ impl<'a> Btree<'a> {
                         }
                         borrowed.set_right_most_pointer(right_most);
                     }
-                    for c in &cells {
-                        self.insert_cell_into_page(page_id, c)?;
-                    }
+                    self.write_ordered_cells(page_id, &cells)?;
 
                     Ok(InsertResult::Done)
                 }
             }
         }
+    }
+
+    /// Lay `cells`, already in page order, into the EMPTY page `page_id`
+    /// under one lock: no per-cell search or pointer shifting (the
+    /// interior rebuild used to re-insert every cell one by one, ~900
+    /// sorted inserts per split of a full interior page). Vector order is
+    /// child order, kept exactly.
+    fn write_ordered_cells(&mut self, page_id: PageId, cells: &[Cell]) -> Result<()> {
+        let page = self.pager.get_page(page_id)?;
+        {
+            let mut b = page.lock();
+            if b.n_cells() != 0 {
+                return Err(Error::corruption(format!(
+                    "page {} is not empty for an ordered rebuild",
+                    page_id
+                )));
+            }
+            let header_offset = if page_id == 0 {
+                crate::storage::page::DB_HEADER_SIZE as usize
+            } else {
+                0
+            };
+            let mut ptr = header_offset + PAGE_HEADER_SIZE as usize;
+            let mut start = b.cell_content_start() as usize;
+            for c in cells {
+                let size = c.encoded_size();
+                if start < size || start - size < ptr + 2 {
+                    return Err(Error::corruption(format!(
+                        "{} cells do not fit page {}",
+                        cells.len(),
+                        page_id
+                    )));
+                }
+                start -= size;
+                c.encode_into(&mut b.data[start..start + size]);
+                b.data[ptr..ptr + 2].copy_from_slice(&(start as u16).to_be_bytes());
+                ptr += 2;
+            }
+            b.set_cell_content_start(start as u32);
+            b.set_n_cells(cells.len() as u16);
+            b.touch();
+        }
+        self.pager.note_dirty(page_id);
+        Ok(())
     }
 
     /// Insert a cell into a leaf or interior page. Cells are kept sorted:
@@ -6446,10 +6640,21 @@ impl<'a> Btree<'a> {
             n = b.n_cells() as usize;
             content_start = b.cell_content_start() as usize;
             if n == 0 {
-                // Nothing to compact — an empty leaf's whole content area
-                // is already gap (free_space is honest). Splitting (or the
-                // caller's insert) proceeds normally.
-                return Ok(false);
+                // An EMPTY leaf whose cells were all deleted can keep a
+                // stale content start (deletes never rewind it), so its
+                // free space under-reports. Reset the content area, as
+                // SQLite's dropCell does for the last cell: splitting an
+                // empty leaf instead put the new cell alone on a right
+                // page with separator `key - 1`, which for i64::MIN wraps
+                // to i64::MAX and routes every later key into the empty
+                // left page (stateful seeds 136136, 174174).
+                drop(b);
+                let mut b = page.lock();
+                b.set_cell_content_start(psz as u32);
+                let fits = b.free_space() as usize >= need;
+                drop(b);
+                self.pager.note_dirty(page_id);
+                return Ok(fits);
             }
             // Exact in-page byte sum, overflow-aware.
             let mut total = 0usize;

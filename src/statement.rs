@@ -1250,6 +1250,7 @@ impl<'a> Statement<'a> {
         db.set_last_insert_rowid(ctx.last_insert_rowid);
         if is_dml {
             crate::executor::change_counters::record_outcome(
+                &db.change_counts,
                 out.is_ok() || keep_partial,
                 ctx.changes,
                 ctx.trigger_changes,

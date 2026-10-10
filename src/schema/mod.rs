@@ -176,6 +176,10 @@ pub struct Table {
     /// statement has no OR clause; other PRIMARY KEYs carry it on their
     /// index (`Index::on_conflict`). `None` = ABORT.
     pub pk_conflict: Option<crate::sql::ast::ConflictResolution>,
+    /// Any constraint-level `ON CONFLICT` clause (NOT NULL / PRIMARY KEY /
+    /// UNIQUE, column or table level) — the hot DML gates' one-load test
+    /// for "every constraint resolves as plain ABORT".
+    pub conflict_clauses: bool,
 }
 
 impl Table {
@@ -1779,6 +1783,32 @@ pub fn build_table(
         vtab: None,
         pk_conflict,
         check_labels: check_constraint_labels(create_sql),
+        conflict_clauses: columns.iter().any(|c| {
+            c.constraints.iter().any(|cc| {
+                matches!(
+                    cc,
+                    ColumnConstraint::NotNull {
+                        on_conflict: Some(_)
+                    } | ColumnConstraint::Unique {
+                        on_conflict: Some(_)
+                    } | ColumnConstraint::PrimaryKey {
+                        on_conflict: Some(_),
+                        ..
+                    }
+                )
+            })
+        }) || constraints.iter().any(|tc| {
+            matches!(
+                tc,
+                TableConstraint::PrimaryKey {
+                    on_conflict: Some(_),
+                    ..
+                } | TableConstraint::Unique {
+                    on_conflict: Some(_),
+                    ..
+                }
+            )
+        }),
     })
 }
 
@@ -2125,6 +2155,7 @@ pub fn sqlite_master_table() -> Table {
         vtab: None,
         pk_conflict: None,
         check_labels: Vec::new(),
+        conflict_clauses: false,
     }
 }
 
