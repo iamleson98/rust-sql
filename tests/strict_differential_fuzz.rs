@@ -1072,6 +1072,65 @@ fn both_ok_or_both_err(a: &Result<Rows, String>, b: &Result<Rows, String>) -> bo
 static UNSPECIFIED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Queries compared in total.
 static COMPARED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Queries whose answer differed from SQLite's but equals SQLite's own
+/// answer under a `NOT INDEXED` plan (see `plan_variant_matches`).
+static PLAN_DEPENDENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `sql` with `NOT INDEXED` after every table reference in a FROM / JOIN
+/// (the fuzzer never aliases tables): the same query under a plan hint
+/// SQLite treats as semantics-preserving. `None` when nothing changed.
+fn not_indexed_variant(sql: &str) -> Option<String> {
+    let b = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 32);
+    let mut i = 0;
+    let mut changed = false;
+    while i < b.len() {
+        let rest = &sql[i..];
+        let kw = ["FROM ", "JOIN "].iter().find(|k| rest.starts_with(**k));
+        let boundary = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+        if let (Some(kw), true) = (kw, boundary) {
+            let after = &rest[kw.len()..];
+            if let Some(t) = ["t1", "t2", "t3"].iter().find(|t| after.starts_with(**t)) {
+                let next = after.as_bytes().get(t.len()).copied();
+                if !next.is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'.') {
+                    out.push_str(kw);
+                    out.push_str(t);
+                    out.push_str(" NOT INDEXED");
+                    i += kw.len() + t.len();
+                    changed = true;
+                    continue;
+                }
+            }
+        }
+        let ch = rest.chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    changed.then_some(out)
+}
+
+/// Is our (differing) answer SQLite's own answer under another plan?
+/// Which rows a scan visits first decides unspecified things — the
+/// representative SQLite keeps for a DISTINCT / GROUP BY class, a
+/// `group_concat` without ORDER BY, which term raises first — and SQLite
+/// picks covering indexes freely. If forcing table scans (`NOT INDEXED`)
+/// makes SQLite produce exactly our answer, ours is one SQLite itself
+/// gives for this query; a real bug differs from both plans.
+fn plan_variant_matches(
+    theirs: &rusqlite::Connection,
+    q: &Query,
+    ours: &Result<Rows, String>,
+) -> bool {
+    let Some(alt) = not_indexed_variant(&q.sql) else {
+        return false;
+    };
+    let c = sqlite_rows(theirs, &alt).map(|r| normalize(r, q.ordered));
+    match (ours, &c) {
+        (Ok(x), Ok(y)) => x == y || unspecified_only(&alt, q.ordered, &q.minmax_cols, x, y),
+        (Err(_), Err(_)) => true,
+        _ => false,
+    }
+}
 
 fn run_seed(seed: u64, stmts_per_case: usize) -> Vec<Divergence> {
     let mut rng = Rng::new(seed);
@@ -1205,6 +1264,13 @@ fn run_seed(seed: u64, stmts_per_case: usize) -> Vec<Divergence> {
                 }
                 _ => both_ok_or_both_err(&a, &b),
             };
+            let same = same || {
+                let p = plan_variant_matches(&theirs, &q, &a);
+                if p {
+                    PLAN_DEPENDENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                p
+            };
             if !same {
                 out.push(Divergence {
                     seed,
@@ -1239,9 +1305,10 @@ fn strict_differential_vs_sqlite() {
         eprintln!("{}", d);
     }
     eprintln!(
-        "strict fuzz: {} queries compared, {} matched only modulo an unspecified representative / tie order, {} divergences",
+        "strict fuzz: {} queries compared, {} matched only modulo an unspecified representative / tie order, {} matched SQLite's own answer under a NOT INDEXED plan, {} divergences",
         COMPARED.load(std::sync::atomic::Ordering::Relaxed),
         UNSPECIFIED.load(std::sync::atomic::Ordering::Relaxed),
+        PLAN_DEPENDENT.load(std::sync::atomic::Ordering::Relaxed),
         all.len()
     );
     assert!(

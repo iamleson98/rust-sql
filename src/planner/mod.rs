@@ -434,6 +434,22 @@ impl<'a> Planner<'a> {
         // each to the WHERE, in FROM order): planned as one conjunct list
         // they are tested in SQLite's order — the WHERE's own terms first
         // at every loop level, constant ones once before the loop.
+        let reduced;
+        let s = match self.reduce_left_joins(s) {
+            Some(r) => {
+                reduced = r;
+                &reduced
+            }
+            None => s,
+        };
+        let pruned;
+        let s = match self.omit_noop_left_joins(s, order_terms) {
+            Some(p) => {
+                pruned = p;
+                &pruned
+            }
+            None => s,
+        };
         let hoisted;
         let s = match hoist_inner_on_terms(s) {
             Some(h) => {
@@ -470,6 +486,430 @@ impl<'a> Planner<'a> {
             }
         }
         self.plan_simple_select_body(s, order_terms)
+    }
+
+    /// SQLite's OUTER JOIN strength reduction (sqlite3Select, tag-select-
+    /// 0220): a LEFT JOIN whose right table cannot be the NULL row under
+    /// the WHERE (`sqlite3ExprImpliesNonNullRow` over the WHERE plus every
+    /// inner-join ON term — a LEFT join's own ON terms are EP_OuterON and
+    /// pruned) is an ordinary JOIN, and its ON terms become WHERE terms.
+    /// Same rows either way; the point is SQLite's evaluation order
+    /// (a constant term of the converted ON is then evaluated before the
+    /// loop). FROM items are checked in order, a converted join's ON terms
+    /// counting for the later ones. Declines (no conversion) whenever a
+    /// column cannot be attributed with certainty, and with RIGHT / FULL /
+    /// USING / NATURAL joins present.
+    fn reduce_left_joins(&self, s: &SimpleSelect) -> Option<SimpleSelect> {
+        let from = s.from.as_ref()?;
+        // Spine joins in FROM order: (join type, ON clause, right item).
+        fn spine<'t>(
+            t: &'t TableExpression,
+            out: &mut Vec<(JoinType, Option<&'t Expr>, &'t TableExpression)>,
+            first: &mut Option<&'t TableExpression>,
+        ) -> bool {
+            match t {
+                TableExpression::Join {
+                    left,
+                    right,
+                    join_type,
+                    constraint,
+                } => {
+                    if !spine(left, out, first) {
+                        return false;
+                    }
+                    let on = match constraint {
+                        JoinConstraint::On(e) => Some(e),
+                        JoinConstraint::None => None,
+                        JoinConstraint::Using(_) | JoinConstraint::Natural => return false,
+                    };
+                    if matches!(join_type, JoinType::Right | JoinType::Full) {
+                        return false;
+                    }
+                    out.push((*join_type, on, right));
+                    true
+                }
+                other => {
+                    *first = Some(other);
+                    true
+                }
+            }
+        }
+        let mut joins = Vec::new();
+        let mut first = None;
+        if !spine(from, &mut joins, &mut first)
+            || !joins.iter().any(|(jt, ..)| *jt == JoinType::Left)
+        {
+            return None;
+        }
+        // Each FROM item's qualifier and columns (None: not derivable).
+        let item_cols = |t: &TableExpression| -> Option<(String, Vec<String>, bool)> {
+            match t {
+                TableExpression::Table {
+                    name,
+                    schema,
+                    alias,
+                    ..
+                } => {
+                    let lname = name.to_ascii_lowercase();
+                    if self.ctes.contains_key(&lname)
+                        || self
+                            .outer_ctes
+                            .as_ref()
+                            .is_some_and(|c| c.contains_key(&lname))
+                        || self.foreign.is_some()
+                        || schema.as_deref().is_some_and(|d| {
+                            !d.eq_ignore_ascii_case("main") && !d.eq_ignore_ascii_case("temp")
+                        })
+                    {
+                        return None;
+                    }
+                    let table = self.catalog.get_table(name)?;
+                    if table.vtab.is_some() {
+                        return None;
+                    }
+                    let cols = table.columns.iter().map(|c| c.name.clone()).collect();
+                    Some((
+                        alias.clone().unwrap_or_else(|| name.clone()),
+                        cols,
+                        !table.without_rowid,
+                    ))
+                }
+                TableExpression::Subquery {
+                    select,
+                    alias: Some(alias),
+                    column_aliases,
+                } => {
+                    let cols = match column_aliases {
+                        Some(c) => c.clone(),
+                        None => subquery_atom_output_names(self.catalog, select)?,
+                    };
+                    Some((alias.clone(), cols, false))
+                }
+                _ => None,
+            }
+        };
+        let items: Vec<Option<(String, Vec<String>, bool)>> = std::iter::once(first?)
+            .chain(joins.iter().map(|(_, _, r)| *r))
+            .map(item_cols)
+            .collect();
+        // Every item attributable (plain tables and FROM-subqueries; a
+        // virtual table's `x = y` proves nothing in SQLite's walk).
+        if items.iter().any(|i| i.is_none()) {
+            return None;
+        }
+        let mut kinds: Vec<JoinType> = joins.iter().map(|(jt, ..)| *jt).collect();
+        let mut changed = false;
+        for k in 0..joins.len() {
+            if kinds[k] != JoinType::Left {
+                continue;
+            }
+            let Some((qual, cols, rowid)) = &items[k + 1] else {
+                continue;
+            };
+            let is_tab = |table: &Option<String>, name: &str| -> bool {
+                let has = |c: &[String]| c.iter().any(|n| n.eq_ignore_ascii_case(name));
+                match table {
+                    Some(q) => {
+                        q.eq_ignore_ascii_case(qual)
+                            && (has(cols) || (*rowid && is_rowid_spelling(name)))
+                    }
+                    None => {
+                        has(cols)
+                            && items.iter().enumerate().all(|(i, it)| {
+                                i == k + 1 || it.as_ref().is_some_and(|(_, c, _)| !has(c))
+                            })
+                    }
+                }
+            };
+            // The WHERE as SQLite holds it here: the statement's WHERE AND
+            // every ON clause in FROM order (sqlite3ProcessJoin), a LEFT
+            // join's ON pruned whole (EP_OuterON) unless already reduced.
+            let mut leaves: Vec<&Expr> = Vec::new();
+            let pruned = Expr::Literal(Value::Null);
+            if let Some(w) = &s.where_clause {
+                and_leaves(w, &mut leaves);
+            }
+            for (j, (_, on, _)) in joins.iter().enumerate() {
+                if let Some(on) = on {
+                    if kinds[j] == JoinType::Left {
+                        leaves.push(&pruned);
+                    } else {
+                        and_leaves(on, &mut leaves);
+                    }
+                }
+            }
+            if implies_non_null_row(&leaves, &is_tab) {
+                kinds[k] = JoinType::Inner;
+                changed = true;
+            }
+        }
+        if !changed {
+            return None;
+        }
+        // Rewrite the spine's join types (FROM order = kinds order).
+        fn retype(t: &mut TableExpression, kinds: &[JoinType], idx: &mut usize) {
+            if let TableExpression::Join {
+                left, join_type, ..
+            } = t
+            {
+                retype(left, kinds, idx);
+                *join_type = kinds[*idx];
+                *idx += 1;
+            }
+        }
+        let mut out = s.clone();
+        if let Some(f) = out.from.as_mut() {
+            retype(f, &kinds, &mut 0);
+        }
+        Some(out)
+    }
+
+    /// SQLite's whereOmitNoopJoin: a LEFT JOIN that cannot change the
+    /// result is not run at all — its right table is referenced nowhere
+    /// but in its own ON clause (not in the result set, the ORDER BY, the
+    /// WHERE or another join's ON), and either it matches at most one row
+    /// per left row (an equality on its INTEGER PRIMARY KEY / rowid to an
+    /// expression over the tables before it) or the query is DISTINCT.
+    /// Each left row then yields exactly one row either way, so the join
+    /// is dropped — with its ON terms, which SQLite never evaluates there
+    /// (`LEFT JOIN t2 ON t1.a = t2.id AND abs(-9223372036854775808)`
+    /// returns t1's rows). Aggregate / window queries keep the join
+    /// (SQLite passes no result set to the WHERE planner for them), and
+    /// any subquery in the statement keeps it (references hide there).
+    fn omit_noop_left_joins(
+        &self,
+        s: &SimpleSelect,
+        order_terms: &[OrderTerm],
+    ) -> Option<SimpleSelect> {
+        let from = s.from.as_ref()?;
+        if !matches!(from, TableExpression::Join { .. })
+            || !s.group_by.is_empty()
+            || s.having.is_some()
+            || self.expr_list_has_aggregates(&s.columns)
+            || self.expr_list_has_windows(&s.columns)
+            || has_right_or_full_join(from)
+        {
+            return None;
+        }
+        // The spine in FROM order.
+        fn spine<'t>(
+            t: &'t TableExpression,
+            joins: &mut Vec<(JoinType, Option<&'t Expr>, &'t TableExpression)>,
+        ) -> Option<&'t TableExpression> {
+            match t {
+                TableExpression::Join {
+                    left,
+                    right,
+                    join_type,
+                    constraint,
+                } => {
+                    let first = spine(left, joins)?;
+                    let on = match constraint {
+                        JoinConstraint::On(e) => Some(e),
+                        JoinConstraint::None => None,
+                        _ => return None,
+                    };
+                    joins.push((*join_type, on, right));
+                    Some(first)
+                }
+                other => Some(other),
+            }
+        }
+        let mut joins = Vec::new();
+        let first = spine(from, &mut joins)?;
+        if !joins.iter().any(|(jt, ..)| *jt == JoinType::Left) {
+            return None;
+        }
+        // Every item a plain table: (qualifier, table).
+        let item = |t: &TableExpression| -> Option<(String, Arc<Table>)> {
+            let TableExpression::Table {
+                name,
+                schema,
+                alias,
+                ..
+            } = t
+            else {
+                return None;
+            };
+            let lname = name.to_ascii_lowercase();
+            if self.ctes.contains_key(&lname)
+                || self
+                    .outer_ctes
+                    .as_ref()
+                    .is_some_and(|c| c.contains_key(&lname))
+                || self.foreign.is_some()
+                || schema.is_some()
+            {
+                return None;
+            }
+            let table = self.catalog.get_table(name)?;
+            if table.vtab.is_some() {
+                return None;
+            }
+            Some((alias.clone().unwrap_or_else(|| name.clone()), table))
+        };
+        let items: Vec<(String, Arc<Table>)> = std::iter::once(first)
+            .chain(joins.iter().map(|(_, _, r)| *r))
+            .map(item)
+            .collect::<Option<_>>()?;
+        let sub = crate::executor::expr_has_subquery;
+        let has_col = |t: &Table, name: &str| {
+            t.find_column(name).is_some() || (!t.without_rowid && is_rowid_spelling(name))
+        };
+        // Does `e` reference item `k` (qualified to it, or an unqualified
+        // name it has — ambiguity counts as a reference)? Inside a
+        // subquery any MENTION of its qualifier or of one of its column
+        // names counts (an over-approximation: correlation hides there).
+        let refs_item = |e: &Expr, k: usize| -> bool {
+            let (q, t) = &items[k];
+            if collect_column_refs(e).iter().any(|(tq, n)| match tq {
+                Some(tq) => tq.eq_ignore_ascii_case(q),
+                None => has_col(t, n),
+            }) {
+                return true;
+            }
+            if !sub(e) {
+                return false;
+            }
+            let d = format!("{e:?}").to_ascii_lowercase();
+            d.contains(&format!("some(\"{}\")", q.to_ascii_lowercase()))
+                || t.columns
+                    .iter()
+                    .map(|c| c.name.to_ascii_lowercase())
+                    .chain(["rowid", "oid", "_rowid_"].map(String::from))
+                    .any(|n| d.contains(&format!("name: \"{n}\"")))
+        };
+        // SELECT DISTINCT whose ORDER BY is exactly its result list (all
+        // ASC) becomes a GROUP BY in SQLite — an aggregate, no omission.
+        let distinct_ok = s.distinct
+            && {
+                let exprs: Vec<(&Expr, Option<&String>)> = s
+                    .columns
+                    .iter()
+                    .filter_map(|c| match c {
+                        ResultColumn::Expr { expr, alias } => Some((expr, alias.as_ref())),
+                        _ => None,
+                    })
+                    .collect();
+                let as_group_by = !order_terms.is_empty()
+                && exprs.len() == s.columns.len()
+                && order_terms.len() == exprs.len()
+                && order_terms.iter().zip(&exprs).enumerate().all(|(i, (o, (e, alias)))| {
+                    matches!(o.order, Order::Asc)
+                        && o.nulls == NullsOrder::First
+                        && (matches!(&o.expr, Expr::Literal(Value::Integer(n)) if *n == i as i64 + 1)
+                            || format!("{:?}", o.expr) == format!("{e:?}")
+                            || matches!((&o.expr, alias), (Expr::Column { table: None, name }, Some(a)) if name.eq_ignore_ascii_case(a)))
+                });
+                !as_group_by
+            };
+        let mut drop: Vec<bool> = vec![false; joins.len()];
+        for k in 0..joins.len() {
+            let (jt, on, _) = &joins[k];
+            if *jt != JoinType::Left {
+                continue;
+            }
+            let ik = k + 1;
+            let (q, t) = &items[ik];
+            // Unreferenced outside its own ON.
+            let used = s.columns.iter().any(|c| match c {
+                ResultColumn::Star => true,
+                ResultColumn::TableStar(tq) => tq.eq_ignore_ascii_case(q),
+                ResultColumn::Expr { expr, .. } => refs_item(expr, ik),
+            }) || order_terms.iter().any(|o| refs_item(&o.expr, ik))
+                || s.where_clause.as_ref().is_some_and(|w| refs_item(w, ik))
+                || joins
+                    .iter()
+                    .enumerate()
+                    .any(|(j, (_, on, _))| j != k && on.is_some_and(|e| refs_item(e, ik)));
+            if used {
+                continue;
+            }
+            // At most one row per left row: `R.ipk = <expr over earlier
+            // tables>` among its ON's AND-terms (or a DISTINCT query).
+            let one_row = distinct_ok
+                || on.is_some_and(|on| {
+                    let mut leaves = Vec::new();
+                    and_leaves(on, &mut leaves);
+                    leaves.iter().any(|leaf| {
+                        let Expr::Binary {
+                            op: BinaryOp::Eq,
+                            left,
+                            right,
+                        } = leaf
+                        else {
+                            return false;
+                        };
+                        let is_key = |e: &Expr| match e {
+                            Expr::Column { table: tq, name } => {
+                                tq.as_deref().map_or(true, |tq| tq.eq_ignore_ascii_case(q))
+                                    && !t.without_rowid
+                                    && (is_rowid_spelling(name)
+                                        || t.rowid_alias.is_some_and(|i| {
+                                            t.columns[i].name.eq_ignore_ascii_case(name)
+                                        }))
+                                    // An unqualified name must be R's alone.
+                                    && (tq.is_some()
+                                        || items
+                                            .iter()
+                                            .enumerate()
+                                            .all(|(i, (_, ot))| i == ik || !has_col(ot, name)))
+                            }
+                            _ => false,
+                        };
+                        // The other side reads only tables BEFORE R (and no
+                        // subquery — it could read R and match many rows).
+                        let earlier = |e: &Expr| {
+                            !sub(e)
+                                && collect_column_refs(e).iter().all(|(tq, n)| {
+                                    items[..ik].iter().any(|(oq, ot)| match tq {
+                                        Some(tq) => tq.eq_ignore_ascii_case(oq) && has_col(ot, n),
+                                        None => has_col(ot, n),
+                                    }) && match tq {
+                                        Some(tq) => !tq.eq_ignore_ascii_case(q),
+                                        None => !has_col(t, n),
+                                    }
+                                })
+                        };
+                        (is_key(left) && earlier(right)) || (is_key(right) && earlier(left))
+                    })
+                });
+            if one_row {
+                drop[k] = true;
+            }
+        }
+        if !drop.iter().any(|d| *d) {
+            return None;
+        }
+        // Rebuild the spine without the dropped joins.
+        fn rebuild(t: &TableExpression, drop: &[bool], idx: &mut usize) -> TableExpression {
+            match t {
+                TableExpression::Join {
+                    left,
+                    right,
+                    join_type,
+                    constraint,
+                } => {
+                    let l = rebuild(left, drop, idx);
+                    let k = *idx;
+                    *idx += 1;
+                    if drop[k] {
+                        l
+                    } else {
+                        TableExpression::Join {
+                            left: Box::new(l),
+                            right: right.clone(),
+                            join_type: *join_type,
+                            constraint: constraint.clone(),
+                        }
+                    }
+                }
+                other => other.clone(),
+            }
+        }
+        let mut out = s.clone();
+        out.from = Some(rebuild(from, &drop, &mut 0));
+        Some(out)
     }
 
     fn plan_simple_select_body(
@@ -4974,6 +5414,100 @@ fn hoist_inner_on_terms(s: &SimpleSelect) -> Option<SimpleSelect> {
 
 /// An index-range bound as BLOB bytes: (bytes, inclusive).
 type BlobBound = (Vec<u8>, bool);
+
+/// The AND-leaves of `e`, left to right (SQLite's AND trees are
+/// left-deep, so this is its walk order).
+fn and_leaves<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+    match e {
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            and_leaves(left, out);
+            and_leaves(right, out);
+        }
+        other => out.push(other),
+    }
+}
+
+/// sqlite3ExprImpliesNonNullRow over a WHERE given as its AND-leaves:
+/// can the WHERE hold only when some column of the table (`is_tab`
+/// recognizes its column references) is non-NULL? SQLite's walk is
+/// reproduced exactly, quirks included: only the FIRST leaf is unwrapped
+/// (COLLATE / likely() skipped, `x NOTNULL` reduced to `x`); every other
+/// leaf goes straight to the node walker, where NOTNULL / IS / functions
+/// / CASE prune. False negatives only cost the reduction; a false
+/// positive would drop NULL-extended rows, so anything unrecognized
+/// prunes.
+fn implies_non_null_row(leaves: &[&Expr], is_tab: &dyn Fn(&Option<String>, &str) -> bool) -> bool {
+    fn walk(e: &Expr, is_tab: &dyn Fn(&Option<String>, &str) -> bool) -> bool {
+        let both = |a: &Expr, b: &Expr| walk(a, is_tab) && walk(b, is_tab);
+        match e {
+            Expr::IsNull { .. }
+            | Expr::Is { .. }
+            | Expr::Row(_)
+            | Expr::Function { .. }
+            | Expr::Case { .. }
+            | Expr::Like { .. }
+            | Expr::Subquery(_)
+            | Expr::Exists(_)
+            | Expr::Raise { .. }
+            | Expr::Literal(_)
+            | Expr::Parameter(_) => false,
+            Expr::Column { table, name } => is_tab(table, name),
+            Expr::Binary {
+                op: BinaryOp::And | BinaryOp::Or,
+                left,
+                right,
+            } => both(left, right),
+            Expr::Binary { left, right, .. } => walk(left, is_tab) || walk(right, is_tab),
+            Expr::In { expr, source, .. } => match source {
+                InSource::List(l) if !l.is_empty() => walk(expr, is_tab),
+                _ => false,
+            },
+            Expr::Between {
+                expr, low, high, ..
+            } => walk(expr, is_tab) || both(low, high),
+            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::Collate { expr, .. } => {
+                walk(expr, is_tab)
+            }
+        }
+    }
+    let mut first = true;
+    for leaf in leaves {
+        let mut e: &Expr = leaf;
+        if first {
+            first = false;
+            // sqlite3ExprSkipCollateAndLikely, then the TK_NOTNULL unwrap.
+            loop {
+                match e {
+                    Expr::Collate { expr, .. } => e = expr,
+                    Expr::Function { name, args, .. }
+                        if (name.eq_ignore_ascii_case("likely")
+                            || name.eq_ignore_ascii_case("unlikely")
+                            || name.eq_ignore_ascii_case("likelihood"))
+                            && !args.is_empty() =>
+                    {
+                        e = &args[0]
+                    }
+                    _ => break,
+                }
+            }
+            if let Expr::IsNull {
+                expr,
+                negated: true,
+            } = e
+            {
+                e = expr;
+            }
+        }
+        if walk(e, is_tab) {
+            return true;
+        }
+    }
+    false
+}
 
 fn has_right_or_full_join(t: &TableExpression) -> bool {
     match t {
