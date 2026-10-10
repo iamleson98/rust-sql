@@ -328,8 +328,18 @@ pub(crate) const DEFAULT_PARALLEL_SCAN_MIN_ROWS: i64 = 131_072;
 /// cache's read lock; direct indexing costs ~2 ns. Ids beyond
 /// `PAGE_VEC_DIRECT_LIMIT` (huge files) spill into a HashMap so the Vec
 /// can never grow proportional to a multi-GB file.
+///
+/// Eviction is SECOND CHANCE (CLOCK over the insertion queue): a hit sets
+/// the slot's reference bit under the shared lock, and the evictor gives a
+/// referenced page one more trip through the queue instead of evicting
+/// it. Plain insertion order evicted the pages every reader keeps
+/// revisiting (the prefix that each `id <= ?` range scan starts from)
+/// as readily as a scan's one-touch pages, so concurrent scans of a table
+/// larger than the cache missed on nearly every page.
 pub struct PageCache {
     slots: Vec<Option<PageRef>>,
+    /// Reference bits for `slots` (set by hits, consumed by eviction).
+    refbits: Vec<std::sync::atomic::AtomicBool>,
     overflow: PageCacheMap,
     count: usize,
 }
@@ -338,9 +348,30 @@ impl PageCache {
     pub fn new() -> Self {
         Self {
             slots: Vec::new(),
+            refbits: Vec::new(),
             overflow: PageCacheMap::default(),
             count: 0,
         }
+    }
+
+    /// Mark a cached page referenced (a hit). Shared access: the bit is
+    /// atomic, and an already-set bit is not rewritten (hot pages stay
+    /// read-only cache lines for the readers that share them).
+    #[inline]
+    pub fn touch(&self, id: PageId) {
+        if let Some(b) = self.refbits.get(id as usize) {
+            if !b.load(Ordering::Relaxed) {
+                b.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Consume a page's reference bit: true when it was set.
+    #[inline]
+    pub fn take_ref(&self, id: PageId) -> bool {
+        self.refbits
+            .get(id as usize)
+            .is_some_and(|b| b.swap(false, Ordering::Relaxed))
     }
 
     #[inline]
@@ -363,6 +394,8 @@ impl PageCache {
             let idx = id as usize;
             if idx >= self.slots.len() {
                 self.slots.resize(idx + 1, None);
+                self.refbits
+                    .resize_with(idx + 1, || std::sync::atomic::AtomicBool::new(false));
             }
             if self.slots[idx].replace(page).is_none() {
                 self.count += 1;
@@ -377,6 +410,9 @@ impl PageCache {
     #[inline]
     pub fn remove(&mut self, id: PageId) -> Option<PageRef> {
         let old = if (id as usize) < PAGE_VEC_DIRECT_LIMIT {
+            if let Some(b) = self.refbits.get(id as usize) {
+                b.store(false, Ordering::Relaxed);
+            }
             self.slots.get_mut(id as usize).and_then(|s| s.take())
         } else {
             self.overflow.remove(&id)
@@ -399,6 +435,7 @@ impl PageCache {
 
     pub fn clear(&mut self) {
         self.slots.clear();
+        self.refbits.clear();
         self.overflow.clear();
         self.count = 0;
     }
@@ -3405,9 +3442,16 @@ impl Pager {
         // deliberately published pages (see `splice_txn_freed`) — the
         // bound guards the MISS path's disk/WAL reads, where an
         // uncommitted allocation must be unfetchable.
+        //
+        // `read_recursive`: a hit takes the shared lock even while a miss
+        // waits for the exclusive one. parking_lot's plain `read` blocks
+        // behind a queued writer, so with several threads missing (scans
+        // larger than the cache) every HIT stalled behind the missers —
+        // eight concurrent range scans spent most of their time there.
         {
-            let cache = self.cache.read();
+            let cache = self.cache.read_recursive();
             if let Some(page_ref) = cache.get(id).cloned() {
+                cache.touch(id);
                 self.cache_hits.fetch_add(1, Ordering::Relaxed);
                 drop(cache);
                 self.note_seq_access(id, false);
@@ -7489,18 +7533,26 @@ impl Pager {
         // lazy_writeback is off), the loop below would otherwise spin
         // forever moving dirty pages to the back. `attempts` caps it.
         let mut attempts = cache.len();
+        // Second chances granted by this call: at most one per cached page,
+        // so a queue of all-referenced pages still evicts after one pass.
+        let mut chances = cache.len();
         while cache.len() >= self.cache_capacity.load(Ordering::Relaxed) && attempts > 0 {
-            attempts -= 1;
             let evict_id = {
                 let mut lru = self.lru.lock();
                 match lru.front().copied() {
                     Some(id) => {
                         lru.pop_front();
+                        if chances > 0 && cache.take_ref(id) && cache.get(id).is_some() {
+                            chances -= 1;
+                            lru.push_back(id);
+                            continue;
+                        }
                         id
                     }
                     None => break,
                 }
             };
+            attempts -= 1;
             let should_evict = match cache.get(evict_id) {
                 Some(p) => {
                     // PIN GUARD: a strong count above 1 means btree/pager

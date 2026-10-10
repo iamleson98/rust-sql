@@ -9398,10 +9398,15 @@ impl<'a> Btree<'a> {
                         _ => hi = mid,
                     }
                 }
-                // Count cells from lo while rowid <= end.
-                let mut count: u64 = 0;
-                for i in lo..n {
-                    let cell_ptr = borrowed.cell_pointer(i) as usize;
+                // And the first cell past `end`: the count is the span
+                // between the two (cells are in rowid order) — no per-cell
+                // decode of the rows in range.
+                let first_in = lo;
+                let mut hi_lo: u16 = first_in;
+                let mut hi_hi: u16 = n;
+                while hi_lo < hi_hi {
+                    let mid = (hi_lo + hi_hi) / 2;
+                    let cell_ptr = borrowed.cell_pointer(mid) as usize;
                     if cell_ptr >= psz {
                         return Err(Error::corruption(format!(
                             "cell pointer {} out of range",
@@ -9409,18 +9414,14 @@ impl<'a> Btree<'a> {
                         )));
                     }
                     match varint::decode_signed(borrowed.cell_slice_checked(cell_ptr)?) {
-                        Some((rowid, _)) => {
-                            if rowid > end {
-                                break;
-                            }
-                            count += 1;
-                        }
+                        Some((rowid, _)) if rowid <= end => hi_lo = mid + 1,
+                        Some(_) => hi_hi = mid,
                         None => {
                             return Err(Error::corruption("truncated leaf rowid in count_range"))
                         }
                     }
                 }
-                Ok(count)
+                Ok((hi_lo - first_in) as u64)
             }
             PageType::InteriorTable => {
                 let n = borrowed.n_cells();
@@ -9442,16 +9443,23 @@ impl<'a> Btree<'a> {
                         hi = mid;
                     }
                 }
+                // Children from there up to the FIRST whose separator
+                // reaches `end`: it holds rowids <= its key, every later
+                // child only rowids > key >= end. (Visiting them all made
+                // a `rowid <= x` count read every leaf of the table.)
                 let mut children: Vec<PageId> = Vec::with_capacity((n - lo) as usize + 1);
+                let mut past_end = false;
                 for i in lo..n {
-                    let cell_ptr = borrowed.cell_pointer(i) as usize;
-                    if let Some(child) =
-                        decode_table_interior_child(borrowed.cell_slice_checked(cell_ptr)?)
-                    {
+                    let cell = borrowed.cell_slice_checked(borrowed.cell_pointer(i) as usize)?;
+                    if let Some(child) = decode_table_interior_child(cell) {
                         children.push(child);
                     }
+                    if decode_table_interior_key(cell).is_some_and(|k| k >= end) {
+                        past_end = true;
+                        break;
+                    }
                 }
-                if right != 0 {
+                if !past_end && right != 0 {
                     children.push(right);
                 }
                 drop(borrowed);
