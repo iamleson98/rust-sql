@@ -699,14 +699,14 @@ impl Wal {
 
     /// Reset the WAL to empty. Called after a checkpoint.
     pub fn reset(&mut self) -> Result<()> {
-        self.reset_synced(true)
+        self.reset_synced(true, true)
     }
 
     /// Reset the WAL to a fresh header. `sync=false` skips the header
     /// fsync — `PRAGMA synchronous=OFF` checkpoints must not pay it
     /// (SQLite's WAL reset under OFF is a plain header rewrite; the
     /// durability point is the caller's to decide).
-    pub fn reset_synced(&mut self, sync: bool) -> Result<()> {
+    pub fn reset_synced(&mut self, sync: bool, full: bool) -> Result<()> {
         self.header = WalHeader::new(self.page_size);
         self.checksum = (self.header.checksum1, self.header.checksum2);
         self.n_frames = 0;
@@ -717,7 +717,7 @@ impl Wal {
         // checkpoint reset); nothing left to defer.
         self.header_dirty = false;
         if sync {
-            self.file.sync_all()?;
+            crate::storage::pager::fsync_file(&self.file, full)?;
         }
         Ok(())
     }
@@ -733,7 +733,7 @@ impl Wal {
     /// operation (page-cache teardown of a multi-MB file + regrowth on
     /// the next append cycle) that the auto-checkpoint paid on every
     /// 1000-frame fold of a bulk load (measured ~3% of the whole build).
-    pub fn reset_keep_size_synced(&mut self, sync: bool) -> Result<()> {
+    pub fn reset_keep_size_synced(&mut self, sync: bool, full: bool) -> Result<()> {
         self.header = WalHeader::new(self.page_size);
         self.checksum = (self.header.checksum1, self.header.checksum2);
         self.n_frames = 0;
@@ -741,15 +741,15 @@ impl Wal {
         self.file.write_all(&self.header.encode())?;
         self.header_dirty = false;
         if sync {
-            self.file.sync_all()?;
+            crate::storage::pager::fsync_file(&self.file, full)?;
         }
         Ok(())
     }
 
     /// fsync the WAL file (the durability point of a commit; callers decide
-    /// based on `PRAGMA synchronous`).
-    pub fn sync(&mut self) -> Result<()> {
-        self.file.sync_all()?;
+    /// based on `PRAGMA synchronous`, and `full` on `PRAGMA fullfsync`).
+    pub fn sync(&mut self, full: bool) -> Result<()> {
+        crate::storage::pager::fsync_file(&self.file, full)?;
         Ok(())
     }
 

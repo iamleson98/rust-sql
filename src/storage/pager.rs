@@ -112,6 +112,9 @@ struct PersistedFileSettings {
     synchronous: Option<u8>,
     /// `PRAGMA temp_store` (0/1/2).
     temp_store: Option<i64>,
+    /// `PRAGMA fullfsync` / `PRAGMA checkpoint_fullfsync`.
+    fullfsync: Option<bool>,
+    checkpoint_fullfsync: Option<bool>,
 }
 
 /// Hard cap on remembered files — one entry per distinct database path
@@ -180,6 +183,12 @@ impl Pager {
         }
         if let Some(ts) = saved.temp_store {
             self.temp_store.store(ts.clamp(0, 2), Ordering::Release);
+        }
+        if let Some(on) = saved.fullfsync {
+            self.fullfsync.store(on, Ordering::Release);
+        }
+        if let Some(on) = saved.checkpoint_fullfsync {
+            self.checkpoint_fullfsync.store(on, Ordering::Release);
         }
     }
 }
@@ -625,9 +634,9 @@ impl Store {
     /// Durability barrier. Pure no-op for the memory store (nothing to
     /// sync — the image IS the durable state for as long as the pager
     /// lives, and it is deleted on drop by design).
-    fn sync_all(&self) -> std::io::Result<()> {
+    fn sync_all(&self, full: bool) -> std::io::Result<()> {
         match self {
-            Store::File(f) => f.sync_all(),
+            Store::File(f) => fsync_file(f, full),
             Store::Memory(_) => Ok(()),
         }
     }
@@ -947,6 +956,13 @@ pub struct Pager {
     /// In WAL mode NORMAL skips the per-commit fsync (checkpoints carry
     /// durability) — SQLite's recommended high-throughput setting.
     synchronous: std::sync::atomic::AtomicU8,
+    /// PRAGMA fullfsync (SQLite's default OFF): on Apple platforms a
+    /// commit's sync is F_FULLFSYNC only when set — a plain fsync otherwise,
+    /// exactly as SQLite does. No effect elsewhere.
+    fullfsync: AtomicBool,
+    /// PRAGMA checkpoint_fullfsync (default OFF): F_FULLFSYNC for the syncs
+    /// of a checkpoint even when `fullfsync` is off.
+    checkpoint_fullfsync: AtomicBool,
     /// Monotonic write version, bumped by every `note_write()` (i.e. every
     /// mutating B+tree/pager operation). Readers use it to invalidate
     /// advisory caches (btree leaf hints): a version change means SOME
@@ -2384,6 +2400,8 @@ impl Pager {
             del_spill_arena: Mutex::new(Vec::new()),
             commit_page_writes: std::sync::atomic::AtomicU64::new(0),
             synchronous: std::sync::atomic::AtomicU8::new(2),
+            fullfsync: AtomicBool::new(false),
+            checkpoint_fullfsync: AtomicBool::new(false),
             cache_misses: std::sync::atomic::AtomicU64::new(0),
             cache_hits: std::sync::atomic::AtomicU64::new(0),
             rows_modified: std::sync::atomic::AtomicI64::new(0),
@@ -2667,7 +2685,7 @@ impl Pager {
         // an fsync here costs ~0.4 ms on CI Linux, ~1.5 ms on macOS and
         // ~10 ms on Windows per open, and buys nothing.
         if !self.skip_fsync.load(Ordering::Acquire) {
-            self.store.read().sync_all()?;
+            self.store.read().sync_all(self.fullfsync())?;
         }
         self.n_pages.store(1, Ordering::Release);
         self.committed_n_pages.store(1, Ordering::Release);
@@ -2858,7 +2876,7 @@ impl Pager {
         if self.write_file_at(0, &page0.data).is_err() {
             return false;
         }
-        let _ = self.store.read().sync_all();
+        let _ = self.store.read().sync_all(self.fullfsync());
         self.page_size.store(size, Ordering::Release);
         true
     }
@@ -5328,7 +5346,7 @@ impl Pager {
         let mut raw = [0u8; 4];
         raw.copy_from_slice(&mode.to_le_bytes());
         self.write_file_at(72, &raw)?;
-        self.store.read().sync_all()?;
+        self.store.read().sync_all(self.fullfsync())?;
         Ok(())
     }
 
@@ -5671,12 +5689,16 @@ impl Pager {
         // rotational-ish storage per VACUUM).
         let sync_mode = self.synchronous.load(Ordering::Acquire);
         if sync_mode >= 1 && !self.skip_fsync.load(Ordering::Acquire) {
-            self.store.read().sync_all()?;
+            self.store.read().sync_all(self.checkpoint_full())?;
         }
         if truncate {
-            state.wal.reset_synced(sync_mode >= 1)?;
+            state
+                .wal
+                .reset_synced(sync_mode >= 1, self.checkpoint_full())?;
         } else {
-            state.wal.reset_keep_size_synced(sync_mode >= 1)?;
+            state
+                .wal
+                .reset_keep_size_synced(sync_mode >= 1, self.checkpoint_full())?;
         }
         if fold_dbg {
             eprintln!(
@@ -5878,7 +5900,7 @@ impl Pager {
             let sync_mode = self.synchronous.load(Ordering::Acquire);
             sync_needed = sync && sync_mode >= 2 && !self.skip_fsync.load(Ordering::Acquire);
             if sync_needed {
-                state.wal.sync()?;
+                state.wal.sync(self.fullfsync())?;
             }
             // Cumulative frame accounting (across WAL generations — the
             // counter survives checkpoint resets): this is the
@@ -6027,7 +6049,7 @@ impl Pager {
                 let sync_res = {
                     let mut guard = self.wal.write();
                     match guard.as_mut() {
-                        Some(state) => state.wal.sync().map_err(|e| e.to_string()),
+                        Some(state) => state.wal.sync(self.fullfsync()).map_err(|e| e.to_string()),
                         None => Ok(()), // WAL gone (mode flip): nothing to sync
                     }
                 };
@@ -7252,7 +7274,7 @@ impl Pager {
         // Skip the entire call to make in-memory mode match SQLite's `:memory:`
         // performance.
         if !self.skip_fsync.load(Ordering::Acquire) {
-            self.store.read().sync_all()?;
+            self.store.read().sync_all(self.fullfsync())?;
         }
         // Mass-delete tail truncation: shrink the file with the commit.
         self.apply_pending_truncate()?;
@@ -7611,6 +7633,31 @@ impl Pager {
 
     pub fn synchronous(&self) -> u8 {
         self.synchronous.load(Ordering::Acquire)
+    }
+
+    /// PRAGMA fullfsync (see the field).
+    pub fn set_fullfsync(&self, on: bool) {
+        self.fullfsync.store(on, Ordering::Release);
+        self.persist_file_setting(|s| s.fullfsync = Some(on));
+    }
+
+    pub fn fullfsync(&self) -> bool {
+        self.fullfsync.load(Ordering::Acquire)
+    }
+
+    /// PRAGMA checkpoint_fullfsync (see the field).
+    pub fn set_checkpoint_fullfsync(&self, on: bool) {
+        self.checkpoint_fullfsync.store(on, Ordering::Release);
+        self.persist_file_setting(|s| s.checkpoint_fullfsync = Some(on));
+    }
+
+    pub fn checkpoint_fullfsync(&self) -> bool {
+        self.checkpoint_fullfsync.load(Ordering::Acquire)
+    }
+
+    /// The full-flush flag for a checkpoint's syncs.
+    fn checkpoint_full(&self) -> bool {
+        self.fullfsync() || self.checkpoint_fullfsync()
     }
 
     /// Trigger recursion toggle (PRAGMA recursive_triggers). Default OFF —
@@ -8087,6 +8134,28 @@ impl<P: AsRef<Path>> PathExt for P {
     fn ref_to_path(&self) -> PathBuf {
         self.as_ref().to_path_buf()
     }
+}
+
+/// fsync `f`: on Apple platforms `full` asks for F_FULLFSYNC (a flush of
+/// the drive's cache — `PRAGMA fullfsync`), otherwise a plain fsync, which
+/// is what SQLite issues there by default; elsewhere `sync_all`.
+pub(crate) fn fsync_file(f: &std::fs::File, full: bool) -> std::io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    if !full {
+        use std::os::unix::io::AsRawFd;
+        loop {
+            // SAFETY: a valid open descriptor owned by `f`.
+            if unsafe { libc::fsync(f.as_raw_fd()) } == 0 {
+                return Ok(());
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                return Err(e);
+            }
+        }
+    }
+    let _ = full;
+    f.sync_all()
 }
 
 #[cfg(test)]

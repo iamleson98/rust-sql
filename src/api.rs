@@ -15125,6 +15125,24 @@ impl Database {
             );
             let v = crate::executor::evaluate(value_as_expr(value), &eval_ctx)?;
             match name.as_str() {
+                "fullfsync" | "checkpoint_fullfsync" => {
+                    // SQLite's boolean spellings (ON/OFF/TRUE/FALSE/YES/NO/1/0).
+                    let on = match (&v, value_as_expr(value)) {
+                        (_, crate::sql::ast::Expr::Column { name, .. }) => matches!(
+                            name.to_ascii_lowercase().as_str(),
+                            "on" | "true" | "yes" | "1"
+                        ),
+                        (Value::Text(t), _) => {
+                            matches!(t.to_ascii_lowercase().as_str(), "on" | "true" | "yes" | "1")
+                        }
+                        _ => v.is_truthy(),
+                    };
+                    if name == "fullfsync" {
+                        ctx.pager.set_fullfsync(on);
+                    } else {
+                        ctx.pager.set_checkpoint_fullfsync(on);
+                    }
+                }
                 "foreign_keys" | "recursive_triggers" => {
                     // Accept booleans, numbers, and ON/OFF bare words.
                     let on = match (&v, value_as_expr(value)) {
@@ -16312,6 +16330,8 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
                 .unwrap_or_else(|| "none".into()),
         ),
         "synchronous" => Value::Integer(pager.synchronous() as i64),
+        "fullfsync" => Value::Integer(pager.fullfsync() as i64),
+        "checkpoint_fullfsync" => Value::Integer(pager.checkpoint_fullfsync() as i64),
         "locking_mode" => Value::Text(if pager.locking_mode_exclusive() {
             "exclusive".into()
         } else {
