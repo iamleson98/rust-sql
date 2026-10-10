@@ -4494,6 +4494,7 @@ fn try_index_range(
         } else {
             Some(combine_and(&residual))
         };
+        let bounded = end.is_some();
         let range = Plan::IndexRange {
             table: table.clone(),
             alias: alias.clone(),
@@ -4509,7 +4510,9 @@ fn try_index_range(
         // with the bounds as BLOBs (iLikeRepCntr) — here a second range
         // over the same bytes, concatenated (a row is text or blob, never
         // both; the residual re-checks every candidate).
-        if let Some((lo, hi)) = like_blob {
+        // (A text range with no upper bound already runs through every
+        // BLOB key — the twin would return those rows twice.)
+        if let (Some((lo, hi)), true) = (like_blob, bounded) {
             let blob_range = Plan::IndexRange {
                 table: table.clone(),
                 alias: alias.clone(),
@@ -4654,7 +4657,10 @@ fn extract_like_prefix(expr: &Expr) -> Option<(String, String, bool, bool)> {
     // GLOB's `[...]` character class is a wildcard too (`[a-c]*` was taken
     // as the LITERAL prefix "[a-c" — the range found nothing), and a NUL
     // ends the C-string pattern early: neither has a literal prefix.
-    if body.contains(wc_any)
+    // An EMPTY prefix (`LIKE '%'`, `LIKE ''`) has no range to seek:
+    // SQLite's isLikeOrGlob requires at least one literal character.
+    if body.is_empty()
+        || body.contains(wc_any)
         || body.contains(wc_one)
         || (glob && body.contains('['))
         || body.contains('\0')

@@ -36,3 +36,7 @@ SELECT count(*) FROM n WHERE h LIKE 'a%' AND a > 100;
 SELECT a FROM n WHERE h LIKE 'a%' ORDER BY h, a;
 SELECT a FROM n WHERE h GLOB 'a*' ORDER BY a;
 SELECT (SELECT count(*) FROM n AS i WHERE i.h LIKE 'a%' AND i.a <= o.a) FROM n AS o ORDER BY o.a;
+SELECT a FROM n WHERE h LIKE '%' ORDER BY a;
+SELECT a FROM n WHERE h LIKE '' ORDER BY a;
+SELECT a FROM n WHERE h GLOB '*' ORDER BY a;
+SELECT count(*) FROM n WHERE h LIKE '%%';
