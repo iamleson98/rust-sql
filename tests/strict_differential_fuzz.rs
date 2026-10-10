@@ -914,7 +914,7 @@ impl std::fmt::Display for Divergence {
 /// `1.0` compare equal), TEXT case-folded when a NOCASE comparison is in
 /// play. Used ONLY to recognize the two answers SQL leaves unspecified
 /// (see `unspecified_only`).
-fn eq_class(v: &V, nocase: bool) -> V {
+fn eq_class(v: &V, nocase: bool, rtrim: bool) -> V {
     match v {
         V::Real(b) => {
             let f = f64::from_bits(*b);
@@ -928,7 +928,18 @@ fn eq_class(v: &V, nocase: bool) -> V {
                 v.clone()
             }
         }
-        V::Text(t) if nocase => V::Text(t.to_ascii_lowercase()),
+        V::Text(t) if nocase || rtrim => {
+            let mut end = t.len();
+            while rtrim && end > 0 && t[end - 1] == b' ' {
+                end -= 1;
+            }
+            let t = &t[..end];
+            V::Text(if nocase {
+                t.to_ascii_lowercase()
+            } else {
+                t.to_vec()
+            })
+        }
         _ => v.clone(),
     }
 }
@@ -969,6 +980,8 @@ fn unspecified_only(
     if !dedups && !ordered && minmax_cols.is_empty() {
         return false;
     }
+    // RTRIM: trailing spaces do not count (`'abc'` ties `'abc  '`).
+    let rtrim = up.contains("RTRIM");
     let nocase = up.contains("NOCASE")
         || sql
             .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
@@ -989,7 +1002,7 @@ fn unspecified_only(
                     .enumerate()
                     .map(|(i, v)| {
                         if all_cols || (dedups && i == 0) || minmax_cols.contains(&i) {
-                            eq_class(v, nocase)
+                            eq_class(v, nocase, rtrim)
                         } else {
                             v.clone()
                         }

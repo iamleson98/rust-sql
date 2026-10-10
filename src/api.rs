@@ -12363,7 +12363,16 @@ impl Database {
         // comparison on a column with a DECLARED collation (NOCASE /
         // RTRIM) must compare through it — and the index-selection gate
         // below needs the comparison's collation to match the index's.
-        let source = if let (Some(pred), None) = (&upd.where_clause, &from) {
+        let (where_owned, consts) = match (&upd.where_clause, &from) {
+            (Some(w), None) => match crate::planner::split_constant_dml_where(w) {
+                Some((rest, consts)) if crate::executor::empty_input_plan(&scan).is_some() => {
+                    (rest, consts)
+                }
+                _ => (upd.where_clause.clone(), Vec::new()),
+            },
+            _ => (upd.where_clause.clone(), Vec::new()),
+        };
+        let source = if let (Some(pred), None) = (&where_owned, &from) {
             let coll_scope = vec![(
                 table.clone(),
                 upd.alias.clone().unwrap_or_else(|| upd.table.clone()),
@@ -12420,6 +12429,7 @@ impl Database {
         } else {
             source
         };
+        let source = crate::planner::const_where_marker(source, consts);
         Ok(crate::planner::plan::Plan::Update {
             table,
             source: Box::new(source),
@@ -12477,7 +12487,20 @@ impl Database {
             index: None,
             predicate: None,
         };
-        let source = if let Some(pred) = &del.where_clause {
+        // Constant WHERE terms run once, before the loop (see
+        // split_constant_dml_where) — only when the source has an empty
+        // form for the executor to fall back on.
+        let (where_rest, consts) = match del
+            .where_clause
+            .as_ref()
+            .and_then(crate::planner::split_constant_dml_where)
+        {
+            Some((rest, consts)) if crate::executor::empty_input_plan(&scan).is_some() => {
+                (rest, consts)
+            }
+            _ => (del.where_clause.clone(), Vec::new()),
+        };
+        let source = if let Some(pred) = &where_rest {
             // Same fix as plan_update: route through apply_where_for_scan so
             // `DELETE FROM t WHERE id = ?` uses RowidLookup, not a full scan.
             // Collation resolution first (declared NOCASE/RTRIM columns
@@ -12510,6 +12533,7 @@ impl Database {
         } else {
             source
         };
+        let source = crate::planner::const_where_marker(source, consts);
         Ok(crate::planner::plan::Plan::Delete {
             table,
             source: Box::new(source),

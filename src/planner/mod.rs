@@ -4923,6 +4923,56 @@ pub(crate) fn first_bare_column_ref(e: &Expr) -> Option<(Option<String>, String)
     }
 }
 
+/// sqlite3WhereBegin's constant-term split for an UPDATE / DELETE WHERE:
+/// `(rest, consts)` — the conjuncts with no column, rowid or correlated
+/// reference (minus the ones that fold TRUE, which can neither raise nor
+/// filter) are evaluated ONCE before the loop; a FALSE / NULL one ends
+/// the statement before any row is read (`DELETE … WHERE abs(k) AND
+/// '%'` never evaluates abs()). `None` when there is nothing to split.
+pub(crate) fn split_constant_dml_where(w: &Expr) -> Option<(Option<Expr>, Vec<Expr>)> {
+    let mut rest = Vec::new();
+    let mut consts = Vec::new();
+    let mut changed = false;
+    for term in split_and_chain(w) {
+        if !is_constant_where_term(&term) {
+            rest.push(term);
+            continue;
+        }
+        changed = true;
+        let mut folded = term.clone();
+        fold::fold_expr(&mut folded);
+        match &folded {
+            Expr::Literal(v) if fold::literal_truthy(v) => {}
+            _ => consts.push(term),
+        }
+    }
+    if !changed {
+        return None;
+    }
+    let rest = (!rest.is_empty()).then(|| combine_and(&rest));
+    Some((rest, consts))
+}
+
+/// Wrap a DML source in the constant-WHERE marker (see
+/// [`split_constant_dml_where`]); `exec_delete` / `exec_update` evaluate
+/// it before touching the source.
+pub(crate) fn const_where_marker(source: Plan, consts: Vec<Expr>) -> Plan {
+    if consts.is_empty() {
+        return source;
+    }
+    Plan::Filter {
+        input: Box::new(source),
+        predicate: Expr::Function {
+            name: CONST_WHERE_FN.to_string(),
+            distinct: false,
+            args: consts,
+            filter: None,
+            over: None,
+            order_by: Vec::new(),
+        },
+    }
+}
+
 /// Is `e` the constant-WHERE marker predicate?
 pub(crate) fn const_where_terms(e: &Expr) -> Option<&[Expr]> {
     match e {

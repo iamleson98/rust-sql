@@ -103,6 +103,11 @@ fn substr_range(n: i64, y: i64, z: i64) -> (i64, i64) {
 ///   the operand's own via sqlite3CompareAffinity).
 pub(crate) const AFF_MARKER: &str = "\0aff:";
 pub(crate) const IN_RHS_MARKER: &str = "\0inrhs:";
+/// Identity carrier around a MATERIALIZED uncorrelated subquery value with
+/// no affinity of its own: the expression still "holds a subquery"
+/// (EP_Subquery) for the evaluation-order rules (`contains_subquery`).
+/// AFF_MARKER and IN_RHS_MARKER carriers wrap materialized subqueries too.
+pub(crate) const SUBQ_MARKER: &str = "\0subq";
 
 pub(crate) fn affinity_marker(prefix: &str, a: crate::types::Affinity) -> String {
     use crate::types::Affinity as A;
@@ -877,7 +882,7 @@ pub(crate) fn expr_affinity_with(
         Expr::Cast { type_name, expr } => {
             if let Some(a) = marker_affinity(type_name, AFF_MARKER) {
                 Some(a)
-            } else if type_name.starts_with(IN_RHS_MARKER) {
+            } else if type_name.starts_with(IN_RHS_MARKER) || type_name.starts_with(SUBQ_MARKER) {
                 expr_affinity_with(expr, col_aff)
             } else {
                 Some(crate::types::Affinity::from_declared_type(type_name))
@@ -1016,10 +1021,74 @@ fn simplified_and_or(e: &Expr) -> &Expr {
     e
 }
 
+/// EP_Subquery: does the expression tree hold a subquery anywhere? A
+/// non-allocating walk (the evaluator asks per operand, per row).
+pub(crate) fn contains_subquery(e: &Expr) -> bool {
+    match e {
+        Expr::Subquery(_) | Expr::Exists(_) => true,
+        Expr::In { expr, source, .. } => {
+            matches!(source, InSource::Subquery(_))
+                || contains_subquery(expr)
+                || matches!(source, InSource::List(l) if l.iter().any(contains_subquery))
+        }
+        Expr::Binary { left, right, .. } | Expr::Is { left, right, .. } => {
+            contains_subquery(left) || contains_subquery(right)
+        }
+        // A materialized subquery's carrier (see SUBQ_MARKER).
+        Expr::Cast { type_name, .. }
+            if type_name.starts_with(SUBQ_MARKER)
+                || type_name.starts_with(AFF_MARKER)
+                || type_name.starts_with(IN_RHS_MARKER) =>
+        {
+            true
+        }
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. } => contains_subquery(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => contains_subquery(expr) || contains_subquery(low) || contains_subquery(high),
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            contains_subquery(expr)
+                || contains_subquery(pattern)
+                || escape.as_deref().is_some_and(contains_subquery)
+        }
+        Expr::Row(items) => items.iter().any(contains_subquery),
+        Expr::Function { args, filter, .. } => {
+            args.iter().any(contains_subquery) || filter.as_deref().is_some_and(contains_subquery)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            operand.as_deref().is_some_and(contains_subquery)
+                || whens
+                    .iter()
+                    .any(|(w, t)| contains_subquery(w) || contains_subquery(t))
+                || else_.as_deref().is_some_and(contains_subquery)
+        }
+        Expr::Raise { message, .. } => message.as_deref().is_some_and(contains_subquery),
+        Expr::Literal(_) | Expr::Parameter(_) | Expr::Column { .. } => false,
+    }
+}
+
+/// sqlite3ExprCanBeNull, conservatively: only a non-NULL literal is known
+/// never to be NULL.
+fn can_be_null(e: &Expr) -> bool {
+    !matches!(e, Expr::Literal(v) if !v.is_null())
+}
+
 /// SQLite's exprEvalRhsFirst: with a subquery only on the LEFT, the
 /// right operand of an AND / OR goes first.
 fn and_or_order<'a>(left: &'a Expr, right: &'a Expr) -> (&'a Expr, &'a Expr) {
-    if crate::executor::expr_has_subquery(left) && !crate::executor::expr_has_subquery(right) {
+    if contains_subquery(left) && !contains_subquery(right) {
         (right, left)
     } else {
         (left, right)
@@ -1531,7 +1600,7 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
             }
             let (first, second) = and_or_order(left, right);
             let a = evaluate(first, ctx)?;
-            if crate::executor::expr_has_subquery(second) && !a.is_null() {
+            if !a.is_null() && contains_subquery(second) {
                 let t = a.is_truthy();
                 if *op == BinaryOp::And && !t {
                     return Ok(Value::Integer(0));
@@ -1547,8 +1616,49 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
             row_binary(*op, left, right, ctx, false)
         }
         Expr::Binary { op, left, right } => {
-            let l = evaluate(left, ctx)?;
-            let r = evaluate(right, ctx)?;
+            // exprComputeOperands (comparisons, arithmetic, bitwise, shifts,
+            // `||` — every operator that is NULL when an operand is NULL):
+            // an operand holding a subquery goes second and is SKIPPED
+            // when the other one is NULL — `NULL + CASE WHEN
+            // abs(-9223372036854775808) THEN (SELECT 1) END` is NULL, not
+            // "integer overflow". With the subquery only on the LEFT and a
+            // right operand that may be NULL, the right one goes first.
+            let null_skips = matches!(
+                op,
+                BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::LtEq
+                    | BinaryOp::Gt
+                    | BinaryOp::GtEq
+                    | BinaryOp::Add
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Div
+                    | BinaryOp::Mod
+                    | BinaryOp::BitAnd
+                    | BinaryOp::BitOr
+                    | BinaryOp::ShiftLeft
+                    | BinaryOp::ShiftRight
+                    | BinaryOp::Concat
+            );
+            let (l, r) = if null_skips
+                && can_be_null(right)
+                && contains_subquery(left)
+                && !contains_subquery(right)
+            {
+                let r = evaluate(right, ctx)?;
+                if r.is_null() {
+                    return Ok(Value::Null);
+                }
+                (evaluate(left, ctx)?, r)
+            } else {
+                let l = evaluate(left, ctx)?;
+                if null_skips && l.is_null() && contains_subquery(right) {
+                    return Ok(Value::Null);
+                }
+                (l, evaluate(right, ctx)?)
+            };
             // Comparison-affinity coercion (SQLite's exprAffinity rules):
             // applied BEFORE the collation dispatch — `text_col > 0` must
             // compare TEXT-to-TEXT even under a COLLATE, and

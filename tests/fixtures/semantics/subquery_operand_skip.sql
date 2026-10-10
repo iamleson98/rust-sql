@@ -1,0 +1,23 @@
+-- exprComputeOperands (SQLite 3.53): in a comparison / arithmetic / bitwise
+-- / shift / `||` operator, an operand holding a subquery is evaluated
+-- SECOND and SKIPPED when the other operand is NULL (the result is NULL
+-- anyway) — so a raising expression inside it never runs. With the
+-- subquery only on the left and a nullable right operand, the right one
+-- goes first. IS / IS NOT compare NULLs and never skip.
+CREATE TABLE s(j TEXT, k INTEGER);
+INSERT INTO s VALUES ('a', NULL), ('b', 2), ('c', NULL);
+SELECT NULL + CASE WHEN abs(-9223372036854775808) THEN (SELECT 1) END;
+SELECT 1 + CASE WHEN abs(-9223372036854775808) THEN (SELECT 1) END;
+SELECT NULL % CASE WHEN abs(-9223372036854775808) THEN (SELECT 1) END;
+SELECT NULL || CASE WHEN abs(-9223372036854775808) THEN (SELECT 'x') END;
+SELECT NULL = CASE WHEN abs(-9223372036854775808) THEN (SELECT 1) END;
+SELECT NULL < (SELECT abs(-9223372036854775808));
+SELECT NULL IS (SELECT abs(-9223372036854775808));
+SELECT (SELECT abs(-9223372036854775808)) + NULL;
+SELECT (SELECT abs(-9223372036854775808)) + 1;
+SELECT (SELECT abs(-9223372036854775808)) + (SELECT NULL);
+SELECT NULL + CASE WHEN abs(-9223372036854775808) THEN 1 END;
+SELECT j FROM s WHERE k % CASE WHEN abs(-9223372036854775808) THEN 1 WHEN k THEN (SELECT max(k) FROM s AS s2 WHERE s2.k < s.k) END;
+SELECT j FROM s WHERE NULL % CASE WHEN abs(-9223372036854775808) THEN 1 WHEN k THEN (SELECT max(k) FROM s AS s2 WHERE s2.k < s.k) END;
+SELECT j, k + (SELECT abs(-9223372036854775808) WHERE s.k IS NOT NULL) FROM s WHERE k IS NULL ORDER BY j;
+SELECT j, k > (SELECT count(*) FROM s) FROM s ORDER BY j;

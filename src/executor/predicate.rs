@@ -782,6 +782,11 @@ fn bind_operand(e: &Expr, table: &crate::schema::Table, prefix: &str) -> Option<
 fn compile_pred_expr(e: &Expr, table: &crate::schema::Table, prefix: &str) -> Option<PredExpr> {
     match e {
         Expr::Literal(v) => Some(PredExpr::Literal(v.clone())),
+        // A materialized subquery's identity carrier: the value is a
+        // literal for every compiled purpose (no affinity of its own).
+        Expr::Cast { expr, type_name } if type_name == crate::executor::expr::SUBQ_MARKER => {
+            compile_pred_expr(expr, table, prefix)
+        }
         Expr::Parameter(p) => p.parse::<usize>().ok().map(PredExpr::Param),
         Expr::Column { table: ref_t, name } => {
             let matches = ref_t
@@ -891,6 +896,9 @@ fn between_kleene(v: &Value, l: &Value, h: &Value) -> Option<bool> {
 fn bind_leaf(e: &Expr, table: &crate::schema::Table, prefix: &str) -> Option<PredValue> {
     match e {
         Expr::Literal(v) => Some(PredValue::Literal(v.clone())),
+        Expr::Cast { expr, type_name } if type_name == crate::executor::expr::SUBQ_MARKER => {
+            bind_leaf(expr, table, prefix)
+        }
         Expr::Parameter(p) => p.parse::<usize>().ok().map(PredValue::Param),
         // `-10` parses as Unary(Neg, Literal(10)). Fold it so predicates
         // with negative literal bounds (`a BETWEEN -10 AND -1`, `a > -5`)
@@ -1719,6 +1727,9 @@ pub(crate) fn compile_expr(
 ) -> Option<CompiledExpr> {
     match e {
         Expr::Literal(v) => Some(CompiledExpr::Literal(v.clone())),
+        Expr::Cast { expr, type_name } if type_name == crate::executor::expr::SUBQ_MARKER => {
+            compile_expr(expr, col_names, params_len)
+        }
         Expr::Column { table: None, name } => {
             let idx = col_names
                 .iter()

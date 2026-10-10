@@ -4369,15 +4369,15 @@ fn rewrite_subqueries_rec(e: &Expr, ctx: &mut ExecContext<'_>) -> Result<Expr> {
                 // Keep the subquery's comparison affinity (sqlite3ExprAffinity
                 // of TK_SELECT is its first result column's): `(SELECT
                 // textcol …) = 1` compares as TEXT.
-                Ok(match aff {
-                    Some(a) => Expr::Cast {
-                        expr: Box::new(Expr::Literal(v)),
-                        type_name: crate::executor::expr::affinity_marker(
+                Ok(Expr::Cast {
+                    expr: Box::new(Expr::Literal(v)),
+                    type_name: match aff {
+                        Some(a) => crate::executor::expr::affinity_marker(
                             crate::executor::expr::AFF_MARKER,
                             a,
                         ),
+                        None => crate::executor::expr::SUBQ_MARKER.to_string(),
                     },
-                    None => Expr::Literal(v),
                 })
             }
         }
@@ -4395,11 +4395,12 @@ fn rewrite_subqueries_rec(e: &Expr, ctx: &mut ExecContext<'_>) -> Result<Expr> {
                     }
                     Err(e) => return Err(e),
                 };
-                Ok(Expr::Literal(Value::Integer(if res.rows.is_empty() {
-                    0
-                } else {
-                    1
-                })))
+                Ok(Expr::Cast {
+                    expr: Box::new(Expr::Literal(Value::Integer(i64::from(
+                        !res.rows.is_empty(),
+                    )))),
+                    type_name: crate::executor::expr::SUBQ_MARKER.to_string(),
+                })
             }
         }
         Expr::In {
@@ -8183,6 +8184,17 @@ fn const_where_holds(ctx: &ExecContext<'_>, terms: &[Expr]) -> Result<bool> {
         }
     }
     Ok(true)
+}
+
+/// The constant-WHERE marker on top of an UPDATE / DELETE source:
+/// `(source below it, terms)`.
+fn dml_const_where(source: &Plan) -> Option<(&Plan, &[Expr])> {
+    match source {
+        Plan::Filter { input, predicate } => {
+            crate::planner::const_where_terms(predicate).map(|t| (input.as_ref(), t))
+        }
+        _ => None,
+    }
 }
 
 fn exec_const_where(ctx: &mut ExecContext<'_>, input: &Plan, terms: &[Expr]) -> Result<ExecResult> {
@@ -16348,6 +16360,9 @@ fn compile_join_jexpr(
 ) -> Option<JExpr> {
     match e {
         Expr::Literal(v) => Some(JExpr::Literal(v.clone())),
+        Expr::Cast { expr, type_name } if type_name == crate::executor::expr::SUBQ_MARKER => {
+            compile_join_jexpr(expr, combined, n_left, params_len)
+        }
         Expr::Column { table, name } => {
             let p = resolve_column_index(combined, table.as_deref(), name)?;
             Some(if p < n_left {
@@ -25320,6 +25335,28 @@ fn exec_update(
     or_conflict: ConflictResolution,
     from: Option<&crate::planner::plan::UpdateFrom>,
 ) -> Result<ExecResult> {
+    // Constant WHERE terms (planner::split_constant_dml_where): evaluated
+    // once before any row is read; a FALSE / NULL one updates nothing.
+    if let Some((input, consts)) = dml_const_where(source) {
+        let input = if const_where_holds(ctx, consts)? {
+            input.clone()
+        } else {
+            empty_input_plan(input).ok_or_else(|| {
+                Error::runtime(
+                    "internal error: constant WHERE over a DML source without an empty form",
+                )
+            })?
+        };
+        return exec_update(
+            ctx,
+            table,
+            &input,
+            assignments,
+            returning,
+            or_conflict,
+            from,
+        );
+    }
     // `UPDATE ... FROM` (SQLite 3.33+): the target table is joined with
     // the FROM side and the WHERE clause spans both. Per SQLite
     // semantics: a target row matching multiple FROM rows is updated
@@ -29004,6 +29041,17 @@ fn exec_delete(
     source: &Plan,
     returning: Option<&[crate::sql::ast::ResultColumn]>,
 ) -> Result<ExecResult> {
+    // Constant WHERE terms (planner::split_constant_dml_where): evaluated
+    // once before any row is read; a FALSE / NULL one deletes nothing.
+    if let Some((input, consts)) = dml_const_where(source) {
+        if const_where_holds(ctx, consts)? {
+            return exec_delete(ctx, table, input, returning);
+        }
+        let empty = empty_input_plan(input).ok_or_else(|| {
+            Error::runtime("internal error: constant WHERE over a DML source without an empty form")
+        })?;
+        return exec_delete(ctx, table, &empty, returning);
+    }
     // Virtual table: collect matching rowids through the module, batch
     // xUpdate (delete ops).
     if table.vtab.is_some() {
