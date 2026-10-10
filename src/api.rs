@@ -5322,15 +5322,24 @@ impl Database {
     /// `Err` for a real failure. Not-applicable cases: WITHOUT ROWID /
     /// STRICT tables, generated columns, missing DEFAULT evaluation,
     /// duplicate column names (the general path produces nicer errors).
-    fn exec_fast_insert(&mut self, fi: FastInsert<'_>) -> Result<bool> {
-        let table = match self.catalog.get_table_fast(fi.table) {
+    /// The fast INSERT's target and column positions — or `None` when the
+    /// statement must take the general path (a view, an unknown table, a
+    /// table shape the byte path does not serve). The ONLY decline point:
+    /// once this returns `Some`, the fast path runs the statement.
+    fn fast_insert_target(
+        &self,
+        table_name: &str,
+        columns: &[&str],
+        n_values_per_row: usize,
+    ) -> Result<Option<(Arc<Table>, Vec<usize>)>> {
+        let table = match self.catalog.get_table_fast(table_name) {
             Some(t) => t,
             // Not a table — a VIEW (DML on views routes to INSTEAD OF
             // triggers via the cached-statement `view_target` check) or
             // an unknown name (the general path's planner produces the
             // canonical "no such table" error). Fall through: this path
             // is table-only by construction.
-            None => return Ok(false),
+            None => return Ok(None),
         };
         // Table-shape bails: fall through to the general path.
         // Virtual tables route through xUpdate — the byte scanner's
@@ -5343,20 +5352,19 @@ impl Database {
             // general path's sqlite_sequence maintenance.
             || table.columns.iter().any(|c| c.autoincrement)
         {
-            return Ok(false);
+            return Ok(None);
         }
         // If any column has a DEFAULT and the row doesn't supply every
         // column, defaults must be evaluated — general path.
-        let supplies_all = fi.columns.is_empty() || (fi.columns.len() == table.n_columns());
+        let supplies_all = columns.is_empty() || (columns.len() == table.n_columns());
         if !supplies_all && table.columns.iter().any(|c| c.default.is_some()) {
-            return Ok(false);
+            return Ok(None);
         }
 
         // Resolve target column indices ONCE for the whole batch (was: per
         // value, per row). Empty = all columns in declared order.
         let n_cols = table.n_columns();
-        let n_values_per_row = fi.values.first().map(|r| r.len()).unwrap_or(0);
-        let col_indices: Vec<usize> = if fi.columns.is_empty() {
+        let col_indices: Vec<usize> = if columns.is_empty() {
             if n_values_per_row != n_cols {
                 return Err(Error::semantic(format!(
                     "table {} has {} columns but {} values were supplied",
@@ -5365,20 +5373,20 @@ impl Database {
             }
             Vec::new()
         } else {
-            if n_values_per_row != fi.columns.len() {
+            if n_values_per_row != columns.len() {
                 return Err(Error::semantic(format!(
                     "{} VALUES for {} columns",
                     n_values_per_row,
-                    fi.columns.len()
+                    columns.len()
                 )));
             }
-            let mut seen: Vec<usize> = Vec::with_capacity(fi.columns.len());
-            for name in fi.columns.iter() {
+            let mut seen: Vec<usize> = Vec::with_capacity(columns.len());
+            for name in columns.iter() {
                 match resolve_insert_column(&table, name) {
                     Some(idx) => {
                         if seen.contains(&idx) {
                             // Duplicate column — general path errors nicely.
-                            return Ok(false);
+                            return Ok(None);
                         }
                         seen.push(idx);
                     }
@@ -5392,7 +5400,28 @@ impl Database {
             }
             seen
         };
+        Ok(Some((table, col_indices)))
+    }
 
+    fn exec_fast_insert(&mut self, fi: FastInsert<'_>) -> Result<bool> {
+        let n_values_per_row = fi.values.first().map(|r| r.len()).unwrap_or(0);
+        let Some((table, col_indices)) =
+            self.fast_insert_target(fi.table, &fi.columns, n_values_per_row)?
+        else {
+            return Ok(false);
+        };
+        self.exec_fast_insert_resolved(&fi.columns, table, col_indices, fi.values)?;
+        Ok(true)
+    }
+
+    /// Run a fast INSERT whose target `fast_insert_target` resolved.
+    fn exec_fast_insert_resolved(
+        &mut self,
+        stmt_cols: &[&str],
+        table: Arc<Table>,
+        col_indices: Vec<usize>,
+        values: Vec<Vec<Value>>,
+    ) -> Result<()> {
         // Set up the execution context exactly like `execute` does.
         let in_txn = self.in_transaction.load(Ordering::Acquire);
         let txn_snap = self.txn_snapshot.get_mut().take();
@@ -5408,7 +5437,7 @@ impl Database {
         ctx.shared_detached = true;
         // The original column-list shape (empty = supplies-all) decides the
         // chain's scanner gate — take it out before `fi.values` moves.
-        let stmt_columns: Vec<&str> = fi.columns.clone();
+        let stmt_columns: Vec<&str> = stmt_cols.to_vec();
         // A statement that supplies an explicit (non-NULL) rowid-alias
         // value is a shape the chain never serves (its scanner rejects
         // explicit rowids): building one would only be flushed by the next
@@ -5417,14 +5446,14 @@ impl Database {
             col_indices
                 .iter()
                 .position(|&c| c == alias)
-                .is_some_and(|k| fi.values.iter().any(|row| !row[k].is_null()))
+                .is_some_and(|k| values.iter().any(|row| !row[k].is_null()))
         });
         // Pre-statement dirty-set mark for the autocommit failure restore
         // below (the same DELTA gate the general path uses).
         let fast_dirty_at_start = self.pager.dirty_set_marked();
         let result =
-            crate::executor::fast_insert_literal_rows(&mut ctx, &table, &col_indices, fi.values)
-                .map(|(inserted, root, max_rowid)| {
+            crate::executor::fast_insert_literal_rows(&mut ctx, &table, &col_indices, values).map(
+                |(inserted, root, max_rowid)| {
                     // Seed the cross-statement INSERT chain (eligibility
                     // is checked inside; plain tables only). The chain
                     // serves the NEXT same-shape statement; this one paid
@@ -5446,7 +5475,8 @@ impl Database {
                         leaf_hint,
                     );
                     inserted
-                });
+                },
+            );
 
         // ── Statement journal (row-granularity statement atomicity — see
         // the general path's hook): a FAILED fast-path INSERT leaves no
@@ -5567,7 +5597,7 @@ impl Database {
         }
         // Allocator-wake drain at auto-commit write-burst completion.
         self.maybe_drain_after_burst();
-        Ok(true)
+        Ok(())
     }
 
     /// True when the statement carries a WITH clause — its plan embeds
@@ -6364,38 +6394,60 @@ impl Database {
                         return Ok(());
                     }
                     // Memo hit: the same bound INSERT text as last time.
-                    let memo_fi = params.as_slice().and_then(|p| {
+                    // Its row IS the parameter list — MOVED in (a 2 KB TEXT
+                    // parameter was cloned per call) once the target is
+                    // resolved (the only point the fast path can decline).
+                    let memo_hit: Option<(&str, Vec<&str>)> = params.as_slice().and_then(|p| {
                         let m = self.fast_insert_memo.lock();
                         let m = m.as_ref()?;
-                        (m.sql.as_ref() == sql && m.n_params == p.len()).then(|| FastInsert {
-                            table: &sql[m.table.0..m.table.1],
-                            columns: m.columns.iter().map(|&(a, b)| &sql[a..b]).collect(),
-                            values: vec![p.to_vec()],
-                            bound: true,
+                        (m.sql.as_ref() == sql && m.n_params == p.len()).then(|| {
+                            (
+                                &sql[m.table.0..m.table.1],
+                                m.columns.iter().map(|&(a, b)| &sql[a..b]).collect(),
+                            )
                         })
                     });
-                    let parsed = match memo_fi {
-                        Some(fi) => Some(fi),
-                        None => {
-                            let fi = try_fast_insert_parse(sql, params.as_slice());
-                            // Remember a BOUND single-row shape (its row IS
-                            // the parameter list).
-                            if let (Some(fi), Some(p)) = (&fi, params.as_slice()) {
-                                if fi.bound {
-                                    let off = |s: &str| {
-                                        let a = s.as_ptr() as usize - sql.as_ptr() as usize;
-                                        (a, a + s.len())
-                                    };
-                                    *self.fast_insert_memo.lock() = Some(FastInsertShape {
-                                        sql: sql.into(),
-                                        table: off(fi.table),
-                                        columns: fi.columns.iter().map(|c| off(c)).collect(),
-                                        n_params: p.len(),
-                                    });
-                                }
-                            }
-                            fi
+                    if let Some((tname, cols)) = memo_hit {
+                        let n = params.as_slice().map_or(0, |p| p.len());
+                        let target = self.fast_insert_target(tname, &cols, n);
+                        if target.is_err() {
+                            self.recover_failed_autocommit_fastpath(dirty_at_start);
                         }
+                        if let Some((table, col_indices)) = target? {
+                            let row: Vec<Value> = params.into_iter().collect();
+                            let fast = self.exec_fast_insert_resolved(
+                                &cols,
+                                table,
+                                col_indices,
+                                vec![row],
+                            );
+                            if fast.is_err() {
+                                self.recover_failed_autocommit_fastpath(dirty_at_start);
+                            }
+                            fast?;
+                            self.note_pending_write()?;
+                            return Ok(());
+                        }
+                    }
+                    let parsed = {
+                        let fi = try_fast_insert_parse(sql, params.as_slice());
+                        // Remember a BOUND single-row shape (its row IS
+                        // the parameter list).
+                        if let (Some(fi), Some(p)) = (&fi, params.as_slice()) {
+                            if fi.bound {
+                                let off = |s: &str| {
+                                    let a = s.as_ptr() as usize - sql.as_ptr() as usize;
+                                    (a, a + s.len())
+                                };
+                                *self.fast_insert_memo.lock() = Some(FastInsertShape {
+                                    sql: sql.into(),
+                                    table: off(fi.table),
+                                    columns: fi.columns.iter().map(|c| off(c)).collect(),
+                                    n_params: p.len(),
+                                });
+                            }
+                        }
+                        fi
                     };
                     if let Some(fi) = parsed {
                         let fast = self.exec_fast_insert(fi);

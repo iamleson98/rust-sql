@@ -1604,12 +1604,26 @@ impl<'a> ExecContext<'a> {
         // and so must we. DELETE of the max rowid invalidates the entry
         // entirely (see `invalidate_max_rowid_if_deleted`), which is the
         // only legitimate way the cached max shrinks.
-        if let Some(v) = self.max_rowids.get_mut(table_name_lc) {
-            if rowid > *v {
-                *v = rowid;
-                self.max_rowids_changed = true;
+        if !self.max_rowids.is_empty() {
+            if let Some(v) = self.max_rowids.get_mut(table_name_lc) {
+                if rowid > *v {
+                    *v = rowid;
+                    self.max_rowids_changed = true;
+                }
+                return;
             }
-            return;
+        }
+        // Uniquely owned maps (a detached autocommit context, a plain
+        // transaction — see below): raise the entry in place with ONE
+        // lookup (the general branches below look it up twice).
+        if let Some(shared) = std::sync::Arc::get_mut(&mut self.shared) {
+            if let Some(v) = shared.max_rowids.get_mut(table_name_lc) {
+                if rowid > *v {
+                    *v = rowid;
+                    self.max_rowids_changed = true;
+                }
+                return;
+            }
         }
         if let Some(&shared_max) = self.shared.max_rowids.get(table_name_lc) {
             if rowid > shared_max {
@@ -23235,7 +23249,10 @@ pub fn fast_insert_literal_rows(
     let table_name_lc = table.name.to_ascii_lowercase();
     let n_cols = table.n_columns();
     let mut full_row: Vec<Value> = vec![Value::Null; n_cols];
-    let mut payload_buf: Vec<u8> = Vec::with_capacity(n_cols * 8);
+    // Reused across statements (a 2 KB row regrew a fresh buffer from 16
+    // bytes — seven reallocations — on every single-row statement).
+    let mut payload_buf: Vec<u8> = FAST_PAYLOAD_BUF.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    payload_buf.clear();
     // Column names — needed for CHECK constraints and GENERATED columns
     // (NOT NULL is positional).
     let col_names: Vec<String> =
@@ -23435,6 +23452,10 @@ pub fn fast_insert_literal_rows(
     // the live root back itself.
     flush_insert_index_bufs(ctx, &mut index_states)?;
     return_fast_index_states(table, index_states);
+    // Keep a modest buffer for the next statement (not a huge one).
+    if payload_buf.capacity() <= 64 * 1024 {
+        FAST_PAYLOAD_BUF.with(|b| *b.borrow_mut() = payload_buf);
+    }
     // (rows inserted, final live root, final max rowid) — the caller's
     // INSERT-chain setup consumes the live root / max-rowid so the next
     // same-shape statement can skip the derivation entirely.
@@ -23442,6 +23463,9 @@ pub fn fast_insert_literal_rows(
 }
 
 std::thread_local! {
+    /// The literal fast path's row-payload buffer, carried to the next
+    /// statement (see `fast_insert_literal_rows`).
+    static FAST_PAYLOAD_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     /// The literal fast path's index states, carried to the next
     /// statement on the same table (the general path's `InsertScratch`
     /// twin): single-row INSERT streams keep each index's validated
