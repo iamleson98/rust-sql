@@ -699,24 +699,45 @@ fn inlj_covering_emission_and_count_shapes() {
         let theirs = lite_rows(&con, sql);
         assert_eq!(ours, theirs, "mismatch on {sql}");
     }
-    // EXPLAIN: the covering form reports SQLite's wording.
+    // EXPLAIN: the covering form reports SQLite's wording — for the
+    // implicit-join spelling too (its join key is a WHERE term the rewrite
+    // consumes, not an inner-column read).
+    for sql in [
+        "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM a JOIN b ON a.k = b.k WHERE a.id = 4",
+        "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM a, b WHERE a.id = 4 AND a.k = b.k",
+    ] {
+        let rows = db.query(sql, []).unwrap();
+        let details: Vec<String> = rows
+            .iter()
+            .filter_map(|r| match r.last() {
+                Some(Value::Text(t)) => Some(t.as_str().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            details
+                .iter()
+                .any(|d| d.contains("USING COVERING INDEX ib")),
+            "covering wording missing for {sql}: {details:?}"
+        );
+    }
+    // A WHERE read of an inner column keeps the table fetch.
     let rows = db
         .query(
-            "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM a JOIN b ON a.k = b.k WHERE a.id = 4",
+            "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM a, b WHERE a.id = 4 AND a.k = b.k AND b.w + 0 > 1",
             [],
         )
         .unwrap();
-    let details: Vec<String> = rows
-        .iter()
-        .filter_map(|r| match r.last() {
-            Some(Value::Text(t)) => Some(t.as_str().to_string()),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        details
-            .iter()
-            .any(|d| d.contains("USING COVERING INDEX ib")),
-        "covering wording missing: {details:?}"
+    assert!(!rows.iter().any(|r| matches!(r.last(),
+        Some(Value::Text(t)) if t.as_str().contains("COVERING"))));
+    assert_eq!(
+        engine_strs(&engine_rows(
+            &db,
+            "SELECT COUNT(*) FROM a, b WHERE a.id = 4 AND a.k = b.k AND b.w + 0 > 1"
+        )),
+        lite_rows(
+            &con,
+            "SELECT COUNT(*) FROM a, b WHERE a.id = 4 AND a.k = b.k AND b.w + 0 > 1"
+        )
     );
 }

@@ -532,6 +532,12 @@ pub(crate) fn lookup_codec(name: &str) -> Option<Arc<dyn PageCodec>> {
     scope::current().and_then(|r| r.codec(name))
 }
 
+/// Does the current statement scope have any user-registered collation?
+/// (Hash-keyed joins fold text keys for the built-in collations only.)
+pub(crate) fn custom_collations_registered() -> bool {
+    scope::current().is_some_and(|r| !r.collations.is_empty())
+}
+
 /// Resolve a collation (built-ins NOCASE/RTRIM are always available;
 /// BINARY is the engine's default order and needs no object).
 pub(crate) fn lookup_collation(name: &str) -> Option<Arc<dyn Collation>> {

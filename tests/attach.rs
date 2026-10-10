@@ -253,11 +253,19 @@ fn cross_schema_insert_synthesis() {
     db.execute("INSERT INTO copy SELECT * FROM aux.x WHERE a <= 1", [])
         .unwrap();
     assert_eq!(rows(&db, "SELECT a, b FROM copy"), vec![vec!["1", "one"]]);
-    // Upsert preserved through synthesis.
+    // Upsert preserved through synthesis. (`WHERE true`: right after a
+    // FROM clause SQLite reads `ON` as a join constraint — the upsert
+    // without it is `near "DO": syntax error` there and here.)
     db.execute("CREATE UNIQUE INDEX aux.ua ON x(a)", [])
         .unwrap();
+    assert!(db
+        .execute(
+            "INSERT INTO aux.x(a,b) SELECT a, 'u' FROM t ON CONFLICT(a) DO UPDATE SET b='upd'",
+            [],
+        )
+        .is_err());
     db.execute(
-        "INSERT INTO aux.x(a,b) SELECT a, 'u' FROM t ON CONFLICT(a) DO UPDATE SET b='upd'",
+        "INSERT INTO aux.x(a,b) SELECT a, 'u' FROM t WHERE true ON CONFLICT(a) DO UPDATE SET b='upd'",
         [],
     )
     .unwrap();

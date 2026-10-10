@@ -1309,6 +1309,7 @@ impl Parser {
         } else {
             None
         };
+        let values_start = self.pos;
         let source = if self.peek().is_keyword("VALUES") {
             self.advance();
             let mut rows = Vec::new();
@@ -1331,9 +1332,45 @@ impl Parser {
                     break;
                 }
             }
-            InsertSource::Values(rows)
+            // The INSERT source is a full select statement in SQLite's
+            // grammar: a VALUES list that continues as a compound
+            // (`VALUES (1, 'a') UNION SELECT 2, 'b'`) is re-read as one.
+            if ["UNION", "INTERSECT", "EXCEPT"]
+                .iter()
+                .any(|k| self.peek().is_keyword(k))
+            {
+                self.pos = values_start;
+                InsertSource::Select(Box::new(self.parse_select()?))
+            } else {
+                InsertSource::Values(rows)
+            }
         } else if self.peek().is_keyword("SELECT") {
             InsertSource::Select(Box::new(self.parse_select()?))
+        } else if self.peek().is_keyword("WITH") {
+            // `INSERT INTO t WITH c AS (…) SELECT …` (or `… VALUES …`):
+            // the source select carries its own WITH clause, visible only
+            // inside it. Read it as `SELECT * FROM (<that select>)` — a
+            // FROM-subquery materializes its own CTEs.
+            let inner = self.parse_select()?;
+            InsertSource::Select(Box::new(SelectStatement {
+                with: None,
+                body: SelectBody::Simple(SimpleSelect {
+                    distinct: false,
+                    columns: vec![ResultColumn::Star],
+                    from: Some(TableExpression::Subquery {
+                        select: Box::new(inner),
+                        alias: None,
+                        column_aliases: None,
+                    }),
+                    where_clause: None,
+                    group_by: Vec::new(),
+                    having: None,
+                    window: Vec::new(),
+                }),
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+            }))
         } else if self.peek().is_keyword("DEFAULT") {
             self.advance();
             self.expect_keyword("VALUES")?;
@@ -1347,6 +1384,20 @@ impl Parser {
             ));
         };
         let upsert = if self.peek().is_keyword("ON") {
+            // SQLite's parsing ambiguity: right after a FROM clause, `ON`
+            // is that FROM's join constraint (`ON CONFLICT` reads as `ON
+            // <expr CONFLICT>`), so an upsert there is `near "DO": syntax
+            // error` — the documented fix is a `WHERE true`.
+            if let InsertSource::Select(sel) = &source {
+                if select_ends_on_from(sel) {
+                    let mut i = self.pos;
+                    while i < self.toks.len() - 1 && !self.toks[i].is_keyword("DO") {
+                        i += 1;
+                    }
+                    let t = &self.toks[i];
+                    return Err(Error::parse(t.line, t.col, "near \"DO\": syntax error"));
+                }
+            }
             self.advance();
             self.expect_keyword("CONFLICT")?;
             let target = if self.peek().is_punct('(') {
@@ -3735,6 +3786,31 @@ impl Parser {
         if self.pos < self.toks.len() - 1 {
             self.pos += 1;
         }
+    }
+}
+
+/// Does the select statement's text end with a FROM clause (its last
+/// core has a FROM and nothing after it — no WHERE / GROUP BY / HAVING /
+/// WINDOW, and no ORDER BY / LIMIT on the statement)?
+fn select_ends_on_from(sel: &SelectStatement) -> bool {
+    fn last_core(b: &SelectBody) -> &SelectBody {
+        match b {
+            SelectBody::Binary { right, .. } => last_core(right),
+            other => other,
+        }
+    }
+    if !sel.order_by.is_empty() || sel.limit.is_some() {
+        return false;
+    }
+    match last_core(&sel.body) {
+        SelectBody::Simple(s) => {
+            s.from.is_some()
+                && s.where_clause.is_none()
+                && s.group_by.is_empty()
+                && s.having.is_none()
+                && s.window.is_empty()
+        }
+        SelectBody::Binary { .. } => false,
     }
 }
 

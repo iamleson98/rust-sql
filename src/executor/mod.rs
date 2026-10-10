@@ -16551,6 +16551,127 @@ fn exec_join_rows(
     let compiled = condition
         .as_ref()
         .and_then(|c| compile_join_term(c, &combined_cols, n_left, params.len(), affinities));
+
+    // ---- KEYED path: equality conjuncts between the two sides ----------
+    // `b.y = a.x + 1`, `b.q = 'q' || a.x`, a cross-affinity `a.n = b.t`:
+    // the planner's hash join keys bare same-affinity column pairs only,
+    // and every other equality ran the nested loop below over EVERY pair
+    // (20k x 20k rows: 95 s, where SQLite seeks an automatic index in
+    // 8 ms). Hash the right side on a key that never separates two values
+    // SQLite's `=` can find equal (`push_join_value_key`), then test the
+    // WHOLE condition on each candidate pair exactly as the loop would:
+    // same rows, same order (left-major, right rows ascending), same
+    // outer-join NULL extension. Pairs the key rejects are never
+    // evaluated — as behind SQLite's index seek.
+    if let Some(cond) = condition {
+        if left_res.rows.len().saturating_mul(right_res.rows.len()) >= KEYED_JOIN_MIN_PAIRS
+            && !crate::plugin::custom_collations_registered()
+        {
+            if let Some(keys) = join_key_exprs(cond, &left_res.columns, &right_res.columns) {
+                let (l_affs, r_affs) = match affinities {
+                    Some(a) if a.len() == n_left + n_right => {
+                        (Some(&a[..n_left]), Some(&a[n_left..]))
+                    }
+                    _ => (None, None),
+                };
+                let lk: Vec<&Expr> = keys.iter().map(|(l, _)| *l).collect();
+                let rk: Vec<&Expr> = keys.iter().map(|(_, r)| *r).collect();
+                let right_keys = join_side_keys(
+                    &rk,
+                    &right_res.rows,
+                    &right_res.columns,
+                    r_affs,
+                    &params,
+                    &named_params,
+                )?;
+                let mut table: HashMap<Vec<u8>, Vec<u32>, crate::api::FxHashBuild> =
+                    HashMap::with_capacity_and_hasher(right_res.rows.len(), Default::default());
+                for (ri, k) in right_keys.into_iter().enumerate() {
+                    if let Some(k) = k {
+                        table.entry(k).or_default().push(ri as u32);
+                    }
+                }
+                let left_keys = join_side_keys(
+                    &lk,
+                    &left_res.rows,
+                    &left_res.columns,
+                    l_affs,
+                    &params,
+                    &named_params,
+                )?;
+                let left_outer = matches!(
+                    join_type,
+                    crate::sql::ast::JoinType::Left | crate::sql::ast::JoinType::Full
+                );
+                let p: &[Value] = &params;
+                for (left_row, key) in left_res.rows.iter().zip(left_keys) {
+                    let mut matched = false;
+                    if let Some(cands) = key.as_ref().and_then(|k| table.get(k)) {
+                        for &ri in cands {
+                            let right_row = &right_res.rows[ri as usize];
+                            let ok = match &compiled {
+                                Some(jt) => jt.truthy(left_row, right_row, p),
+                                None => {
+                                    let mut combined: Row = Vec::with_capacity(n_left + n_right);
+                                    combined.extend_from_slice(left_row);
+                                    combined.extend_from_slice(right_row);
+                                    match affinities {
+                                        Some(affs) => eval_row_aff_where(
+                                            cond,
+                                            &combined,
+                                            &combined_cols,
+                                            affs,
+                                            &params,
+                                            &named_params,
+                                        )?,
+                                        None => eval_row_where(
+                                            cond,
+                                            &combined,
+                                            &combined_cols,
+                                            &params,
+                                            &named_params,
+                                        )?,
+                                    }
+                                }
+                            };
+                            if ok {
+                                let mut combined: Row = Vec::with_capacity(n_left + n_right);
+                                combined.extend_from_slice(left_row);
+                                combined.extend_from_slice(right_row);
+                                out_rows.push(combined);
+                                matched = true;
+                                right_matched[ri as usize] = true;
+                            }
+                        }
+                    }
+                    if !matched && left_outer {
+                        let mut combined: Row = Vec::with_capacity(n_left + n_right);
+                        combined.extend_from_slice(left_row);
+                        combined.extend(std::iter::repeat(Value::Null).take(n_right));
+                        out_rows.push(combined);
+                    }
+                }
+                if matches!(
+                    join_type,
+                    crate::sql::ast::JoinType::Right | crate::sql::ast::JoinType::Full
+                ) {
+                    for (ri, right_row) in right_res.rows.iter().enumerate() {
+                        if !right_matched[ri] {
+                            let mut combined: Row = Vec::with_capacity(n_left + n_right);
+                            combined.extend(std::iter::repeat(Value::Null).take(n_left));
+                            combined.extend_from_slice(right_row);
+                            out_rows.push(combined);
+                        }
+                    }
+                }
+                return Ok(ExecResult {
+                    columns: combined_cols.into(),
+                    rows: out_rows,
+                });
+            }
+        }
+    }
+
     if let Some(jt) = compiled {
         // ---- Intra-statement parallel split: the LEFT (outer) side's
         // row range splits across workers; each worker runs the
@@ -16675,6 +16796,255 @@ fn exec_join_rows(
         columns: combined_cols.into(),
         rows: out_rows,
     })
+}
+
+/// Below this many (left x right) pairs the plain nested loop is as cheap
+/// as building a keyed table.
+const KEYED_JOIN_MIN_PAIRS: usize = 4096;
+
+/// The equality conjuncts of a join condition usable as hash keys: each
+/// `L = R` (top-level AND chain) whose one operand reads only the LEFT
+/// side's columns and the other only the RIGHT side's, both
+/// deterministic and subquery-free. Returned as (left operand, right
+/// operand); `None` when there is none.
+fn join_key_exprs<'e>(
+    cond: &'e Expr,
+    left_cols: &[String],
+    right_cols: &[String],
+) -> Option<Vec<(&'e Expr, &'e Expr)>> {
+    #[derive(PartialEq)]
+    enum Side {
+        Left,
+        Right,
+    }
+    fn has_col(cols: &[String], table: Option<&str>, name: &str) -> bool {
+        match table {
+            Some(t) => cols.iter().any(|c| {
+                let b = c.as_bytes();
+                (b.len() == t.len() + 1 + name.len()
+                    && b[t.len()] == b'.'
+                    && b[..t.len()].eq_ignore_ascii_case(t.as_bytes())
+                    && b[t.len() + 1..].eq_ignore_ascii_case(name.as_bytes()))
+                    || (crate::planner::is_rowid_spelling(name)
+                        && crate::planner::is_hidden_rowid(c)
+                        && c.rfind('.').is_some_and(|p| c[..p].eq_ignore_ascii_case(t)))
+            }),
+            None => cols.iter().any(|c| {
+                c.eq_ignore_ascii_case(name)
+                    || c.rsplit_once('.')
+                        .is_some_and(|(_, n)| n.eq_ignore_ascii_case(name))
+            }),
+        }
+    }
+    fn keyable(e: &Expr) -> bool {
+        join_operand_keyable(e)
+    }
+    let side = |e: &Expr| -> Option<Side> {
+        if !keyable(e) {
+            return None;
+        }
+        let refs = crate::planner::collect_column_refs(e);
+        if refs.is_empty() {
+            return None;
+        }
+        let l = refs.iter().all(|(t, n)| {
+            has_col(left_cols, t.as_deref(), n) && !has_col(right_cols, t.as_deref(), n)
+        });
+        let r = refs.iter().all(|(t, n)| {
+            has_col(right_cols, t.as_deref(), n) && !has_col(left_cols, t.as_deref(), n)
+        });
+        match (l, r) {
+            (true, false) => Some(Side::Left),
+            (false, true) => Some(Side::Right),
+            _ => None,
+        }
+    };
+    fn leaves<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+        match e {
+            Expr::Binary {
+                op: BinaryOp::And,
+                left,
+                right,
+            } => {
+                leaves(left, out);
+                leaves(right, out);
+            }
+            other => out.push(other),
+        }
+    }
+    let mut all = Vec::new();
+    leaves(cond, &mut all);
+    let mut keys = Vec::new();
+    for leaf in all {
+        if let Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } = leaf
+        {
+            match (side(left), side(right)) {
+                (Some(Side::Left), Some(Side::Right)) => keys.push((&**left, &**right)),
+                (Some(Side::Right), Some(Side::Left)) => keys.push((&**right, &**left)),
+                _ => {}
+            }
+        }
+    }
+    (!keys.is_empty()).then_some(keys)
+}
+
+/// Can a join-key operand be evaluated once per row (deterministic,
+/// subquery-free)? Shared with the planner's join cost model.
+pub(crate) fn join_operand_keyable(e: &Expr) -> bool {
+    match e {
+        Expr::Column { .. } | Expr::Literal(_) | Expr::Parameter(_) => true,
+        Expr::Binary { left, right, .. } | Expr::Is { left, right, .. } => {
+            join_operand_keyable(left) && join_operand_keyable(right)
+        }
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. } => join_operand_keyable(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => join_operand_keyable(expr) && join_operand_keyable(low) && join_operand_keyable(high),
+        Expr::In {
+            expr,
+            source: crate::sql::ast::InSource::List(l),
+            ..
+        } => join_operand_keyable(expr) && l.iter().all(join_operand_keyable),
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            operand.as_deref().map_or(true, join_operand_keyable)
+                && whens
+                    .iter()
+                    .all(|(w, t)| join_operand_keyable(w) && join_operand_keyable(t))
+                && else_.as_deref().map_or(true, join_operand_keyable)
+        }
+        Expr::Function {
+            name,
+            distinct,
+            args,
+            filter,
+            over,
+            order_by,
+        } => {
+            !*distinct
+                && filter.is_none()
+                && over.is_none()
+                && order_by.is_empty()
+                && crate::planner::is_constant_function(name)
+                && args.iter().all(join_operand_keyable)
+        }
+        _ => false,
+    }
+}
+
+/// Each row's composite join key over `exprs` (`None` when any part is
+/// NULL — `=` never matches it). Bare columns read their slot; other
+/// operands evaluate against the side's own row and affinities, as the
+/// full condition does.
+fn join_side_keys(
+    exprs: &[&Expr],
+    rows: &[Row],
+    cols: &[String],
+    affs: Option<&[crate::types::Affinity]>,
+    params: &[Value],
+    named_params: &HashMap<String, Value>,
+) -> Result<Vec<Option<Vec<u8>>>> {
+    let slots: Vec<Option<usize>> = exprs
+        .iter()
+        .map(|e| match e {
+            Expr::Column { table, name } => resolve_column_index(cols, table.as_deref(), name),
+            _ => None,
+        })
+        .collect();
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut buf = Vec::with_capacity(16);
+        let mut null = false;
+        for (e, slot) in exprs.iter().zip(&slots) {
+            let ok = match slot {
+                Some(i) => push_join_value_key(&row[*i], &mut buf),
+                None => {
+                    let ctx =
+                        EvalContext::new(row, cols, params, named_params).with_affinities(affs);
+                    push_join_value_key(&evaluate(e, &ctx)?, &mut buf)
+                }
+            };
+            if !ok {
+                null = true;
+                break;
+            }
+        }
+        out.push((!null).then_some(buf));
+    }
+    Ok(out)
+}
+
+/// Append `v`'s join-key form; `false` for NULL. The key must never
+/// SEPARATE two values SQLite's `=` can find equal under any built-in
+/// comparison affinity and collation — it may merge values that differ
+/// (the full condition re-tests every candidate pair):
+/// - numbers, and TEXT that reads as a number, key on the number rounded
+///   to 15 significant digits: NUMERIC affinity turns `'1.0'` into 1, TEXT
+///   affinity compares a REAL by its 15-digit rendering, and an INTEGER
+///   equals a REAL only when they are the same number;
+/// - other TEXT keys on its bytes before the first NUL (NOCASE stops
+///   comparing there), ASCII-lowercased (NOCASE) with trailing spaces
+///   dropped (RTRIM) — `inf` / `-inf` key as the infinities (a REAL's
+///   rendering);
+/// - BLOBs key on their bytes (no affinity or collation applies to them).
+fn push_join_value_key(v: &Value, buf: &mut Vec<u8>) -> bool {
+    fn num(x: f64, buf: &mut Vec<u8>) {
+        let x = if x == 0.0 {
+            0.0
+        } else if !x.is_finite() || (x.fract() == 0.0 && x.abs() < 1e15) {
+            x
+        } else {
+            format!("{x:.14e}").parse().unwrap_or(x)
+        };
+        buf.push(1);
+        buf.extend_from_slice(&x.to_bits().to_le_bytes());
+    }
+    match v {
+        Value::Null => return false,
+        Value::Integer(i) => num(*i as f64, buf),
+        Value::Real(r) => num(*r, buf),
+        Value::Text(t) => {
+            let b = t.as_bytes();
+            let b = &b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())];
+            let mut k = b.to_ascii_lowercase();
+            while k.last() == Some(&b' ') {
+                k.pop();
+            }
+            match crate::types::numeric::apply_numeric_affinity(&k) {
+                Some(crate::types::numeric::NumericAffinity::Integer(i)) => num(i as f64, buf),
+                Some(crate::types::numeric::NumericAffinity::Real(r)) => num(r, buf),
+                None => {
+                    let lead = k.iter().take_while(|c| c.is_ascii_whitespace()).count();
+                    let trimmed = &k[lead..];
+                    if trimmed == b"inf" || trimmed == b"+inf" {
+                        num(f64::INFINITY, buf);
+                    } else if trimmed == b"-inf" {
+                        num(f64::NEG_INFINITY, buf);
+                    } else {
+                        buf.push(2);
+                        buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(&k);
+                    }
+                }
+            }
+        }
+        Value::Blob(b) => {
+            buf.push(3);
+            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            buf.extend_from_slice(b);
+        }
+    }
+    true
 }
 
 /// Static column list a bare `Plan::Scan` would report — without executing

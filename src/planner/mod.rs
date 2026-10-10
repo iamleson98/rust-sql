@@ -430,6 +430,18 @@ impl<'a> Planner<'a> {
     }
 
     fn plan_simple_select(&mut self, s: &SimpleSelect, order_terms: &[OrderTerm]) -> Result<Plan> {
+        // INNER JOIN ON terms are WHERE terms (sqlite3ProcessJoin appends
+        // each to the WHERE, in FROM order): planned as one conjunct list
+        // they are tested in SQLite's order — the WHERE's own terms first
+        // at every loop level, constant ones once before the loop.
+        let hoisted;
+        let s = match hoist_inner_on_terms(s) {
+            Some(h) => {
+                hoisted = h;
+                &hoisted
+            }
+            None => s,
+        };
         // CONSTANT WHERE TERMS (sqlite3WhereBegin): a deterministic term
         // with no column reference is evaluated ONCE, before the loop,
         // in term order — an error raises even over an empty table, and
@@ -565,9 +577,11 @@ impl<'a> Planner<'a> {
         if let Some(h) = &s.having {
             collect_col_refs(h, &mut stmt_needed);
         }
-        if let Some(w) = &s.where_clause {
-            collect_col_refs(w, &mut stmt_needed);
-        }
+        // (Not the WHERE: its terms are already IN the plan — Filters and
+        // join conditions the walk charges where they evaluate. Seeding
+        // them here charged a join key the rewrite CONSUMES — `a.k =
+        // b.k` — as an inner-column read, so `FROM a, b WHERE a.k = b.k`
+        // and an INNER JOIN's ON (WHERE terms too) never went covering.)
         for t in order_terms {
             collect_col_refs(&t.expr, &mut stmt_needed);
         }
@@ -4798,6 +4812,12 @@ const CONSTANT_FUNCTIONS: &[&str] = &[
 /// prerequisites are empty (no column, rowid or correlated reference)
 /// and that is deterministic is evaluated ONCE, before the loop.
 /// Subqueries are left per-row (their own lazy/eager machinery applies).
+/// Is `name` a built-in SQLite treats as constant for one statement
+/// (deterministic: same arguments, same result)?
+pub(crate) fn is_constant_function(name: &str) -> bool {
+    CONSTANT_FUNCTIONS.contains(&name.to_ascii_lowercase().as_str())
+}
+
 fn is_constant_where_term(e: &Expr) -> bool {
     match e {
         Expr::Literal(_) | Expr::Parameter(_) => true,
@@ -4901,25 +4921,55 @@ fn split_constant_where(s: &SimpleSelect) -> Option<(SimpleSelect, Vec<Expr>)> {
     } else {
         split(&s.having)
     };
-    // An INNER join's ON terms join the WHERE (sqlite3ProcessJoin appends
-    // them in FROM order), so its constant ones are evaluated before the
-    // loop too — unless a RIGHT / FULL join is present (sqlite3WhereBegin's
-    // condition 3: JT_LTORJ keeps EP_InnerON terms in the loop). A LEFT
-    // join's ON terms belong to its inner table and stay.
-    let mut from = s.from.clone();
-    if let Some(f) = from.as_mut() {
-        if !has_right_or_full_join(f) {
-            split_inner_on_constants(f, &mut split);
-        }
-    }
     if !changed {
         return None;
     }
     let mut out = s.clone();
     out.where_clause = where_clause;
     out.having = having;
-    out.from = from;
     Some((out, consts))
+}
+
+/// sqlite3ProcessJoin for a simple SELECT: every INNER / CROSS join ON
+/// clause on the left-deep FROM spine moves to the end of the WHERE, in
+/// FROM order (`None` when there is none). Not with a RIGHT / FULL join
+/// present: sqlite3WhereBegin then keeps EP_InnerON terms at their loop
+/// (condition 3, JT_LTORJ). A LEFT join's ON terms belong to its inner
+/// table and stay.
+fn hoist_inner_on_terms(s: &SimpleSelect) -> Option<SimpleSelect> {
+    let from = s.from.as_ref()?;
+    if !matches!(from, TableExpression::Join { .. }) || has_right_or_full_join(from) {
+        return None;
+    }
+    fn walk(t: &mut TableExpression, out: &mut Vec<Expr>) {
+        if let TableExpression::Join {
+            left,
+            join_type,
+            constraint,
+            ..
+        } = t
+        {
+            walk(left, out);
+            if matches!(join_type, JoinType::Inner | JoinType::Cross) {
+                if let JoinConstraint::On(on) = constraint {
+                    out.push(on.clone());
+                    *constraint = JoinConstraint::None;
+                }
+            }
+        }
+    }
+    let mut from = from.clone();
+    let mut ons = Vec::new();
+    walk(&mut from, &mut ons);
+    if ons.is_empty() {
+        return None;
+    }
+    let mut out = s.clone();
+    let mut terms: Vec<Expr> = s.where_clause.iter().cloned().collect();
+    terms.extend(ons);
+    out.where_clause = Some(combine_and(&terms));
+    out.from = Some(from);
+    Some(out)
 }
 
 /// An index-range bound as BLOB bytes: (bytes, inclusive).
@@ -4938,30 +4988,6 @@ fn has_right_or_full_join(t: &TableExpression) -> bool {
                 || has_right_or_full_join(right)
         }
         _ => false,
-    }
-}
-
-/// Run `split` over the ON clause of every INNER / CROSS join on the
-/// left-deep FROM spine, leftmost first, replacing each with its
-/// non-constant rest (`ON 1` when nothing is left).
-fn split_inner_on_constants(
-    t: &mut TableExpression,
-    split: &mut impl FnMut(&Option<Expr>) -> Option<Expr>,
-) {
-    if let TableExpression::Join {
-        left,
-        join_type,
-        constraint,
-        ..
-    } = t
-    {
-        split_inner_on_constants(left, split);
-        if matches!(join_type, JoinType::Inner | JoinType::Cross) {
-            if let JoinConstraint::On(on) = constraint {
-                let rest = split(&Some(on.clone()));
-                *on = rest.unwrap_or(Expr::Literal(Value::Integer(1)));
-            }
-        }
     }
 }
 
@@ -6682,11 +6708,21 @@ pub fn pushdown_filter(catalog: &Catalog, plan: Plan, predicate: &Expr) -> Plan 
                 (Vec::new(), top_preds)
             };
 
+        // The WHERE conjuncts go FIRST: sqlite3ProcessJoin appends an inner
+        // join's ON terms after the WHERE's, and each loop level tests its
+        // terms in that order (`… ON a IN (b, id) WHERE CASE WHEN abs(…)
+        // …` raises in SQLite even when no pair passes the ON term).
+        // Equalities with a bare-column side go first: SQLite seeks with
+        // them (through an index or an automatic one), so no other term
+        // of the level is tested on a pair they reject.
         let condition = if fusable.is_empty() {
             condition.clone()
         } else {
-            let mut parts: Vec<Expr> = condition.iter().cloned().collect();
-            parts.extend(fusable);
+            let (mut parts, rest): (Vec<Expr>, Vec<Expr>) = fusable
+                .into_iter()
+                .partition(|c| is_join_seek_key(c, &left_cols, &right_cols));
+            parts.extend(rest);
+            parts.extend(condition.iter().cloned());
             Some(combine_and(&parts))
         };
         // Recompute the algorithm over the (possibly extended) condition:
@@ -6720,6 +6756,39 @@ pub fn pushdown_filter(catalog: &Catalog, plan: Plan, predicate: &Expr) -> Plan 
         // or wrap in a Filter for other plan shapes.
         apply_where_for_scan(catalog, plan, &combine_and(&conjuncts))
     }
+}
+
+/// `col = expr` / `col IS expr` where `col` is a bare column of one join
+/// side and `expr` reads only the other side: a term an index (or an
+/// automatic index) on `col` can be seeked with.
+fn is_join_seek_key(
+    c: &Expr,
+    left_cols: &[(Option<String>, String)],
+    right_cols: &[(Option<String>, String)],
+) -> bool {
+    let (l, r) = match c {
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } => (left.as_ref(), right.as_ref()),
+        Expr::Is {
+            left,
+            right,
+            negated: false,
+        } => (left.as_ref(), right.as_ref()),
+        _ => return false,
+    };
+    let keyed = |col: &Expr, other: &Expr, own: &[(Option<String>, String)], far| {
+        matches!(col, Expr::Column { .. })
+            && conjunct_bound_by(col, own)
+            && !collect_column_refs(other).is_empty()
+            && conjunct_bound_by(other, far)
+    };
+    keyed(l, r, left_cols, right_cols)
+        || keyed(l, r, right_cols, left_cols)
+        || keyed(r, l, left_cols, right_cols)
+        || keyed(r, l, right_cols, left_cols)
 }
 
 /// True when the conjunct references at least one column of EACH side of
@@ -7991,6 +8060,10 @@ struct DpConjunct {
     expr: Expr,
     mask: u64,
     eq: Option<((usize, String), (usize, String))>,
+    /// Any other equality whose two operands read disjoint relation sets
+    /// (`b.y = a.x + 1`): the operands' masks. The join executor hashes
+    /// such keys too (`exec_join_rows`' keyed path).
+    keyed: Option<(u64, u64)>,
 }
 
 /// Everything the DP needs about the spine, precomputed once.
@@ -8071,6 +8144,13 @@ impl<'a> DpCtx<'a> {
             let m = c.mask;
             if m & !t == 0 && m & s1 != 0 && m & s2 != 0 {
                 has_attaching = true;
+                if let Some((lm, rm)) = c.keyed {
+                    // Keyed by the join executor when its operands fall on
+                    // opposite sides of this step.
+                    if (lm & !s1 == 0 && rm & !s2 == 0) || (lm & !s2 == 0 && rm & !s1 == 0) {
+                        has_eq = true;
+                    }
+                }
                 match &c.eq {
                     Some(((a1, col1), (a2, col2))) => {
                         has_eq = true;
@@ -8307,6 +8387,33 @@ fn eq_pair_of(
     Some(((la, plain(ln)), (ra, plain(rn))))
 }
 
+/// `L = R` whose operands are hashable join keys over disjoint, non-empty
+/// relation sets: (mask of L, mask of R).
+fn keyed_eq_masks(expr: &Expr, n: usize, atom_cols: &[Vec<String>]) -> Option<(u64, u64)> {
+    let Expr::Binary {
+        op: BinaryOp::Eq,
+        left,
+        right,
+    } = expr
+    else {
+        return None;
+    };
+    let mask = |e: &Expr| -> Option<u64> {
+        if !crate::executor::join_operand_keyable(e) {
+            return None;
+        }
+        let refs = collect_column_refs(e);
+        let mut m = 0u64;
+        for (q, name) in &refs {
+            let (a, _) = resolve_ref_window(q, name, 0, n, atom_cols)?;
+            m |= 1u64 << a;
+        }
+        (m != 0).then_some(m)
+    };
+    let (l, r) = (mask(left)?, mask(right)?);
+    (l & r == 0).then_some((l, r))
+}
+
 /// Cost-searched rebuild of one flattened inner-join spine. Returns None
 /// (caller keeps the syntactic tree) when the DP finds no meaningful win
 /// and the filter fusion contributed nothing.
@@ -8349,10 +8456,16 @@ fn try_cost_search_spine(
             mask |= 1u64 << r;
         }
         let eq = eq_pair_of(&pc.expr, n, atom_cols);
+        let keyed = if eq.is_none() {
+            keyed_eq_masks(&pc.expr, n, atom_cols)
+        } else {
+            None
+        };
         conjuncts.push(DpConjunct {
             expr: pc.expr,
             mask,
             eq,
+            keyed,
         });
     }
 
