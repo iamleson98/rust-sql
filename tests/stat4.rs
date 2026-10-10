@@ -368,3 +368,125 @@ fn stat4_targeted_analyze() {
     let n = q1(&mut db, "SELECT count(DISTINCT tbl) FROM sqlite_stat4");
     assert_eq!(n, "2");
 }
+
+/// Every sqlite_stat4 row (and sqlite_stat1 row) ANALYZE writes equals
+/// the bundled SQLite's, byte for byte: the same samples chosen by
+/// analyze.c's sampler (periodic samples, per-prefix repetition
+/// candidates, eviction, hash tiebreaks) with the same neq/nlt/ndlt
+/// counters and sample records — over index shapes (multi-column, DESC,
+/// UNIQUE nullable / NOT NULL, partial, expression, NOCASE, on the
+/// INTEGER PRIMARY KEY, WITHOUT ROWID) and table sizes around the
+/// periodic-interval and 24-sample boundaries.
+#[test]
+fn stat4_rows_match_sqlite_exactly() {
+    fn rows_lite(c: &rusqlite::Connection, sql: &str) -> Vec<String> {
+        let mut st = c.prepare(sql).unwrap();
+        let n = st.column_count();
+        let mut out = Vec::new();
+        let mut rows = st.query([]).unwrap();
+        while let Some(r) = rows.next().unwrap() {
+            let cells: Vec<String> = (0..n)
+                .map(|i| format!("{:?}", r.get::<_, rusqlite::types::Value>(i).unwrap()))
+                .collect();
+            out.push(cells.join("|"));
+        }
+        out
+    }
+    fn rows_ours(db: &mut Database, sql: &str) -> Vec<String> {
+        db.query(sql, [])
+            .unwrap()
+            .into_iter()
+            .map(|r| {
+                r.into_iter()
+                    .map(|v| match v {
+                        rustqlite::Value::Null => "Null".to_string(),
+                        rustqlite::Value::Integer(i) => format!("Integer({i})"),
+                        rustqlite::Value::Real(f) => format!("Real({f:?})"),
+                        rustqlite::Value::Text(t) => format!("Text({:?})", t.as_str()),
+                        rustqlite::Value::Blob(b) => format!("Blob({b:?})"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect()
+    }
+    const SCHEMA: &[&str] = &[
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c REAL, d INTEGER NOT NULL)",
+        "CREATE INDEX ia ON t(a)",
+        "CREATE INDEX iab ON t(a, b)",
+        "CREATE INDEX iba ON t(b DESC, a)",
+        "CREATE INDEX ibn ON t(b COLLATE NOCASE)",
+        "CREATE UNIQUE INDEX ud ON t(d)",
+        "CREATE UNIQUE INDEX uc ON t(c)",
+        "CREATE UNIQUE INDEX uda ON t(d, a)",
+        "CREATE INDEX ip ON t(a) WHERE a > 3",
+        "CREATE INDEX ix ON t(a % 3, c)",
+        "CREATE UNIQUE INDEX uid ON t(id)",
+        "CREATE TABLE w (k1 INTEGER, k2 TEXT, v INTEGER, PRIMARY KEY (k1, k2)) WITHOUT ROWID",
+        "CREATE INDEX wv ON w(v)",
+    ];
+    let mut checked = 0usize;
+    for &n in &[
+        0usize, 1, 2, 3, 8, 9, 10, 17, 24, 25, 26, 60, 100, 217, 500, 1500,
+    ] {
+        for skew in [2u64, 7, 1000] {
+            let mut db = Database::open_in_memory().unwrap();
+            let c = lite();
+            for s in SCHEMA {
+                db.execute(s, []).unwrap();
+                c.execute_batch(s).unwrap();
+            }
+            let mut x: u64 = 0x9e3779b97f4a7c15 ^ (n as u64) ^ (skew << 20);
+            let mut next = || {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x
+            };
+            let mut vals = Vec::new();
+            let mut wvals = Vec::new();
+            for i in 0..n {
+                // Skewed `a` (a few heavy keys), case-varying `b`, unique
+                // `c` with NULLs, unique NOT NULL `d`.
+                let r = next();
+                let a = if r % 4 == 0 {
+                    (r >> 8) % skew
+                } else {
+                    (r >> 8) % 3
+                };
+                let b = ["x", "X", "y", "Y", "zz", "a"][(r >> 20) as usize % 6];
+                let c_val = if r % 5 == 0 {
+                    "NULL".to_string()
+                } else {
+                    format!("{}.5", i)
+                };
+                vals.push(format!("({a}, '{b}', {c_val}, {})", n - i));
+                wvals.push(format!("({}, 'k{}', {})", r % 11, i, (r >> 30) % skew));
+            }
+            for chunk in vals.chunks(200) {
+                let sql = format!("INSERT INTO t (a, b, c, d) VALUES {}", chunk.join(", "));
+                db.execute(&sql, []).unwrap();
+                c.execute_batch(&sql).unwrap();
+            }
+            for chunk in wvals.chunks(200) {
+                let sql = format!("INSERT INTO w VALUES {}", chunk.join(", "));
+                db.execute(&sql, []).unwrap();
+                c.execute_batch(&sql).unwrap();
+            }
+            db.execute("ANALYZE", []).unwrap();
+            c.execute_batch("ANALYZE").unwrap();
+            for q in [
+                "SELECT tbl, idx, stat FROM sqlite_stat1 ORDER BY 1, 2",
+                "SELECT tbl, idx, neq, nlt, ndlt, hex(sample) FROM sqlite_stat4 ORDER BY 1, 2, 4",
+            ] {
+                assert_eq!(
+                    rows_ours(&mut db, q),
+                    rows_lite(&c, q),
+                    "[n={n} skew={skew}] {q}"
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 0);
+}

@@ -345,3 +345,108 @@ fn savepoint_rollback_leaves_ok_database() {
         vec!["ok".to_string()]
     );
 }
+
+/// A mass DELETE's file-tail truncation can drop a freelist TRUNK page
+/// whose own entries are below the new end of file; those entries are
+/// still free pages and must go back on the freelist. Dropping them with
+/// the trunk leaked one page per cycle ("Page N is never used", and the
+/// file grew without bound) — stateful-fuzz seed 50050, where every
+/// ANALYZE's `DELETE FROM sqlite_stat4` + refill hit it.
+#[test]
+fn mass_delete_refill_cycles_leak_no_pages() {
+    for file_backed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = if file_backed {
+            Database::open(dir.path().join("cycle.db")).unwrap()
+        } else {
+            Database::open_in_memory().unwrap()
+        };
+        db.execute("CREATE TABLE s (a, b, c)", []).unwrap();
+        db.execute("CREATE TABLE x (y)", []).unwrap();
+        db.execute("CREATE TABLE z (y)", []).unwrap();
+        db.execute("DROP TABLE x", []).unwrap();
+        let rows: Vec<String> = (0..70)
+            .map(|i| format!("('t{i}', '{}', x'{}')", "L".repeat(60), "AB".repeat(40)))
+            .collect();
+        let insert = format!("INSERT INTO s VALUES {}", rows.join(", "));
+        let mut steady: Option<String> = None;
+        for cycle in 0..8 {
+            db.execute("DELETE FROM s", []).unwrap();
+            db.execute(&insert, []).unwrap();
+            assert_eq!(
+                first_col(&mut db, "PRAGMA integrity_check"),
+                vec!["ok".to_string()],
+                "cycle {cycle} (file-backed: {file_backed})"
+            );
+            let pages = first_col(&mut db, "PRAGMA page_count").join("");
+            if cycle >= 2 {
+                let want = steady.get_or_insert_with(|| pages.clone());
+                assert_eq!(&pages, want, "page count grew at cycle {cycle}");
+            }
+        }
+    }
+}
+
+/// A mass DELETE that frees the file's tail truncates the file at commit.
+/// Since the store became an RwLock (c66e68f) the truncation held the
+/// store's read guard while taking its write lock, so every file-backed
+/// commit that shrank an already-written file HUNG forever (`DELETE FROM
+/// t WHERE id > 100` after committing 20k rows). Run under a watchdog so
+/// a regression fails instead of stalling the suite; cover the rollback
+/// journal and WAL, explicit transactions and reopen.
+#[test]
+fn file_backed_tail_delete_commits_and_shrinks() {
+    for (mode, explicit_txn) in [("delete", false), ("delete", true), ("wal", false)] {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("tail.db");
+            {
+                let mut db = Database::open(&path).unwrap();
+                db.execute(&format!("PRAGMA journal_mode = {mode}"), [])
+                    .unwrap();
+                db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", [])
+                    .unwrap();
+                db.execute("BEGIN", []).unwrap();
+                for i in 0..20000 {
+                    db.execute(
+                        "INSERT INTO t VALUES (?, ?)",
+                        [
+                            Value::Integer(i),
+                            Value::Text(format!("value {i} padded").into()),
+                        ],
+                    )
+                    .unwrap();
+                }
+                db.execute("COMMIT", []).unwrap();
+                if explicit_txn {
+                    db.execute("BEGIN", []).unwrap();
+                }
+                db.execute("DELETE FROM t WHERE id > 100", []).unwrap();
+                if explicit_txn {
+                    db.execute("COMMIT", []).unwrap();
+                }
+                assert_eq!(
+                    first_col(&mut db, "PRAGMA integrity_check"),
+                    vec!["ok".to_string()]
+                );
+            }
+            let mut db = Database::open(&path).unwrap();
+            let n = first_col(&mut db, "SELECT count(*) FROM t");
+            assert_eq!(n, vec!["101".to_string()]);
+            assert_eq!(
+                first_col(&mut db, "PRAGMA integrity_check"),
+                vec!["ok".to_string()]
+            );
+            tx.send(()).unwrap();
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(120)) {
+            Ok(()) => worker.join().unwrap(),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // The worker panicked: surface its message.
+                worker.join().unwrap();
+            }
+            Err(e) => panic!("mode {mode} (explicit txn {explicit_txn}): tail DELETE hung ({e})"),
+        }
+    }
+}

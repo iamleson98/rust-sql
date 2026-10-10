@@ -81,6 +81,11 @@ const INDEXES: &[(&str, &str)] = &[
     ("alias_unique", "CREATE UNIQUE INDEX ix_id ON t(id)"),
     ("covering_a", "CREATE INDEX ix_a ON t(a)"),
     ("wide_b", "CREATE INDEX ix_b ON t(b)"),
+    (
+        "alias_partial",
+        "CREATE UNIQUE INDEX ix_id ON t(id) WHERE id IS NOT NULL",
+    ),
+    ("a_partial", "CREATE INDEX ix_a ON t(a) WHERE a IS NOT NULL"),
 ];
 
 const LISTS: &[&str] = &[
@@ -213,5 +218,163 @@ fn rowid_in_boundary_member_follows_sqlite_plan_choice() {
         matched_boundary > 0 && skipped_boundary > 0,
         "plan mix: boundary matched {matched_boundary}x, sought-past {skipped_boundary}x \
          ({checked} statements)"
+    );
+}
+
+/// Runs `sql` in both engines; a `!` prefix marks a statement that must
+/// fail in both.
+fn both_or_fail(db: &mut Database, rc: &Connection, sql: &str) {
+    match sql.strip_prefix('!') {
+        Some(sql) => {
+            assert!(db.execute(sql, []).is_err(), "ours accepted {sql}");
+            assert!(rc.execute_batch(sql).is_err(), "sqlite accepted {sql}");
+        }
+        None => both(db, rc, sql),
+    }
+}
+
+/// SQLite's sqlite3DefaultRowEst floors the TABLE's in-memory row
+/// estimate when CREATE INDEX is parsed, so the floor (and with it the
+/// IPK-seek-vs-scan choice) outlives an index that fails to build or is
+/// dropped, until ANALYZE's stat load or a schema reload (ALTER TABLE,
+/// ROLLBACK of a real schema change) recomputes it (stateful-fuzz seed
+/// 53053: a failed CREATE UNIQUE INDEX turned a 6-row analyzed table's
+/// numeric IN-compare into a seek).
+#[test]
+fn rowid_in_row_estimate_floor_lifecycle_matches_sqlite() {
+    const SCENARIOS: &[&[&str]] = &[
+        &[],
+        &["!CREATE UNIQUE INDEX ux ON t(e)"],
+        &["!CREATE UNIQUE INDEX ux ON t(e) WHERE e IS NOT NULL"],
+        &["CREATE INDEX ie ON t(e)", "DROP INDEX ie"],
+        &["CREATE INDEX ie ON t(e)", "ANALYZE", "DROP INDEX ie"],
+        &["!CREATE UNIQUE INDEX ux ON t(e)", "ANALYZE"],
+        &[
+            "!CREATE UNIQUE INDEX ux ON t(e)",
+            "ALTER TABLE t ADD COLUMN g",
+        ],
+        &[
+            "!CREATE UNIQUE INDEX ux ON t(e)",
+            "ALTER TABLE u ADD COLUMN g",
+        ],
+        &["BEGIN", "CREATE INDEX ie ON t(e)", "ROLLBACK"],
+        &["BEGIN", "!CREATE UNIQUE INDEX ux ON t(e)", "ROLLBACK"],
+        &["BEGIN", "!CREATE UNIQUE INDEX ux ON t(e)", "COMMIT"],
+        &[
+            "BEGIN",
+            "!CREATE UNIQUE INDEX ux ON t(e)",
+            "CREATE TABLE v(a)",
+            "ROLLBACK",
+        ],
+        &["CREATE INDEX iu ON u(a)"],
+        &["!CREATE INDEX bad ON t(nosuch)"],
+        &[
+            "CREATE INDEX ie ON t(e)",
+            "ANALYZE",
+            "CREATE INDEX IF NOT EXISTS ie ON t(e)",
+        ],
+        &["CREATE INDEX ie ON t(e)", "DROP INDEX ie", "ANALYZE"],
+        // An ANALYZE of an empty table writes no stat row: the estimate
+        // the last load gave stays (floored only while a stat-less index
+        // exists).
+        &["DELETE FROM t", "ANALYZE", "FILL"],
+        &[
+            "CREATE INDEX ie ON t(e)",
+            "ANALYZE",
+            "DELETE FROM t",
+            "ANALYZE",
+            "FILL",
+        ],
+        &[
+            "CREATE INDEX ie ON t(e)",
+            "ANALYZE",
+            "DROP INDEX ie",
+            "DELETE FROM t",
+            "ANALYZE",
+            "FILL",
+        ],
+        &[
+            "!CREATE UNIQUE INDEX ux ON t(e)",
+            "DROP TABLE t",
+            "CREATE TABLE t (f INTEGER PRIMARY KEY, e TEXT)",
+        ],
+    ];
+    const QUERIES: &[&str] = &[
+        "SELECT rowid FROM t WHERE f IN (9007199254740992, 41, -9.2233720368547758e18) ORDER BY 1",
+        "SELECT f, e FROM t WHERE f IN (-9.2233720368547758e18, 2) ORDER BY 1",
+        "SELECT count(*) FROM t WHERE f IN (-9.2233720368547758e18)",
+    ];
+    let mut checked = 0usize;
+    let (mut seeks, mut compares) = (0usize, 0usize);
+    for &n in &[2usize, 6, 12, 40, 200] {
+        for (si, scenario) in SCENARIOS.iter().enumerate() {
+            for dml in [false, true] {
+                let mut db = Database::open_in_memory().unwrap();
+                let rc = Connection::open_in_memory().unwrap();
+                both(
+                    &mut db,
+                    &rc,
+                    "CREATE TABLE t (f INTEGER PRIMARY KEY, e TEXT)",
+                );
+                both(&mut db, &rc, "CREATE TABLE u (a INTEGER)");
+                both(&mut db, &rc, "INSERT INTO u VALUES (1), (2)");
+                let fill = |db: &mut Database, rc: &Connection| {
+                    // Duplicate `e` values: a UNIQUE index on e fails.
+                    let mut ins = String::from(
+                        "INSERT INTO t VALUES (-9223372036854775808, 'dup'), (2, 'dup')",
+                    );
+                    for i in 2..n {
+                        ins.push_str(&format!(", ({}, 'e{i}')", i * 3));
+                    }
+                    both(db, rc, &ins);
+                };
+                fill(&mut db, &rc);
+                both(&mut db, &rc, "ANALYZE");
+                for stmt in scenario.iter() {
+                    if *stmt == "FILL" {
+                        fill(&mut db, &rc);
+                        continue;
+                    }
+                    both_or_fail(&mut db, &rc, stmt);
+                    if stmt.starts_with("CREATE TABLE t ") {
+                        fill(&mut db, &rc);
+                    }
+                }
+                let tag = format!("[n={n} scenario={si} {scenario:?}]");
+                if dml {
+                    both(
+                        &mut db,
+                        &rc,
+                        "DELETE FROM t WHERE f IN (9007199254740992, 41, -9.2233720368547758e18)",
+                    );
+                    let q = "SELECT rowid, e FROM t ORDER BY 1";
+                    let ours = norm_ours(db.query(q, []).unwrap());
+                    let theirs = sqlite_rows(&rc, q);
+                    assert_eq!(ours, theirs, "{tag} after DELETE: {q}");
+                    checked += 1;
+                    continue;
+                }
+                for q in QUERIES {
+                    let ours = norm_ours(
+                        db.query(q, [])
+                            .unwrap_or_else(|e| panic!("{tag} ours {q}: {e}")),
+                    );
+                    let theirs = sqlite_rows(&rc, q);
+                    assert_eq!(ours, theirs, "{tag} {q}");
+                    checked += 1;
+                    if q.starts_with("SELECT rowid") {
+                        if theirs.is_empty() {
+                            seeks += 1;
+                        } else {
+                            compares += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        seeks > 0 && compares > 0,
+        "plan mix: seek {seeks}x, compare {compares}x ({checked} checks)"
     );
 }

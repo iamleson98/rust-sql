@@ -512,6 +512,22 @@ pub struct Catalog {
     /// after close/reopen. Kept as a side registry (not a struct field)
     /// so `load_schema` needs no changes — persisted rows are never temp.
     temp_objects: std::collections::HashSet<String>,
+    /// SQLite's in-memory TABLE row estimate (`Table::nRowLogEst`, LogEst
+    /// units), keyed by lowercased table name, wherever it has drifted
+    /// from what a fresh schema load would derive from the stats (see
+    /// [`Catalog::sqlite_row_logest`]). It drifts because SQLite updates
+    /// it in place: `sqlite3DefaultRowEst` floors it at 99 the moment
+    /// CREATE INDEX is parsed (even if the build then fails), DROP INDEX
+    /// keeps the value its stat rows gave, and an ANALYZE that writes no
+    /// row for a table (it is empty) leaves the old value. A schema
+    /// reload (ALTER TABLE, ROLLBACK of a schema change) recomputes
+    /// everything. Planner-only, never persisted.
+    row_logest: NameMap<i32>,
+    /// Tables (lowercased) whose SQLite `TF_HasStat4` flag is set: it is
+    /// raised when any of the table's indexes loads STAT4 samples and only
+    /// a schema reload clears it — it outlives DROP INDEX and an ANALYZE
+    /// that writes no samples. Planner-only (the full-scan cost).
+    stat4_tables: std::collections::HashSet<String>,
 }
 
 /// One `sqlite_stat1` row: the planner's estimate inputs for an index.
@@ -545,8 +561,10 @@ pub struct Stat4Sample {
     /// The sample's index-column values (raw, unfolded — the collation
     /// applied at comparison time, like SQLite's stored samples).
     pub keys: Vec<Value>,
-    /// The sample entry's rowid (the record's last field).
-    pub rowid: i64,
+    /// The sample entry's rowid (the record's last field) — None for a
+    /// WITHOUT ROWID table, whose record ends with the PRIMARY KEY
+    /// columns (kept in `keys`).
+    pub rowid: Option<i64>,
     pub neq: Vec<i64>,
     pub nlt: Vec<i64>,
     pub ndlt: Vec<i64>,
@@ -557,7 +575,9 @@ impl Stat4Sample {
     /// the rowid, in SQLite's record format (`encode_record`).
     pub fn record_hex(&self) -> Vec<u8> {
         let mut vals = self.keys.clone();
-        vals.push(Value::Integer(self.rowid));
+        if let Some(r) = self.rowid {
+            vals.push(Value::Integer(r));
+        }
         crate::storage::sqlitefmt::record::encode_record(&vals)
     }
 
@@ -584,8 +604,15 @@ impl Stat4Sample {
         if vals.is_empty() {
             return None;
         }
-        let Some(Value::Integer(rowid)) = vals.pop() else {
-            return None;
+        // A trailing INTEGER is the rowid; anything else ends a WITHOUT
+        // ROWID record's PRIMARY KEY columns.
+        let rowid = match vals.last() {
+            Some(Value::Integer(r)) => {
+                let r = *r;
+                vals.pop();
+                Some(r)
+            }
+            _ => None,
         };
         Some(Stat4Sample {
             keys: vals,
@@ -809,12 +836,140 @@ impl Catalog {
         self.stat1.get(&index_name.to_ascii_lowercase()).cloned()
     }
 
-    /// Replace the whole in-memory stat map (ANALYZE's refresh path).
+    /// Replace the whole in-memory stat map (stat-row bookkeeping, e.g.
+    /// dropping a removed index's rows). Row-estimate floors stay — see
+    /// [`Self::load_stat1`] for ANALYZE's load.
     pub fn set_stat1(&mut self, rows: Vec<(String, IndexStats)>) {
         self.stat1.clear();
         for (name, s) in rows {
             self.stat1.insert(name.to_ascii_lowercase(), s);
         }
+    }
+
+    /// ANALYZE's stat load (SQLite's sqlite3AnalysisLoad): replace the
+    /// stat map. A table the new rows cover — a table-level row or a
+    /// non-partial index's row (analysisLoader) — takes its estimate from
+    /// them; any other table keeps the estimate it had. Either way an
+    /// index left without stats floors it at 99 (DefaultRowEst again).
+    pub fn load_stat1(&mut self, rows: Vec<(String, IndexStats)>) {
+        let mut covered = std::collections::HashSet::new();
+        for (name, _) in &rows {
+            let key = name.to_ascii_lowercase();
+            match self.indexes.get(&key) {
+                Some(i) if i.partial_expr.is_none() => {
+                    covered.insert(i.table.to_ascii_lowercase());
+                }
+                Some(_) => {}
+                None => {
+                    if self.tables.contains_key(&key) {
+                        covered.insert(key);
+                    }
+                }
+            }
+        }
+        let kept: Vec<(String, i32)> = self
+            .tables
+            .keys()
+            .filter(|t| !covered.contains(*t))
+            .map(|t| (t.clone(), self.sqlite_row_logest(t)))
+            .collect();
+        self.set_stat1(rows);
+        for t in &covered {
+            self.row_logest.remove(t);
+        }
+        for (t, x) in kept {
+            self.row_logest.insert(t, x);
+        }
+        let floored: Vec<String> = self
+            .row_logest
+            .keys()
+            .filter(|t| {
+                self.indexes_on_table(t)
+                    .iter()
+                    .any(|i| !self.stat1.contains_key(&i.name.to_ascii_lowercase()))
+            })
+            .cloned()
+            .collect();
+        for t in floored {
+            if let Some(x) = self.row_logest.get_mut(&t) {
+                *x = (*x).max(99);
+            }
+        }
+        let sampled: Vec<String> = self
+            .tables
+            .keys()
+            .filter(|t| self.derived_has_stat4(t))
+            .cloned()
+            .collect();
+        self.stat4_tables.extend(sampled);
+    }
+
+    /// SQLite's `TF_HasStat4` for `table`: sticky once set (see the
+    /// field), else whether an index of the table has STAT4 samples.
+    pub fn sqlite_has_stat4(&self, table: &str) -> bool {
+        let key = table.to_ascii_lowercase();
+        self.stat4_tables.contains(&key) || self.derived_has_stat4(&key)
+    }
+
+    fn derived_has_stat4(&self, table_lc: &str) -> bool {
+        self.indexes_on_table(table_lc).iter().any(|i| {
+            self.stat1
+                .get(&i.name.to_ascii_lowercase())
+                .is_some_and(|s| !s.samples.is_empty())
+        })
+    }
+
+    /// SQLite's in-memory row estimate for `table` (LogEst): the drifted
+    /// value when one is recorded, else what a schema load derives — the
+    /// stat1 row count (a table-level row, or any non-partial index's),
+    /// 200 (~1M rows) when unanalyzed, raised to at least 99 (1000 rows)
+    /// when an index of the table has no stat1 row (DefaultRowEst's
+    /// floor).
+    pub fn sqlite_row_logest(&self, table: &str) -> i32 {
+        let key = table.to_ascii_lowercase();
+        if let Some(&x) = self.row_logest.get(&key) {
+            return x;
+        }
+        let indexes = self.indexes_on_table(&key);
+        let analyzed = self.stat1.get(&key).map(|s| s.rows).or_else(|| {
+            indexes
+                .iter()
+                .filter(|i| i.partial_expr.is_none())
+                .find_map(|i| self.stat1.get(&i.name.to_ascii_lowercase()).map(|s| s.rows))
+        });
+        let mut x = match analyzed {
+            Some(n) => crate::planner::sqlite_cost::log_est(n.max(0) as u64),
+            None => 200,
+        };
+        if indexes
+            .iter()
+            .any(|i| !self.stat1.contains_key(&i.name.to_ascii_lowercase()))
+        {
+            x = x.max(99);
+        }
+        x
+    }
+
+    /// CREATE INDEX on `table` reached SQLite's `sqlite3DefaultRowEst`
+    /// (whether or not the index is then built): the table's estimate is
+    /// floored at 99.
+    pub fn note_default_row_est(&mut self, table: &str) {
+        let x = self.sqlite_row_logest(table).max(99);
+        self.row_logest.insert(table.to_ascii_lowercase(), x);
+    }
+
+    /// A schema reload (ALTER TABLE, ROLLBACK of a schema change)
+    /// recomputes every row estimate from the stats.
+    pub fn reset_row_logest(&mut self) {
+        self.row_logest.clear();
+        self.stat4_tables.clear();
+    }
+
+    /// Carry `other`'s drifted estimates over (a restore that SQLite
+    /// would not treat as a schema reset).
+    pub fn copy_row_logest_from(&mut self, other: &Catalog) {
+        self.row_logest.clone_from(&other.row_logest);
+        self.stat4_tables.clone_from(&other.stat4_tables);
     }
 
     /// Current stat rows (index name, stats) — the targeted-ANALYZE merge
@@ -1050,6 +1205,8 @@ impl Catalog {
         self.table_seq.insert(key.clone(), self.next_table_seq);
         // IndexesByTable entry for the table (will be populated by add_index).
         self.indexes_by_table.entry(idx_key).or_default();
+        self.row_logest.remove(&key);
+        self.stat4_tables.remove(&key);
         self.tables.insert(key, table_arc);
         self.schema_cookie = self.schema_cookie.wrapping_add(1);
     }
@@ -1258,6 +1415,8 @@ impl Catalog {
         let key = name.to_ascii_lowercase();
         let t = self.tables.remove(&key)?;
         self.temp_objects.remove(&key);
+        self.row_logest.remove(&key);
+        self.stat4_tables.remove(&key);
         // Remove all indexes on this table.
         if let Some(idx_list) = self.indexes_by_table.remove(&key) {
             for idx in idx_list {
@@ -1278,6 +1437,15 @@ impl Catalog {
 
     pub fn drop_index(&mut self, name: &str) -> Option<Arc<Index>> {
         let key = name.to_ascii_lowercase();
+        // SQLite's DROP INDEX leaves the table's in-memory estimate as it
+        // was (even one this index's stat row set): pin it before the
+        // index — and later its stat rows — go.
+        let table_key = self.indexes.get(&key)?.table.to_ascii_lowercase();
+        let x = self.sqlite_row_logest(&table_key);
+        if self.derived_has_stat4(&table_key) {
+            self.stat4_tables.insert(table_key.clone());
+        }
+        self.row_logest.insert(table_key, x);
         let idx = self.indexes.remove(&key)?;
         self.temp_objects.remove(&key);
         if let Some(list) = self

@@ -189,6 +189,14 @@ pub enum Plan {
         condition: Option<Expr>,
         /// For INNER HASH join: pre-build a hash on the left side.
         algorithm: JoinAlgorithm,
+        /// SQLite's plan verdict for a single rowid-alias equi-key
+        /// (`planner::sqlite_cost::sqlite_join_seeks_alias`): `Some(true)`
+        /// — SQLite runs the alias side as an INTEGER PRIMARY KEY seek
+        /// (OP_SeekRowid's conversion: the boundary REAL -2^63 finds no
+        /// rowid); `Some(false)` — it scans or probes an index and the key
+        /// compares with the general `=`; `None` — not modeled (the
+        /// executor's direction heuristic decides).
+        alias_seek: Option<bool>,
     },
     /// Index nested-loop join: for each outer row, look up matching inner
     /// rows via a secondary index on the inner table's join key. Only

@@ -9928,6 +9928,15 @@ impl Database {
         let mut catalog = Arc::try_unwrap(snap).unwrap_or_else(|a| (*a).clone());
         // The pager's in-memory cookie only moves forward; keep the
         // catalog in step so cookie-keyed caches revalidate.
+        // SQLite resets the schema after rolling back a schema change:
+        // every row estimate is recomputed from stats. When the DDL since
+        // the snapshot all failed (the catalog never changed), nothing
+        // resets — a failed CREATE INDEX's floor stays.
+        if catalog.schema_cookie == self.catalog.schema_cookie {
+            catalog.copy_row_logest_from(&self.catalog);
+        } else {
+            catalog.reset_row_logest();
+        }
         catalog.schema_cookie = self.pager.schema_cookie();
         self.catalog = catalog;
         self.invalidate_stmt_cache();
@@ -12817,92 +12826,50 @@ impl Database {
                 ));
             }
             for index in indexes {
-                // Per-prefix distinct counts: one GROUP BY per prefix k,
-                // counting the groups. Columns render as their SQL (plain
-                // names or the index's expression text — expr_to_sql).
-                let mut distinct: Vec<i64> = Vec::with_capacity(index.columns.len());
-                for k in 1..=index.columns.len() {
-                    let cols: Vec<String> = index.columns[..k]
-                        .iter()
-                        .map(|c| match &c.expr {
-                            Some(e) => expr_to_sql(e),
-                            None => c.name.clone(),
-                        })
-                        .collect();
-                    let sql = format!(
-                        "SELECT COUNT(*) FROM (SELECT 1 FROM \"{}\" GROUP BY {})",
-                        table.name.replace('"', "\"\""),
-                        cols.join(", ")
-                    );
-                    let cnt = Self::analyze_scalar_query(&sql, ctx, catalog)?;
-                    distinct.push(cnt.max(0));
-                }
-                // SQLite's stat numbers (statGet in analyze.c):
-                // D_i = ceil(n / d_i) — the average eq-class size — with
-                // the refinement D==2 && n*10 <= d*11 -> 1. An empty
-                // table's FULL index is omitted from stat1 entirely
-                // ("an empty table is omitted from sqlite_stat1"); a
-                // PARTIAL index keeps its zero row.
-                let is_partial = index.partial_expr.is_some();
-                if n == 0 && !is_partial {
+                let (n_idx, dvals, samples) =
+                    Self::analyze_index_exact(ctx, catalog, table, &index)?;
+                // An empty table's FULL index is omitted from stat1 ("an
+                // empty table is omitted from sqlite_stat1"); a PARTIAL
+                // index keeps its zero row.
+                if n_idx == 0 && index.partial_expr.is_none() {
                     continue;
                 }
-                let dvals: Vec<i64> = distinct
-                    .iter()
-                    .map(|&d| {
-                        let v = if d > 0 { (n + d - 1) / d } else { 0 };
-                        if v == 2 && n * 10 <= d * 11 {
-                            1
-                        } else {
-                            v
-                        }
-                    })
-                    .collect();
-                let stats = crate::schema::IndexStats {
-                    rows: n,
+                // A WITHOUT ROWID table's PRIMARY KEY rows are named after
+                // the table (analyze.c's zIdxName).
+                let stat_name =
+                    if matches!(index.origin, crate::schema::IndexOrigin::WithoutRowidPk) {
+                        table.name.clone()
+                    } else {
+                        index.name.clone()
+                    };
+                let mut stats = crate::schema::IndexStats {
+                    rows: n_idx,
                     distinct_prefix: dvals,
                     samples: Vec::new(),
                 };
-                // sqlite_stat4 samples: up to 24 evenly spaced snapshots
-                // of the index in key order with per-prefix position
-                // statistics (SQLite's IDX_MAX_SAMPLES discipline; the
-                // exact positions are an internal artifact — the schema,
-                // the row format, and the histogram's planner use are
-                // the contract).
-                let mut stats = stats;
-                if n > 0 && !index.columns.is_empty() {
-                    match Self::collect_stat4_samples(ctx, catalog, table, &index, n) {
-                        Ok(samples) if !samples.is_empty() => {
-                            for s in &samples {
-                                let sample_hex: String = s
-                                    .record_hex()
-                                    .iter()
-                                    .map(|b| format!("{:02X}", b))
-                                    .collect();
-                                insert_sqls.push(format!(
-                                    "INSERT INTO sqlite_stat4 VALUES ('{}', '{}', '{}', '{}', '{}', x'{}')",
-                                    table.name.replace('\'', "''"),
-                                    index.name.replace('\'', "''"),
-                                    join_i64(&s.neq),
-                                    join_i64(&s.nlt),
-                                    join_i64(&s.ndlt),
-                                    sample_hex,
-                                ));
-                            }
-                            stats.samples = samples;
-                        }
-                        Ok(_) => {}
-                        // Sampling never fails ANALYZE — the stat1 numbers
-                        // stand alone (the planner degrades to D_k).
-                        Err(_) => {}
-                    }
-                }
                 insert_sqls.push(format!(
                     "INSERT INTO sqlite_stat1 VALUES ('{}', '{}', '{}')",
                     table.name.replace('\'', "''"),
-                    index.name.replace('\'', "''"),
+                    stat_name.replace('\'', "''"),
                     stats.to_stat_text()
                 ));
+                for s in &samples {
+                    let sample_hex: String = s
+                        .record_hex()
+                        .iter()
+                        .map(|b| format!("{:02X}", b))
+                        .collect();
+                    insert_sqls.push(format!(
+                        "INSERT INTO sqlite_stat4 VALUES ('{}', '{}', '{}', '{}', '{}', x'{}')",
+                        table.name.replace('\'', "''"),
+                        stat_name.replace('\'', "''"),
+                        join_i64(&s.neq),
+                        join_i64(&s.nlt),
+                        join_i64(&s.ndlt),
+                        sample_hex,
+                    ));
+                }
+                stats.samples = samples;
                 stat_rows.push((index.name.clone(), stats));
             }
         }
@@ -12914,32 +12881,62 @@ impl Database {
         if target.is_some() {
             let mut merged: Vec<(String, crate::schema::IndexStats)> = catalog.stat1_snapshot();
             merged.extend(stat_rows);
-            catalog.set_stat1(merged);
+            catalog.load_stat1(merged);
         } else {
-            catalog.set_stat1(stat_rows);
+            catalog.load_stat1(stat_rows);
         }
         Ok(())
     }
 
-    /// Collect sqlite_stat4 samples for one index: scan the table,
-    /// build the index key values per row (collation-folded for the
-    /// sort, raw for the record), sort in index order, and stream the
-    /// per-prefix (neq, nlt, ndlt) counters, snapshotting at even
-    /// intervals (max 24 samples, consecutive same-key samples merged).
-    fn collect_stat4_samples(
+    /// SQLite's ANALYZE of one index (analyze.c analyzeOneTable +
+    /// stat_init / stat_push / stat_get): walk the index entries in key
+    /// order — the key columns, then the rowid (or, on a WITHOUT ROWID
+    /// table, the PRIMARY KEY columns the key lacks) — tracking where
+    /// each entry's prefix changes under the index collations. Returns
+    /// the entry count, the stat1 numbers (`D_k`) and the STAT4 samples,
+    /// all exactly as the bundled SQLite computes them.
+    fn analyze_index_exact(
         ctx: &mut ExecContext,
         catalog: &Catalog,
         table: &Arc<crate::schema::Table>,
         index: &Arc<crate::schema::Index>,
-        n_rows: i64,
-    ) -> Result<Vec<crate::schema::Stat4Sample>> {
+    ) -> Result<(i64, Vec<i64>, Vec<crate::schema::Stat4Sample>)> {
         use crate::plugin::collation_fold_key_ref;
         let n_cols = table.n_columns();
         let root = ctx.table_root(table);
         let mut bt = Btree::new(ctx.pager, root, false);
-        // (folded sort key values, raw key values, rowid)
+        let n_key = index.columns.len();
+        let pk_index = matches!(index.origin, crate::schema::IndexOrigin::WithoutRowidPk);
+        // The trailing columns: the WITHOUT ROWID PRIMARY KEY columns the
+        // key does not already carry under the same collation
+        // (isDupColumn); a rowid table's entries end with the rowid.
+        let suffix: Vec<crate::schema::IndexColumn> = if table.without_rowid && !pk_index {
+            catalog
+                .indexes_on_table(&table.name)
+                .iter()
+                .find(|i| matches!(i.origin, crate::schema::IndexOrigin::WithoutRowidPk))
+                .map(|pk| {
+                    pk.columns
+                        .iter()
+                        .filter(|pc| {
+                            !index.columns.iter().any(|ic| {
+                                ic.expr.is_none()
+                                    && ic.name.eq_ignore_ascii_case(&pc.name)
+                                    && ic.collation.eq_ignore_ascii_case(&pc.collation)
+                            })
+                        })
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let has_rowid = !table.without_rowid;
+        let cols: Vec<&crate::schema::IndexColumn> =
+            index.columns.iter().chain(suffix.iter()).collect();
+        // (folded sort values, raw record values, internal rowid)
         let mut entries: Vec<(Vec<Value>, Vec<Value>, i64)> = Vec::new();
-        let idx_cols = &index.columns;
         let named: Vec<String> = table
             .columns
             .iter()
@@ -12947,51 +12944,64 @@ impl Database {
             .collect();
         let params: Vec<Value> = Vec::new();
         let named_params = std::collections::HashMap::new();
-        let mut decode_err: Option<Error> = None;
+        let mut scan_err: Option<Error> = None;
         bt.scan_table(|rowid, payload| {
             let row = match decode_row(payload, n_cols, rowid, table.rowid_alias) {
                 Ok(r) => r,
                 Err(e) => {
-                    decode_err = Some(e);
+                    scan_err = Some(e);
                     return false;
                 }
             };
-            // Partial index: only rows matching the predicate.
+            // Partial index: only the rows it holds.
             if let Some(p) = &index.partial_expr {
                 match crate::executor::eval_row_where(p, &row, &named, &params, &named_params) {
                     Ok(true) => {}
-                    _ => return true,
+                    Ok(false) => return true,
+                    Err(e) => {
+                        scan_err = Some(e);
+                        return false;
+                    }
                 }
             }
-            let mut folded = Vec::with_capacity(idx_cols.len());
-            let mut raw = Vec::with_capacity(idx_cols.len());
-            for c in idx_cols {
+            let mut folded = Vec::with_capacity(cols.len() + 1);
+            let mut raw = Vec::with_capacity(cols.len() + 1);
+            for c in &cols {
                 let v = match &c.expr {
-                    Some(e) => Self::analyze_eval_expr(e, &row, &named, &params, &named_params)
-                        .unwrap_or(Value::Null),
-                    None => row
-                        .iter()
-                        .enumerate()
-                        .find(|(i, _)| table.columns[*i].name.eq_ignore_ascii_case(&c.name))
-                        .map(|(_, v)| v.clone())
+                    Some(e) => {
+                        match Self::analyze_eval_expr(e, &row, &named, &params, &named_params) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                scan_err = Some(e);
+                                return false;
+                            }
+                        }
+                    }
+                    None => table
+                        .find_column(&c.name)
+                        .and_then(|p| row.get(p))
+                        .cloned()
                         .unwrap_or(Value::Null),
                 };
                 folded.push(collation_fold_key_ref(&c.collation, &v).into_owned());
                 raw.push(v);
             }
+            if has_rowid {
+                folded.push(Value::Integer(rowid));
+                raw.push(Value::Integer(rowid));
+            }
             entries.push((folded, raw, rowid));
             true
         })?;
-        if let Some(e) = decode_err {
+        if let Some(e) = scan_err {
             return Err(e);
         }
         drop(bt);
-        let _ = catalog;
-        // Index order: folded column values with DESC columns inverted,
-        // then rowid.
-        let desc: Vec<bool> = idx_cols
+        // Index order: each column folded (DESC inverted), the rowid last.
+        let desc: Vec<bool> = cols
             .iter()
             .map(|c| matches!(c.order, crate::sql::ast::Order::Desc))
+            .chain(has_rowid.then_some(false))
             .collect();
         entries.sort_by(|a, b| {
             for (i, (x, y)) in a.0.iter().zip(b.0.iter()).enumerate() {
@@ -13003,69 +13013,84 @@ impl Database {
             }
             a.2.cmp(&b.2)
         });
-        // Per-prefix eq-class TOTALS (SQLite's neq is the whole class
-        // size, not a running count — every ia sample carries neq=100
-        // for a 100-row class regardless of the sample's position).
-        // Keyed by the folded prefix's concatenated order-key bytes.
-        let ncols = idx_cols.len();
-        let order_key = |vals: &[Value]| -> Vec<u8> {
+        // nCol: every entry column (key + trailing); the change scan
+        // compares nColTest of them — all but the last, or only the
+        // first nKeyCol-1 of a UNIQUE index over NOT NULL plain columns
+        // (uniqNotNull; the INTEGER PRIMARY KEY and a WITHOUT ROWID PK
+        // count as NOT NULL).
+        let n_col = if pk_index {
+            n_key
+        } else {
+            cols.len() + usize::from(has_rowid)
+        };
+        let uniq_not_null = index.unique
+            && index.columns.iter().all(|c| {
+                c.expr.is_none()
+                    && table.find_column(&c.name).is_some_and(|p| {
+                        let col = &table.columns[p];
+                        table.rowid_alias == Some(p)
+                            || col.explicit_not_null
+                            || (table.without_rowid && col.primary_key)
+                    })
+            });
+        let n_col_test = if !pk_index && uniq_not_null {
+            n_key - 1
+        } else {
+            n_col - 1
+        };
+        let order_key = |v: &Value| -> Vec<u8> {
             let mut out = Vec::new();
-            for v in vals {
-                v.encode_order_key_into(&mut out);
-            }
+            v.encode_order_key_into(&mut out);
             out
         };
-        let mut class_counts: Vec<std::collections::HashMap<Vec<u8>, i64>> = (0..=ncols + 1)
-            .map(|_| std::collections::HashMap::new())
-            .collect();
-        for (folded, _raw, rowid) in &entries {
-            let mut full: Vec<Value> = folded.clone();
-            full.push(Value::Integer(*rowid));
-            for k in 1..=ncols + 1 {
-                *class_counts[k].entry(order_key(&full[..k])).or_insert(0) += 1;
-            }
+        let mut acc = Stat4Accum::new(n_col, entries.len() as u64);
+        let mut prev: Option<Vec<Vec<u8>>> = None;
+        for (pos, (folded, _raw, _rowid)) in entries.iter().enumerate() {
+            let keys: Vec<Vec<u8>> = folded[..n_col_test].iter().map(order_key).collect();
+            let i_chng = match &prev {
+                None => 0,
+                Some(p) => (0..n_col_test)
+                    .find(|&i| p[i] != keys[i])
+                    .unwrap_or(n_col_test),
+            };
+            acc.push(i_chng, pos);
+            prev = Some(keys);
         }
-        // Streaming per-prefix counters (nlt/ndlt are complete at any
-        // point — all smaller keys precede in the sorted walk).
-        let total = entries.len();
-        let interval = std::cmp::max(1, total / 24);
-        let mut prev: Vec<Option<Vec<u8>>> = vec![None; ncols + 2];
-        let mut eq: Vec<i64> = vec![0; ncols + 2];
-        let mut nlt: Vec<i64> = vec![0; ncols + 2];
-        let mut ndlt: Vec<i64> = vec![0; ncols + 2];
-        let mut out: Vec<crate::schema::Stat4Sample> = Vec::new();
-        let mut last_key: Option<Vec<Value>> = None;
-        for (pos, (folded, raw, rowid)) in entries.iter().enumerate() {
-            let mut full: Vec<Value> = folded.clone();
-            full.push(Value::Integer(*rowid));
-            for k in 1..=ncols + 1 {
-                let prefix = order_key(&full[..k]);
-                if prev[k].as_ref() != Some(&prefix) {
-                    nlt[k] += eq[k];
-                    ndlt[k] += 1;
-                    eq[k] = 0;
-                    prev[k] = Some(prefix);
+        // stat_get(STAT1): D_i = ceil(nRow / nDistinct_i), with the
+        // 2-but-close-to-1 refinement.
+        let n_row = acc.n_row;
+        let dvals: Vec<i64> = (0..n_key)
+            .map(|i| {
+                let n_distinct = acc.cur.dlt[i] + 1;
+                let v = n_row.div_ceil(n_distinct);
+                if v == 2 && n_row * 10 <= n_distinct * 11 {
+                    1
+                } else {
+                    v as i64
                 }
-                eq[k] += 1;
-            }
-            // 1-indexed multiples of `interval`, capped at 24 samples,
-            // consecutive same-key samples merged (the first kept).
-            if (pos + 1) % interval == 0 && out.len() < 24 && last_key.as_ref() != Some(raw) {
-                let neq: Vec<i64> = (1..=ncols + 1)
-                    .map(|k| *class_counts[k].get(&order_key(&full[..k])).unwrap_or(&1))
-                    .collect();
-                out.push(crate::schema::Stat4Sample {
-                    keys: raw.clone(),
-                    rowid: *rowid,
-                    neq,
-                    nlt: nlt[1..=ncols + 1].to_vec(),
-                    ndlt: ndlt[1..=ncols + 1].to_vec(),
-                });
-                last_key = Some(raw.clone());
-            }
-        }
-        let _ = n_rows;
-        Ok(out)
+            })
+            .collect();
+        let samples = acc
+            .finish()
+            .into_iter()
+            .map(|s| {
+                let (_, raw, _) = &entries[s.pos];
+                let (keys, rowid) = if has_rowid {
+                    let (k, r) = raw.split_at(raw.len() - 1);
+                    (k.to_vec(), Some(r[0].as_integer()))
+                } else {
+                    (raw.clone(), None)
+                };
+                crate::schema::Stat4Sample {
+                    keys,
+                    rowid,
+                    neq: s.eq.iter().map(|&v| v as i64).collect(),
+                    nlt: s.lt.iter().map(|&v| v as i64).collect(),
+                    ndlt: s.dlt.iter().map(|&v| v as i64).collect(),
+                }
+            })
+            .collect();
+        Ok((n_row as i64, dvals, samples))
     }
 
     /// Evaluate an expression against one row for ANALYZE sampling.
@@ -13077,25 +13102,6 @@ impl Database {
         named_params: &std::collections::HashMap<String, Value>,
     ) -> Result<Value> {
         crate::executor::eval_row(e, row, col_names, params, named_params)
-    }
-
-    /// Run a scalar `SELECT COUNT(*) …` for ANALYZE's distinct counting.
-    fn analyze_scalar_query(sql: &str, ctx: &mut ExecContext, catalog: &Catalog) -> Result<i64> {
-        let stmt = parse(sql)?;
-        match stmt {
-            Statement::Select(sel) => {
-                let mut planner = Planner::new(catalog);
-                let plan = planner.plan_select(&sel)?;
-                let res = execute(&plan, ctx)?;
-                if let Some(first) = res.rows.first() {
-                    if let Some(v) = first.first() {
-                        return Ok(v.as_integer());
-                    }
-                }
-                Ok(0)
-            }
-            _ => Err(Error::semantic("ANALYZE internal query must be SELECT")),
-        }
     }
 
     fn execute_statement_static(
@@ -13207,7 +13213,13 @@ impl Database {
                 Ok(())
             }
             Statement::Pragma(p) => Self::execute_pragma(p.clone(), ctx),
-            Statement::Alter(a) => Self::execute_alter(a.clone(), ctx, catalog),
+            Statement::Alter(a) => {
+                Self::execute_alter(a.clone(), ctx, catalog)?;
+                // SQLite reloads the schema after every ALTER TABLE
+                // (renameReloadSchema): row estimates restart from stats.
+                catalog.reset_row_logest();
+                Ok(())
+            }
             Statement::Analyze { target, .. } => {
                 Self::execute_analyze(target.clone(), ctx, catalog)
             }
@@ -13778,6 +13790,10 @@ impl Database {
                     origin: crate::schema::IndexOrigin::CreateIndex,
                     kind,
                 };
+                // SQLite's sqlite3DefaultRowEst runs here, at parse time:
+                // the table's in-memory row estimate is floored even when
+                // the backfill below fails.
+                catalog.note_default_row_est(&table.name);
                 // ---- BACKFILL ----
                 // Populate the index from rows that already exist in the
                 // table. Previously CREATE INDEX registered an EMPTY B+tree
@@ -17638,6 +17654,24 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
     }
     // sqlite_stat1 rows -> the catalog's cost map, so a database that
     // was ANALYZEd in a previous session plans cost-based immediately.
+    // A stat row whose idx names its own table is a WITHOUT ROWID
+    // table's PRIMARY KEY (analysisLoader's sqlite3PrimaryKeyIndex): the
+    // engine keys it by its internal PK index.
+    let wr_pk_index: std::collections::HashMap<String, String> = catalog
+        .all_indexes()
+        .into_iter()
+        .filter(|(_, i)| i.origin == crate::schema::IndexOrigin::WithoutRowidPk)
+        .map(|(_, i)| (i.table.to_ascii_lowercase(), i.name.clone()))
+        .collect();
+    let stat_key = |tbl: &Value, idx: &str| -> String {
+        match tbl {
+            Value::Text(t) if t.as_str().eq_ignore_ascii_case(idx) => wr_pk_index
+                .get(&idx.to_ascii_lowercase())
+                .cloned()
+                .unwrap_or_else(|| idx.to_string()),
+            _ => idx.to_string(),
+        }
+    };
     if let Some(stat_table) = catalog.get_table("sqlite_stat1") {
         if stat_table.n_columns() == 3 {
             let mut bt = Btree::new(pager, stat_table.root_page, false);
@@ -17652,7 +17686,7 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
                     match (&row[1], &row[2]) {
                         (Value::Text(idx), Value::Text(stat)) => {
                             stats.push((
-                                idx.as_str().to_string(),
+                                stat_key(&row[0], idx.as_str()),
                                 crate::schema::IndexStats::parse(stat.as_str()),
                             ));
                         }
@@ -17700,7 +17734,7 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
                             ndlt.as_str(),
                             sample,
                         ) {
-                            rows.push((idx.as_str().to_string(), s));
+                            rows.push((stat_key(&row[0], idx.as_str()), s));
                         }
                     }
                 }
@@ -20648,6 +20682,211 @@ mod persist_tests {
             .query("SELECT id FROM t WHERE cat = 'a' AND val = 999", [])
             .unwrap();
         assert_eq!(r, vec![vec![Value::Integer(999)]]);
+    }
+}
+
+/// One STAT4 candidate (analyze.c's StatSample): the per-column
+/// (nEq, nLt, nDLt) counters at an index entry (`pos` into the sorted
+/// entries), whether it is a periodic sample, the column whose
+/// repetition it was chosen for (`icol`), and its tiebreak hash.
+#[derive(Clone)]
+struct Stat4Cand {
+    eq: Vec<u64>,
+    lt: Vec<u64>,
+    dlt: Vec<u64>,
+    pos: usize,
+    is_p: bool,
+    icol: usize,
+    hash: u32,
+}
+
+/// SQLite's STAT4 sample accumulator (analyze.c StatAccum with
+/// SQLITE_STAT4_SAMPLES = 24), ported rule for rule so ANALYZE writes the
+/// same sqlite_stat4 rows: periodic samples every `nEst/9 + 1` entries,
+/// plus, per key prefix, the entry whose prefix repeats most (ties: the
+/// later columns' repetition, then a pseudo-random hash), with the
+/// least valuable non-periodic sample evicted once 24 are held.
+struct Stat4Accum {
+    ncol: usize,
+    n_row: u64,
+    n_psample: u64,
+    prn: u32,
+    cur: Stat4Cand,
+    best: Vec<Stat4Cand>,
+    a: Vec<Stat4Cand>,
+    i_min: usize,
+    max_eq_zero: usize,
+}
+
+impl Stat4Accum {
+    const MX_SAMPLE: usize = 24;
+
+    /// `stat_init(N, K, C, 0)`: `ncol` = index columns + rowid, `n_est`
+    /// = the index's entry count.
+    fn new(ncol: usize, n_est: u64) -> Self {
+        let blank = |icol| Stat4Cand {
+            eq: vec![0; ncol],
+            lt: vec![0; ncol],
+            dlt: vec![0; ncol],
+            pos: 0,
+            is_p: false,
+            icol,
+            hash: 0,
+        };
+        Stat4Accum {
+            ncol,
+            n_row: 0,
+            n_psample: n_est / (Self::MX_SAMPLE as u64 / 3 + 1) + 1,
+            prn: 0x689e962du32.wrapping_mul(ncol as u32)
+                ^ 0xd0944565u32.wrapping_mul(n_est as i32 as u32),
+            cur: blank(0),
+            best: (0..ncol).map(blank).collect(),
+            a: Vec::new(),
+            i_min: 0,
+            max_eq_zero: 0,
+        }
+    }
+
+    /// sampleIsBetterPost: equal repetition on the chosen column — the
+    /// later columns' repetition decides, then the hash.
+    fn better_post(&self, new: &Stat4Cand, old: &Stat4Cand) -> bool {
+        for i in new.icol + 1..self.ncol {
+            if new.eq[i] != old.eq[i] {
+                return new.eq[i] > old.eq[i];
+            }
+        }
+        new.hash > old.hash
+    }
+
+    /// sampleIsBetter.
+    fn better(&self, new: &Stat4Cand, old: &Stat4Cand) -> bool {
+        let (n, o) = (new.eq[new.icol], old.eq[old.icol]);
+        if n != o {
+            return n > o;
+        }
+        new.icol < old.icol || (new.icol == old.icol && self.better_post(new, old))
+    }
+
+    /// sampleInsert.
+    fn insert(&mut self, new: Stat4Cand, n_eq_zero: usize) {
+        self.max_eq_zero = self.max_eq_zero.max(n_eq_zero);
+        if !new.is_p {
+            // A sample sharing this prefix is already held: upgrade the
+            // best such sample instead of adding this one.
+            let mut upgrade: Option<usize> = None;
+            for i in (0..self.a.len()).rev() {
+                let old = &self.a[i];
+                if old.eq[new.icol] == 0 {
+                    if old.is_p {
+                        return;
+                    }
+                    if upgrade.map_or(true, |u| self.better(old, &self.a[u])) {
+                        upgrade = Some(i);
+                    }
+                }
+            }
+            if let Some(u) = upgrade {
+                let c = new.icol;
+                self.a[u].icol = c;
+                self.a[u].eq[c] = new.eq[c];
+                self.find_new_min();
+                return;
+            }
+        }
+        if self.a.len() >= Self::MX_SAMPLE {
+            self.a.remove(self.i_min);
+        }
+        let mut s = new;
+        for e in &mut s.eq[..n_eq_zero] {
+            *e = 0;
+        }
+        self.a.push(s);
+        self.find_new_min();
+    }
+
+    fn find_new_min(&mut self) {
+        if self.a.len() >= Self::MX_SAMPLE {
+            let mut i_min: Option<usize> = None;
+            for i in 0..Self::MX_SAMPLE {
+                if self.a[i].is_p {
+                    continue;
+                }
+                if i_min.map_or(true, |m| self.better(&self.a[m], &self.a[i])) {
+                    i_min = Some(i);
+                }
+            }
+            self.i_min = i_min.unwrap_or(0);
+        }
+    }
+
+    /// samplePushPrevious: column `i_chng` changed — the best candidates
+    /// for the prefixes that just ended may enter the sample set, and the
+    /// held samples' pending nEq values complete.
+    fn push_previous(&mut self, i_chng: usize) {
+        if self.ncol >= 2 {
+            for i in (i_chng..=self.ncol - 2).rev() {
+                self.best[i].eq[i] = self.cur.eq[i];
+                if self.a.len() < Self::MX_SAMPLE || self.better(&self.best[i], &self.a[self.i_min])
+                {
+                    let b = self.best[i].clone();
+                    self.insert(b, i);
+                }
+            }
+        }
+        if i_chng < self.max_eq_zero {
+            for s in &mut self.a {
+                for j in i_chng..self.ncol {
+                    if s.eq[j] == 0 {
+                        s.eq[j] = self.cur.eq[j];
+                    }
+                }
+            }
+            self.max_eq_zero = i_chng;
+        }
+    }
+
+    /// stat_push(P, iChng, rowid) for the entry at `pos`.
+    fn push(&mut self, i_chng: usize, pos: usize) {
+        if self.n_row == 0 {
+            self.cur.eq.fill(1);
+        } else {
+            self.push_previous(i_chng);
+            for i in 0..i_chng {
+                self.cur.eq[i] += 1;
+            }
+            for i in i_chng..self.ncol {
+                self.cur.dlt[i] += 1;
+                self.cur.lt[i] += self.cur.eq[i];
+                self.cur.eq[i] = 1;
+            }
+        }
+        self.n_row += 1;
+        self.cur.pos = pos;
+        self.prn = self.prn.wrapping_mul(1103515245).wrapping_add(12345);
+        self.cur.hash = self.prn;
+        let n_lt = self.cur.lt[self.ncol - 1];
+        if n_lt / self.n_psample != (n_lt + 1) / self.n_psample {
+            self.cur.is_p = true;
+            self.cur.icol = 0;
+            let c = self.cur.clone();
+            self.insert(c, self.ncol - 1);
+            self.cur.is_p = false;
+        }
+        for i in 0..self.ncol - 1 {
+            self.cur.icol = i;
+            if i >= i_chng || self.better_post(&self.cur, &self.best[i]) {
+                self.best[i] = self.cur.clone();
+            }
+        }
+    }
+
+    /// The samples in index order (stat_get's first ROWID call flushes
+    /// the last prefixes).
+    fn finish(mut self) -> Vec<Stat4Cand> {
+        if self.n_row > 0 {
+            self.push_previous(0);
+        }
+        self.a
     }
 }
 

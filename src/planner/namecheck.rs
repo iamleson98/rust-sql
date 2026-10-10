@@ -1385,7 +1385,10 @@ fn validate_insert(ctx: &Ctx<'_>, ins: &InsertStatement, scope: &mut Scope) -> R
             if c.expr.is_some() {
                 continue; // expression targets validated by index matching
             }
-            if !target.has_column(&c.name) {
+            // `ON CONFLICT(rowid)` names the rowid of a rowid table.
+            if !target.has_column(&c.name)
+                && !(target.rowid_table && Source::is_rowid_spelling(&c.name))
+            {
                 return Err(Error::NotFound(format!("no such column: {}", c.name)));
             }
         }

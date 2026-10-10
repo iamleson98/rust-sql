@@ -4501,6 +4501,7 @@ impl Pager {
         while k > 1 && set.contains(&(k - 1)) {
             k -= 1;
         }
+
         // SAVEPOINT FLOOR: never truncate below the lowest active
         // savepoint's base n_pages. Pages below that bound were alive at
         // BEGIN time and are logged in at least one undo map — ROLLBACK
@@ -4537,6 +4538,7 @@ impl Pager {
             // poisoning the file after the next flush (found by the OOM
             // fault-injection sweep).
             let mut kept_pages: u32 = 0;
+            let mut orphans: Vec<PageId> = Vec::new();
             // Cycle guard: the trunk chain can't be longer than the old
             // page count; a corrupt file stops the walk.
             let mut steps = (self.freelist_count.load(Ordering::Acquire) + n).max(1);
@@ -4562,8 +4564,11 @@ impl Pager {
                     (next, kn, entries)
                 };
                 if cur >= k {
-                    // The whole trunk page is gone: it + its entries are
-                    // all removed from the freelist.
+                    // The trunk page itself is truncated away; its
+                    // entries below the new end are still free pages and
+                    // go back on the freelist below (dropping them with
+                    // the trunk leaked them: "Page N is never used").
+                    orphans.extend(entries.into_iter().filter(|&e| e < k));
                 } else {
                     let kept: Vec<u32> = entries.into_iter().filter(|&e| e < k).collect();
                     // The kept trunk itself stays a free page.
@@ -4597,8 +4602,10 @@ impl Pager {
             }
             self.freelist_head.store(new_head, Ordering::Release);
             self.freelist_count.store(kept_pages, Ordering::Release);
+            for id in orphans {
+                self.free_page(id)?;
+            }
         }
-
         // --- drop [k, n) from the cache, LRU, dirty set, WAL map ---
         {
             let mut cache = self.cache.write();
@@ -4618,7 +4625,6 @@ impl Pager {
                 state.map.retain(|&id, _| id < k);
             }
         }
-
         // --- rewind the page count + arm the physical truncate ---
         self.n_pages.store(k, Ordering::Release);
         self.pending_truncate.store(k, Ordering::Release);
@@ -4645,7 +4651,11 @@ impl Pager {
             return Ok(());
         }
         let want_len = k as u64 * self.page_size() as u64;
-        if let Ok(len) = self.store.read().len() {
+        // Bind the length first: an `if let` scrutinee's read guard lives
+        // through the whole body, and the write below then waited on it
+        // forever (a file-backed commit that shrank the file hung).
+        let len = self.store.read().len();
+        if let Ok(len) = len {
             if len > want_len {
                 self.store.write().set_len(want_len)?;
             }
@@ -6768,7 +6778,10 @@ impl Pager {
         //    through the committed map), so the trim is harmless.
         let committed = self.committed_n_pages.load(Ordering::Acquire);
         let target_size = committed as u64 * self.page_size.load(Ordering::Acquire) as u64;
-        if let Ok(len) = self.store.read().len() {
+        // Length first (see apply_pending_truncate: an `if let` guard
+        // would outlive the scrutinee and block the write).
+        let len = self.store.read().len();
+        if let Ok(len) = len {
             if len > target_size {
                 let _ = self.store.write().set_len(target_size);
             }

@@ -1988,9 +1988,17 @@ fn evaluate_in(
     // comparison (SQLite: `v COLLATE NOCASE IN ('a', 'B')`).
     // BINARY is the default collation: no lookup (lookup_collation maps
     // it to None, which must not read as "unknown collation").
-    let coll_name = comparison_collation(expr)
-        .or_else(|| ctx.expr_collation(expr))
-        .filter(|n| !n.eq_ignore_ascii_case("binary"));
+    //
+    // SQLite's parser rewrites `x IN (c)` with ONE constant member into
+    // `x == +c` (parse.y), so that pair's collation follows
+    // sqlite3BinaryCompareCollSeq: an explicit COLLATE on the member wins
+    // over the left column's declared one (`h IN ('abc' COLLATE BINARY)`
+    // on a NOCASE column compares BINARY; with two members it is NOCASE).
+    let coll_name = match single_constant_member(source) {
+        Some(member) => ctx.binary_comparison_collation(expr, member),
+        None => comparison_collation(expr).or_else(|| ctx.expr_collation(expr)),
+    }
+    .filter(|n| !n.eq_ignore_ascii_case("binary"));
     let coll = coll_name
         .as_deref()
         .and_then(crate::plugin::lookup_collation);
@@ -2147,6 +2155,15 @@ fn evaluate_in(
 
 /// An IN-list member SQLite treats as constant (sqlite3ExprIsConstant):
 /// no column or rowid reference, no subquery, no non-deterministic call.
+/// The member of a one-member IN list SQLite's parser turns into an
+/// equality (`x IN (c)` → `x == +c` when `c` is constant).
+pub(crate) fn single_constant_member(source: &InSource) -> Option<&Expr> {
+    match source {
+        InSource::List(l) if l.len() == 1 && is_constant_member(&l[0]) => Some(&l[0]),
+        _ => None,
+    }
+}
+
 fn is_constant_member(e: &Expr) -> bool {
     match e {
         Expr::Literal(_) | Expr::Parameter(_) => true,

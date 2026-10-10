@@ -879,6 +879,23 @@ fn exec_stmt(
     ctx_cell: &std::cell::RefCell<Ctx>,
     sql: String,
 ) -> Result<(bool, bool), String> {
+    // A join over tables that triggers have grown to tens of thousands of
+    // rows sharing a few values is quadratic in BOTH engines (seed 54054
+    // case 11: ~4.9e9 pairs behind `ORDER BY 1, 2 LIMIT 200`, minutes in
+    // SQLite too). Skip such a join — it would stall the run, not test it.
+    if let Some(rest) = sql.strip_prefix("SELECT a.rowid, b.rowid FROM ") {
+        let mut words = rest.split_whitespace();
+        let t = words.next().unwrap_or_default();
+        let u = words.nth(2).unwrap_or_default();
+        let count = |name: &str| -> i64 {
+            oracle
+                .query_row(&format!("SELECT count(*) FROM {name}"), [], |r| r.get(0))
+                .unwrap_or(0)
+        };
+        if count(t).saturating_mul(count(u)) > 20_000_000 {
+            return Ok((true, true));
+        }
+    }
     let idx = {
         let mut c = ctx_cell.borrow_mut();
         c.script.push(sql.clone());
@@ -951,7 +968,7 @@ fn run_case(seed: u64, case: usize, n_ops: usize) -> Result<(), String> {
     let mut op_i = 0usize;
     // Set when the random-rowid regime arms: the armed table's rowids are
     // engine-local from that point, so the final dump skips just it.
-    let mut skip_final: Option<String> = None;
+    let mut skip_final: Vec<String> = Vec::new();
     while op_i < n_ops {
         // Auto-close an open transaction.
         if in_txn && txn_ops_left == 0 {
@@ -1024,20 +1041,25 @@ fn run_case(seed: u64, case: usize, n_ops: usize) -> Result<(), String> {
         // by design and can never agree differentially, so end the case
         // cleanly (everything verified so far is still rigorous) instead of
         // reporting a false divergence.
-        if let Some(armed_table) = random_rowid_armed(&mut ours, &sc) {
-            // The arming statement may itself have completed a random
-            // allocation in a later tuple — the armed table's rowids are
-            // already engine-local. Skip only that table in the final dump;
-            // every other table stays under full verification.
+        let armed = random_rowid_armed(&mut ours, &sc);
+        if !armed.is_empty() {
+            // The arming statement may itself have completed random
+            // allocations in later tuples — or, through a trigger, in
+            // SEVERAL tables at once (seed 32032: one INSERT filled both
+            // t1 and audit) — so every armed table's rowids are already
+            // engine-local. Skip exactly those in the final dump; every
+            // other table stays under full verification.
             eprintln!(
                 "stateful fuzz: case {} ended early at op {}: random-rowid regime armed on {} (max rowid = i64::MAX)",
-                case, op_i, armed_table
+                case,
+                op_i,
+                armed.join(", ")
             );
-            skip_final = Some(armed_table);
+            skip_final = armed;
             break;
         }
         if !our_ok || was_ddl || n % 5 == 0 || op_i + 1 == n_ops {
-            compare_full_state(&mut ours, &oracle, &sc, &ctx_cell, n - 1, &op, None)?;
+            compare_full_state(&mut ours, &oracle, &sc, &ctx_cell, n - 1, &op, &[])?;
         } else {
             compare_counts(&mut ours, &oracle, &sc, &ctx_cell, n - 1, &op)?;
         }
@@ -1054,7 +1076,7 @@ fn run_case(seed: u64, case: usize, n_ops: usize) -> Result<(), String> {
         &ctx_cell,
         usize::MAX,
         "<final>",
-        skip_final.as_deref(),
+        &skip_final,
     )?;
     // Our engine must still pass integrity_check (defense in depth; the
     // per-op gate above should have caught any violation already).
@@ -1070,11 +1092,12 @@ fn run_case(seed: u64, case: usize, n_ops: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// True when any rowid table's max rowid has reached i64::MAX — the point
-/// after which implicit-rowid INSERTs allocate RANDOM rowids (in both this
-/// engine and SQLite), making further differential rowid verification
-/// impossible by design.
-fn random_rowid_armed(ours: &mut Database, sc: &Schema) -> Option<String> {
+/// The rowid tables whose max rowid has reached i64::MAX — the point after
+/// which implicit-rowid INSERTs allocate RANDOM rowids (in both this
+/// engine and SQLite), making further differential rowid verification of
+/// those tables impossible by design.
+fn random_rowid_armed(ours: &mut Database, sc: &Schema) -> Vec<String> {
+    let mut armed = Vec::new();
     for t in &sc.tables {
         if t.worowid_pk.is_some() {
             continue; // WITHOUT ROWID tables have no rowid
@@ -1083,12 +1106,12 @@ fn random_rowid_armed(ours: &mut Database, sc: &Schema) -> Option<String> {
         if let Ok(rows) = ours.query(&sql, ()) {
             if let Some(v) = rows.first().and_then(|r| r.first()) {
                 if v.as_integer() == i64::MAX {
-                    return Some(t.name.clone());
+                    armed.push(t.name.clone());
                 }
             }
         }
     }
-    None
+    armed
 }
 
 /// Invariant gate: our engine must pass `PRAGMA integrity_check`. Checked
@@ -1160,10 +1183,10 @@ fn compare_full_state(
     ctx_cell: &std::cell::RefCell<Ctx>,
     stmt_idx: usize,
     stmt: &str,
-    skip_table: Option<&str>,
+    skip_tables: &[String],
 ) -> Result<(), String> {
     for t in &sc.tables {
-        if skip_table == Some(t.name.as_str()) {
+        if skip_tables.iter().any(|s| s == &t.name) {
             continue; // random-rowid regime: rowids are engine-local
         }
         let a = our_run(ours, &dump_sql(t));
@@ -1238,26 +1261,46 @@ fn stateful_random_workload_matches_sqlite() {
 /// round added the random-rowid statement-max regression, SQLite's
 /// rowid-IN access-path cost model (scan vs seek decides whether the
 /// boundary REAL matches), and SQLITE_FULL's transaction-wide rollback
-/// when the statement runs without a statement journal.
+/// when the statement runs without a statement journal. The 2026-10
+/// long-run round (80 cases x 500 ops) added SQLite's rowid-join plan
+/// choice and its row-estimate lifecycle, trigger OR-clause inheritance,
+/// REPLACE over several unique keys and its max-rowid bookkeeping,
+/// rowid-ordered complex DELETEs, roots moved by triggers mid-loop, the
+/// rowid DELETE fast path's journaling, and a freelist leak in tail
+/// truncation.
 #[test]
 fn stateful_fuzz_fresh_seed_pins() {
-    let pins: [(u64, usize); 12] = [
-        (777001, 3),  // auto rowids 28.. vs SQLite 40.. after a rowid move
-        (777001, 39), // parallel slice-local [2^62, 2^62+8] false overflow
-        (777023, 1),  // upsert DO UPDATE left two rows sharing a UNIQUE key
-        (777023, 28), // `id IN (blob, text, -2^63e18)` boundary REAL match
-        (777101, 3),  // Real(-2^63) = Integer(i64::MIN) join pair dropped
-        (777101, 36), // "index entries out of order or duplicated" on undo
+    // (seed, case, ops): the long-run cases replay the 500-op workload
+    // they were found in.
+    let pins: [(u64, usize, usize); 23] = [
+        (777001, 3, 400),  // auto rowids 28.. vs SQLite 40.. after a rowid move
+        (777001, 39, 400), // parallel slice-local [2^62, 2^62+8] false overflow
+        (777023, 1, 400),  // upsert DO UPDATE left two rows sharing a UNIQUE key
+        (777023, 28, 400), // `id IN (blob, text, -2^63e18)` boundary REAL match
+        (777101, 3, 400),  // Real(-2^63) = Integer(i64::MIN) join pair dropped
+        (777101, 36, 400), // "index entries out of order or duplicated" on undo
         // 2026-10 round:
-        (1001, 21), // random rowid lowered the statement max: duplicate pk
-        (3003, 1),  // analyzed 4-row scan: boundary REAL matched i64::MIN
-        (4004, 22), // SQLITE_FULL without a statement journal: txn rollback
-        (5005, 26), // same: COMMIT after it is "no transaction is active"
-        (6006, 30), // analyzed 11-row table: SQLite seeks, boundary misses
-        (7007, 38), // AUTOINCREMENT exhaustion inside BEGIN
+        (1001, 21, 400), // random rowid lowered the statement max: duplicate pk
+        (3003, 1, 400),  // analyzed 4-row scan: boundary REAL matched i64::MIN
+        (4004, 22, 400), // SQLITE_FULL without a statement journal: txn rollback
+        (5005, 26, 400), // same: COMMIT after it is "no transaction is active"
+        (6006, 30, 400), // analyzed 11-row table: SQLite seeks, boundary misses
+        (7007, 38, 400), // AUTOINCREMENT exhaustion inside BEGIN
+        // 2026-10 long-run round (80 cases x 500 ops):
+        (8008, 14, 500),  // rowid-alias join: SQLite scans, boundary REAL matches
+        (13013, 22, 500), // trigger step inherits the outer statement's OR clause
+        (16016, 6, 500),  // REPLACE deleted the max-rowid holder: next auto rowid
+        (36036, 64, 500), // trigger/FK DELETE visits rows in rowid order
+        (39039, 31, 500), // streaming UPDATE wrote through a trigger-moved root
+        (40040, 48, 500), // rowid DELETE fast path not journaled before triggers
+        (43043, 54, 500), // REPLACE removes EVERY conflicting unique-key holder
+        (50050, 58, 500), // tail truncation dropped a freelist trunk's entries
+        (53053, 58, 500), // failed CREATE INDEX still floors the row estimate
+        (54054, 11, 500), // streaming DELETE wrote through a trigger-moved root
+        (64064, 10, 500), // upsert target naming the rowid is checked first
     ];
-    for (seed, case) in pins {
-        if let Err(msg) = run_case(seed, case, 400) {
+    for (seed, case, ops) in pins {
+        if let Err(msg) = run_case(seed, case, ops) {
             panic!("seed {seed} case {case}: {msg}");
         }
     }

@@ -184,9 +184,30 @@ pub(crate) fn fire_triggers(
         // nesting level deeper than the statement's own rows (SQLite:
         // top-level triggers fire their rows at depth 1, nested at 2).
         let _preupdate_depth = crate::preupdate::enter_nested_change();
+        // SQLite's codeTriggerProgram: the firing statement's ON CONFLICT
+        // policy, when it has one, REPLACES each step's own (`INSERT OR
+        // REPLACE` firing a body `INSERT` replaces where the body alone
+        // would abort); a DELETE step fires its own programs with the
+        // default policy.
+        let firing_or = ctx.firing_or;
         let result = (|| {
             for stmt in &trig.body {
                 let mut s = stmt.clone();
+                let step_or = match &mut s {
+                    Statement::Insert(i) => {
+                        if firing_or.is_some() {
+                            i.or = firing_or;
+                        }
+                        i.or
+                    }
+                    Statement::Update(u) => {
+                        if firing_or.is_some() {
+                            u.or = firing_or;
+                        }
+                        u.or
+                    }
+                    _ => None,
+                };
                 substitute_new_old(&mut s, new_row, old_row, col_names)?;
                 if trig.has_foreign_refs && crate::attach_fire::try_foreign_body(ctx, &s)? {
                     continue;
@@ -224,7 +245,10 @@ pub(crate) fn fire_triggers(
                 if crate::executor::plan_has_subqueries(&plan) {
                     plan = crate::executor::rewrite_plan_subqueries(&plan, ctx)?;
                 }
-                execute(&plan, ctx)?;
+                let saved_or = std::mem::replace(&mut ctx.firing_or, step_or);
+                let step = execute(&plan, ctx);
+                ctx.firing_or = saved_or;
+                step?;
             }
             Ok(())
         })();

@@ -1227,6 +1227,13 @@ pub struct ExecContext<'a> {
     /// trigger firing a log2 trigger must run at depth 2). This stack
     /// is the "is this trigger already active" check.
     pub trigger_stack: Vec<String>,
+    /// SQLite's `orconf` for the trigger programs the executing statement
+    /// fires: its ON CONFLICT policy when it has one (`INSERT OR
+    /// REPLACE`), which then REPLACES each trigger step's own policy
+    /// (codeTriggerProgram). Set by top-level INSERT / UPDATE from their
+    /// plan, and by `fire_triggers` to each step's effective policy while
+    /// the step runs (so nested programs inherit it); `None` = default.
+    pub firing_or: Option<ConflictResolution>,
     /// Marker to keep the lifetime.
     _marker: std::marker::PhantomData<&'a crate::schema::Catalog>,
 }
@@ -1263,6 +1270,7 @@ impl<'a> ExecContext<'a> {
             subquery_plans: HashMap::new(),
             trigger_depth: 0,
             trigger_stack: Vec::new(),
+            firing_or: None,
             explain_stats: None,
             explain_depth: 0,
             _marker: std::marker::PhantomData,
@@ -1310,6 +1318,7 @@ impl<'a> ExecContext<'a> {
             subquery_plans: HashMap::new(),
             trigger_depth: 0,
             trigger_stack: Vec::new(),
+            firing_or: None,
             explain_stats: None,
             explain_depth: 0,
             _marker: std::marker::PhantomData,
@@ -1957,10 +1966,19 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
                 join_type,
                 condition,
                 algorithm,
+                alias_seek,
             } = &**input
             {
                 if *algorithm == crate::planner::plan::JoinAlgorithm::Hash {
-                    return exec_hash_join(ctx, left, right, *join_type, condition, Some(columns));
+                    return exec_hash_join(
+                        ctx,
+                        left,
+                        right,
+                        *join_type,
+                        condition,
+                        Some(columns),
+                        *alias_seek,
+                    );
                 }
             }
             // FUSED PATH: Project over a RowidRange / RowidLookup with
@@ -2125,6 +2143,7 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             join_type,
             condition,
             algorithm,
+            alias_seek,
         } => {
             if dbg_fused() {
                 eprintln!(
@@ -2133,7 +2152,7 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
                 );
             }
             if *algorithm == crate::planner::plan::JoinAlgorithm::Hash {
-                exec_hash_join(ctx, left, right, *join_type, condition, None)
+                exec_hash_join(ctx, left, right, *join_type, condition, None, *alias_seek)
             } else {
                 exec_join(ctx, left, right, *join_type, condition)
             }
@@ -2280,15 +2299,17 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             on_conflict,
             upsert,
             returning,
-        } => exec_insert(
-            ctx,
-            table.clone(),
-            source,
-            columns,
-            *on_conflict,
-            upsert.as_ref(),
-            returning.as_deref(),
-        ),
+        } => with_firing_or(ctx, *on_conflict, |ctx| {
+            exec_insert(
+                ctx,
+                table.clone(),
+                source,
+                columns,
+                *on_conflict,
+                upsert.as_ref(),
+                returning.as_deref(),
+            )
+        }),
         Plan::Update {
             table,
             source,
@@ -2296,15 +2317,17 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             returning,
             or_conflict,
             from,
-        } => exec_update(
-            ctx,
-            table.clone(),
-            source,
-            assignments,
-            returning.as_deref(),
-            *or_conflict,
-            from.as_deref(),
-        ),
+        } => with_firing_or(ctx, *or_conflict, |ctx| {
+            exec_update(
+                ctx,
+                table.clone(),
+                source,
+                assignments,
+                returning.as_deref(),
+                *or_conflict,
+                from.as_deref(),
+            )
+        }),
         Plan::Delete {
             table,
             source,
@@ -8123,12 +8146,14 @@ pub(crate) fn empty_input_plan(plan: &Plan) -> Option<Plan> {
             join_type,
             condition,
             algorithm,
+            alias_seek,
         } => Plan::Join {
             left: sub(left)?,
             right: sub(right)?,
             join_type: *join_type,
             condition: condition.clone(),
             algorithm: *algorithm,
+            alias_seek: *alias_seek,
         },
         Plan::IndexNestedLoopJoin {
             outer,
@@ -14205,6 +14230,7 @@ fn exec_aggregate(
                 join_type,
                 condition,
                 algorithm: crate::planner::plan::JoinAlgorithm::Hash,
+                alias_seek,
             } = join_input
             {
                 if matches!(
@@ -14212,7 +14238,14 @@ fn exec_aggregate(
                     crate::sql::ast::JoinType::Inner | crate::sql::ast::JoinType::Cross
                 ) {
                     if let Some(res) = try_fused_scan_hash_join(
-                        ctx, left, right, *join_type, condition, None, true,
+                        ctx,
+                        left,
+                        right,
+                        *join_type,
+                        condition,
+                        None,
+                        true,
+                        *alias_seek,
                     )? {
                         return Ok(res);
                     }
@@ -17254,6 +17287,91 @@ fn unique_index_serves_eq_probe(ctx: &ExecContext<'_>, table: &Arc<Table>, col_p
     false
 }
 
+/// SQLite's semantics for a join's single equi-key between a rowid ALIAS
+/// and a column of the other side: true when SQLite seeks the alias side
+/// (OP_SeekRowid's conversion — ticket #3922 + the Atoi64 text parse: the
+/// boundary REAL -2^63 finds no rowid, TEXT '5' seeks rowid 5), false when
+/// it compares with the general `=` (a scan or an index probe — the
+/// boundary pair Real(-2^63) = Integer(i64::MIN) MATCHES).
+///
+/// `alias_seek` is the planner's model of SQLite's whole plan choice
+/// (`planner::sqlite_cost::sqlite_join_seeks_alias`: stat1 sizes, scan
+/// orders serving the ORDER BY, automatic indexes) for the two-table
+/// INNER joins it covers. Elsewhere SQLite's DIRECTION rules decide:
+/// LEFT — the right (inner) side is sought; RIGHT — the left; FULL —
+/// never; INNER/CROSS — the alias side is sought unless the non-alias key
+/// has a serving UNIQUE index and the alias side is the smaller (outer)
+/// one by row estimate (sqlite_stat1, else 2^20; ties keep the syntactic
+/// left outer) — then SQLite scans the alias side and probes that index
+/// (stateful-fuzz seed 777101 case 3).
+fn join_alias_seek_gate(
+    ctx: &ExecContext<'_>,
+    l_table: &Arc<Table>,
+    r_table: &Arc<Table>,
+    l_key: usize,
+    r_key: usize,
+    join_type: crate::sql::ast::JoinType,
+    alias_seek: Option<bool>,
+) -> bool {
+    use crate::sql::ast::JoinType;
+    let l_key_is_alias = l_table.rowid_alias == Some(l_key);
+    let r_key_is_alias = r_table.rowid_alias == Some(r_key);
+    let gated = match join_type {
+        JoinType::Inner | JoinType::Cross => l_key_is_alias ^ r_key_is_alias,
+        JoinType::Left => r_key_is_alias && !l_key_is_alias,
+        JoinType::Right => l_key_is_alias && !r_key_is_alias,
+        JoinType::Full => false,
+    };
+    if !gated || !matches!(join_type, JoinType::Inner | JoinType::Cross) {
+        return gated;
+    }
+    if let Some(seeks) = alias_seek {
+        return seeks;
+    }
+    // Both directions index-backed? The NON-alias side's key needs the
+    // serving unique index (the alias side is seekable by definition).
+    let non_alias_indexed = if l_key_is_alias {
+        unique_index_serves_eq_probe(ctx, r_table, r_key)
+    } else {
+        unique_index_serves_eq_probe(ctx, l_table, l_key)
+    };
+    if !non_alias_indexed {
+        return true;
+    }
+    let outer_is_left = {
+        let l_rows = crate::planner::table_rows_hint(ctx.catalog(), l_table);
+        let r_rows = crate::planner::table_rows_hint(ctx.catalog(), r_table);
+        if l_rows == r_rows {
+            true // tie: syntactic left is outer
+        } else {
+            l_rows < r_rows // smaller estimate is outer
+        }
+    };
+    // Outer = the ALIAS side -> SQLite scans it and probes the non-alias
+    // side's unique index: NUMERIC semantics.
+    let outer_is_alias = if l_key_is_alias {
+        outer_is_left
+    } else {
+        !outer_is_left
+    };
+    !outer_is_alias
+}
+
+/// The base table a scan-shaped plan reads (through filters) — the sides
+/// whose output columns are the table's columns (+ the hidden rowid slot).
+fn plan_scan_table(plan: &Plan) -> Option<&Arc<Table>> {
+    match plan {
+        Plan::Scan { table, .. }
+        | Plan::RowidLookup { table, .. }
+        | Plan::RowidRange { table, .. }
+        | Plan::IndexLookup { table, .. }
+        | Plan::IndexRange { table, .. } => Some(table),
+        Plan::Filter { input, .. } => plan_scan_table(input),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn try_fused_scan_hash_join(
     ctx: &mut ExecContext<'_>,
     left: &Plan,
@@ -17262,6 +17380,9 @@ fn try_fused_scan_hash_join(
     condition: &Option<Expr>,
     projection: Option<&[crate::planner::plan::ProjectExpr]>,
     count_only: bool,
+    // The planner's model of SQLite's plan for a single rowid-alias key
+    // (`Plan::Join::alias_seek`); None = the direction heuristic below.
+    alias_seek: Option<bool>,
 ) -> Result<Option<ExecResult>> {
     // COUNT-ONLY MODE: the consumer is a bare `COUNT(*)` aggregate —
     // the join's cardinality is the answer, so the machine decodes ONLY
@@ -17401,71 +17522,10 @@ fn try_fused_scan_hash_join(
     // (inner) side; RIGHT — the LEFT (inner) side; FULL — never.
     let l_key_is_alias = l_table.rowid_alias == Some(l_keys[0]);
     let r_key_is_alias = r_table.rowid_alias == Some(r_keys[0]);
-    let mut rowid_seek_join = n_keys == 1
-        && match join_type {
-            crate::sql::ast::JoinType::Inner | crate::sql::ast::JoinType::Cross => {
-                l_key_is_alias ^ r_key_is_alias
-            }
-            crate::sql::ast::JoinType::Left => r_key_is_alias && !l_key_is_alias,
-            crate::sql::ast::JoinType::Right => l_key_is_alias && !r_key_is_alias,
-            crate::sql::ast::JoinType::Full => false,
-        };
-    // SQLite's DIRECTION rule for an INNER/CROSS join with one rowid-
-    // alias equi key — the rowid-seek direction applies ticket-#3922
-    // conversion (boundary REAL never finds the extreme rowid), the
-    // index-probe direction compares NUMERICALLY (the boundary pair
-    // Real(-2^63) = Integer(i64::MIN) MATCHES — stateful-fuzz seed
-    // 777101 case 3). Which direction SQLite plans:
-    //   1. Non-alias key UNINDEXED: the only index-backed plan seeks
-    //      the alias side (the unindexed inner full-scan is
-    //      catastrophic) — SEEK semantics, keep the gate.
-    //   2. Non-alias key covered by a non-partial UNIQUE btree index
-    //      (both directions index-backed): the OUTER side is the one
-    //      with the SMALLER row estimate (sqlite_stat1 when ANALYZE
-    //      ran, else the 2^20 unanalyzed default — verified: a stale
-    //      1-row stat1 flips SQLite to scan the alias side); an
-    //      estimate TIE keeps the SYNTACTIC LEFT as outer (verified
-    //      across unanalyzed size sweeps). Outer=alias side -> probe
-    //      the unique index (NUMERIC, DECLINE the gate); outer=
-    //      non-alias side -> SEEK the alias (keep).
-    // LEFT/RIGHT joins never reorder: the alias side is the inner side
-    // by construction and SQLite seeks it — the gate stays for those.
-    if rowid_seek_join
-        && matches!(
-            join_type,
-            crate::sql::ast::JoinType::Inner | crate::sql::ast::JoinType::Cross
-        )
-    {
-        // Both directions index-backed? The NON-alias side's key needs
-        // the serving unique index (the alias side is seekable by
-        // definition — it's the rowid).
-        let non_alias_indexed = if l_key_is_alias {
-            unique_index_serves_eq_probe(ctx, r_table, r_keys[0])
-        } else {
-            unique_index_serves_eq_probe(ctx, l_table, l_keys[0])
-        };
-        if non_alias_indexed {
-            let outer_is_left = {
-                let l_rows = crate::planner::table_rows_hint(ctx.catalog(), l_table);
-                let r_rows = crate::planner::table_rows_hint(ctx.catalog(), r_table);
-                if l_rows == r_rows {
-                    true // tie: syntactic left is outer
-                } else {
-                    l_rows < r_rows // smaller estimate is outer
-                }
-            };
-            // Outer = the ALIAS side -> SQLite scans it and probes the
-            // non-alias side's unique index: NUMERIC semantics.
-            let outer_is_alias = if l_key_is_alias {
-                outer_is_left
-            } else {
-                !outer_is_left
-            };
-            if outer_is_alias {
-                rowid_seek_join = false;
-            }
-        }
-    }
+    let rowid_seek_join = n_keys == 1
+        && join_alias_seek_gate(
+            ctx, l_table, r_table, l_keys[0], r_keys[0], join_type, alias_seek,
+        );
     // Cross-affinity equi keys (INTEGER col = TEXT col — needs the
     // NUMERIC fold) must NOT hash: the encoded order keys are
     // class-ordered and would never collide. DECLINE to the nested-loop
@@ -18281,6 +18341,7 @@ fn exec_hash_join(
     join_type: crate::sql::ast::JoinType,
     condition: &Option<Expr>,
     projection: Option<&[crate::planner::plan::ProjectExpr]>,
+    alias_seek: Option<bool>,
 ) -> Result<ExecResult> {
     // ---- FUSED STREAMING PATH ----
     // INNER equi-join of two bare table scans under a bare-column
@@ -18318,9 +18379,9 @@ fn exec_hash_join(
         // RIGHT/FULL append the unmatched BUILD rows (a matched bitmap)
         // with NULL left values — exactly the materialized path's
         // left-driven order.
-        if let Some(res) =
-            try_fused_scan_hash_join(ctx, left, right, join_type, condition, projection, false)?
-        {
+        if let Some(res) = try_fused_scan_hash_join(
+            ctx, left, right, join_type, condition, projection, false, alias_seek,
+        )? {
             return Ok(res);
         }
     }
@@ -18346,6 +18407,31 @@ fn exec_hash_join(
             }
             _ => None,
         };
+    // ---- Rowid-alias SEEK semantics (`join_alias_seek_gate`) ----------
+    // The fused path's gate, for materialized sides: a single key pair
+    // between a rowid alias and the other side's column that SQLite
+    // SEEKS matches only when the other value converts (OP_SeekRowid)
+    // to exactly the alias rowid — the general `=` this hash compares
+    // with also pairs the boundary REAL -2^63 with i64::MIN. Seek matches
+    // are a subset of `=` matches, so the gate is a per-pair check.
+    // (alias side is LEFT, alias key position, other key position)
+    let seek_check: Option<(bool, usize, usize)> = match (
+        eq_pairs.as_slice(),
+        plan_scan_table(left),
+        plan_scan_table(right),
+    ) {
+        ([(li, ri)], Some(lt), Some(rt))
+            if join_alias_seek_gate(ctx, lt, rt, *li, *ri, join_type, alias_seek) =>
+        {
+            if lt.rowid_alias == Some(*li) {
+                Some((true, *li, *ri))
+            } else {
+                Some((false, *ri, *li))
+            }
+        }
+        _ => None,
+    };
+
     // Cross-affinity equi keys must not hash (see the fused path's
     // gate) — treat as no-equi and take the nested loop, which folds.
     let eq_pairs = if eq_pairs.iter().any(|&(li, ri)| {
@@ -18366,7 +18452,7 @@ fn exec_hash_join(
         // projection). The sides are ALREADY materialized above: run the
         // nested loop over them directly (exec_join_rows) — the old
         // call re-executed BOTH sides a second time.
-        let res = exec_join_rows(
+        let mut res = exec_join_rows(
             ctx,
             left_res,
             right_res,
@@ -18374,6 +18460,25 @@ fn exec_hash_join(
             condition,
             affs.as_deref(),
         )?;
+        // The folded comparison pairs the boundary text/REAL with
+        // i64::MIN where a seeking SQLite does not (INNER joins: the
+        // combined rows carry both keys).
+        if let (Some((alias_left, ai, oi)), true) = (
+            seek_check,
+            matches!(
+                join_type,
+                crate::sql::ast::JoinType::Inner | crate::sql::ast::JoinType::Cross
+            ),
+        ) {
+            res.rows.retain(|row| {
+                let (alias_v, other_v) = if alias_left {
+                    (&row[ai], &row[n_left + oi])
+                } else {
+                    (&row[n_left + ai], &row[oi])
+                };
+                matches!(alias_v, Value::Integer(r) if rowid_seek_value(other_v) == Some(*r))
+            });
+        }
         return match projection {
             Some(cols) => apply_projection(res, cols, ctx),
             None => Ok(res),
@@ -18650,7 +18755,25 @@ fn exec_hash_join(
                 }
                 let bi = n as usize;
                 let build_row = &build_rows[bi];
-                if let Some(res) = residual {
+                let seek_ok = match seek_check {
+                    None => true,
+                    Some((alias_left, ai, oi)) => {
+                        let (l_row, r_row) = if probe_is_left {
+                            (probe_row, build_row)
+                        } else {
+                            (build_row, probe_row)
+                        };
+                        let (alias_v, other_v) = if alias_left {
+                            (&l_row[ai], &r_row[oi])
+                        } else {
+                            (&r_row[ai], &l_row[oi])
+                        };
+                        matches!(alias_v, Value::Integer(r) if rowid_seek_value(other_v) == Some(*r))
+                    }
+                };
+                if !seek_ok {
+                    // The general `=` paired them; the seek does not.
+                } else if let Some(res) = residual {
                     // Residual predicates need the FULL combined row.
                     let mut combined: Row = Vec::with_capacity(n_left + n_right);
                     if probe_is_left {
@@ -22424,6 +22547,27 @@ fn return_insert_scratch(sc: InsertScratch) {
     });
 }
 
+/// Run a top-level INSERT / UPDATE with its ON CONFLICT policy as the
+/// `orconf` its trigger programs inherit (`ExecContext::firing_or`).
+/// Inside a trigger program the step's effective policy was already set
+/// by `fire_triggers`. The plan keeps no "explicit" bit: an explicit
+/// `OR ABORT` reads as the default here (it would also override a body
+/// step's own non-default policy in SQLite).
+fn with_firing_or(
+    ctx: &mut ExecContext<'_>,
+    policy: ConflictResolution,
+    run: impl FnOnce(&mut ExecContext<'_>) -> Result<ExecResult>,
+) -> Result<ExecResult> {
+    if ctx.trigger_depth > 0 {
+        return run(ctx);
+    }
+    let saved = ctx.firing_or;
+    ctx.firing_or = (policy != ConflictResolution::Abort).then_some(policy);
+    let result = run(ctx);
+    ctx.firing_or = saved;
+    result
+}
+
 fn exec_insert(
     ctx: &mut ExecContext<'_>,
     table: Arc<Table>,
@@ -23792,42 +23936,66 @@ fn exec_insert_one_row(
         RowidPk,
         Index(usize),
     }
+    // sqlite3UpsertAnalyzeTarget: a single-term target naming the rowid
+    // (its INTEGER PRIMARY KEY alias, or a rowid spelling no column
+    // shadows) is the rowid — checked before any index, even one on the
+    // same column. Otherwise the first UNIQUE index whose key columns the
+    // target lists exactly; a PARTIAL index matches only when the target
+    // repeats its WHERE clause.
     let upsert_target = match upsert {
         Some(u) if u.target.is_empty() => UpsertTarget::Any,
         Some(u) => {
-            let idx_pos = index_states.iter().position(|st| {
-                st.idx.unique
-                    && st.idx.columns.len() == u.target.len()
-                    && u.target.iter().all(|t| {
-                        st.idx
-                            .columns
-                            .iter()
-                            .any(|c| c.name.eq_ignore_ascii_case(&t.name))
-                    })
-            });
+            let names_rowid = !table.without_rowid
+                && u.target.len() == 1
+                && u.target[0].expr.is_none()
+                && match table.find_column(&u.target[0].name) {
+                    Some(col_idx) => table.rowid_alias == Some(col_idx),
+                    None => ["rowid", "_rowid_", "oid"]
+                        .iter()
+                        .any(|r| r.eq_ignore_ascii_case(&u.target[0].name)),
+                };
+            let render = |e: &Expr| crate::api::expr_to_sql(e).to_ascii_lowercase();
+            let idx_pos = if names_rowid {
+                None
+            } else {
+                index_states.iter().position(|st| {
+                    st.idx.unique
+                        && st.idx.columns.len() == u.target.len()
+                        && match (&st.idx.partial_expr, &u.target_where) {
+                            (None, _) => true,
+                            (Some(_), None) => false,
+                            (Some(p), Some(w)) => render(p) == render(w),
+                        }
+                        && st.idx.columns.iter().all(|c| {
+                            u.target.iter().any(|t| {
+                                // A target COLLATE must name the index
+                                // column's collation (sqlite3ExprCompare);
+                                // a bare term matches any.
+                                let coll_ok = t.collation.as_deref().map_or(true, |tc| {
+                                    let ic = if c.collation.is_empty() {
+                                        "BINARY"
+                                    } else {
+                                        c.collation.as_str()
+                                    };
+                                    tc.eq_ignore_ascii_case(ic)
+                                });
+                                coll_ok
+                                    && match (&c.expr, &t.expr) {
+                                        (None, None) => c.name.eq_ignore_ascii_case(&t.name),
+                                        (Some(ce), Some(te)) => render(ce) == render(te),
+                                        _ => false,
+                                    }
+                            })
+                        })
+                })
+            };
             match idx_pos {
                 Some(i) => UpsertTarget::Index(i),
+                None if names_rowid => UpsertTarget::RowidPk,
                 None => {
-                    // Single-column target on the rowid alias (INTEGER PK)?
-                    if u.target.len() == 1 {
-                        if let Some(col_idx) = table.find_column(&u.target[0].name) {
-                            if table.rowid_alias == Some(col_idx) {
-                                UpsertTarget::RowidPk
-                            } else {
-                                return Err(Error::semantic(
-                                    "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint",
-                                ));
-                            }
-                        } else {
-                            return Err(Error::semantic(
-                                "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint",
-                            ));
-                        }
-                    } else {
-                        return Err(Error::semantic(
-                            "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint",
-                        ));
-                    }
+                    return Err(Error::semantic(
+                        "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint",
+                    ));
                 }
             }
         }
@@ -23872,140 +24040,181 @@ fn exec_insert_one_row(
     // the configured conflict resolution (IGNORE → skip, REPLACE → delete
     // the conflicting row first, ABORT/FAIL/ROLLBACK → error,
     // UPSERT → DO NOTHING / DO UPDATE).
-    let mut conflict_rowid: Option<i64> = None;
-    let mut conflict_cols: Vec<String> = Vec::new();
-    let mut conflict_on_target = false;
-    for (i, st) in index_states.iter_mut().enumerate() {
-        if !st.idx.unique {
-            continue;
-        }
-        // Partial index: rows failing the WHERE predicate are not
-        // indexed at all (SQLite) — exempt from uniqueness. The
-        // `is_none` gate keeps the hot (non-partial) path branch-only.
-        if st.idx.partial_expr.is_some()
-            && !index_row_matches_partial(&st.idx, table, full_row, &ctx.params, &ctx.named_params)?
-        {
-            continue;
-        }
-        // NULLs are distinct in UNIQUE indexes (SQLite semantics): a row
-        // with ANY NULL among the indexed columns is exempt from the
-        // uniqueness check, so multiple NULL rows coexist. Expression
-        // keys count too: a row whose expression evaluates to NULL is
-        // exempt (`index_key_has_null` evaluates them).
-        if index_key_has_null(&st.idx, table, full_row) {
-            continue;
-        }
-        // Any REPLACE/UPSERT path below mutates the index trees, so the
-        // append hint may go stale — drop it (it re-pins on the next
-        // plain insert).
-        st.clear_hints();
-        let key_bytes = st.encode_key(full_row)?.to_vec();
-        let idx_root = st.root;
-        let mut ibt = Btree::new(ctx.pager, idx_root, true);
-        let matches = ibt.lookup_index(&key_bytes)?;
-        if !matches.is_empty() {
-            conflict_rowid = Some(matches[0]);
-            conflict_cols = st
-                .idx
-                .columns
-                .iter()
-                .map(|c| format!("{}.{}", table.name, c.name))
-                .collect();
-            conflict_on_target =
-                matches!(upsert_target, UpsertTarget::Any | UpsertTarget::Index(_))
-                    && (matches!(upsert_target, UpsertTarget::Any) || {
-                        if let UpsertTarget::Index(t) = &upsert_target {
-                            *t == i
-                        } else {
-                            false
-                        }
-                    });
-            break;
-        }
-    }
-    if let Some(existing_rowid) = conflict_rowid {
-        // UPSERT path: conflicts on the targeted index take the upsert
-        // action; conflicts on OTHER constraints are plain errors.
-        if conflict_on_target {
-            if let Some(u) = upsert {
-                return exec_upsert_row(
-                    ctx,
+    // REPLACE resolves EVERY constraint the new row collides with —
+    // SQLite deletes the holder of each conflicting UNIQUE key in turn
+    // (sqlite3GenerateConstraintChecks walks all of them) — so after a
+    // REPLACE deletion the probe repeats until the row is clean. Breaking
+    // at the first conflict left a second holder in place: two rows
+    // sharing a UNIQUE key (stateful-fuzz seed 43043: a partial unique
+    // index on the rowid alias resolved, the one on `note` never probed).
+    let mut replaced_holders: Vec<i64> = Vec::new();
+    loop {
+        let mut conflict_rowid: Option<i64> = None;
+        let mut conflict_cols: Vec<String> = Vec::new();
+        let mut conflict_on_target = false;
+        for (i, st) in index_states.iter_mut().enumerate() {
+            if !st.idx.unique {
+                continue;
+            }
+            // Partial index: rows failing the WHERE predicate are not
+            // indexed at all (SQLite) — exempt from uniqueness. The
+            // `is_none` gate keeps the hot (non-partial) path branch-only.
+            if st.idx.partial_expr.is_some()
+                && !index_row_matches_partial(
+                    &st.idx,
                     table,
-                    table_name_lc,
-                    current_root,
                     full_row,
-                    payload_buf,
-                    index_states,
-                    existing_rowid,
-                    u,
-                );
+                    &ctx.params,
+                    &ctx.named_params,
+                )?
+            {
+                continue;
+            }
+            // NULLs are distinct in UNIQUE indexes (SQLite semantics): a row
+            // with ANY NULL among the indexed columns is exempt from the
+            // uniqueness check, so multiple NULL rows coexist. Expression
+            // keys count too: a row whose expression evaluates to NULL is
+            // exempt (`index_key_has_null` evaluates them).
+            if index_key_has_null(&st.idx, table, full_row) {
+                continue;
+            }
+            // Any REPLACE/UPSERT path below mutates the index trees, so the
+            // append hint may go stale — drop it (it re-pins on the next
+            // plain insert).
+            st.clear_hints();
+            let key_bytes = st.encode_key(full_row)?.to_vec();
+            let idx_root = st.root;
+            let mut ibt = Btree::new(ctx.pager, idx_root, true);
+            let matches = ibt.lookup_index(&key_bytes)?;
+            if !matches.is_empty() {
+                conflict_rowid = Some(matches[0]);
+                conflict_cols = st
+                    .idx
+                    .columns
+                    .iter()
+                    .map(|c| format!("{}.{}", table.name, c.name))
+                    .collect();
+                conflict_on_target =
+                    matches!(upsert_target, UpsertTarget::Any | UpsertTarget::Index(_))
+                        && (matches!(upsert_target, UpsertTarget::Any) || {
+                            if let UpsertTarget::Index(t) = &upsert_target {
+                                *t == i
+                            } else {
+                                false
+                            }
+                        });
+                break;
             }
         }
-        match on_conflict {
-            ConflictResolution::Ignore => return Ok((InsertOutcome::Skipped, rowid)),
-            ConflictResolution::Replace => {
-                // Delete the conflicting row from the table and from
-                // all indexes (we'll re-insert the new row below).
-                let mut bt = Btree::new(ctx.pager, *current_root, false);
-                let old_payload_opt = match bt.lookup_table(existing_rowid)? {
-                    LookupResult::Found(p) => Some(p),
-                    LookupResult::NotFound => None,
-                };
-                // Preupdate: the conflicting row is about to be deleted
-                // (the new row's INSERT event fires in the write block
-                // below, matching SQLite's DELETE-then-INSERT pair for
-                // INSERT OR REPLACE).
-                if let Some(p) = old_payload_opt.as_ref() {
-                    crate::preupdate::fire_delete_payload(table, existing_rowid, p);
-                }
-                bt.delete_table(existing_rowid)?;
-                *current_root = bt.root;
-                ctx.set_table_root_lc(table_name_lc, *current_root);
-                if let Some(old_payload) = old_payload_opt {
-                    let old_row = decode_row(
-                        &old_payload,
-                        table.n_columns(),
+        let Some(existing_rowid) = conflict_rowid else {
+            break;
+        };
+        {
+            // UPSERT path: conflicts on the targeted index take the upsert
+            // action; conflicts on OTHER constraints are plain errors.
+            if conflict_on_target {
+                if let Some(u) = upsert {
+                    return exec_upsert_row(
+                        ctx,
+                        table,
+                        table_name_lc,
+                        current_root,
+                        full_row,
+                        payload_buf,
+                        index_states,
                         existing_rowid,
-                        table.rowid_alias,
-                    )?;
-                    for st in index_states.iter_mut() {
-                        // Multi-entry (gin/gist): delete every key the
-                        // old row contributed.
-                        let old_keys =
-                            crate::executor::index_am::index_entry_keys(&st.idx, table, &old_row)?;
-                        let mut ibt = Btree::new(ctx.pager, st.root, true);
-                        for old_key in &old_keys {
-                            ibt.delete_index(old_key, existing_rowid)?;
-                        }
-                        if st.root != ibt.root {
-                            ctx.set_index_root(&st.idx.name, ibt.root);
-                        }
-                        st.root = ibt.root;
-                    }
-                    // Statement journal: the replaced holder's payload, so
-                    // a LATER failure in this statement re-inserts it (the
-                    // matching Inserted entry for the new row deletes the
-                    // replacement first — reverse replay order guarantees
-                    // the pairing).
-                    ctx.stmt_undo.push(StmtUndoEntry::Deleted {
-                        table: std::sync::Arc::clone(table),
-                        rowid: existing_rowid,
-                        payload: old_payload,
-                    });
+                        u,
+                    );
                 }
             }
-            _ => {
-                // SQLite's message shape: "UNIQUE constraint failed: t.col"
-                // (comma-joined for composite keys).
-                let cols = if conflict_cols.is_empty() {
-                    table.name.clone()
-                } else {
-                    conflict_cols.join(", ")
-                };
-                return Err(Error::constraint(format!(
-                    "UNIQUE constraint failed: {}",
-                    cols
-                )));
+            match on_conflict {
+                ConflictResolution::Ignore => return Ok((InsertOutcome::Skipped, rowid)),
+                ConflictResolution::Replace => {
+                    // A holder seen twice means its delete removed nothing
+                    // (an index entry naming a missing row): corruption —
+                    // error instead of probing forever.
+                    if replaced_holders.contains(&existing_rowid) {
+                        return Err(Error::corruption(format!(
+                            "REPLACE could not remove row {} holding a UNIQUE key of {}",
+                            existing_rowid, table.name
+                        )));
+                    }
+                    replaced_holders.push(existing_rowid);
+                    // Delete the conflicting row from the table and from
+                    // all indexes (we'll re-insert the new row below).
+                    let mut bt = Btree::new(ctx.pager, *current_root, false);
+                    let old_payload_opt = match bt.lookup_table(existing_rowid)? {
+                        LookupResult::Found(p) => Some(p),
+                        LookupResult::NotFound => None,
+                    };
+                    // Preupdate: the conflicting row is about to be deleted
+                    // (the new row's INSERT event fires in the write block
+                    // below, matching SQLite's DELETE-then-INSERT pair for
+                    // INSERT OR REPLACE).
+                    if let Some(p) = old_payload_opt.as_ref() {
+                        crate::preupdate::fire_delete_payload(table, existing_rowid, p);
+                    }
+                    bt.delete_table(existing_rowid)?;
+                    *current_root = bt.root;
+                    ctx.set_table_root_lc(table_name_lc, *current_root);
+                    if let Some(old_payload) = old_payload_opt {
+                        let old_row = decode_row(
+                            &old_payload,
+                            table.n_columns(),
+                            existing_rowid,
+                            table.rowid_alias,
+                        )?;
+                        for st in index_states.iter_mut() {
+                            // Multi-entry (gin/gist): delete every key the
+                            // old row contributed.
+                            let old_keys = crate::executor::index_am::index_entry_keys(
+                                &st.idx, table, &old_row,
+                            )?;
+                            let mut ibt = Btree::new(ctx.pager, st.root, true);
+                            for old_key in &old_keys {
+                                ibt.delete_index(old_key, existing_rowid)?;
+                            }
+                            if st.root != ibt.root {
+                                ctx.set_index_root(&st.idx.name, ibt.root);
+                            }
+                            st.root = ibt.root;
+                        }
+                        // Statement journal: the replaced holder's payload, so
+                        // a LATER failure in this statement re-inserts it (the
+                        // matching Inserted entry for the new row deletes the
+                        // replacement first — reverse replay order guarantees
+                        // the pairing).
+                        ctx.stmt_undo.push(StmtUndoEntry::Deleted {
+                            table: std::sync::Arc::clone(table),
+                            rowid: existing_rowid,
+                            payload: old_payload,
+                        });
+                    }
+                    // OP_NewRowid re-reads the tree's LAST rowid for every
+                    // allocation: a REPLACE that deleted the current maximum
+                    // lowers what the next automatic rowid builds on — later
+                    // rows of this statement (the statement-local max, which
+                    // already counts this row's own rowid) and later
+                    // statements (the cached max). Stateful-fuzz seed 16016.
+                    ctx.invalidate_max_rowid_if_deleted(table_name_lc, existing_rowid);
+                    if max_rowid.is_some_and(|m| existing_rowid >= m) {
+                        let tree_max = find_max_rowid_opt(ctx.pager, *current_root)?;
+                        *max_rowid = Some(tree_max.map_or(rowid, |m| m.max(rowid)));
+                    }
+                }
+                _ => {
+                    // SQLite's message shape: "UNIQUE constraint failed: t.col"
+                    // (comma-joined for composite keys).
+                    let cols = if conflict_cols.is_empty() {
+                        table.name.clone()
+                    } else {
+                        conflict_cols.join(", ")
+                    };
+                    return Err(Error::constraint(format!(
+                        "UNIQUE constraint failed: {}",
+                        cols
+                    )));
+                }
             }
         }
     }
@@ -24463,6 +24672,18 @@ fn exec_upsert_row(
                 }
             }
 
+            // DO UPDATE is a full UPDATE: a SET on the INTEGER PRIMARY KEY
+            // moves the row to the new rowid (it used to be silently
+            // pinned to the old one). OP_MustBeInt: NULL or a non-integer
+            // is "datatype mismatch".
+            let new_rowid = match table.rowid_alias {
+                Some(idx) => match &new_row[idx] {
+                    Value::Integer(i) => *i,
+                    _ => return Err(Error::constraint("datatype mismatch")),
+                },
+                None => existing_rowid,
+            };
+
             // Enforce NOT NULL + CHECK on the merged row.
             let plain_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
             enforce_row_constraints(
@@ -24472,11 +24693,6 @@ fn exec_upsert_row(
                 &ctx.params,
                 &ctx.named_params,
             )?;
-
-            // Rowid alias must stay consistent (it's the B+tree key).
-            if let Some(idx) = table.rowid_alias {
-                new_row[idx] = Value::Integer(existing_rowid);
-            }
 
             // UNIQUE-index enforcement for the MERGED row: in SQLite the
             // DO UPDATE is a full UPDATE — every unique index on the
@@ -24575,13 +24791,9 @@ fn exec_upsert_row(
             // otherwise delete + insert.
             payload_buf.clear();
             encode_row_aliased_into(&new_row, table.rowid_alias, payload_buf);
-            // Statement journal: a multi-VALUES insert whose LATER row
-            // fails must roll this upsert-rewrite back too (SQLite's
-            // statement atomicity covers the whole INSERT statement).
-            journal_row_rewrite(ctx, table, existing_rowid, &old_row);
             // Preupdate: UPSERT's DO UPDATE is a row UPDATE (old = the
             // stored row, new = the merged row — SQLite fires exactly one
-            // UPDATE event per upserted row).
+            // UPDATE event per upserted row, a rowid move included).
             crate::preupdate::fire(
                 crate::preupdate::PreupdateOp::Update,
                 table,
@@ -24589,44 +24801,78 @@ fn exec_upsert_row(
                 Some(old_row.as_slice()),
                 Some(new_row.as_slice()),
             );
-            {
-                let mut bt = Btree::new(ctx.pager, *current_root, false);
-                let did_in_place = bt
-                    .update_table(existing_rowid, payload_buf)
-                    .unwrap_or(false);
-                if !did_in_place {
-                    bt.delete_table(existing_rowid)?;
-                    bt.insert_table(existing_rowid, payload_buf)?;
+            if new_rowid != existing_rowid {
+                // The plain UPDATE's move: rowid conflict check (ABORT —
+                // sqlite3UpsertDoUpdate runs its UPDATE under OE_Abort),
+                // delete + reinsert with every index entry, journaled.
+                let new_alias = Value::Integer(new_rowid);
+                apply_rowid_alias_move(
+                    ctx,
+                    table,
+                    existing_rowid,
+                    &new_alias,
+                    payload_buf,
+                    &new_row,
+                    ConflictResolution::Abort,
+                )?;
+                enforce_parent_update_fks(
+                    ctx,
+                    table,
+                    &old_row,
+                    &new_row,
+                    existing_rowid,
+                    new_rowid,
+                    0,
+                )?;
+                *current_root = ctx.table_root(table);
+                for st in index_states.iter_mut() {
+                    st.clear_hints();
+                    st.root = ctx.index_root(&st.idx);
                 }
-                *current_root = bt.root;
-                ctx.set_table_root_lc(table_name_lc, *current_root);
-            }
+            } else {
+                // Statement journal: a multi-VALUES insert whose LATER row
+                // fails must roll this upsert-rewrite back too (SQLite's
+                // statement atomicity covers the whole INSERT statement).
+                journal_row_rewrite(ctx, table, existing_rowid, &old_row);
+                {
+                    let mut bt = Btree::new(ctx.pager, *current_root, false);
+                    let did_in_place = bt
+                        .update_table(existing_rowid, payload_buf)
+                        .unwrap_or(false);
+                    if !did_in_place {
+                        bt.delete_table(existing_rowid)?;
+                        bt.insert_table(existing_rowid, payload_buf)?;
+                    }
+                    *current_root = bt.root;
+                    ctx.set_table_root_lc(table_name_lc, *current_root);
+                }
 
-            // Index maintenance: update entries whose key changed.
-            for st in index_states.iter_mut() {
-                // Multi-entry keys (gin/gist): diff the whole key SETS —
-                // delete every old key, insert every new key.
-                let old_keys =
-                    crate::executor::index_am::index_entry_keys(&st.idx, table, &old_row)?;
-                let new_keys =
-                    crate::executor::index_am::index_entry_keys(&st.idx, table, &new_row)?;
-                if old_keys == new_keys {
-                    continue;
+                // Index maintenance: update entries whose key changed.
+                for st in index_states.iter_mut() {
+                    // Multi-entry keys (gin/gist): diff the whole key SETS —
+                    // delete every old key, insert every new key.
+                    let old_keys =
+                        crate::executor::index_am::index_entry_keys(&st.idx, table, &old_row)?;
+                    let new_keys =
+                        crate::executor::index_am::index_entry_keys(&st.idx, table, &new_row)?;
+                    if old_keys == new_keys {
+                        continue;
+                    }
+                    // The tree shape changes here — drop any append hint.
+                    st.clear_hints();
+                    let mut ibt = Btree::new(ctx.pager, st.root, true);
+                    for old_key in &old_keys {
+                        ibt.delete_index(old_key, existing_rowid)?;
+                    }
+                    let mut ibt = Btree::new(ctx.pager, ibt.root, true);
+                    for new_key in &new_keys {
+                        ibt.insert_index(new_key, existing_rowid)?;
+                    }
+                    if st.root != ibt.root {
+                        ctx.set_index_root(&st.idx.name, ibt.root);
+                    }
+                    st.root = ibt.root;
                 }
-                // The tree shape changes here — drop any append hint.
-                st.clear_hints();
-                let mut ibt = Btree::new(ctx.pager, st.root, true);
-                for old_key in &old_keys {
-                    ibt.delete_index(old_key, existing_rowid)?;
-                }
-                let mut ibt = Btree::new(ctx.pager, ibt.root, true);
-                for new_key in &new_keys {
-                    ibt.insert_index(new_key, existing_rowid)?;
-                }
-                if st.root != ibt.root {
-                    ctx.set_index_root(&st.idx.name, ibt.root);
-                }
-                st.root = ibt.root;
             }
 
             // AFTER UPDATE triggers (NEW = post-change, OLD = pre-change):
@@ -24653,7 +24899,7 @@ fn exec_upsert_row(
             *full_row = new_row;
             ctx.changes += 1;
             ctx.last_insert_rowid = existing_rowid;
-            Ok((InsertOutcome::UpdatedExisting, existing_rowid))
+            Ok((InsertOutcome::UpdatedExisting, new_rowid))
         }
     }
 }
@@ -26629,6 +26875,31 @@ fn exec_update_from(
 /// Returns `Ok(Some(result))` if the streaming path handled the UPDATE;
 /// `Ok(None)` if the source shape wasn't recognized and the caller should
 /// fall back to the non-streaming path.
+/// After a trigger body ran inside the streaming UPDATE's per-row loop:
+/// re-read the table and touched-index roots from the context. A body
+/// that writes the SAME table (an AFTER UPDATE trigger inserting into its
+/// own table) can split those trees — the root page MOVES — and the loop's
+/// cached roots and index cursors would then keep writing into what is
+/// now an interior page of the new tree: rows vanish from lookups and
+/// index entries point at missing rows (stateful-fuzz seed 39039).
+fn refresh_update_roots<'p>(
+    ctx: &ExecContext<'p>,
+    table: &Arc<Table>,
+    root: &mut u32,
+    touched_indexes: &[&Arc<crate::schema::Index>],
+    index_roots: &mut [u32],
+    index_bts: &mut [Btree<'p>],
+) {
+    *root = ctx.table_root(table);
+    for (ti, idx) in touched_indexes.iter().enumerate() {
+        let r = ctx.index_root(idx);
+        if r != index_roots[ti] {
+            index_roots[ti] = r;
+            index_bts[ti] = Btree::new(ctx.pager, r, true);
+        }
+    }
+}
+
 fn try_streaming_update(
     ctx: &mut ExecContext<'_>,
     table: &Arc<Table>,
@@ -28155,6 +28426,14 @@ fn try_streaming_update(
                     Some(&old_r),
                     &table.col_names,
                 )?;
+                refresh_update_roots(
+                    ctx,
+                    table,
+                    &mut root,
+                    &touched_indexes,
+                    &mut index_roots,
+                    &mut index_bts,
+                );
             }
         }
         let new_root;
@@ -28329,6 +28608,14 @@ fn try_streaming_update(
                     Some(&old_r),
                     &table.col_names,
                 )?;
+                refresh_update_roots(
+                    ctx,
+                    table,
+                    &mut root,
+                    &touched_indexes,
+                    &mut index_roots,
+                    &mut index_bts,
+                );
             }
         }
         ctx.changes += 1;
@@ -28870,6 +29157,18 @@ fn flatten_dml_source(source: &Plan) -> Option<Plan> {
         }),
         _ => None,
     }
+}
+
+/// SQLite's `bComplex` for a DELETE beyond triggers: foreign-key work —
+/// the pragma is on and the table is a child or a parent of some FK.
+fn delete_fk_work(ctx: &ExecContext<'_>, table: &Table) -> bool {
+    ctx.pager.foreign_keys_enabled()
+        && (!table.foreign_keys.is_empty()
+            || ctx.catalog().all_tables().iter().any(|(_, t)| {
+                t.foreign_keys
+                    .iter()
+                    .any(|fk| fk.ref_table.eq_ignore_ascii_case(&table.name))
+            }))
 }
 
 fn try_streaming_delete(
@@ -29516,6 +29815,13 @@ fn try_streaming_delete(
             rows: vec![vec![Value::Integer(deleted)]],
         }));
     }
+    // A complex DELETE (triggers / FK work) reads its targets back from
+    // SQLite's RowSet in ascending rowid order; an IndexRange walk
+    // collected them in index-key order (see the general path's note,
+    // stateful-fuzz seed 36036).
+    if !rowids_in_table_order && (has_delete_triggers || delete_fk_work(ctx, table)) {
+        rowids.sort_unstable();
+    }
     for rid in rowids {
         // Preupdate: fire this row's DELETE event BEFORE the FK actions
         // (SQLite's order: the parent's event first, then cascaded
@@ -29549,6 +29855,9 @@ fn try_streaming_delete(
                     Some(&old_row),
                     &table.col_names,
                 )?;
+                // The body may have written this very table (split
+                // trees move their root): continue from the live root.
+                new_root = ctx.table_root(table);
             }
         }
         // FOREIGN KEY (parent side): reject / cascade / set-null BEFORE the
@@ -29559,6 +29868,8 @@ fn try_streaming_delete(
             if let LookupResult::Found(payload) = bt.lookup_table(rid)? {
                 let old_row = decode_row(&payload, n_cols, rid, table.rowid_alias)?;
                 enforce_parent_delete_fks(ctx, table, &old_row, rid, 0)?;
+                // A self-referencing FK's cascade rewrites this table.
+                new_root = ctx.table_root(table);
             }
         }
         // One descent: find + delete, payload returned for maintenance.
@@ -29617,6 +29928,10 @@ fn try_streaming_delete(
                     Some(&row),
                     &table.col_names,
                 )?;
+                // An AFTER DELETE body inserting into this table splits it
+                // — the root MOVES; the next row's descent from the stale
+                // root found "no valid child" (stateful-fuzz seed 54054).
+                new_root = ctx.table_root(table);
             }
         }
     }
@@ -29773,6 +30088,26 @@ fn exec_delete(
             let mut deleted = 0i64;
             let mut returning_rows: Vec<Vec<Value>> = Vec::new();
             if let Some(payload) = old_payload {
+                // Statement journal BEFORE index maintenance and the AFTER
+                // DELETE triggers (the general path's contract): the cell
+                // is already gone, and a trigger body / FK / RETURNING
+                // failure after this point must re-insert the row — the
+                // fast path used to lose it (`DELETE … WHERE id = 1` whose
+                // trigger hit a UNIQUE index: SQLite keeps row 1;
+                // stateful-fuzz seed 40040).
+                if crate::executor::triggers::has_triggers_for(
+                    ctx,
+                    &table,
+                    &crate::sql::ast::TriggerEvent::Delete,
+                ) || ctx.pager.foreign_keys_enabled()
+                    || returning.is_some()
+                {
+                    ctx.stmt_undo.push(StmtUndoEntry::Deleted {
+                        table: std::sync::Arc::clone(&table),
+                        rowid: rowid_val,
+                        payload: payload.clone(),
+                    });
+                }
                 deleted = 1;
                 ctx.changes += 1;
                 let need_row = !indexes.is_empty()
@@ -29865,6 +30200,7 @@ fn exec_delete(
     } else {
         None
     };
+    let mut targets: Vec<(i64, &Row)> = Vec::with_capacity(source_res.rows.len());
     for row in &source_res.rows {
         let rowid: i64 = if let Some(idx) = table.rowid_alias {
             row[idx].as_integer()
@@ -29882,6 +30218,20 @@ fn exec_delete(
                 "DELETE on a table without INTEGER PRIMARY KEY",
             ));
         };
+        targets.push((rowid, row));
+    }
+    // A "complex" DELETE (triggers to fire, or foreign-key work) runs in
+    // two passes in SQLite: the target rowids collect into a RowSet,
+    // which reads back SORTED — rows are deleted, and AFTER DELETE
+    // triggers fire, in ascending rowid order whatever order the WHERE's
+    // index walk produced. Observable through triggers that insert into
+    // the same table: each auto rowid builds on the max still standing
+    // (stateful-fuzz seed 36036 walked a `note DESC` index, deleted the
+    // max row first, and allocated one rowid lower than SQLite).
+    if has_delete_triggers || delete_fk_work(ctx, &table) {
+        targets.sort_by_key(|(rowid, _)| *rowid);
+    }
+    for (rowid, row) in targets {
         if rowid > max_deleted {
             max_deleted = rowid;
         }
