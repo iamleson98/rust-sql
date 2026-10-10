@@ -3799,7 +3799,7 @@ fn apply_where_for_scan_inner(
             .and_then(|idx| table.columns.get(idx))
             .map(|c| c.name.clone());
         let rowid_eq = conjuncts.iter().any(|c| {
-            extract_eq_predicate(c).map_or(false, |(col, _)| is_rowid_col(&col, &alias_name))
+            extract_eq_predicate(c).is_some_and(|(col, _)| is_rowid_col(&col, &alias_name))
         });
         // Rowid IN-list: `WHERE id IN (v1, v2, ...)` — a batched
         // multi-seek instead of a full scan + per-row IN evaluation (which
@@ -4287,7 +4287,8 @@ impl ScanColumnUse {
         let resolved_order: Vec<Option<String>> = order_terms
             .iter()
             .map(|t| match &t.expr {
-                Expr::Literal(Value::Integer(n)) if *n >= 1 => match s.columns.get(*n as usize - 1) {
+                Expr::Literal(Value::Integer(n)) if *n >= 1 => match s.columns.get(*n as usize - 1)
+                {
                     Some(ResultColumn::Expr { expr, .. }) => key(expr),
                     _ => None,
                 },
@@ -4384,8 +4385,8 @@ fn log_est(x: u64) -> i32 {
 /// sqlite3LogEstAdd: the LogEst of the sum of two LogEst quantities.
 fn log_est_add(a: i32, b: i32) -> i32 {
     const X: [i32; 32] = [
-        10, 10, 9, 9, 8, 8, 7, 7, 7, 6, 6, 6, 5, 5, 5, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2,
-        2, 2, 2,
+        10, 10, 9, 9, 8, 8, 7, 7, 7, 6, 6, 6, 5, 5, 5, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2,
+        2, 2,
     ];
     let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
     if hi > lo + 49 {
@@ -4516,7 +4517,10 @@ fn sqlite_table_row_logest(catalog: &Catalog, table: &Table) -> i32 {
         Some(n) => log_est(n.max(0) as u64),
         None => 200,
     };
-    if indexes.iter().any(|i| catalog.index_stats(&i.name).is_none()) {
+    if indexes
+        .iter()
+        .any(|i| catalog.index_stats(&i.name).is_none())
+    {
         x = x.max(99);
     }
     x
@@ -4645,7 +4649,9 @@ fn sqlite_rowid_in_seeks(
             .index_stats(&i.name)
             .is_some_and(|s| !s.samples.is_empty())
     });
-    let alias = table.rowid_alias.map(|i| table.columns[i].name.to_ascii_lowercase());
+    let alias = table
+        .rowid_alias
+        .map(|i| table.columns[i].name.to_ascii_lowercase());
     let is_rowid_key = |k: &Option<String>| match k {
         Some(k) => {
             alias.as_deref() == Some(k.as_str())
@@ -4722,7 +4728,10 @@ fn sqlite_rowid_in_seeks(
                 let mut n = 0;
                 for (i, o) in col_use.order.iter().enumerate() {
                     match idx.columns.get(i) {
-                        Some(ic) if o.as_deref().is_some_and(|o| ic.name.eq_ignore_ascii_case(o)) => {
+                        Some(ic)
+                            if o.as_deref()
+                                .is_some_and(|o| ic.name.eq_ignore_ascii_case(o)) =>
+                        {
                             n += 1
                         }
                         None if is_rowid_key(o) => {
@@ -4806,7 +4815,11 @@ fn sqlite_rowid_in_seeks(
                 let eq1 = Loop {
                     run: log_est_add(est_log(a0), n_out + 1 + k) + n_in,
                     n_out: n_out + n_in - others,
-                    sorted: if rowid_ordered || min_max_unique { full } else { 0 },
+                    sorted: if rowid_ordered || min_max_unique {
+                        full
+                    } else {
+                        0
+                    },
                     ipk: false,
                     constrained: true,
                     sort_idx,

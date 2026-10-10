@@ -1234,16 +1234,27 @@ fn stateful_random_workload_matches_sqlite() {
 /// enforcement, rowid IN-list boundary-REAL seek-vs-numeric planning,
 /// boundary-value hash joins (Real(-2^63) vs Integer(i64::MIN)) with the
 /// unique-index-probe join direction, and AFTER UPDATE trigger vs index
-/// maintenance ordering (undo-journal duplication window).
+/// maintenance ordering (undo-journal duplication window). The 2026-10
+/// round added the random-rowid statement-max regression, SQLite's
+/// rowid-IN access-path cost model (scan vs seek decides whether the
+/// boundary REAL matches), and SQLITE_FULL's transaction-wide rollback
+/// when the statement runs without a statement journal.
 #[test]
 fn stateful_fuzz_fresh_seed_pins() {
-    let pins: [(u64, usize); 6] = [
+    let pins: [(u64, usize); 12] = [
         (777001, 3),  // auto rowids 28.. vs SQLite 40.. after a rowid move
         (777001, 39), // parallel slice-local [2^62, 2^62+8] false overflow
         (777023, 1),  // upsert DO UPDATE left two rows sharing a UNIQUE key
         (777023, 28), // `id IN (blob, text, -2^63e18)` boundary REAL match
         (777101, 3),  // Real(-2^63) = Integer(i64::MIN) join pair dropped
         (777101, 36), // "index entries out of order or duplicated" on undo
+        // 2026-10 round:
+        (1001, 21), // random rowid lowered the statement max: duplicate pk
+        (3003, 1),  // analyzed 4-row scan: boundary REAL matched i64::MIN
+        (4004, 22), // SQLITE_FULL without a statement journal: txn rollback
+        (5005, 26), // same: COMMIT after it is "no transaction is active"
+        (6006, 30), // analyzed 11-row table: SQLite seeks, boundary misses
+        (7007, 38), // AUTOINCREMENT exhaustion inside BEGIN
     ];
     for (seed, case) in pins {
         if let Err(msg) = run_case(seed, case, 400) {

@@ -102,7 +102,11 @@ fn run(s: &Scenario) -> bool {
         format!("INSERT INTO full_t (id, v) VALUES ({MAX}, 'top')"),
         "CREATE TABLE marker (x)".to_string(),
     ];
-    for sql in base.iter().map(String::as_str).chain(s.setup.iter().copied()) {
+    for sql in base
+        .iter()
+        .map(String::as_str)
+        .chain(s.setup.iter().copied())
+    {
         ours_run(&mut db, sql).unwrap_or_else(|e| panic!("[{}] ours setup {sql}: {e}", s.name));
         sqlite_run(&rc, sql).unwrap_or_else(|e| panic!("[{}] sqlite setup {sql}: {e}", s.name));
     }
@@ -119,14 +123,22 @@ fn run(s: &Scenario) -> bool {
         s.name
     );
     let ours_err = ours.expect_err(&format!("[{}] ours must fail like SQLite", s.name));
-    assert_eq!(ours_err, "database or disk is full", "[{}] error text", s.name);
+    assert_eq!(
+        ours_err, "database or disk is full",
+        "[{}] error text",
+        s.name
+    );
     let sqlite_rolled_back = rc.is_autocommit();
     assert_eq!(
         db.is_autocommit(),
         sqlite_rolled_back,
         "[{}] rollback scope: SQLite {} the transaction",
         s.name,
-        if sqlite_rolled_back { "rolled back" } else { "kept" }
+        if sqlite_rolled_back {
+            "rolled back"
+        } else {
+            "kept"
+        }
     );
     for t in ["marker", "full_t", "sqlite_sequence"]
         .iter()

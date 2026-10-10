@@ -1,5 +1,17 @@
-// Scratch: replay a one-statement-per-line SQL script on both engines and
-// print every statement's outcome divergence plus final probe results.
+//! Differential replay: run a one-statement-per-line SQL script against
+//! this engine and the bundled SQLite side by side, printing every
+//! statement whose success/failure differs and every query's results.
+//! The tool behind triaging stateful-fuzz divergences (paste the failing
+//! script, then bisect by deleting lines).
+//!
+//! ```text
+//! cargo run --release --example diff_replay -- script.sql
+//! V=1 ...      # print every statement's outcome, not just queries
+//! PROBE="SELECT * FROM t ORDER BY rowid;SELECT ..." ...
+//!              # run the probes after EVERY statement and stop at the
+//!              # first statement after which they diverge
+//! ```
+
 use rusqlite::types::Value as Sv;
 use rustqlite::{Database, Value};
 
@@ -16,7 +28,9 @@ fn our_run(db: &mut Database, sql: &str) -> Result<Vec<Vec<Value>>, String> {
     if is_queryish(sql) {
         db.query(sql, []).map_err(|e| e.to_string())
     } else {
-        db.execute(sql, []).map(|_| Vec::new()).map_err(|e| e.to_string())
+        db.execute(sql, [])
+            .map(|_| Vec::new())
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -24,7 +38,10 @@ fn sq_run(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<Sv>>, String
     let mut stmt = conn.prepare(sql).map_err(|e| format!("prepare: {}", e))?;
     let ncols = stmt.column_count();
     if ncols == 0 {
-        return stmt.execute([]).map(|_| Vec::new()).map_err(|e| format!("execute: {}", e));
+        return stmt
+            .execute([])
+            .map(|_| Vec::new())
+            .map_err(|e| format!("execute: {}", e));
     }
     let mut rows = stmt.query([]).map_err(|e| format!("query: {}", e))?;
     let mut out = Vec::new();
@@ -95,10 +112,29 @@ fn main() {
         }
         if let Ok(probe) = std::env::var("PROBE") {
             for p in probe.split(';') {
-                let a = format!("{:?}", our_run(&mut ours, p).map(|r| r.iter().map(|row| row.iter().map(norm_ours).collect::<Vec<_>>()).collect::<Vec<_>>()).map_err(|_| "ERR"));
-                let b = format!("{:?}", sq_run(&sq, p).map(|r| r.iter().map(|row| row.iter().map(norm_sq).collect::<Vec<_>>()).collect::<Vec<_>>()).map_err(|_| "ERR"));
+                let a = format!(
+                    "{:?}",
+                    our_run(&mut ours, p)
+                        .map(|r| r
+                            .iter()
+                            .map(|row| row.iter().map(norm_ours).collect::<Vec<_>>())
+                            .collect::<Vec<_>>())
+                        .map_err(|_| "ERR")
+                );
+                let b = format!(
+                    "{:?}",
+                    sq_run(&sq, p)
+                        .map(|r| r
+                            .iter()
+                            .map(|row| row.iter().map(norm_sq).collect::<Vec<_>>())
+                            .collect::<Vec<_>>())
+                        .map_err(|_| "ERR")
+                );
                 if a != b {
-                    println!("PROBE DIVERGES after stmt {}: {}\n  probe: {}\n  ours  : {}\n  sqlite: {}", i, sql, p, a, b);
+                    println!(
+                        "PROBE DIVERGES after stmt {}: {}\n  probe: {}\n  ours  : {}\n  sqlite: {}",
+                        i, sql, p, a, b
+                    );
                     return;
                 }
             }

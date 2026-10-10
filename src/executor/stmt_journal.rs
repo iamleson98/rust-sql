@@ -27,10 +27,9 @@
 
 use crate::schema::{Catalog, Table, Trigger};
 use crate::sql::ast::{
-    BinaryOp, ConflictResolution, DeleteStatement, Expr, ForeignKeyAction, InSource,
-    InsertSource, InsertStatement, JoinConstraint, RaiseAction, ResultColumn, SelectBody,
-    SelectStatement, Statement, TableExpression, TriggerEvent, UpdateStatement, UpsertAction,
-    WithClause,
+    BinaryOp, ConflictResolution, DeleteStatement, Expr, ForeignKeyAction, InSource, InsertSource,
+    InsertStatement, JoinConstraint, RaiseAction, ResultColumn, SelectBody, SelectStatement,
+    Statement, TableExpression, TriggerEvent, UpdateStatement, UpsertAction, WithClause,
 };
 use std::sync::Arc;
 
@@ -97,7 +96,11 @@ impl Model<'_> {
         self.catalog.get_table(name)
     }
 
-    fn firing_triggers(&self, table: &str, event: &dyn Fn(&TriggerEvent) -> bool) -> Vec<Arc<Trigger>> {
+    fn firing_triggers(
+        &self,
+        table: &str,
+        event: &dyn Fn(&TriggerEvent) -> bool,
+    ) -> Vec<Arc<Trigger>> {
         self.catalog
             .triggers_on_table(table)
             .into_iter()
@@ -269,11 +272,9 @@ impl Model<'_> {
             && !matches!(ins.source, InsertSource::DefaultValues)
             && match &ins.columns {
                 None => table.rowid_alias.is_some(),
-                Some(cols) => cols.iter().any(|c| {
-                    match table.find_column(c) {
-                        Some(i) => table.rowid_alias == Some(i),
-                        None => is_rowid_spelling(c),
-                    }
+                Some(cols) => cols.iter().any(|c| match table.find_column(c) {
+                    Some(i) => table.rowid_alias == Some(i),
+                    None => is_rowid_spelling(c),
                 }),
             };
         if pk_chng {
@@ -284,12 +285,11 @@ impl Model<'_> {
             if !(table.rowid_alias.is_some() && upsert_covers(&alias_name)) {
                 match mode {
                     ConflictResolution::Abort => self.may_abort = true,
-                    ConflictResolution::Replace => {
+                    ConflictResolution::Replace
                         if !self.catalog.indexes_on_table(&table.name).is_empty()
-                            || self.replace_needs_row_delete(&table)
-                        {
-                            self.multi_write = true;
-                        }
+                            || self.replace_needs_row_delete(&table) =>
+                    {
+                        self.multi_write = true;
                     }
                     _ => {}
                 }
@@ -349,14 +349,20 @@ impl Model<'_> {
             // UPDATE codes only the CHECKs that read a changed column.
             if let Some(ch) = changed {
                 let refs = column_refs(chk);
-                if !refs.iter().any(|r| ch.iter().any(|c| c.eq_ignore_ascii_case(r))) {
+                if !refs
+                    .iter()
+                    .any(|r| ch.iter().any(|c| c.eq_ignore_ascii_case(r)))
+                {
                     continue;
                 }
             }
             self.scan_expr(chk);
             // OR IGNORE skips the row; REPLACE has no meaning for a CHECK
             // and halts like ABORT.
-            if matches!(mode, ConflictResolution::Abort | ConflictResolution::Replace) {
+            if matches!(
+                mode,
+                ConflictResolution::Abort | ConflictResolution::Replace
+            ) {
                 self.may_abort = true;
             }
         }
@@ -410,17 +416,23 @@ impl Model<'_> {
         // hasFK (sqlite3FkRequired): a child FK whose columns change, or
         // a parent key other tables reference that changes.
         let child_fk = self.foreign_keys
-            && table
-                .foreign_keys
-                .iter()
-                .any(|fk| fk.columns.iter().any(|&i| is_changed(&table.columns[i].name)));
+            && table.foreign_keys.iter().any(|fk| {
+                fk.columns
+                    .iter()
+                    .any(|&i| is_changed(&table.columns[i].name))
+            });
         let parent_fks: Vec<_> = self
             .fks_referencing(&table.name)
             .into_iter()
             .filter(|(_, fk)| {
                 if fk.ref_columns.is_empty() {
-                    table.columns.iter().any(|c| c.primary_key && is_changed(&c.name))
-                        || table.rowid_alias.is_some_and(|i| is_changed(&table.columns[i].name))
+                    table
+                        .columns
+                        .iter()
+                        .any(|c| c.primary_key && is_changed(&c.name))
+                        || table
+                            .rowid_alias
+                            .is_some_and(|i| is_changed(&table.columns[i].name))
                 } else {
                     fk.ref_columns.iter().any(|c| is_changed(c))
                 }
@@ -467,7 +479,10 @@ impl Model<'_> {
             }
         }
         let mut unique_touched = table.without_rowid
-            && table.columns.iter().any(|c| c.primary_key && is_changed(&c.name));
+            && table
+                .columns
+                .iter()
+                .any(|c| c.primary_key && is_changed(&c.name));
         for idx in self.catalog.indexes_on_table(&table.name) {
             let touched = rowid_changed
                 || idx.columns.iter().any(|ic| match &ic.expr {
@@ -595,7 +610,9 @@ impl Model<'_> {
         let has = |n: &str| eq_cols.iter().any(|c| c.eq_ignore_ascii_case(n));
         if !table.without_rowid
             && (eq_cols.iter().any(|c| is_rowid_spelling(c))
-                || table.rowid_alias.is_some_and(|i| has(&table.columns[i].name)))
+                || table
+                    .rowid_alias
+                    .is_some_and(|i| has(&table.columns[i].name)))
         {
             return true;
         }
@@ -608,11 +625,17 @@ impl Model<'_> {
         {
             return true;
         }
-        self.catalog.indexes_on_table(&table.name).iter().any(|idx| {
-            idx.unique
-                && idx.partial_expr.is_none()
-                && idx.columns.iter().all(|ic| ic.expr.is_none() && has(&ic.name))
-        })
+        self.catalog
+            .indexes_on_table(&table.name)
+            .iter()
+            .any(|idx| {
+                idx.unique
+                    && idx.partial_expr.is_none()
+                    && idx
+                        .columns
+                        .iter()
+                        .all(|ic| ic.expr.is_none() && has(&ic.name))
+            })
     }
 
     // ── expression scanning: call sites and RAISE(ABORT) ────────────────
@@ -813,10 +836,9 @@ fn is_rowid_spelling(name: &str) -> bool {
 /// is the scalar call.
 fn is_aggregate_call(lc: &str, n_args: usize) -> bool {
     match lc {
-        "count" | "sum" | "total" | "avg" | "group_concat" | "string_agg"
-        | "json_group_array" | "json_group_object" | "jsonb_group_array"
-        | "jsonb_group_object" | "median" | "percentile" | "percentile_cont"
-        | "percentile_disc" => true,
+        "count" | "sum" | "total" | "avg" | "group_concat" | "string_agg" | "json_group_array"
+        | "json_group_object" | "jsonb_group_array" | "jsonb_group_object" | "median"
+        | "percentile" | "percentile_cont" | "percentile_disc" => true,
         "min" | "max" => n_args <= 1,
         _ => false,
     }

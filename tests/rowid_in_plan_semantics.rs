@@ -132,9 +132,7 @@ fn rowid_in_boundary_member_follows_sqlite_plan_choice() {
                     &rc,
                     "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)",
                 );
-                let mut ins = String::from(
-                    "INSERT INTO t VALUES (-9223372036854775808, 0, 'min')",
-                );
+                let mut ins = String::from("INSERT INTO t VALUES (-9223372036854775808, 0, 'min')");
                 for i in 1..n {
                     ins.push_str(&format!(", ({i}, {}, 'r{i}')", i % 7));
                 }
