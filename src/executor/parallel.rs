@@ -118,6 +118,18 @@ pub(crate) fn plan_range_split(ctx: &ExecContext<'_>, root: u32) -> Result<Optio
     if ctx.in_transaction {
         return Ok(None);
     }
+    // Gate 2b: a file-backed database the page cache cannot hold (the
+    // file's page count bounds every table's). The workers' ranges then
+    // stream through the shared cache from disk, evicting each other's
+    // pages: the scan is I/O-bound — no faster than the serial walk with
+    // read-ahead — while the workers' stacks and allocator heaps add
+    // several MB of peak RSS, and the row count below would itself read
+    // the whole table once more (torture S17's cold open + SUM over 1M
+    // rows: 16.1 MB vs 10.6 MB serial, 21-22 ms vs 20 ms). In-memory
+    // databases never evict and keep the parallel scan.
+    if !ctx.pager.is_memory() && ctx.pager.n_pages() as usize > ctx.pager.cache_capacity() {
+        return Ok(None);
+    }
     // Gate 3: cheap row estimate. The count is the ACTUAL b-tree row
     // count (a pure n_cells walk — no payload decode); the previous
     // max_rowid heuristic mistook a 3-row table holding huge rowids
