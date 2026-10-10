@@ -1648,8 +1648,8 @@ fn validate_create(ctx: &Ctx<'_>, c: &CreateStatement, scope: &mut Scope) -> Res
                     TableConstraint::Check(e) => {
                         validate_expr(ctx, e, &mut col_scope, &EMPTY_CTES)?
                     }
-                    TableConstraint::Unique(cols)
-                    | TableConstraint::PrimaryKey { columns: cols } => {
+                    TableConstraint::Unique { columns: cols, .. }
+                    | TableConstraint::PrimaryKey { columns: cols, .. } => {
                         for ic in cols {
                             if ic.expr.is_some() {
                                 continue; // expression keys validated by build

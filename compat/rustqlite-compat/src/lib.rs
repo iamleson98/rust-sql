@@ -2821,15 +2821,19 @@ fn run_once(stmt: &mut Stmt) -> c_int {
         // Identity arming: same rationale as the tx-control arm above —
         // concurrent owners/joiners and their reads key on it.
         let before = engine.total_changes();
-        let (result, txn_ended) = {
+        let (result, txn_ended, stmt_changes) = {
             let _id = rustqlite::ConnIdentityGuard::arm(conn.id as u64);
             let mut w = engine.db.write();
             let r = w.execute(&sql, binds);
             // A failed statement can END the transaction engine-side
             // (SQLITE_FULL without a statement journal rolls the whole
-            // transaction back — sqlite3VdbeHalt's special-error arm).
+            // transaction back — sqlite3VdbeHalt's special-error arm; a
+            // ROLLBACK conflict resolution likewise).
             let ended = r.is_err() && w.is_autocommit();
-            (r, ended)
+            // sqlite3_changes(): the statement's OWN rows (trigger rows
+            // count only toward total_changes), 0 after a failure that
+            // undid them — read while this statement is the engine's last.
+            (r, ended, w.changes())
         };
         if txn_ended && conn.state.in_tx.load(Ordering::Acquire) {
             release_tx_hold(&engine, &conn);
@@ -2837,11 +2841,18 @@ fn run_once(stmt: &mut Stmt) -> c_int {
             metrics::bump(&metrics::TX_ROLLED_BACK);
             fire_rollback_hook(&conn);
         }
+        if result.is_err() && writes {
+            let delta = engine.total_changes() - before;
+            conn.state.changes.store(stmt_changes, Ordering::Release);
+            conn.state.total_changes.fetch_add(delta, Ordering::AcqRel);
+        }
         match result {
             Ok(()) => {
                 let after = engine.total_changes();
                 let delta = after - before;
-                conn.state.changes.store(delta, Ordering::Release);
+                if writes {
+                    conn.state.changes.store(stmt_changes, Ordering::Release);
+                }
                 conn.state.total_changes.fetch_add(delta, Ordering::AcqRel);
                 if delta > 0 {
                     conn.state
@@ -3113,19 +3124,22 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> c_int {
                 // the regime's owner and other joiners (concurrent
                 // transactions key on it).
                 let before = engine.total_changes();
-                let outcome = {
+                let (outcome, stmt_changes) = {
                     let _id = rustqlite::ConnIdentityGuard::arm(conn.id as u64);
                     let _w = engine.db.write();
                     // Preupdate bridge: this connection's C hook fires
                     // for the engine's row events of this step (per-
                     // connection semantics with one engine per file).
                     let _pu = preupdate_bridge(&conn);
-                    eng.step()
+                    let o = eng.step();
+                    (o, _w.changes())
                 };
                 let after = engine.total_changes();
                 let delta = after - before;
                 if delta > 0 {
-                    conn.state.changes.store(delta, Ordering::Release);
+                    // The statement's own rows (sqlite3_changes excludes
+                    // its triggers'); total_changes counts them all.
+                    conn.state.changes.store(stmt_changes, Ordering::Release);
                     conn.state.total_changes.fetch_add(delta, Ordering::AcqRel);
                     conn.state
                         .last_rowid

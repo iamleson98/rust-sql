@@ -521,6 +521,10 @@ impl<'a> Statement<'a> {
 
     /// Produce the next row. Returns [`StepResult::Row`] while rows remain.
     pub fn step(&mut self) -> Result<StepResult> {
+        // changes() / total_changes() are per connection: a DML step
+        // records into this statement's connection (see ConnScope).
+        let db = self.db;
+        let _counts = crate::executor::change_counters::ConnScope::enter(&db.change_counts);
         self.step_inner()
     }
 
@@ -1062,6 +1066,17 @@ impl<'a> Statement<'a> {
             } else {
                 exec_res
             };
+            if is_dml && exec_res.is_err() {
+                // The failed statement's root moves (splits survive the
+                // row-level undo) still reach the connection's maps.
+                self.db
+                    .write_epoch
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+                self.merge_dml_maps();
+                if !implicit_cw {
+                    let _ = self.db.sync_schema_roots_public();
+                }
+            }
             let res = exec_res?;
             if is_dml {
                 // DML through a prepared statement bypasses
@@ -1185,6 +1200,38 @@ impl<'a> Statement<'a> {
         // sessions) — the stepped-statement surface records too.
         let _session_guard = db.session_stmt_scope();
         let out = f(&mut ctx);
+        // Statement atomicity (Database::execute's contract, which this
+        // stepped surface bypasses): a FAILED DML statement undoes every
+        // row it wrote — its own and its triggers' (they share `ctx`) —
+        // unless a FAIL conflict ended it: those changes stand, and an
+        // autocommit statement commits them. A failing multi-row INSERT
+        // used to keep the rows before the failing one.
+        let is_dml = matches!(
+            self.stmt.as_ref(),
+            AstStatement::Insert(_) | AstStatement::Update(_) | AstStatement::Delete(_)
+        );
+        let keep_partial =
+            out.is_err() && ctx.halt_action == Some(crate::sql::ast::ConflictResolution::Fail);
+        if out.is_err() && !keep_partial && !ctx.stmt_undo.is_empty() {
+            let entries = std::mem::take(&mut ctx.stmt_undo);
+            if let Err(e) = crate::executor::replay_stmt_undo(&mut ctx, entries) {
+                eprintln!("stmt-undo replay failed after a stepped statement's error: {e}");
+            }
+        }
+        if keep_partial && !ctx.in_transaction && !ctx.deferred_flush {
+            if let Err(e) = db.pager.flush() {
+                eprintln!("commit of a FAIL statement's changes failed: {e}");
+            }
+        }
+        // ROLLBACK resolution: the whole transaction ends — on this
+        // connection's next `execute` (the stepped surface cannot run
+        // transaction control; see Database::execute).
+        if out.is_err()
+            && ctx.in_transaction
+            && ctx.halt_action == Some(crate::sql::ast::ConflictResolution::Rollback)
+        {
+            db.note_pending_halt_rollback();
+        }
         // CONCURRENT owner: NO schema-row rewrite here. The durable
         // schema row is a single HOT row under the concurrent regime
         // (every root-moving transaction and every merge wants it), and
@@ -1201,11 +1248,19 @@ impl<'a> Statement<'a> {
         // through the streaming-statement path must update the Database
         // and the change counters the same way Database::execute does.
         db.set_last_insert_rowid(ctx.last_insert_rowid);
-        crate::executor::change_counters::record(ctx.changes);
+        if is_dml {
+            crate::executor::change_counters::record_outcome(
+                out.is_ok() || keep_partial,
+                ctx.changes,
+                ctx.trigger_changes,
+            );
+        }
         // Engine-wide aggregate for the stats endpoint (any-thread read).
         db.pager.note_rows_modified(ctx.changes);
-        let out = out?;
-        // Capture deltas (query()'s DML merge-back semantics).
+        // Capture deltas (query()'s DML merge-back semantics) — on failure
+        // too: a failed statement may still have split a tree (the page
+        // writes are not undone by the row-level journal), so its root
+        // moves must reach the connection's maps.
         self.deltas = CtxDeltas {
             root_overrides: ctx.root_overrides.clone(),
             index_roots: ctx.index_roots.clone(),
@@ -1217,7 +1272,7 @@ impl<'a> Statement<'a> {
             roots_invalidated: ctx.roots_invalidated.clone(),
             index_roots_invalidated: ctx.index_roots_invalidated.clone(),
         };
-        Ok(out)
+        out
     }
 
     fn merge_dml_maps(&mut self) {

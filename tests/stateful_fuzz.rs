@@ -1272,7 +1272,7 @@ fn stateful_random_workload_matches_sqlite() {
 fn stateful_fuzz_fresh_seed_pins() {
     // (seed, case, ops): the long-run cases replay the 500-op workload
     // they were found in.
-    let pins: [(u64, usize, usize); 23] = [
+    let pins: [(u64, usize, usize); 25] = [
         (777001, 3, 400),  // auto rowids 28.. vs SQLite 40.. after a rowid move
         (777001, 39, 400), // parallel slice-local [2^62, 2^62+8] false overflow
         (777023, 1, 400),  // upsert DO UPDATE left two rows sharing a UNIQUE key
@@ -1298,6 +1298,8 @@ fn stateful_fuzz_fresh_seed_pins() {
         (53053, 58, 500), // failed CREATE INDEX still floors the row estimate
         (54054, 11, 500), // streaming DELETE wrote through a trigger-moved root
         (64064, 10, 500), // upsert target naming the rowid is checked first
+        (63063, 60, 500), // INSERT OR REPLACE: NOT NULL takes the DEFAULT
+        (76076, 11, 500), // AFTER DELETE trigger reuses the deleted max rowid
     ];
     for (seed, case, ops) in pins {
         if let Err(msg) = run_case(seed, case, ops) {

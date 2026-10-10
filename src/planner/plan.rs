@@ -289,7 +289,9 @@ pub enum Plan {
         table: Arc<Table>,
         source: Box<Plan>,
         columns: Option<Vec<usize>>,
-        on_conflict: crate::sql::ast::ConflictResolution,
+        /// The statement's OR clause; `None` = none given (each constraint
+        /// then resolves by its own ON CONFLICT clause, else ABORT).
+        on_conflict: Option<crate::sql::ast::ConflictResolution>,
         /// `ON CONFLICT ... DO NOTHING / DO UPDATE SET ...` (UPSERT).
         upsert: Option<crate::sql::ast::UpsertClause>,
         /// `RETURNING <cols>` — if present, output one row per affected row.
@@ -303,7 +305,8 @@ pub enum Plan {
         /// `UPDATE [OR IGNORE|REPLACE|ABORT|FAIL|ROLLBACK]` — the
         /// conflict algorithm applied when the write set violates a
         /// UNIQUE index. Default ABORT.
-        or_conflict: crate::sql::ast::ConflictResolution,
+        /// The statement's OR clause (`None` = none given; see Insert).
+        or_conflict: Option<crate::sql::ast::ConflictResolution>,
         /// `UPDATE ... FROM <table-expression>` (SQLite 3.33+): the
         /// FROM-side plan plus the WHERE clause evaluated over
         /// target++from combined rows. `None` for plain UPDATEs.

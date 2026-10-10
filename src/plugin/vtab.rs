@@ -619,6 +619,8 @@ pub(crate) fn vtab_columns_to_schema(
         col_affinities: std::sync::Arc::from(Vec::new()),
         qualified_col_names: std::sync::Arc::from(Vec::new()),
         vtab: None,
+        pk_conflict: None,
+        check_labels: Vec::new(),
     };
     for (name, ty) in cols {
         let affinity = crate::types::Affinity::from_declared_type(ty);
@@ -638,6 +640,7 @@ pub(crate) fn vtab_columns_to_schema(
             collation: "BINARY".to_string(),
             pk_collation: String::new(),
             generated: None,
+            not_null_conflict: None,
         });
     }
     table.rebuild_name_caches();

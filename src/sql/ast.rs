@@ -185,13 +185,21 @@ pub struct ColumnDef {
 
 #[derive(Clone, Debug)]
 pub enum ColumnConstraint {
+    /// `PRIMARY KEY [ASC|DESC] [ON CONFLICT x] [AUTOINCREMENT]`.
     PrimaryKey {
         autoincrement: bool,
         order: Order,
+        on_conflict: Option<ConflictResolution>,
     },
-    NotNull,
+    /// `NOT NULL [ON CONFLICT x]`.
+    NotNull {
+        on_conflict: Option<ConflictResolution>,
+    },
     Null,
-    Unique,
+    /// `UNIQUE [ON CONFLICT x]`.
+    Unique {
+        on_conflict: Option<ConflictResolution>,
+    },
     Check(Expr),
     Default(Expr),
     Collate(String),
@@ -225,10 +233,16 @@ pub enum Order {
 
 #[derive(Clone, Debug)]
 pub enum TableConstraint {
+    /// `PRIMARY KEY (cols) [ON CONFLICT x]`.
     PrimaryKey {
         columns: Vec<IndexedColumn>,
+        on_conflict: Option<ConflictResolution>,
     },
-    Unique(Vec<IndexedColumn>),
+    /// `UNIQUE (cols) [ON CONFLICT x]`.
+    Unique {
+        columns: Vec<IndexedColumn>,
+        on_conflict: Option<ConflictResolution>,
+    },
     Check(Expr),
     ForeignKey {
         columns: Vec<String>,

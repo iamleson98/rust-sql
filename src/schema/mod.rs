@@ -51,6 +51,9 @@ pub struct Column {
     pub pk_collation: String,
     /// For generated columns: the expression and whether it is STORED.
     pub generated: Option<(crate::sql::ast::Expr, bool)>,
+    /// `NOT NULL ON CONFLICT x`: the column's own NOT NULL resolution,
+    /// used when the statement has no OR clause (`None` = ABORT).
+    pub not_null_conflict: Option<crate::sql::ast::ConflictResolution>,
 }
 
 impl Column {
@@ -143,6 +146,10 @@ pub struct Table {
     /// the full row after defaults are applied; a NULL or false result
     /// rejects the write with `CHECK constraint failed: <table>`.
     pub check_exprs: Vec<crate::sql::ast::Expr>,
+    /// Per CHECK (same order as `check_exprs`): what SQLite's "CHECK
+    /// constraint failed: <label>" names — the constraint's name, else the
+    /// expression's source text (`check_constraint_labels`).
+    pub check_labels: Vec<String>,
     /// FOREIGN KEY clauses (column-level REFERENCES and table-level FOREIGN
     /// KEY). Enforced on INSERT/UPDATE (child side) and DELETE/parent-key
     /// UPDATE (parent side) when `PRAGMA foreign_keys = ON` (default OFF,
@@ -164,6 +171,11 @@ pub struct Table {
     /// (root_page is 0 — there is no B+tree; all access goes through the
     /// module callbacks).
     pub vtab: Option<std::sync::Arc<crate::plugin::vtab::VtabInstance>>,
+    /// The PRIMARY KEY's `ON CONFLICT x` clause. For a rowid alias it is
+    /// SQLite's keyConf — the resolution of a ROWID conflict when the
+    /// statement has no OR clause; other PRIMARY KEYs carry it on their
+    /// index (`Index::on_conflict`). `None` = ABORT.
+    pub pk_conflict: Option<crate::sql::ast::ConflictResolution>,
 }
 
 impl Table {
@@ -235,6 +247,10 @@ pub struct Index {
     /// rowid) entry per grid cell covered by the geometry's bounding
     /// box. GIN/GIST indexes are NEVER unique.
     pub kind: IndexKind,
+    /// The UNIQUE / PRIMARY KEY constraint's `ON CONFLICT x` clause this
+    /// index enforces (SQLite's Index.onError), used when the statement
+    /// has no OR clause; `None` = ABORT (always for CREATE UNIQUE INDEX).
+    pub on_conflict: Option<crate::sql::ast::ConflictResolution>,
 }
 
 /// The index access method family (see `Index::kind`).
@@ -1500,9 +1516,17 @@ pub fn build_table(
 
     // First, find the PRIMARY KEY at the table level.
     let mut table_pk: Vec<IndexedColumn> = Vec::new();
+    // The PRIMARY KEY's ON CONFLICT clause (SQLite's keyConf when the key
+    // is the rowid; the PK index's onError otherwise).
+    let mut pk_conflict = None;
     for c in constraints {
-        if let TableConstraint::PrimaryKey { columns } = c {
+        if let TableConstraint::PrimaryKey {
+            columns,
+            on_conflict,
+        } = c
+        {
             table_pk = columns.clone();
+            pk_conflict = *on_conflict;
         }
     }
 
@@ -1543,13 +1567,18 @@ pub fn build_table(
         let mut collation = "BINARY".to_string();
         let mut generated = None;
         let mut explicit_not_null = false;
+        let mut not_null_conflict = None;
 
         for constraint in &col.constraints {
             match constraint {
                 ColumnConstraint::PrimaryKey {
                     autoincrement: ai,
                     order,
+                    on_conflict,
                 } => {
+                    if on_conflict.is_some() {
+                        pk_conflict = *on_conflict;
+                    }
                     primary_key = true;
                     autoincrement = *ai;
                     primary_key_order = *order;
@@ -1566,12 +1595,15 @@ pub fn build_table(
                         rowid_alias = Some(i);
                     }
                 }
-                ColumnConstraint::NotNull => {
+                ColumnConstraint::NotNull { on_conflict } => {
                     nullable = false;
                     explicit_not_null = true;
+                    if on_conflict.is_some() {
+                        not_null_conflict = *on_conflict;
+                    }
                 }
                 ColumnConstraint::Null => nullable = true,
-                ColumnConstraint::Unique => unique = true,
+                ColumnConstraint::Unique { .. } => unique = true,
                 ColumnConstraint::Check(_) => {}
                 ColumnConstraint::Default(e) => default = Some(e.clone()),
                 ColumnConstraint::Collate(c) => collation = c.clone(),
@@ -1598,6 +1630,7 @@ pub fn build_table(
             collation,
             pk_collation: String::new(),
             generated,
+            not_null_conflict,
         });
     }
 
@@ -1638,7 +1671,7 @@ pub fn build_table(
 
     // Mark UNIQUE columns from table-level UNIQUE constraints.
     for c in constraints {
-        if let TableConstraint::Unique(cols) = c {
+        if let TableConstraint::Unique { columns: cols, .. } = c {
             for ic in cols {
                 if let Some(idx) = table_columns
                     .iter()
@@ -1744,7 +1777,175 @@ pub fn build_table(
         qualified_col_names: qualified.into(),
         col_affinities: table_columns_affinities.into(),
         vtab: None,
+        pk_conflict,
+        check_labels: check_constraint_labels(create_sql),
     })
+}
+
+/// The label of each CHECK constraint in a CREATE TABLE text, in source
+/// order (column constraints, then table constraints — the order
+/// `check_exprs` collects them): the `CONSTRAINT name` in effect (it holds
+/// until the next top-level comma, as SQLite's constraintName does), else
+/// the text between CHECK's parentheses, trimmed — SQLite's
+/// sqlite3AddCheckConstraint span.
+pub fn check_constraint_labels(create_sql: &str) -> Vec<String> {
+    let b = create_sql.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut depth = 0usize;
+    let mut name: Option<String> = None;
+    // Skip a quoted run starting at `i` (quote char at b[i]); returns the
+    // index after it.
+    fn skip_quoted(b: &[u8], i: usize) -> usize {
+        let close = if b[i] == b'[' { b']' } else { b[i] };
+        let mut j = i + 1;
+        while j < b.len() {
+            if b[j] == close {
+                if close != b']' && j + 1 < b.len() && b[j + 1] == close {
+                    j += 2;
+                    continue;
+                }
+                return j + 1;
+            }
+            j += 1;
+        }
+        j
+    }
+    fn skip_comment(b: &[u8], i: usize) -> Option<usize> {
+        if b[i] == b'-' && b.get(i + 1) == Some(&b'-') {
+            let mut j = i;
+            while j < b.len() && b[j] != b'\n' {
+                j += 1;
+            }
+            return Some(j);
+        }
+        if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+            let mut j = i + 2;
+            while j + 1 < b.len() && !(b[j] == b'*' && b[j + 1] == b'/') {
+                j += 1;
+            }
+            return Some((j + 2).min(b.len()));
+        }
+        None
+    }
+    let dequote = |t: &str| -> String {
+        let t = t.trim();
+        if t.len() >= 2 {
+            let (f, l) = (t.as_bytes()[0], t.as_bytes()[t.len() - 1]);
+            if matches!(
+                (f, l),
+                (b'"', b'"') | (b'\'', b'\'') | (b'`', b'`') | (b'[', b']')
+            ) {
+                let q = f as char;
+                let inner = &t[1..t.len() - 1];
+                return if f == b'[' {
+                    inner.to_string()
+                } else {
+                    inner.replace(&format!("{q}{q}"), &q.to_string())
+                };
+            }
+        }
+        t.to_string()
+    };
+    // The next token (word or quoted identifier) after position `j`.
+    let next_token = |mut j: usize| -> Option<(usize, usize)> {
+        while j < b.len() && (b[j] as char).is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= b.len() {
+            return None;
+        }
+        if matches!(b[j], b'"' | b'\'' | b'`' | b'[') {
+            return Some((j, skip_quoted(b, j)));
+        }
+        let start = j;
+        while j < b.len()
+            && ((b[j] as char).is_ascii_alphanumeric() || b[j] == b'_' || b[j] >= 0x80)
+        {
+            j += 1;
+        }
+        (j > start).then_some((start, j))
+    };
+    while i < b.len() {
+        let c = b[i];
+        if matches!(c, b'\'' | b'"' | b'`' | b'[') {
+            i = skip_quoted(b, i);
+            continue;
+        }
+        if let Some(j) = skip_comment(b, i) {
+            i = j;
+            continue;
+        }
+        match c {
+            b'(' => {
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+                continue;
+            }
+            b',' if depth == 1 => {
+                name = None;
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if (c as char).is_ascii_alphabetic() || c == b'_' {
+            let start = i;
+            while i < b.len()
+                && ((b[i] as char).is_ascii_alphanumeric() || b[i] == b'_' || b[i] >= 0x80)
+            {
+                i += 1;
+            }
+            let word = &create_sql[start..i];
+            if depth == 1 && word.eq_ignore_ascii_case("CONSTRAINT") {
+                if let Some((s0, e0)) = next_token(i) {
+                    name = Some(dequote(&create_sql[s0..e0]));
+                    i = e0;
+                }
+            } else if depth == 1 && word.eq_ignore_ascii_case("CHECK") {
+                let mut j = i;
+                while j < b.len() && (b[j] as char).is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < b.len() && b[j] == b'(' {
+                    // Balanced body.
+                    let body_start = j + 1;
+                    let mut d = 1usize;
+                    let mut k = body_start;
+                    while k < b.len() && d > 0 {
+                        if matches!(b[k], b'\'' | b'"' | b'`' | b'[') {
+                            k = skip_quoted(b, k);
+                            continue;
+                        }
+                        if let Some(e) = skip_comment(b, k) {
+                            k = e;
+                            continue;
+                        }
+                        match b[k] {
+                            b'(' => d += 1,
+                            b')' => d -= 1,
+                            _ => {}
+                        }
+                        k += 1;
+                    }
+                    let body_end = k.saturating_sub(1).max(body_start);
+                    out.push(match &name {
+                        Some(n) => n.clone(),
+                        None => create_sql[body_start..body_end].trim().to_string(),
+                    });
+                    i = k;
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Default conflict resolution for INSERT/UPDATE.
@@ -1893,6 +2094,7 @@ pub fn sqlite_master_table() -> Table {
             collation: "BINARY".to_string(),
             pk_collation: String::new(),
             generated: None,
+            not_null_conflict: None,
         });
     }
     Table {
@@ -1921,6 +2123,8 @@ pub fn sqlite_master_table() -> Table {
             crate::types::Affinity::Text,
         ]),
         vtab: None,
+        pk_conflict: None,
+        check_labels: Vec::new(),
     }
 }
 

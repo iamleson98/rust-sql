@@ -178,6 +178,11 @@ pub(crate) fn fire_triggers(
             continue;
         }
         // Execute the body with NEW/OLD substituted to literals.
+        // last_insert_rowid() inside the body sees the body's own inserts;
+        // once the trigger program ends it reverts (sqlite3_last_insert_rowid).
+        let saved_last_insert_rowid = ctx.last_insert_rowid;
+        // The body's rows count toward total_changes() only.
+        let saved_changes = ctx.changes;
         ctx.trigger_depth += 1;
         ctx.trigger_stack.push(trig.name.clone());
         // Preupdate depth: rows written by the trigger body are one
@@ -257,6 +262,10 @@ pub(crate) fn fire_triggers(
         }
         ctx.trigger_depth -= 1;
         ctx.trigger_stack.pop();
+        ctx.last_insert_rowid = saved_last_insert_rowid;
+        crate::executor::change_counters::note_conn_rowid(saved_last_insert_rowid);
+        ctx.trigger_changes += ctx.changes - saved_changes;
+        ctx.changes = saved_changes;
         result?;
     }
     Ok(())

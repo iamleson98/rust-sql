@@ -799,6 +799,7 @@ pub(crate) fn exec_insert_vtab(
     }
     ctx.changes = changes;
     ctx.last_insert_rowid = last_rowid;
+    crate::executor::change_counters::note_conn_rowid(last_rowid);
     // Autocommit: the vtab branch returns before the normal insert tail's
     // flush — the shadow rows ride the pager like any table write, so the
     // same boundary applies (matches the plain-insert path).

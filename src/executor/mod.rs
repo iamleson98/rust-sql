@@ -1234,6 +1234,15 @@ pub struct ExecContext<'a> {
     /// plan, and by `fire_triggers` to each step's effective policy while
     /// the step runs (so nested programs inherit it); `None` = default.
     pub firing_or: Option<ConflictResolution>,
+    /// How a statement ended by a constraint violation must finish
+    /// (sqlite3HaltConstraint's errorAction): `Fail` keeps the changes it
+    /// made before the violation, `Rollback` ends the whole transaction;
+    /// `None` = ABORT (undo the statement). Set by [`halt_constraint`].
+    pub halt_action: Option<ConflictResolution>,
+    /// Rows written by trigger bodies (and their nested triggers) during
+    /// this statement: `total_changes()` counts them, `changes()` does not
+    /// (`fire_triggers` moves each body's rows here from `changes`).
+    pub trigger_changes: i64,
     /// Marker to keep the lifetime.
     _marker: std::marker::PhantomData<&'a crate::schema::Catalog>,
 }
@@ -1271,6 +1280,8 @@ impl<'a> ExecContext<'a> {
             trigger_depth: 0,
             trigger_stack: Vec::new(),
             firing_or: None,
+            halt_action: None,
+            trigger_changes: 0,
             explain_stats: None,
             explain_depth: 0,
             _marker: std::marker::PhantomData,
@@ -1319,6 +1330,8 @@ impl<'a> ExecContext<'a> {
             trigger_depth: 0,
             trigger_stack: Vec::new(),
             firing_or: None,
+            halt_action: None,
+            trigger_changes: 0,
             explain_stats: None,
             explain_depth: 0,
             _marker: std::marker::PhantomData,
@@ -1787,6 +1800,62 @@ pub mod change_counters {
     pub fn record(changes: i64) {
         LAST.with(|c| c.set(changes));
         TOTAL.with(|t| t.set(t.get() + changes));
+    }
+    /// A finished INSERT / UPDATE / DELETE (sqlite3VdbeHalt's change
+    /// accounting): `changes()` is the statement's own rows (`direct`),
+    /// `total_changes()` also counts the rows its trigger bodies wrote
+    /// (`nested`). A statement that failed and was rolled back counts
+    /// nothing and leaves `changes()` at 0; one that `kept` its rows (a
+    /// FAIL conflict) counts them.
+    pub fn record_outcome(kept: bool, direct: i64, nested: i64) {
+        if kept {
+            LAST.with(|c| c.set(direct));
+            TOTAL.with(|t| t.set(t.get() + direct + nested));
+        } else {
+            LAST.with(|c| c.set(0));
+        }
+    }
+    /// A connection's counters while one of its statements runs: entry
+    /// loads them into this thread (the SQL functions read the thread
+    /// slot), drop writes them back and restores whatever was loaded
+    /// before — SQLite's counters are per CONNECTION, and a re-entrant
+    /// statement on another connection must not leak into this one.
+    pub struct ConnScope<'a> {
+        conn: &'a [std::sync::atomic::AtomicI64; 2],
+        /// The thread slot's previous owner and values (None when this
+        /// connection already owned it — a nested statement of the same
+        /// connection, e.g. one part of a `;` script).
+        prev: Option<(usize, i64, i64)>,
+    }
+    thread_local! {
+        static OWNER: Cell<usize> = const { Cell::new(0) };
+    }
+    impl<'a> ConnScope<'a> {
+        pub fn enter(conn: &'a [std::sync::atomic::AtomicI64; 2]) -> Self {
+            use std::sync::atomic::Ordering::Relaxed;
+            let me = conn as *const _ as usize;
+            let owner = OWNER.with(|o| o.get());
+            if owner == me {
+                return ConnScope { conn, prev: None };
+            }
+            let prev = Some((owner, last(), total()));
+            OWNER.with(|o| o.set(me));
+            LAST.with(|c| c.set(conn[0].load(Relaxed)));
+            TOTAL.with(|t| t.set(conn[1].load(Relaxed)));
+            ConnScope { conn, prev }
+        }
+    }
+    impl Drop for ConnScope<'_> {
+        fn drop(&mut self) {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.conn[0].store(last(), Relaxed);
+            self.conn[1].store(total(), Relaxed);
+            if let Some((owner, l, t)) = self.prev {
+                OWNER.with(|o| o.set(owner));
+                LAST.with(|c| c.set(l));
+                TOTAL.with(|tt| tt.set(t));
+            }
+        }
     }
     /// Rows modified by the most recent statement.
     pub fn last() -> i64 {
@@ -2393,6 +2462,151 @@ pub(crate) fn eval_row_public(
     eval_row(expr, row, col_names, params, named_params)
 }
 
+/// True when the table declares a constraint-level `ON CONFLICT` clause
+/// on its rowid PRIMARY KEY or a NOT NULL column (index clauses live on
+/// `Index::on_conflict`): with no OR clause, its constraints then resolve
+/// differently from plain ABORT.
+pub(crate) fn table_conflict_clauses(table: &Table) -> bool {
+    table.pk_conflict.is_some() || table.columns.iter().any(|c| c.not_null_conflict.is_some())
+}
+
+/// The conflict resolution one constraint applies (SQLite's
+/// sqlite3GenerateConstraintChecks): the statement's OR clause when it has
+/// one, else the constraint's own `ON CONFLICT` clause, else ABORT.
+pub(crate) fn conflict_policy(
+    stmt_or: Option<ConflictResolution>,
+    own: Option<ConflictResolution>,
+) -> ConflictResolution {
+    stmt_or.or(own).unwrap_or(ConflictResolution::Abort)
+}
+
+/// A constraint violation resolved as ABORT, FAIL or ROLLBACK: note how
+/// the statement must end (FAIL keeps its earlier changes, ROLLBACK ends
+/// the transaction — see `ExecContext::halt_action`) and build the error.
+pub(crate) fn halt_constraint(
+    ctx: &mut ExecContext<'_>,
+    policy: ConflictResolution,
+    msg: String,
+) -> Error {
+    if matches!(
+        policy,
+        ConflictResolution::Fail | ConflictResolution::Rollback
+    ) {
+        ctx.halt_action = Some(policy);
+    }
+    Error::constraint(msg)
+}
+
+/// What NOT NULL / CHECK enforcement decided for a row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RowCheck {
+    Pass,
+    /// IGNORE: drop the row (INSERT) or leave it unchanged (UPDATE).
+    Skip,
+}
+
+/// True when column `i` must not hold NULL. SQLite's documented legacy
+/// quirk: PRIMARY KEY columns of ORDINARY rowid tables may hold NULL
+/// (only WITHOUT ROWID tables and an explicit NOT NULL enforce it).
+fn not_null_enforced(table: &Table, i: usize, col: &crate::schema::Column) -> bool {
+    let pk_legacy_null = col.primary_key
+        && !table.without_rowid
+        && !col.explicit_not_null
+        && table.rowid_alias != Some(i);
+    !col.nullable && !pk_legacy_null
+}
+
+/// NOT NULL then CHECK for a new / updated row, each violation resolved
+/// by its conflict policy (sqlite3GenerateConstraintChecks): IGNORE skips
+/// the row; a NOT NULL under REPLACE takes the column's DEFAULT (ABORT
+/// when it has none, or when the DEFAULT is itself NULL — the second
+/// pass); a CHECK under REPLACE aborts; ABORT / FAIL / ROLLBACK raise.
+pub(crate) fn check_row_constraints(
+    ctx: &mut ExecContext<'_>,
+    table: &Table,
+    row: &mut [Value],
+    stmt_or: Option<ConflictResolution>,
+) -> Result<RowCheck> {
+    let mut replaced = false;
+    for (i, col) in table.columns.iter().enumerate() {
+        if !not_null_enforced(table, i, col) || !row.get(i).map_or(true, |v| v.is_null()) {
+            continue;
+        }
+        let mut policy = conflict_policy(stmt_or, col.not_null_conflict);
+        if policy == ConflictResolution::Replace
+            && (col.default.is_none() || col.generated.is_some())
+        {
+            policy = ConflictResolution::Abort;
+        }
+        match policy {
+            ConflictResolution::Ignore => return Ok(RowCheck::Skip),
+            ConflictResolution::Replace => {
+                row[i] = column_default_value(ctx, col)?;
+                replaced = true;
+            }
+            p => {
+                return Err(halt_constraint(
+                    ctx,
+                    p,
+                    format!("NOT NULL constraint failed: {}.{}", table.name, col.name),
+                ))
+            }
+        }
+    }
+    if replaced {
+        // The second pass: REPLACE becomes ABORT (a NULL DEFAULT).
+        for (i, col) in table.columns.iter().enumerate() {
+            if not_null_enforced(table, i, col) && row.get(i).map_or(true, |v| v.is_null()) {
+                return Err(Error::constraint(format!(
+                    "NOT NULL constraint failed: {}.{}",
+                    table.name, col.name
+                )));
+            }
+        }
+    }
+    for (ci, expr) in table.check_exprs.iter().enumerate() {
+        let ok = {
+            let ectx = EvalContext::new(row, &table.col_names, &ctx.params, &ctx.named_params)
+                .with_affinities(Some(&table.col_affinities));
+            evaluate_check(expr, &ectx)?
+        };
+        if !ok {
+            let msg = check_failed_message(table, ci);
+            return match stmt_or.unwrap_or(ConflictResolution::Abort) {
+                ConflictResolution::Ignore => Ok(RowCheck::Skip),
+                ConflictResolution::Replace => Err(Error::constraint(msg)),
+                p => Err(halt_constraint(ctx, p, msg)),
+            };
+        }
+    }
+    Ok(RowCheck::Pass)
+}
+
+/// SQLite's "CHECK constraint failed: <label>" for the table's `i`-th
+/// CHECK (its constraint name, else its source text).
+fn check_failed_message(table: &Table, i: usize) -> String {
+    match table.check_labels.get(i) {
+        Some(l) => format!("CHECK constraint failed: {l}"),
+        None => format!("CHECK constraint failed: {}", table.name),
+    }
+}
+
+/// A column's DEFAULT value for this row (evaluated now, column affinity
+/// applied — sqlite3ExprCodeCopy of the default, then the record's
+/// affinity), NULL when it has none.
+pub(crate) fn column_default_value(
+    ctx: &ExecContext<'_>,
+    col: &crate::schema::Column,
+) -> Result<Value> {
+    let Some(d) = &col.default else {
+        return Ok(Value::Null);
+    };
+    let empty_row: [Value; 0] = [];
+    let empty_cols: [String; 0] = [];
+    let ectx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
+    Ok(col.coerce(evaluate(d, &ectx)?))
+}
+
 /// Enforce NOT NULL and CHECK constraints on a (new or updated) row.
 /// Returns a semantic error naming the offending column / table.
 ///
@@ -2424,7 +2638,7 @@ fn enforce_row_constraints(
             )));
         }
     }
-    for expr in &table.check_exprs {
+    for (ci, expr) in table.check_exprs.iter().enumerate() {
         // CHECK expressions evaluate against the table's OWN column layout
         // with comparison affinities attached: a TEXT-affinity column in a
         // numeric comparison (`f2 TEXT CHECK (f2 >= -1000000)` with f2='')
@@ -2440,10 +2654,7 @@ fn enforce_row_constraints(
         // (sqlite3ExprIfTrue, SQLITE_JUMPIFNULL): `CHECK (x OR f(y))`
         // never evaluates f(y) once x is TRUE or NULL.
         if !evaluate_check(expr, &ctx)? {
-            return Err(Error::constraint(format!(
-                "CHECK constraint failed: {}",
-                table.name
-            )));
+            return Err(Error::constraint(check_failed_message(table, ci)));
         }
     }
     Ok(())
@@ -22555,14 +22766,16 @@ fn return_insert_scratch(sc: InsertScratch) {
 /// step's own non-default policy in SQLite).
 fn with_firing_or(
     ctx: &mut ExecContext<'_>,
-    policy: ConflictResolution,
+    policy: Option<ConflictResolution>,
     run: impl FnOnce(&mut ExecContext<'_>) -> Result<ExecResult>,
 ) -> Result<ExecResult> {
     if ctx.trigger_depth > 0 {
         return run(ctx);
     }
     let saved = ctx.firing_or;
-    ctx.firing_or = (policy != ConflictResolution::Abort).then_some(policy);
+    // An explicit OR clause — `OR ABORT` included — overrides every
+    // trigger step's own (codeTriggerProgram: orconf != OE_Default).
+    ctx.firing_or = policy;
     let result = run(ctx);
     ctx.firing_or = saved;
     result
@@ -22573,7 +22786,7 @@ fn exec_insert(
     table: Arc<Table>,
     source: &Plan,
     columns: &Option<Vec<usize>>,
-    on_conflict: ConflictResolution,
+    on_conflict: Option<ConflictResolution>,
     upsert: Option<&crate::sql::ast::UpsertClause>,
     returning: Option<&[crate::sql::ast::ResultColumn]>,
 ) -> Result<ExecResult> {
@@ -22585,10 +22798,13 @@ fn exec_insert_inner(
     table: Arc<Table>,
     source: &Plan,
     columns: &Option<Vec<usize>>,
-    on_conflict: ConflictResolution,
+    stmt_or: Option<ConflictResolution>,
     upsert: Option<&crate::sql::ast::UpsertClause>,
     returning: Option<&[crate::sql::ast::ResultColumn]>,
 ) -> Result<ExecResult> {
+    // The statement-wide policy; per-constraint decisions consult
+    // `stmt_or` with each constraint's own clause (conflict_policy).
+    let on_conflict = stmt_or.unwrap_or(ConflictResolution::Abort);
     // Virtual table: xUpdate with old_rowid = None. The source rows are
     // evaluated normally, then handed to the module.
     if table.vtab.is_some() {
@@ -22772,7 +22988,7 @@ fn exec_insert_inner(
             &mut index_states,
             expr_rows.len(),
             has_insert_triggers,
-            on_conflict,
+            stmt_or.or_else(|| table_conflict_clauses(&table).then_some(ConflictResolution::Fail)),
             upsert.is_some(),
         );
         for exprs in expr_rows {
@@ -22901,17 +23117,11 @@ fn exec_insert_inner(
             // (9, NULL)` on a `c BLOB NOT NULL` table succeeds as a
             // no-op in SQLite; stateful-fuzz case 31). OR REPLACE/ABORT
             // still error (a NULL cannot be replaced into existence).
-            if let Err(e) = enforce_row_constraints(
-                &table,
-                &full_row,
-                &col_names,
-                &ctx.params,
-                &ctx.named_params,
-            ) {
-                if on_conflict == crate::sql::ast::ConflictResolution::Ignore {
-                    continue; // skip the row — SQLite's OR IGNORE
-                }
-                return Err(e);
+            // Each violation resolves by its policy (the statement's OR,
+            // else the column's own NOT NULL ON CONFLICT clause): IGNORE
+            // skips the row, REPLACE takes a NOT NULL column's DEFAULT.
+            if check_row_constraints(ctx, &table, &mut full_row, stmt_or)? == RowCheck::Skip {
+                continue;
             }
             // FOREIGN KEY (child side) — enforced only when the pragma is on.
             enforce_child_fks(ctx, &table, &full_row)?;
@@ -22963,7 +23173,7 @@ fn exec_insert_inner(
                 &mut full_row,
                 &mut payload_buf,
                 &mut index_states,
-                on_conflict,
+                stmt_or,
                 upsert,
                 rowid_autogen,
                 explicit_rowid,
@@ -23125,7 +23335,7 @@ fn exec_insert_inner(
         &mut index_states,
         source_res.rows.len(),
         has_insert_triggers,
-        on_conflict,
+        stmt_or.or_else(|| table_conflict_clauses(&table).then_some(ConflictResolution::Fail)),
         upsert.is_some(),
     );
     for row in &source_res.rows {
@@ -23224,17 +23434,8 @@ fn exec_insert_inner(
 
         // NOT NULL + CHECK constraints (see the VALUES path): OR IGNORE
         // skips a violating SELECT row exactly like a VALUES row.
-        if let Err(e) = enforce_row_constraints(
-            &table,
-            &full_row,
-            &col_names,
-            &ctx.params,
-            &ctx.named_params,
-        ) {
-            if on_conflict == crate::sql::ast::ConflictResolution::Ignore {
-                continue;
-            }
-            return Err(e);
+        if check_row_constraints(ctx, &table, &mut full_row, stmt_or)? == RowCheck::Skip {
+            continue;
         }
         enforce_child_fks(ctx, &table, &full_row)?;
 
@@ -23247,7 +23448,7 @@ fn exec_insert_inner(
             &mut full_row,
             &mut payload_buf,
             &mut index_states,
-            on_conflict,
+            stmt_or,
             upsert,
             rowid_autogen,
             explicit_rowid,
@@ -23451,7 +23652,7 @@ pub fn fast_insert_literal_rows(
         &mut index_states,
         rows.len(),
         has_insert_triggers,
-        crate::sql::ast::ConflictResolution::Abort,
+        Some(crate::sql::ast::ConflictResolution::Abort),
         false,
     );
 
@@ -23571,7 +23772,7 @@ pub fn fast_insert_literal_rows(
             &mut full_row,
             &mut payload_buf,
             &mut index_states,
-            crate::sql::ast::ConflictResolution::Abort,
+            None,
             None,
             rowid_autogen,
             explicit_rowid,
@@ -23743,7 +23944,7 @@ pub fn fast_insert_single_row(
         &mut full_row,
         &mut payload_buf,
         &mut index_states,
-        crate::sql::ast::ConflictResolution::Abort,
+        None,
         None,
         rowid_autogen,
         None,
@@ -23817,7 +24018,7 @@ fn exec_insert_one_row(
     full_row: &mut Vec<Value>,
     payload_buf: &mut Vec<u8>,
     index_states: &mut [IndexMaintState],
-    on_conflict: ConflictResolution,
+    stmt_or: Option<ConflictResolution>,
     upsert: Option<&crate::sql::ast::UpsertClause>,
     rowid_autogen_hint: bool,
     explicit_rowid: Option<i64>,
@@ -24002,221 +24203,185 @@ fn exec_insert_one_row(
         None => UpsertTarget::Any,
     };
 
-    // UPSERT target = the rowid PK (or the empty any-target): SQLite
-    // checks the ROWID constraint FIRST — its table b-tree insert lands
-    // before any index maintenance, so a rowid conflict takes the upsert
-    // action and the unique-index checks NEVER RUN. `INSERT ... VALUES
-    // (39, 'alpha') ON CONFLICT(id) DO NOTHING` with BOTH id=39 and
-    // note='alpha' taken: SQLite's DO NOTHING succeeds because the note
-    // conflict is never reached (stateful-fuzz case 21 pinned it; the
-    // index-first order raised "UNIQUE constraint failed: audit.note").
-    // Autogenerated and beyond-max rowids can never conflict — skip the
-    // probe on those shapes (zero cost on the bulk-load fast path).
-    if let Some(u) = upsert {
-        if matches!(upsert_target, UpsertTarget::Any | UpsertTarget::RowidPk)
-            && !rowid_was_autogenerated
-            && !rowid_is_fresh_beyond_max
-        {
-            let mut bt = Btree::new(ctx.pager, *current_root, false);
-            if let LookupResult::Found(_) = bt.lookup_table(rowid)? {
-                return exec_upsert_row(
-                    ctx,
-                    table,
-                    table_name_lc,
-                    current_root,
-                    full_row,
-                    payload_buf,
-                    index_states,
-                    rowid,
-                    u,
-                );
+    // ── Constraint checks in SQLite's order (sqlite3GenerateConstraintChecks).
+    // The ROWID first, then the UNIQUE indexes in Table.pIndex order
+    // (newest first, REPLACE indexes last — `sqlite_unique_check_order`);
+    // an upsert's target index goes first (the rowid right after it), and
+    // a rowid REPLACE that comes from the PRIMARY KEY's own ON CONFLICT
+    // clause is deferred after the indexes ("defer IPK REPLACE until
+    // last"). Each conflict resolves by ITS policy (`conflict_policy`):
+    // IGNORE skips the row, REPLACE deletes the holder and the checks
+    // start over (every conflicting holder goes — stateful-fuzz seed
+    // 43043), ABORT / FAIL / ROLLBACK raise. The order decides WHICH error
+    // a row breaking several constraints reports (`t.id` before `t.c`),
+    // and whether a later IGNORE runs before an earlier REPLACE deletes.
+    // A rowid that cannot collide (allocated here, or beyond the max) is
+    // never probed, and without a UNIQUE index the write below probes it
+    // anyway — the early probe runs only when the order matters.
+    let rowid_policy = conflict_policy(stmt_or, table.pk_conflict);
+    let unique_order = sqlite_unique_check_order(index_states, stmt_or);
+    let rowid_checkable =
+        !table.without_rowid && !rowid_was_autogenerated && !rowid_is_fresh_beyond_max;
+    let early_rowid = rowid_checkable
+        && (!unique_order.is_empty()
+            || matches!(upsert_target, UpsertTarget::Any | UpsertTarget::RowidPk)
+                && upsert.is_some());
+    #[derive(Clone, Copy, PartialEq)]
+    enum Check {
+        Rowid,
+        Index(usize),
+    }
+    let mut checks: Vec<Check> = Vec::with_capacity(unique_order.len() + 1);
+    match upsert_target {
+        UpsertTarget::Index(t) if upsert.is_some() => {
+            checks.push(Check::Index(t));
+            if early_rowid {
+                checks.push(Check::Rowid);
+            }
+            checks.extend(
+                unique_order
+                    .iter()
+                    .filter(|&&i| i != t)
+                    .map(|&i| Check::Index(i)),
+            );
+        }
+        _ => {
+            let defer = rowid_policy == ConflictResolution::Replace
+                && stmt_or != Some(ConflictResolution::Replace)
+                && !index_states.is_empty()
+                && upsert.is_none();
+            if early_rowid && !defer {
+                checks.push(Check::Rowid);
+            }
+            checks.extend(unique_order.iter().map(|&i| Check::Index(i)));
+            if early_rowid && defer {
+                checks.push(Check::Rowid);
             }
         }
     }
-
-    // UNIQUE-index constraint check: before touching the table btree, look
-    // up the new row's key in every UNIQUE index on this table. If any
-    // index already contains the key, the row is a duplicate and we apply
-    // the configured conflict resolution (IGNORE → skip, REPLACE → delete
-    // the conflicting row first, ABORT/FAIL/ROLLBACK → error,
-    // UPSERT → DO NOTHING / DO UPDATE).
-    // REPLACE resolves EVERY constraint the new row collides with —
-    // SQLite deletes the holder of each conflicting UNIQUE key in turn
-    // (sqlite3GenerateConstraintChecks walks all of them) — so after a
-    // REPLACE deletion the probe repeats until the row is clean. Breaking
-    // at the first conflict left a second holder in place: two rows
-    // sharing a UNIQUE key (stateful-fuzz seed 43043: a partial unique
-    // index on the rowid alias resolved, the one on `note` never probed).
     let mut replaced_holders: Vec<i64> = Vec::new();
-    loop {
-        let mut conflict_rowid: Option<i64> = None;
-        let mut conflict_cols: Vec<String> = Vec::new();
-        let mut conflict_on_target = false;
-        for (i, st) in index_states.iter_mut().enumerate() {
-            if !st.idx.unique {
-                continue;
-            }
-            // Partial index: rows failing the WHERE predicate are not
-            // indexed at all (SQLite) — exempt from uniqueness. The
-            // `is_none` gate keeps the hot (non-partial) path branch-only.
-            if st.idx.partial_expr.is_some()
-                && !index_row_matches_partial(
-                    &st.idx,
-                    table,
-                    full_row,
-                    &ctx.params,
-                    &ctx.named_params,
-                )?
-            {
-                continue;
-            }
-            // NULLs are distinct in UNIQUE indexes (SQLite semantics): a row
-            // with ANY NULL among the indexed columns is exempt from the
-            // uniqueness check, so multiple NULL rows coexist. Expression
-            // keys count too: a row whose expression evaluates to NULL is
-            // exempt (`index_key_has_null` evaluates them).
-            if index_key_has_null(&st.idx, table, full_row) {
-                continue;
-            }
-            // Any REPLACE/UPSERT path below mutates the index trees, so the
-            // append hint may go stale — drop it (it re-pins on the next
-            // plain insert).
-            st.clear_hints();
-            let key_bytes = st.encode_key(full_row)?.to_vec();
-            let idx_root = st.root;
-            let mut ibt = Btree::new(ctx.pager, idx_root, true);
-            let matches = ibt.lookup_index(&key_bytes)?;
-            if !matches.is_empty() {
-                conflict_rowid = Some(matches[0]);
-                conflict_cols = st
-                    .idx
-                    .columns
-                    .iter()
-                    .map(|c| format!("{}.{}", table.name, c.name))
-                    .collect();
-                conflict_on_target =
-                    matches!(upsert_target, UpsertTarget::Any | UpsertTarget::Index(_))
-                        && (matches!(upsert_target, UpsertTarget::Any) || {
-                            if let UpsertTarget::Index(t) = &upsert_target {
-                                *t == i
-                            } else {
-                                false
-                            }
-                        });
-                break;
-            }
-        }
-        let Some(existing_rowid) = conflict_rowid else {
-            break;
-        };
-        {
-            // UPSERT path: conflicts on the targeted index take the upsert
-            // action; conflicts on OTHER constraints are plain errors.
-            if conflict_on_target {
-                if let Some(u) = upsert {
-                    return exec_upsert_row(
-                        ctx,
-                        table,
-                        table_name_lc,
-                        current_root,
-                        full_row,
-                        payload_buf,
-                        index_states,
-                        existing_rowid,
-                        u,
-                    );
-                }
-            }
-            match on_conflict {
-                ConflictResolution::Ignore => return Ok((InsertOutcome::Skipped, rowid)),
-                ConflictResolution::Replace => {
-                    // A holder seen twice means its delete removed nothing
-                    // (an index entry naming a missing row): corruption —
-                    // error instead of probing forever.
-                    if replaced_holders.contains(&existing_rowid) {
-                        return Err(Error::corruption(format!(
-                            "REPLACE could not remove row {} holding a UNIQUE key of {}",
-                            existing_rowid, table.name
-                        )));
-                    }
-                    replaced_holders.push(existing_rowid);
-                    // Delete the conflicting row from the table and from
-                    // all indexes (we'll re-insert the new row below).
+    'checks: loop {
+        for &check in &checks {
+            match check {
+                Check::Rowid => {
                     let mut bt = Btree::new(ctx.pager, *current_root, false);
-                    let old_payload_opt = match bt.lookup_table(existing_rowid)? {
-                        LookupResult::Found(p) => Some(p),
-                        LookupResult::NotFound => None,
-                    };
-                    // Preupdate: the conflicting row is about to be deleted
-                    // (the new row's INSERT event fires in the write block
-                    // below, matching SQLite's DELETE-then-INSERT pair for
-                    // INSERT OR REPLACE).
-                    if let Some(p) = old_payload_opt.as_ref() {
-                        crate::preupdate::fire_delete_payload(table, existing_rowid, p);
+                    if !matches!(bt.lookup_table(rowid)?, LookupResult::Found(_)) {
+                        continue;
                     }
-                    bt.delete_table(existing_rowid)?;
-                    *current_root = bt.root;
-                    ctx.set_table_root_lc(table_name_lc, *current_root);
-                    if let Some(old_payload) = old_payload_opt {
-                        let old_row = decode_row(
-                            &old_payload,
-                            table.n_columns(),
-                            existing_rowid,
-                            table.rowid_alias,
-                        )?;
-                        for st in index_states.iter_mut() {
-                            // Multi-entry (gin/gist): delete every key the
-                            // old row contributed.
-                            let old_keys = crate::executor::index_am::index_entry_keys(
-                                &st.idx, table, &old_row,
-                            )?;
-                            let mut ibt = Btree::new(ctx.pager, st.root, true);
-                            for old_key in &old_keys {
-                                ibt.delete_index(old_key, existing_rowid)?;
-                            }
-                            if st.root != ibt.root {
-                                ctx.set_index_root(&st.idx.name, ibt.root);
-                            }
-                            st.root = ibt.root;
+                    // UPSERT applies when the target is empty (any
+                    // constraint) or the rowid PK itself.
+                    if let Some(u) = upsert {
+                        if matches!(upsert_target, UpsertTarget::Any | UpsertTarget::RowidPk) {
+                            return exec_upsert_row(
+                                ctx,
+                                table,
+                                table_name_lc,
+                                current_root,
+                                full_row,
+                                payload_buf,
+                                index_states,
+                                rowid,
+                                u,
+                            );
                         }
-                        // Statement journal: the replaced holder's payload, so
-                        // a LATER failure in this statement re-inserts it (the
-                        // matching Inserted entry for the new row deletes the
-                        // replacement first — reverse replay order guarantees
-                        // the pairing).
-                        ctx.stmt_undo.push(StmtUndoEntry::Deleted {
-                            table: std::sync::Arc::clone(table),
-                            rowid: existing_rowid,
-                            payload: old_payload,
-                        });
                     }
-                    // OP_NewRowid re-reads the tree's LAST rowid for every
-                    // allocation: a REPLACE that deleted the current maximum
-                    // lowers what the next automatic rowid builds on — later
-                    // rows of this statement (the statement-local max, which
-                    // already counts this row's own rowid) and later
-                    // statements (the cached max). Stateful-fuzz seed 16016.
-                    ctx.invalidate_max_rowid_if_deleted(table_name_lc, existing_rowid);
-                    if max_rowid.is_some_and(|m| existing_rowid >= m) {
-                        let tree_max = find_max_rowid_opt(ctx.pager, *current_root)?;
-                        *max_rowid = Some(tree_max.map_or(rowid, |m| m.max(rowid)));
+                    match rowid_policy {
+                        ConflictResolution::Ignore => return Ok((InsertOutcome::Skipped, rowid)),
+                        ConflictResolution::Replace => {
+                            replace_delete_holder(
+                                ctx,
+                                table,
+                                table_name_lc,
+                                current_root,
+                                index_states,
+                                max_rowid,
+                                rowid,
+                                rowid,
+                                &mut replaced_holders,
+                            )?;
+                            continue 'checks;
+                        }
+                        p => return Err(halt_constraint(ctx, p, rowid_conflict_message(table))),
                     }
                 }
-                _ => {
-                    // SQLite's message shape: "UNIQUE constraint failed: t.col"
-                    // (comma-joined for composite keys).
-                    let cols = if conflict_cols.is_empty() {
-                        table.name.clone()
-                    } else {
-                        conflict_cols.join(", ")
+                Check::Index(i) => {
+                    let st = &mut index_states[i];
+                    // Partial index: rows failing the WHERE predicate are
+                    // not indexed at all (SQLite) — exempt from uniqueness.
+                    if st.idx.partial_expr.is_some()
+                        && !index_row_matches_partial(
+                            &st.idx,
+                            table,
+                            full_row,
+                            &ctx.params,
+                            &ctx.named_params,
+                        )?
+                    {
+                        continue;
+                    }
+                    // NULLs are distinct in UNIQUE indexes: a row with ANY
+                    // NULL among the key columns (expression keys included)
+                    // is exempt from the uniqueness check.
+                    if index_key_has_null(&st.idx, table, full_row) {
+                        continue;
+                    }
+                    // Any REPLACE/UPSERT path below mutates the index trees,
+                    // so the append hint may go stale — drop it.
+                    st.clear_hints();
+                    let key_bytes = st.encode_key(full_row)?.to_vec();
+                    let mut ibt = Btree::new(ctx.pager, st.root, true);
+                    let matches = ibt.lookup_index(&key_bytes)?;
+                    let Some(&existing_rowid) = matches.first() else {
+                        continue;
                     };
-                    return Err(Error::constraint(format!(
-                        "UNIQUE constraint failed: {}",
-                        cols
-                    )));
+                    // UPSERT: conflicts on the targeted index (or on any
+                    // constraint, for an empty target) take the upsert
+                    // action; other constraints resolve as usual.
+                    if let Some(u) = upsert {
+                        let on_target = match upsert_target {
+                            UpsertTarget::Any => true,
+                            UpsertTarget::Index(t) => t == i,
+                            UpsertTarget::RowidPk => false,
+                        };
+                        if on_target {
+                            return exec_upsert_row(
+                                ctx,
+                                table,
+                                table_name_lc,
+                                current_root,
+                                full_row,
+                                payload_buf,
+                                index_states,
+                                existing_rowid,
+                                u,
+                            );
+                        }
+                    }
+                    match conflict_policy(stmt_or, st.idx.on_conflict) {
+                        ConflictResolution::Ignore => return Ok((InsertOutcome::Skipped, rowid)),
+                        ConflictResolution::Replace => {
+                            replace_delete_holder(
+                                ctx,
+                                table,
+                                table_name_lc,
+                                current_root,
+                                index_states,
+                                max_rowid,
+                                rowid,
+                                existing_rowid,
+                                &mut replaced_holders,
+                            )?;
+                            continue 'checks;
+                        }
+                        p => {
+                            let msg = unique_conflict_message(table, &index_states[i].idx);
+                            return Err(halt_constraint(ctx, p, msg));
+                        }
+                    }
                 }
             }
         }
+        break;
     }
 
     // SPILL DIRECT-WRITE: when the payload will overflow the leaf-cell
@@ -24257,7 +24422,7 @@ fn exec_insert_one_row(
         // resolution is REPLACE (we need to know whether to delete an
         // existing row first).
         if (rowid_was_autogenerated || rowid_is_fresh_beyond_max)
-            && on_conflict != ConflictResolution::Replace
+            && rowid_policy != ConflictResolution::Replace
         {
             old_payload_opt = None;
             // Preupdate: the row is about to be appended (fresh rowid,
@@ -24332,7 +24497,7 @@ fn exec_insert_one_row(
             // common and need the existing row.
             let plain = upsert.is_none()
                 && !matches!(
-                    on_conflict,
+                    rowid_policy,
                     ConflictResolution::Replace | ConflictResolution::Ignore
                 )
                 && !crate::preupdate::armed();
@@ -24366,7 +24531,7 @@ fn exec_insert_one_row(
                             );
                         }
                     }
-                    match on_conflict {
+                    match rowid_policy {
                         ConflictResolution::Replace => {
                             old_payload_opt = Some(existing_payload);
                             crate::preupdate::fire_delete_payload(
@@ -24385,15 +24550,9 @@ fn exec_insert_one_row(
                             bt.insert_table(rowid, payload)?;
                         }
                         ConflictResolution::Ignore => return Ok((InsertOutcome::Skipped, rowid)),
-                        _ => {
-                            let pk = table
-                                .rowid_alias
-                                .and_then(|i| table.columns.get(i).map(|c| c.name.clone()))
-                                .unwrap_or_else(|| "rowid".to_string());
-                            return Err(Error::constraint(format!(
-                                "UNIQUE constraint failed: {}.{}",
-                                table.name, pk
-                            )));
+                        p => {
+                            drop_payload(existing_payload);
+                            return Err(halt_constraint(ctx, p, rowid_conflict_message(table)));
                         }
                     }
                 }
@@ -24558,6 +24717,9 @@ fn exec_insert_one_row(
         }
     }
     ctx.last_insert_rowid = rowid;
+    // The SQL function sees it at once (OP_Insert sets db->lastRowid):
+    // a later row of this statement, or a trigger body, reads it.
+    crate::executor::change_counters::note_conn_rowid(rowid);
     ctx.changes += 1;
     // Cache maintenance: populate a MISSING entry only when `rowid` is
     // PROVEN to be the table's true max — auto-allocated (true_max + 1 at
@@ -24586,6 +24748,144 @@ fn drop_payload(_p: Vec<u8>) {}
 /// row in the B+tree, and maintains indexes.
 ///
 /// On success, `full_row` is replaced with the merged row (for RETURNING).
+/// SQLite's Table.pIndex order restricted to the UNIQUE indexes (the
+/// order sqlite3GenerateConstraintChecks visits them): sqlite3CreateIndex
+/// PREPENDS each new index, except that an index whose own conflict
+/// clause is REPLACE goes after the last non-REPLACE one — so newest
+/// first, REPLACE indexes last. `index_states` is in creation order.
+pub(crate) fn sqlite_unique_check_order(
+    index_states: &[IndexMaintState],
+    _stmt_or: Option<ConflictResolution>,
+) -> Vec<usize> {
+    let idxs: Vec<&crate::schema::Index> = index_states.iter().map(|st| st.idx.as_ref()).collect();
+    sqlite_index_order(&idxs)
+}
+
+/// [`sqlite_unique_check_order`] over plain indexes (creation order in,
+/// positions of the UNIQUE ones out, in Table.pIndex order).
+pub(crate) fn sqlite_index_order(indexes: &[&crate::schema::Index]) -> Vec<usize> {
+    let is_replace = |i: usize| indexes[i].on_conflict == Some(ConflictResolution::Replace);
+    let mut list: Vec<usize> = Vec::with_capacity(indexes.len());
+    for i in 0..indexes.len() {
+        if !is_replace(i) || list.is_empty() || is_replace(list[0]) {
+            list.insert(0, i);
+        } else {
+            let mut at = 0;
+            while at + 1 < list.len() && !is_replace(list[at + 1]) {
+                at += 1;
+            }
+            list.insert(at + 1, i);
+        }
+    }
+    list.retain(|&i| indexes[i].unique);
+    list
+}
+
+/// "UNIQUE constraint failed: t.a, t.b" for an index's key columns.
+fn unique_conflict_message(table: &Table, idx: &crate::schema::Index) -> String {
+    let cols = idx
+        .columns
+        .iter()
+        .map(|c| format!("{}.{}", table.name, c.name))
+        .collect::<Vec<_>>();
+    if cols.is_empty() {
+        format!("UNIQUE constraint failed: {}", table.name)
+    } else {
+        format!("UNIQUE constraint failed: {}", cols.join(", "))
+    }
+}
+
+/// sqlite3RowidConstraint's message: the INTEGER PRIMARY KEY column, or
+/// `rowid` for a table without one.
+fn rowid_conflict_message(table: &Table) -> String {
+    let pk = table
+        .rowid_alias
+        .and_then(|i| table.columns.get(i).map(|c| c.name.clone()))
+        .unwrap_or_else(|| "rowid".to_string());
+    format!("UNIQUE constraint failed: {}.{}", table.name, pk)
+}
+
+/// REPLACE resolution of one conflict: delete the row holding the
+/// conflicting key (`existing_rowid`) from the table and every index,
+/// journaled so a later failure in the statement restores it, with the
+/// max-rowid bookkeeping OP_NewRowid relies on. A holder met twice means
+/// its delete removed nothing (an index entry naming a missing row):
+/// corruption — error instead of probing forever.
+#[allow(clippy::too_many_arguments)]
+fn replace_delete_holder(
+    ctx: &mut ExecContext<'_>,
+    table: &Arc<Table>,
+    table_name_lc: &str,
+    current_root: &mut u32,
+    index_states: &mut [IndexMaintState],
+    max_rowid: &mut Option<i64>,
+    rowid: i64,
+    existing_rowid: i64,
+    replaced_holders: &mut Vec<i64>,
+) -> Result<()> {
+    if replaced_holders.contains(&existing_rowid) {
+        return Err(Error::corruption(format!(
+            "REPLACE could not remove row {} holding a UNIQUE key of {}",
+            existing_rowid, table.name
+        )));
+    }
+    replaced_holders.push(existing_rowid);
+    let mut bt = Btree::new(ctx.pager, *current_root, false);
+    let old_payload_opt = match bt.lookup_table(existing_rowid)? {
+        LookupResult::Found(p) => Some(p),
+        LookupResult::NotFound => None,
+    };
+    // Preupdate: the conflicting row is about to be deleted (the new
+    // row's INSERT event fires at the write, matching SQLite's
+    // DELETE-then-INSERT pair for a REPLACE).
+    if let Some(p) = old_payload_opt.as_ref() {
+        crate::preupdate::fire_delete_payload(table, existing_rowid, p);
+    }
+    bt.delete_table(existing_rowid)?;
+    *current_root = bt.root;
+    ctx.set_table_root_lc(table_name_lc, *current_root);
+    if let Some(old_payload) = old_payload_opt {
+        let old_row = decode_row(
+            &old_payload,
+            table.n_columns(),
+            existing_rowid,
+            table.rowid_alias,
+        )?;
+        for st in index_states.iter_mut() {
+            st.clear_hints();
+            // Multi-entry (gin/gist): delete every key the old row
+            // contributed.
+            let old_keys = crate::executor::index_am::index_entry_keys(&st.idx, table, &old_row)?;
+            let mut ibt = Btree::new(ctx.pager, st.root, true);
+            for old_key in &old_keys {
+                ibt.delete_index(old_key, existing_rowid)?;
+            }
+            if st.root != ibt.root {
+                ctx.set_index_root(&st.idx.name, ibt.root);
+            }
+            st.root = ibt.root;
+        }
+        // Statement journal: the replaced holder's payload, so a LATER
+        // failure in this statement re-inserts it (the matching Inserted
+        // entry for the new row deletes the replacement first — reverse
+        // replay order guarantees the pairing).
+        ctx.stmt_undo.push(StmtUndoEntry::Deleted {
+            table: std::sync::Arc::clone(table),
+            rowid: existing_rowid,
+            payload: old_payload,
+        });
+    }
+    // OP_NewRowid re-reads the tree's LAST rowid for every allocation: a
+    // REPLACE that deleted the current maximum lowers what the next
+    // automatic rowid builds on (stateful-fuzz seed 16016).
+    ctx.invalidate_max_rowid_if_deleted(table_name_lc, existing_rowid);
+    if max_rowid.is_some_and(|m| existing_rowid >= m) {
+        let tree_max = find_max_rowid_opt(ctx.pager, *current_root)?;
+        *max_rowid = Some(tree_max.map_or(rowid, |m| m.max(rowid)));
+    }
+    Ok(())
+}
+
 fn exec_upsert_row(
     ctx: &mut ExecContext<'_>,
     table: &Arc<Table>,
@@ -24896,9 +25196,10 @@ fn exec_upsert_row(
             }
 
             // Replace full_row with the merged row for RETURNING.
+            // sqlite3_last_insert_rowid() is NOT changed by a DO UPDATE
+            // (only an actual insert sets it).
             *full_row = new_row;
             ctx.changes += 1;
-            ctx.last_insert_rowid = existing_rowid;
             Ok((InsertOutcome::UpdatedExisting, new_rowid))
         }
     }
@@ -24947,6 +25248,10 @@ pub(crate) struct UpdateConflictPlan {
     /// Rowids to DELETE before applying the write set (OR REPLACE
     /// conflicting holders — baseline rows or write-set rows).
     pub delete_rowids: Vec<i64>,
+    /// A conflict resolved as FAIL: the write-set position that failed and
+    /// the error. The rows before it apply; the statement then fails with
+    /// it (their changes stand — `ExecContext::halt_action`).
+    pub fail_at: Option<(usize, String)>,
 }
 
 /// True when `row` belongs in a partial index (its WHERE predicate
@@ -25030,34 +25335,41 @@ fn partial_membership_pair(
 }
 
 pub(crate) fn simulate_update_unique(
-    ctx: &ExecContext<'_>,
+    ctx: &mut ExecContext<'_>,
     table: &Table,
     unique_indexes: &[Arc<crate::schema::Index>],
     write_set: &[(i64, &[Value], &[Value])],
-    or_conflict: ConflictResolution,
+    stmt_or: Option<ConflictResolution>,
 ) -> Result<UpdateConflictPlan> {
     let mut plan = UpdateConflictPlan::default();
     if unique_indexes.is_empty() || write_set.is_empty() {
         return Ok(plan);
     }
+    // Row-major, like SQLite: each row runs its unique checks (in
+    // Table.pIndex order) before the next row, so a FAIL stops exactly at
+    // its row and each conflict resolves by ITS index's policy.
+    let refs: Vec<&crate::schema::Index> = unique_indexes.iter().map(|i| i.as_ref()).collect();
+    let order = sqlite_index_order(&refs);
     // rowid -> write-set position (classifies probe matches).
     let pos_of: std::collections::HashMap<i64, usize> = write_set
         .iter()
         .enumerate()
         .map(|(i, r)| (r.0, i))
         .collect();
-    // Rows already condemned by OR REPLACE in this statement — their
-    // entries are (virtually) gone for every index.
+    // Rows already condemned by REPLACE in this statement — their entries
+    // are (virtually) gone for every index.
     let mut deleted: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    // Per index: per-row (old_key, new_key, old_in, new_in), encoded once.
+    // NULL rows carry keys too (they have index entries) but are exempt
+    // from CHECKING. The *_in flags are PARTIAL-INDEX membership: an entry
+    // exists only while the row matches the WHERE predicate, so "same
+    // encoded key" does NOT imply "same entry".
+    #[allow(clippy::type_complexity)]
+    let mut keys: Vec<Vec<(Vec<u8>, Vec<u8>, bool, bool)>> =
+        Vec::with_capacity(unique_indexes.len());
+    let mut roots: Vec<u32> = Vec::with_capacity(unique_indexes.len());
     for idx in unique_indexes {
-        // Per-row (old_key, new_key, old_in, new_in) tuples, encoded once.
-        // NULL rows carry keys too (they have index entries) but are exempt
-        // from CHECKING. The *_in flags are PARTIAL-INDEX membership: an
-        // entry exists only while the row matches the WHERE predicate, so
-        // "same encoded key" does NOT imply "same entry" (a row moving
-        // into the predicate gains an entry that must be uniqueness-
-        // checked; a row leaving it loses the entry).
-        let mut keys: Vec<(Vec<u8>, Vec<u8>, bool, bool)> = Vec::with_capacity(write_set.len());
+        let mut k = Vec::with_capacity(write_set.len());
         for (_, old_row, new_row) in write_set {
             let (old_in, new_in) = partial_membership_pair(
                 idx,
@@ -25067,42 +25379,44 @@ pub(crate) fn simulate_update_unique(
                 &ctx.params,
                 &ctx.named_params,
             )?;
-            keys.push((
+            k.push((
                 encode_index_key(idx, table, old_row)?,
                 encode_index_key(idx, table, new_row)?,
                 old_in,
                 new_in,
             ));
         }
-        let root = ctx.index_root(idx);
-        let mut ibt = Btree::new(ctx.pager, root, true);
-        // New keys claimed by PROCESSED write-set rows (their old entries
-        // are already vacated; their new entries are live).
-        let mut pending_new: std::collections::HashMap<Vec<u8>, i64> =
-            std::collections::HashMap::with_capacity(write_set.len());
-        let mut probe: Vec<i64> = Vec::new();
-        for pos in 0..write_set.len() {
-            let rowid = write_set[pos].0;
-            let (ref old_key, ref new_key, old_in, new_in) = keys[pos];
+        keys.push(k);
+        roots.push(ctx.index_root(idx));
+    }
+    // New keys claimed by PROCESSED write-set rows, per index (their old
+    // entries are vacated; their new entries are live).
+    let mut pending_new: Vec<std::collections::HashMap<Vec<u8>, i64>> =
+        vec![std::collections::HashMap::with_capacity(write_set.len()); unique_indexes.len()];
+    let mut probe: Vec<i64> = Vec::new();
+    for pos in 0..write_set.len() {
+        let rowid = write_set[pos].0;
+        let mut claims: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut skip_row = false;
+        for &ii in &order {
+            let idx = &unique_indexes[ii];
+            let (ref old_key, ref new_key, old_in, new_in) = keys[ii][pos];
             if old_key == new_key && old_in == new_in {
                 // Index entry unchanged — the entry stays; claim it so
-                // LATER rows probing this key see it as taken. (Both OUT
-                // of a partial index: no entry either way — nothing.)
+                // LATER rows probing this key see it as taken.
                 if new_in {
-                    pending_new.insert(new_key.clone(), rowid);
+                    claims.push((ii, new_key.clone()));
                 }
                 continue;
             }
             if !new_in {
-                // The row LEFT the partial index (or never had an entry):
-                // its old entry — if any — is removed at application
-                // time; nothing to claim, nothing to check.
+                // The row LEFT the partial index (or never had an entry).
                 continue;
             }
-            let _ = old_key;
             let null_new = index_key_has_null(idx, table, write_set[pos].2);
             let mut conflict: Option<i64> = None;
             if !null_new {
+                let mut ibt = Btree::new(ctx.pager, roots[ii], true);
                 ibt.lookup_index_into(new_key, &mut probe)?;
                 for &m in probe.iter() {
                     if m == rowid || deleted.contains(&m) {
@@ -25113,15 +25427,10 @@ pub(crate) fn simulate_update_unique(
                             // Earlier write-set row: its old entry was
                             // vacated at its application time — UNLESS its
                             // key never changed or the row was skipped
-                            // (OR IGNORE), in which case the entry persists.
+                            // (IGNORE), in which case the entry persists.
                             let skipped = plan.skip.contains(&lpos);
-                            // Partial-aware: the earlier row's entry
-                            // survives its application iff its NEW row
-                            // holds the same key AND is a member; a
-                            // skipped row keeps its OLD entry (which the
-                            // probe hit already proves exists).
-                            let unchanged = keys[lpos].0 == keys[lpos].1
-                                && (if skipped { keys[lpos].2 } else { keys[lpos].3 });
+                            let k = &keys[ii][lpos];
+                            let unchanged = k.0 == k.1 && (if skipped { k.2 } else { k.3 });
                             if skipped || unchanged {
                                 conflict = Some(m);
                                 break;
@@ -25136,7 +25445,7 @@ pub(crate) fn simulate_update_unique(
                     }
                 }
                 if conflict.is_none() {
-                    if let Some(&holder) = pending_new.get(new_key) {
+                    if let Some(&holder) = pending_new[ii].get(new_key) {
                         if holder != rowid {
                             conflict = Some(holder);
                         }
@@ -25144,35 +25453,35 @@ pub(crate) fn simulate_update_unique(
                 }
             }
             if let Some(holder) = conflict {
-                match or_conflict {
+                match conflict_policy(stmt_or, idx.on_conflict) {
                     ConflictResolution::Ignore => {
                         plan.skip.insert(pos);
-                        continue; // row keeps old values; no key claimed
+                        skip_row = true;
+                        break; // row keeps its old values; no key claimed
                     }
                     ConflictResolution::Replace => {
-                        // Delete the conflicting holder row; the current
-                        // row's update then proceeds cleanly.
+                        // Delete the conflicting holder row; this row's
+                        // update then proceeds.
                         plan.delete_rowids.push(holder);
                         deleted.insert(holder);
                         if let Some(&hpos) = pos_of.get(&holder) {
                             plan.skip.insert(hpos); // its pending update is discarded
                         }
                     }
-                    _ => {
-                        let cols = idx
-                            .columns
-                            .iter()
-                            .map(|c| format!("{}.{}", table.name, c.name))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        return Err(Error::constraint(format!(
-                            "UNIQUE constraint failed: {}",
-                            cols
-                        )));
+                    ConflictResolution::Fail => {
+                        ctx.halt_action = Some(ConflictResolution::Fail);
+                        plan.fail_at = Some((pos, unique_conflict_message(table, idx)));
+                        return Ok(plan);
                     }
+                    p => return Err(halt_constraint(ctx, p, unique_conflict_message(table, idx))),
                 }
             }
-            pending_new.insert(new_key.clone(), rowid);
+            claims.push((ii, new_key.clone()));
+        }
+        if !skip_row {
+            for (ii, k) in claims {
+                pending_new[ii].insert(k, rowid);
+            }
         }
     }
     Ok(plan)
@@ -25287,7 +25596,7 @@ fn apply_rowid_alias_move(
     new_alias: &Value,
     payload: &[u8],
     new_row: &[Value],
-    or_conflict: ConflictResolution,
+    policy: ConflictResolution,
 ) -> Result<bool> {
     let indexes = ctx.catalog().indexes_on_table(&table.name);
     let alias_col = table
@@ -25315,16 +25624,17 @@ fn apply_rowid_alias_move(
         let root = ctx.table_root(table);
         let mut bt = Btree::new(ctx.pager, root, false);
         if let LookupResult::Found(_) = bt.lookup_table(target)? {
-            match or_conflict {
+            match policy {
                 ConflictResolution::Ignore => return Ok(false),
                 ConflictResolution::Replace => {
                     delete_rows_by_rowid(ctx, table, &[target])?;
                 }
-                _ => {
-                    return Err(Error::constraint(format!(
-                        "UNIQUE constraint failed: {}.{}",
-                        table.name, alias_col
-                    )));
+                p => {
+                    return Err(halt_constraint(
+                        ctx,
+                        p,
+                        format!("UNIQUE constraint failed: {}.{}", table.name, alias_col),
+                    ));
                 }
             }
         }
@@ -25662,13 +25972,18 @@ pub(crate) fn arm_insert_index_bufs(
     index_states: &mut [IndexMaintState],
     n_rows: usize,
     has_insert_triggers: bool,
-    on_conflict: crate::sql::ast::ConflictResolution,
+    stmt_or: Option<ConflictResolution>,
     has_upsert: bool,
 ) {
-    let batch_worthy = n_rows >= INDEX_BATCH_MIN_ROWS
-        && !has_insert_triggers
-        && !has_upsert
-        && matches!(on_conflict, crate::sql::ast::ConflictResolution::Abort);
+    // Plain ABORT everywhere: an explicit OR ABORT, or no OR clause and no
+    // constraint-level ON CONFLICT clause (a FAIL must keep the rows it
+    // already wrote WITH their index entries; buffered ones would drop).
+    let plain_abort = match stmt_or {
+        Some(o) => o == ConflictResolution::Abort,
+        None => !index_states.iter().any(|st| st.idx.on_conflict.is_some()),
+    };
+    let batch_worthy =
+        n_rows >= INDEX_BATCH_MIN_ROWS && !has_insert_triggers && !has_upsert && plain_abort;
     for st in index_states.iter_mut() {
         let eligible = batch_worthy
             && !st.idx.unique
@@ -26178,7 +26493,7 @@ fn exec_update(
     source: &Plan,
     assignments: &[(usize, Expr)],
     returning: Option<&[crate::sql::ast::ResultColumn]>,
-    or_conflict: ConflictResolution,
+    stmt_or: Option<ConflictResolution>,
     from: Option<&crate::planner::plan::UpdateFrom>,
 ) -> Result<ExecResult> {
     // Constant WHERE terms (planner::split_constant_dml_where): evaluated
@@ -26193,23 +26508,14 @@ fn exec_update(
                 )
             })?
         };
-        return exec_update(
-            ctx,
-            table,
-            &input,
-            assignments,
-            returning,
-            or_conflict,
-            from,
-        );
+        return exec_update(ctx, table, &input, assignments, returning, stmt_or, from);
     }
     // `UPDATE ... FROM` (SQLite 3.33+): the target table is joined with
     // the FROM side and the WHERE clause spans both. Per SQLite
     // semantics: a target row matching multiple FROM rows is updated
     // ONCE (the last match supplies the SET expression values).
     if let Some(uf) = from {
-        let result =
-            exec_update_from(ctx, &table, source, assignments, returning, or_conflict, uf)?;
+        let result = exec_update_from(ctx, &table, source, assignments, returning, stmt_or, uf)?;
         if !ctx.in_transaction && !ctx.deferred_flush {
             ctx.pager.flush()?;
         }
@@ -26241,7 +26547,7 @@ fn exec_update(
     let flattened = flatten_dml_source(source);
     let source: &Plan = flattened.as_ref().unwrap_or(source);
     if let Some(result) =
-        try_streaming_update(ctx, &table, source, assignments, returning, or_conflict)?
+        try_streaming_update(ctx, &table, source, assignments, returning, stmt_or)?
     {
         // Autocommit flush (transactional execution defers this to COMMIT;
         // deferred_flush leaves it to the threshold/requery logic). The
@@ -26275,6 +26581,14 @@ fn exec_update(
     let n_cols = table.n_columns();
 
     let indexes = ctx.catalog().indexes_on_table(&table.name);
+    let wr_pk_index = if table.without_rowid {
+        indexes
+            .iter()
+            .find(|i| i.origin == crate::schema::IndexOrigin::WithoutRowidPk)
+            .cloned()
+    } else {
+        None
+    };
     let mut returning_rows: Vec<Vec<Value>> = Vec::new();
 
     // ---- Pass 1: compute every new row (assignments + constraints),
@@ -26283,15 +26597,29 @@ fn exec_update(
     // B+tree modification, exactly like SQLite's statement-level ABORT.
     let mut write_set: Vec<(i64, Vec<Value>, Vec<Value>)> =
         Vec::with_capacity(source_res.rows.len());
+    let mut pass1_fail: Option<Error> = None;
     for row in &source_res.rows {
         let rowid = if let Some(idx) = table.rowid_alias {
             row[idx].as_integer()
         } else if hidden_rowid_slot {
             // Trailing hidden slot holds the row's B+tree key.
             row.last().map(|v| v.as_integer()).unwrap_or(0)
+        } else if let Some(pk) = wr_pk_index.as_ref() {
+            // WITHOUT ROWID: the engine-internal PK index maps the row's
+            // PRIMARY KEY to its storage rowid.
+            let key = encode_index_key(pk, &table, &row[..n_cols])?;
+            let mut ibt = Btree::new(ctx.pager, ctx.index_root(pk), true);
+            match ibt.lookup_index(&key)?.first() {
+                Some(&r) => r,
+                None => {
+                    return Err(Error::corruption(
+                        "WITHOUT ROWID row missing from its PK index",
+                    ))
+                }
+            }
         } else {
-            // No alias column and no hidden slot (WITHOUT ROWID table,
-            // a real "rowid" column, or a source that dropped the slot).
+            // No alias column and no hidden slot (a real "rowid" column,
+            // or a source that dropped the slot).
             return Err(Error::Unsupported(
                 "UPDATE on a table without INTEGER PRIMARY KEY",
             ));
@@ -26325,23 +26653,42 @@ fn exec_update(
         // STRICT tables: reject type-mismatched SET values (and fold
         // integers into REAL columns) before any constraint machinery.
         validate_strict_row(&table, &mut new_row)?;
-        // NOT NULL + CHECK constraints on the updated row.
-        enforce_row_constraints(&table, &new_row, &col_names, &ctx.params, &ctx.named_params)?;
+        // NOT NULL + CHECK on the updated row, each by its policy: IGNORE
+        // leaves the row unchanged, REPLACE takes a NOT NULL column's
+        // DEFAULT; a FAIL stops here with the rows before it applied.
+        match check_row_constraints(ctx, &table, &mut new_row, stmt_or) {
+            Ok(RowCheck::Pass) => {}
+            Ok(RowCheck::Skip) => continue,
+            Err(e) if ctx.halt_action == Some(ConflictResolution::Fail) => {
+                pass1_fail = Some(e);
+                break;
+            }
+            Err(e) => return Err(e),
+        }
         // Child-side FK: the new values must reference existing parents.
         enforce_child_fks(ctx, &table, &new_row)?;
         write_set.push((rowid, row.clone(), new_row));
     }
 
     // ---- Unique-index write-set simulation (SQLite sequential
-    // semantics, collation-aware): errors atomically for ABORT-family,
-    // produces the OR IGNORE skip / OR REPLACE delete plan otherwise.
+    // semantics, collation-aware, per-index policies): errors for ABORT /
+    // ROLLBACK, the IGNORE skip / REPLACE delete plan otherwise, and a
+    // FAIL's stopping row.
     let unique_indexes: Vec<Arc<crate::schema::Index>> =
         indexes.iter().filter(|i| i.unique).cloned().collect();
     let ws_refs: Vec<(i64, &[Value], &[Value])> = write_set
         .iter()
         .map(|(r, o, n)| (*r, o.as_slice(), n.as_slice()))
         .collect();
-    let plan = simulate_update_unique(ctx, &table, &unique_indexes, &ws_refs, or_conflict)?;
+    let plan = simulate_update_unique(ctx, &table, &unique_indexes, &ws_refs, stmt_or)?;
+    // FAIL: only the rows before the failing one apply.
+    let fail_error: Option<Error> = match &plan.fail_at {
+        Some((pos, msg)) => {
+            write_set.truncate(*pos);
+            Some(Error::constraint(msg.clone()))
+        }
+        None => pass1_fail,
+    };
 
     // OR REPLACE: delete the conflicting holder rows (table + all index
     // entries) before applying the write set.
@@ -26404,7 +26751,7 @@ fn exec_update(
                         new_alias,
                         &payload,
                         &new_row,
-                        or_conflict,
+                        conflict_policy(stmt_or, table.pk_conflict),
                     )? {
                         // Parent-side FK (ON UPDATE) for the moved key.
                         let new_parent_rowid = table
@@ -26457,10 +26804,10 @@ fn exec_update(
                         }
                         continue;
                     }
-                    // OR IGNORE kept the old position — skip the row.
-                    if !matches!(new_alias, Value::Integer(_)) {
-                        continue;
-                    }
+                    // IGNORE kept the old position: the whole row update
+                    // is skipped (it used to fall through and rewrite the
+                    // other columns in place).
+                    continue;
                 }
             }
         }
@@ -26559,6 +26906,11 @@ fn exec_update(
             )?);
         }
     }
+    // A FAIL conflict: the rows before it stand; the statement fails (the
+    // driver commits them in autocommit — ExecContext::halt_action).
+    if let Some(e) = fail_error {
+        return Err(e);
+    }
     if !ctx.in_transaction && !ctx.deferred_flush {
         ctx.pager.flush()?;
     }
@@ -26595,7 +26947,7 @@ fn exec_update_from(
     target: &Plan,
     assignments: &[(usize, Expr)],
     returning: Option<&[crate::sql::ast::ResultColumn]>,
-    or_conflict: ConflictResolution,
+    stmt_or: Option<ConflictResolution>,
     uf: &crate::planner::plan::UpdateFrom,
 ) -> Result<ExecResult> {
     // Materialize both sides. The FROM side may itself be a join /
@@ -26624,6 +26976,7 @@ fn exec_update_from(
     // ---- Pass 1: compute the write set (nothing applied yet — atomic
     // statement abort on any constraint violation).
     let mut write_set: Vec<(i64, Vec<Value>, Vec<Value>)> = Vec::new();
+    let mut pass1_fail: Option<Error> = None;
     for row in &target_res.rows {
         let rowid = if let Some(idx) = table.rowid_alias {
             row[idx].as_integer()
@@ -26678,7 +27031,16 @@ fn exec_update_from(
             }
         }
         validate_strict_row(table, &mut new_row)?;
-        enforce_row_constraints(table, &new_row, &plain_cols, &ctx.params, &ctx.named_params)?;
+        // NOT NULL + CHECK by policy (see exec_update's pass 1).
+        match check_row_constraints(ctx, table, &mut new_row, stmt_or) {
+            Ok(RowCheck::Pass) => {}
+            Ok(RowCheck::Skip) => continue,
+            Err(e) if ctx.halt_action == Some(ConflictResolution::Fail) => {
+                pass1_fail = Some(e);
+                break;
+            }
+            Err(e) => return Err(e),
+        }
         // Child-side FK: the new values must reference existing parents.
         enforce_child_fks(ctx, table, &new_row)?;
         write_set.push((rowid, row.clone(), new_row));
@@ -26691,7 +27053,15 @@ fn exec_update_from(
         .iter()
         .map(|(r, o, n)| (*r, o.as_slice(), n.as_slice()))
         .collect();
-    let plan = simulate_update_unique(ctx, table, &unique_indexes, &ws_refs, or_conflict)?;
+    let plan = simulate_update_unique(ctx, table, &unique_indexes, &ws_refs, stmt_or)?;
+    // FAIL: only the rows before the failing one apply.
+    let fail_error: Option<Error> = match &plan.fail_at {
+        Some((pos, msg)) => {
+            write_set.truncate(*pos);
+            Some(Error::constraint(msg.clone()))
+        }
+        None => pass1_fail,
+    };
     if !plan.delete_rowids.is_empty() {
         delete_rows_by_rowid(ctx, table, &plan.delete_rowids)?;
     }
@@ -26748,7 +27118,7 @@ fn exec_update_from(
                         new_alias,
                         &payload,
                         &new_row,
-                        or_conflict,
+                        conflict_policy(stmt_or, table.pk_conflict),
                     )? {
                         ctx.changes += 1;
                         updated += 1;
@@ -26765,9 +27135,8 @@ fn exec_update_from(
                         }
                         continue;
                     }
-                    if !matches!(new_alias, Value::Integer(_)) {
-                        continue;
-                    }
+                    // IGNORE kept the old position: skip the whole row.
+                    continue;
                 }
             }
         }
@@ -26841,6 +27210,9 @@ fn exec_update_from(
             )?);
         }
     }
+    if let Some(e) = fail_error {
+        return Err(e);
+    }
     if let Some(ret) = returning {
         return Ok(ExecResult {
             columns: returning_column_names(ret, &plain_cols).into(),
@@ -26906,8 +27278,27 @@ fn try_streaming_update(
     source: &Plan,
     assignments: &[(usize, Expr)],
     returning: Option<&[crate::sql::ast::ResultColumn]>,
-    or_conflict: ConflictResolution,
+    stmt_or: Option<ConflictResolution>,
 ) -> Result<Option<ExecResult>> {
+    // Plain ABORT only (an explicit OR ABORT, or no OR clause and no
+    // constraint-level ON CONFLICT clause): NOT NULL / CHECK below raise
+    // directly, and IGNORE / REPLACE / FAIL / ROLLBACK resolve per row in
+    // the general path (`check_row_constraints`, simulate_update_unique).
+    let plain_abort = match stmt_or {
+        Some(o) => o == ConflictResolution::Abort,
+        None => {
+            !table_conflict_clauses(table)
+                && !ctx
+                    .catalog()
+                    .indexes_on_table(&table.name)
+                    .iter()
+                    .any(|i| i.on_conflict.is_some())
+        }
+    };
+    if !plain_abort {
+        return Ok(None);
+    }
+    let or_conflict = ConflictResolution::Abort;
     // Detect the source shape and extract (table, filter_predicate, range, rowid).
     enum StreamingSource<'a> {
         Scan {
@@ -28225,7 +28616,7 @@ fn try_streaming_update(
             .iter()
             .map(|(r, o, n)| (*r, o.as_slice(), n.as_slice()))
             .collect();
-        simulate_update_unique(ctx, table, &unique_touched, &ws_refs, or_conflict)?
+        simulate_update_unique(ctx, table, &unique_touched, &ws_refs, Some(or_conflict))?
     } else {
         UpdateConflictPlan::default()
     };
@@ -29880,6 +30271,11 @@ fn try_streaming_delete(
             p
         };
         ctx.set_table_root_lc(&table_name_lc, new_root);
+        // An earlier row's AFTER trigger may have re-cached the max while
+        // this row (now gone) still held it.
+        if has_delete_triggers {
+            ctx.invalidate_max_rowid_if_deleted(&table_name_lc, rid);
+        }
         let Some(payload) = payload else { continue };
         deleted += 1;
         ctx.changes += 1;
@@ -30085,6 +30481,8 @@ fn exec_delete(
                 (bt.root, payload)
             };
             ctx.set_table_root_lc(&table_name_lc, new_root);
+            // Before any AFTER DELETE trigger can allocate a rowid here.
+            ctx.invalidate_max_rowid_if_deleted(&table_name_lc, rowid_val);
             let mut deleted = 0i64;
             let mut returning_rows: Vec<Vec<Value>> = Vec::new();
             if let Some(payload) = old_payload {
@@ -30273,6 +30671,12 @@ fn exec_delete(
             new_root = bt.root;
         }
         ctx.set_table_root_lc(&table_name_lc, new_root);
+        // The cached max goes stale the moment the max row is gone: an
+        // AFTER DELETE trigger inserting into this table allocates from
+        // the REMAINING max (it used to build on the deleted one).
+        if has_delete_triggers {
+            ctx.invalidate_max_rowid_if_deleted(&table_name_lc, rowid);
+        }
         // Statement journal: the deleted payload moves in (zero-copy) so a
         // later failure in this statement re-inserts the row + indexes.
         // Pushed BEFORE the index maintenance and AFTER-triggers below —

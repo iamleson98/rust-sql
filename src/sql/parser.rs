@@ -535,6 +535,8 @@ impl Parser {
                 order = Order::Desc;
                 self.advance();
             }
+            // SQLite's grammar: `PRIMARY KEY sortorder onconf autoinc`.
+            let on_conflict = self.parse_onconf()?;
             let autoincrement = if self.peek().is_keyword("AUTOINCREMENT") {
                 self.advance();
                 true
@@ -544,17 +546,22 @@ impl Parser {
             Ok(ColumnConstraint::PrimaryKey {
                 autoincrement,
                 order,
+                on_conflict,
             })
         } else if t.is_keyword("NOT") {
             self.advance();
             self.expect_keyword("NULL")?;
-            Ok(ColumnConstraint::NotNull)
+            let on_conflict = self.parse_onconf()?;
+            Ok(ColumnConstraint::NotNull { on_conflict })
         } else if t.is_keyword("NULL") {
             self.advance();
+            // `NULL onconf` is accepted (and ignored) by SQLite too.
+            let _ = self.parse_onconf()?;
             Ok(ColumnConstraint::Null)
         } else if t.is_keyword("UNIQUE") {
             self.advance();
-            Ok(ColumnConstraint::Unique)
+            let on_conflict = self.parse_onconf()?;
+            Ok(ColumnConstraint::Unique { on_conflict })
         } else if t.is_keyword("CHECK") {
             self.advance();
             self.expect_punct('(')?;
@@ -759,6 +766,34 @@ impl Parser {
         }
     }
 
+    /// SQLite's `onconf`: an optional `ON CONFLICT {ROLLBACK | ABORT | FAIL
+    /// | IGNORE | REPLACE}` after a NOT NULL / PRIMARY KEY / UNIQUE
+    /// constraint.
+    fn parse_onconf(&mut self) -> Result<Option<ConflictResolution>> {
+        if !(self.peek().is_keyword("ON") && self.peek_n(1).is_keyword("CONFLICT")) {
+            return Ok(None);
+        }
+        self.advance();
+        self.advance();
+        let t = self.peek();
+        let r = match &t.token {
+            Token::Keyword("ROLLBACK") => ConflictResolution::Rollback,
+            Token::Keyword("ABORT") => ConflictResolution::Abort,
+            Token::Keyword("FAIL") => ConflictResolution::Fail,
+            Token::Keyword("IGNORE") => ConflictResolution::Ignore,
+            Token::Keyword("REPLACE") => ConflictResolution::Replace,
+            other => {
+                return Err(Error::parse(
+                    t.line,
+                    t.col,
+                    format!("near {:?}: syntax error", other),
+                ))
+            }
+        };
+        self.advance();
+        Ok(Some(r))
+    }
+
     fn parse_table_constraint(&mut self) -> Result<TableConstraint> {
         if self.peek().is_keyword("CONSTRAINT") {
             self.advance();
@@ -770,13 +805,21 @@ impl Parser {
             self.expect_punct('(')?;
             let cols = self.parse_indexed_columns()?;
             self.expect_punct(')')?;
-            Ok(TableConstraint::PrimaryKey { columns: cols })
+            let on_conflict = self.parse_onconf()?;
+            Ok(TableConstraint::PrimaryKey {
+                columns: cols,
+                on_conflict,
+            })
         } else if self.peek().is_keyword("UNIQUE") {
             self.advance();
             self.expect_punct('(')?;
             let cols = self.parse_indexed_columns()?;
             self.expect_punct(')')?;
-            Ok(TableConstraint::Unique(cols))
+            let on_conflict = self.parse_onconf()?;
+            Ok(TableConstraint::Unique {
+                columns: cols,
+                on_conflict,
+            })
         } else if self.peek().is_keyword("CHECK") {
             self.advance();
             self.expect_punct('(')?;

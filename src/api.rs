@@ -395,6 +395,12 @@ pub struct Database {
     /// A ROLLBACK's pre-DDL catalog awaiting reinstatement once the
     /// statement that rolled back returns (see `execute_cached_stmt`).
     catalog_restore_pending: Mutex<Option<Arc<Catalog>>>,
+    /// The last statement failed on a constraint resolved as ROLLBACK
+    /// inside a transaction: `execute` rolls the transaction back.
+    halt_rollback: std::sync::atomic::AtomicBool,
+    /// This connection's `changes()` / `total_changes()` counters (see
+    /// `change_counters::ConnScope`).
+    pub(crate) change_counts: Arc<[std::sync::atomic::AtomicI64; 2]>,
     /// True when the open transaction was started by SAVEPOINT (not
     /// BEGIN) — releasing the outermost savepoint then COMMITS.
     savepoint_txn: AtomicBool,
@@ -1234,18 +1240,26 @@ fn column_def_to_sql(cd: &crate::sql::ast::ColumnDef) -> String {
             C::PrimaryKey {
                 autoincrement,
                 order,
+                on_conflict,
             } => {
                 s.push_str("PRIMARY KEY");
                 if *order == crate::sql::ast::Order::Desc {
                     s.push_str(" DESC");
                 }
+                s.push_str(&onconf_sql(*on_conflict));
                 if *autoincrement {
                     s.push_str(" AUTOINCREMENT");
                 }
             }
-            C::NotNull => s.push_str("NOT NULL"),
+            C::NotNull { on_conflict } => {
+                s.push_str("NOT NULL");
+                s.push_str(&onconf_sql(*on_conflict));
+            }
             C::Null => s.push_str("NULL"),
-            C::Unique => s.push_str("UNIQUE"),
+            C::Unique { on_conflict } => {
+                s.push_str("UNIQUE");
+                s.push_str(&onconf_sql(*on_conflict));
+            }
             C::Check(e) => s.push_str(&format!("CHECK ({})", expr_to_sql(e))),
             C::Default(e) => s.push_str(&format!("DEFAULT {}", expr_to_sql(e))),
             C::Collate(c) => s.push_str(&format!("COLLATE {}", c)),
@@ -1286,6 +1300,23 @@ fn column_def_to_sql(cd: &crate::sql::ast::ColumnDef) -> String {
     s
 }
 
+/// ` ON CONFLICT x` for a constraint's conflict clause ("" when absent).
+fn onconf_sql(on_conflict: Option<ConflictResolution>) -> String {
+    match on_conflict {
+        None => String::new(),
+        Some(r) => format!(
+            " ON CONFLICT {}",
+            match r {
+                ConflictResolution::Rollback => "ROLLBACK",
+                ConflictResolution::Abort => "ABORT",
+                ConflictResolution::Fail => "FAIL",
+                ConflictResolution::Ignore => "IGNORE",
+                ConflictResolution::Replace => "REPLACE",
+            }
+        ),
+    }
+}
+
 fn indexed_columns_to_sql(cols: &[crate::sql::ast::IndexedColumn]) -> String {
     cols.iter()
         .map(|c| {
@@ -1314,10 +1345,22 @@ fn create_table_to_sql(
     let mut parts: Vec<String> = columns.iter().map(column_def_to_sql).collect();
     for tc in constraints {
         let s = match tc {
-            T::PrimaryKey { columns } => {
-                format!("PRIMARY KEY ({})", indexed_columns_to_sql(columns))
-            }
-            T::Unique(cols) => format!("UNIQUE ({})", indexed_columns_to_sql(cols)),
+            T::PrimaryKey {
+                columns,
+                on_conflict,
+            } => format!(
+                "PRIMARY KEY ({}){}",
+                indexed_columns_to_sql(columns),
+                onconf_sql(*on_conflict)
+            ),
+            T::Unique {
+                columns: cols,
+                on_conflict,
+            } => format!(
+                "UNIQUE ({}){}",
+                indexed_columns_to_sql(cols),
+                onconf_sql(*on_conflict)
+            ),
             T::Check(e) => format!("CHECK ({})", expr_to_sql(e)),
             T::ForeignKey {
                 columns,
@@ -1578,7 +1621,7 @@ fn rename_column_in_create_table(
         }
         for tc in constraints.iter_mut() {
             match tc {
-                T::PrimaryKey { columns } | T::Unique(columns) => {
+                T::PrimaryKey { columns, .. } | T::Unique { columns, .. } => {
                     for ic in columns.iter_mut() {
                         if ic.name.eq_ignore_ascii_case(old) {
                             ic.name = new.to_string();
@@ -2552,6 +2595,11 @@ impl Database {
             txn_catalog_snap: Mutex::new(None),
             savepoint_catalogs: Mutex::new(Vec::new()),
             catalog_restore_pending: Mutex::new(None),
+            halt_rollback: std::sync::atomic::AtomicBool::new(false),
+            change_counts: Arc::new([
+                std::sync::atomic::AtomicI64::new(0),
+                std::sync::atomic::AtomicI64::new(0),
+            ]),
             savepoint_txn: AtomicBool::new(false),
             preupdate_hook: crate::preupdate::HookSlot::new(None),
             has_preupdate_hook: AtomicBool::new(false),
@@ -2955,6 +3003,11 @@ impl Database {
             txn_catalog_snap: Mutex::new(None),
             savepoint_catalogs: Mutex::new(Vec::new()),
             catalog_restore_pending: Mutex::new(None),
+            halt_rollback: std::sync::atomic::AtomicBool::new(false),
+            change_counts: Arc::new([
+                std::sync::atomic::AtomicI64::new(0),
+                std::sync::atomic::AtomicI64::new(0),
+            ]),
             savepoint_txn: AtomicBool::new(false),
             preupdate_hook: crate::preupdate::HookSlot::new(None),
             has_preupdate_hook: AtomicBool::new(false),
@@ -5351,6 +5404,14 @@ impl Database {
             // AUTOINCREMENT: sequence high-water semantics need the
             // general path's sqlite_sequence maintenance.
             || table.columns.iter().any(|c| c.autoincrement)
+            // Constraint-level ON CONFLICT clauses resolve per constraint
+            // (the general path's conflict_policy); this path is ABORT-only.
+            || crate::executor::table_conflict_clauses(&table)
+            || self
+                .catalog
+                .indexes_on_table(&table.name)
+                .iter()
+                .any(|i| i.on_conflict.is_some())
         {
             return Ok(None);
         }
@@ -5538,6 +5599,9 @@ impl Database {
         // shadow writes from this statement are now the committed truth.
         if result.is_ok() && !ctx.in_transaction {
             self.clear_vtab_shadow_flight();
+        }
+        if result.is_err() {
+            crate::executor::change_counters::record_outcome(false, 0, 0);
         }
         if let Ok(n) = result {
             crate::executor::change_counters::record(n);
@@ -6156,10 +6220,24 @@ impl Database {
     /// mutations go through interior mutability so the body could in principle
     /// be `&self`. We keep `&mut self` for API clarity (writers serialize).
     pub fn execute<P: Params>(&mut self, sql: &str, params: P) -> Result<()> {
+        // A stepped statement's ROLLBACK resolution (pending since it ran
+        // through `&self`): end the transaction before anything else.
+        if std::mem::take(self.halt_rollback.get_mut()) && !self.is_autocommit() {
+            if let Err(rb) = self.execute_stmt("ROLLBACK", ()) {
+                eprintln!("transaction rollback after a ROLLBACK conflict failed: {rb}");
+            }
+        }
         let result = self.execute_stmt(sql, params);
         if let Err(e) = &result {
             if is_sqlite_full(e) {
                 self.widen_special_error_rollback(sql);
+            }
+            // A constraint resolved as ROLLBACK (OR ROLLBACK / ON CONFLICT
+            // ROLLBACK) ends the whole transaction (sqlite3VdbeHalt).
+            if std::mem::take(self.halt_rollback.get_mut()) && !self.is_autocommit() {
+                if let Err(rb) = self.execute_stmt("ROLLBACK", ()) {
+                    eprintln!("transaction rollback after a ROLLBACK conflict failed: {rb}");
+                }
             }
         }
         result
@@ -6170,6 +6248,13 @@ impl Database {
     /// CONCURRENT). An error can END a transaction (see
     /// [`Self::execute`]'s SQLITE_FULL handling), so callers that mirror
     /// the transaction state must re-read it after a failed statement.
+    /// A stepped statement failed on a ROLLBACK-resolved constraint inside
+    /// a transaction: the next `execute` rolls the transaction back first
+    /// (see Statement::exec_with_ctx).
+    pub(crate) fn note_pending_halt_rollback(&self) {
+        self.halt_rollback.store(true, Ordering::Release);
+    }
+
     pub fn is_autocommit(&self) -> bool {
         !self.in_transaction.load(Ordering::Acquire) && self.concurrent_txn_for_caller().is_none()
     }
@@ -6222,6 +6307,8 @@ impl Database {
         // `last_insert_rowid()` (SQLite: the value is per-connection; the
         // evaluator reads the TLS, which every statement entry refreshes).
         crate::executor::change_counters::note_conn_rowid(self.last_rowid.load(Ordering::Acquire));
+        let counts = Arc::clone(&self.change_counts);
+        let _counts = crate::executor::change_counters::ConnScope::enter(&counts);
         // Statement boundary: any aux-function TLS (bm25/highlight/
         // snippet bound to a previous statement's vtab scan) is stale.
         crate::executor::vtab_exec::aux_tls_clear();
@@ -6788,7 +6875,11 @@ impl Database {
                     .store(ctx.in_transaction, Ordering::Release);
                 self.set_last_insert_rowid(ctx.last_insert_rowid);
                 *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
-                crate::executor::change_counters::record(ctx.changes);
+                crate::executor::change_counters::record_outcome(
+                    res.is_ok(),
+                    ctx.changes,
+                    ctx.trigger_changes,
+                );
                 self.pager.note_rows_modified(ctx.changes);
                 if ctx.roots_changed {
                     let shared = Arc::make_mut(&mut ctx.shared);
@@ -7174,7 +7265,14 @@ impl Database {
         // In-place upsert mutations and vtab xUpdate effects are covered
         // by the same journal. Best-effort: the
         // ORIGINAL statement error is what the caller must see.
-        if result.is_err() && !ctx.stmt_undo.is_empty() {
+        //
+        // A constraint resolved as FAIL is the exception (sqlite3VdbeHalt's
+        // OE_Fail): the changes the statement made BEFORE the violation
+        // stand — no undo — and an autocommit statement commits them.
+        let keep_partial = result.is_err()
+            && ctx.halt_action == Some(ConflictResolution::Fail)
+            && !ctx.rolled_back;
+        if result.is_err() && !keep_partial && !ctx.stmt_undo.is_empty() {
             let entries = std::mem::take(&mut ctx.stmt_undo);
             if let Err(undo_err) = crate::executor::replay_stmt_undo(&mut ctx, entries) {
                 // Exceptional by construction (a healthy b-tree always
@@ -7182,6 +7280,16 @@ impl Database {
                 eprintln!("stmt-undo replay failed after statement error: {undo_err}");
             }
         }
+        if keep_partial && !ctx.in_transaction && !ctx.deferred_flush {
+            if let Err(e) = self.pager.flush() {
+                eprintln!("commit of a FAIL statement's changes failed: {e}");
+            }
+        }
+        // ROLLBACK resolution: the whole transaction ends (executed by
+        // `execute` once this statement context is gone).
+        *self.halt_rollback.get_mut() = result.is_err()
+            && ctx.halt_action == Some(ConflictResolution::Rollback)
+            && ctx.in_transaction;
         // ── Autocommit statement-atomicity (page level) ──
         // A FAILED autocommit write statement is a rolled-back implicit
         // transaction: its page-level work (half-finished splits,
@@ -7203,6 +7311,7 @@ impl Database {
         // and this restore would drop them), (c) the statement actually
         // dirtied pages (read-only failures have nothing to undo).
         if result.is_err()
+            && !keep_partial
             && !ctx.in_transaction
             && !ctx.deferred_flush
             // DELTA gate (dirty_at_start, captured at statement entry):
@@ -7255,7 +7364,19 @@ impl Database {
             .store(ctx.in_transaction, Ordering::Release);
         self.set_last_insert_rowid(ctx.last_insert_rowid);
         *self.txn_snapshot.get_mut() = ctx.txn_snapshot;
-        crate::executor::change_counters::record(ctx.changes);
+        // changes() / total_changes() count INSERT, UPDATE and DELETE only
+        // (sqlite3VdbeCountChanges): BEGIN, DDL, PRAGMA, a SELECT leave the
+        // last DML's count in place.
+        if matches!(
+            stmt_ref,
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+        ) {
+            crate::executor::change_counters::record_outcome(
+                result.is_ok() || keep_partial,
+                ctx.changes,
+                ctx.trigger_changes,
+            );
+        }
         // Engine-wide observability aggregate (thread-local counters
         // above preserve SQL-function semantics; this one is readable by
         // the admin stats endpoint from any thread).
@@ -7909,6 +8030,8 @@ impl Database {
         };
         // Per-connection snapshot for `last_insert_rowid()` (see execute).
         crate::executor::change_counters::note_conn_rowid(self.last_rowid.load(Ordering::Acquire));
+        let counts = Arc::clone(&self.change_counts);
+        let _counts = crate::executor::change_counters::ConnScope::enter(&counts);
         // File text encoding for value ordering / CAST (RAII restore).
         let _conn_enc_guard = crate::executor::ConnEncGuard::install(self.conn_text_enc());
         // A hot INSERT chain owns the table's live root / max-rowid while
@@ -8249,7 +8372,11 @@ impl Database {
                 // Change accounting (mirrors execute's epilogue): DML via
                 // the query path must feed changes()/total_changes() and
                 // the engine-wide observability aggregates too.
-                crate::executor::change_counters::record(ctx.changes);
+                crate::executor::change_counters::record_outcome(
+                    true,
+                    ctx.changes,
+                    ctx.trigger_changes,
+                );
                 self.pager.note_rows_modified(ctx.changes);
                 if ctx.changes > 0 && !ctx.in_transaction {
                     self.pager.note_tx_autocommit();
@@ -8365,13 +8492,13 @@ impl Database {
     /// Running total of rows modified by all statements on this thread
     /// (SQLite's `sqlite3_total_changes`).
     pub fn total_changes(&self) -> i64 {
-        crate::executor::change_counters::total()
+        self.change_counts[1].load(Ordering::Relaxed)
     }
 
     /// Rows modified by the most recent statement (SQLite's
     /// `sqlite3_changes`).
     pub fn changes(&self) -> i64 {
-        crate::executor::change_counters::last()
+        self.change_counts[0].load(Ordering::Relaxed)
     }
 
     /// Output names for a SELECT, seeing through compound bodies (the
@@ -8489,6 +8616,8 @@ impl Database {
         // refresh it from THIS connection's atomic — a routed ATTACH
         // statement may have updated it through another engine).
         crate::executor::change_counters::note_conn_rowid(self.last_rowid.load(Ordering::Acquire));
+        let counts = Arc::clone(&self.change_counts);
+        let _counts = crate::executor::change_counters::ConnScope::enter(&counts);
         let _rbd = ReadBurstDrain {
             db: self,
             sql_len: sql.len(),
@@ -10338,6 +10467,8 @@ impl Database {
             qualified_col_names: view_cols.to_vec().into(),
             col_affinities: std::sync::Arc::from(Vec::new()),
             vtab: None,
+            pk_conflict: None,
+            check_labels: Vec::new(),
         };
         for (new_row, old_row) in &rows {
             // WHEN guard + body per trigger (INSTEAD OF semantics =
@@ -10505,7 +10636,7 @@ impl Database {
                             table,
                             source: Box::new(source_plan),
                             columns,
-                            on_conflict: ins.or.unwrap_or(ConflictResolution::Abort),
+                            on_conflict: ins.or,
                             upsert: ins.upsert.clone(),
                             returning: ins.returning.clone(),
                         }
@@ -10854,7 +10985,7 @@ impl Database {
                             table,
                             source: Box::new(source_plan),
                             columns,
-                            on_conflict: ins.or.unwrap_or(ConflictResolution::Abort),
+                            on_conflict: ins.or,
                             upsert: ins.upsert.clone(),
                             returning: ins.returning.clone(),
                         }))
@@ -10910,7 +11041,7 @@ impl Database {
                             table,
                             source: Box::new(source_plan),
                             columns,
-                            on_conflict: ins.or.unwrap_or(ConflictResolution::Abort),
+                            on_conflict: ins.or,
                             upsert: ins.upsert.clone(),
                             returning: ins.returning.clone(),
                         })
@@ -11001,7 +11132,11 @@ impl Database {
                 | crate::planner::plan::Plan::Update { .. }
                 | crate::planner::plan::Plan::Delete { .. }
         ) {
-            crate::executor::change_counters::record(ctx.changes);
+            crate::executor::change_counters::record_outcome(
+                true,
+                ctx.changes,
+                ctx.trigger_changes,
+            );
             self.pager.note_rows_modified(ctx.changes);
             if ctx.changes > 0 && !ctx.in_transaction {
                 self.pager.note_tx_autocommit();
@@ -11080,7 +11215,11 @@ impl Database {
             plan,
             crate::planner::plan::Plan::Update { .. } | crate::planner::plan::Plan::Delete { .. }
         ) {
-            crate::executor::change_counters::record(ctx.changes);
+            crate::executor::change_counters::record_outcome(
+                true,
+                ctx.changes,
+                ctx.trigger_changes,
+            );
             self.pager.note_rows_modified(ctx.changes);
             if ctx.changes > 0 && !ctx.in_transaction {
                 self.pager.note_tx_autocommit();
@@ -12401,7 +12540,7 @@ impl Database {
             }
         };
         let columns = Self::insert_columns(&table, ins.columns.as_ref())?;
-        let on_conflict = ins.or.unwrap_or(ConflictResolution::Abort);
+        let on_conflict = ins.or;
         Ok(crate::planner::plan::Plan::Insert {
             table,
             source: Box::new(source_plan),
@@ -12597,7 +12736,7 @@ impl Database {
             source: Box::new(source),
             assignments,
             returning: upd.returning.clone(),
-            or_conflict: upd.or.unwrap_or(ConflictResolution::Abort),
+            or_conflict: upd.or,
             from,
         })
     }
@@ -13474,69 +13613,14 @@ impl Database {
                 // silently unenforced (no index → no conflict detection).
                 // We synthesize a parseable `CREATE UNIQUE INDEX` statement
                 // as the schema SQL so the index round-trips on reopen.
-                let mut implicit: Vec<Vec<crate::sql::ast::IndexedColumn>> = Vec::new();
-                for (ci, col) in columns.iter().enumerate() {
-                    let collate = col.constraints.iter().find_map(|c| {
-                        if let crate::sql::ast::ColumnConstraint::Collate(name) = c {
-                            Some(name.clone())
-                        } else {
-                            None
-                        }
-                    });
-                    // Constraint order within the column = textual order
-                    // (SQLite numbers autoindexes that way).
-                    for constraint in &col.constraints {
-                        match constraint {
-                            crate::sql::ast::ColumnConstraint::Unique => {
-                                implicit.push(vec![crate::sql::ast::IndexedColumn {
-                                    name: col.name.clone(),
-                                    order: crate::sql::ast::Order::Asc,
-                                    collation: collate.clone(),
-                                    expr: None,
-                                }]);
-                            }
-                            crate::sql::ast::ColumnConstraint::PrimaryKey { order, .. }
-                                // PK autoindex: only for rowid tables whose
-                                // PK is NOT the rowid alias.
-                                if !without_rowid && table.rowid_alias != Some(ci) => {
-                                    implicit.push(vec![crate::sql::ast::IndexedColumn {
-                                        name: col.name.clone(),
-                                        order: *order,
-                                        collation: collate.clone(),
-                                        expr: None,
-                                    }]);
-                                }
-                            _ => {}
-                        }
-                    }
-                }
-                for c in &constraints {
-                    match c {
-                        crate::sql::ast::TableConstraint::Unique(cols) => {
-                            implicit.push(cols.clone());
-                        }
-                        crate::sql::ast::TableConstraint::PrimaryKey { columns: cols } => {
-                            // Skip the single INTEGER PK (rowid alias) and
-                            // WITHOUT ROWID PKs (the table b-tree IS the
-                            // PK index there — SQLite never materializes
-                            // an autoindex row for it; the engine's
-                            // internal WR-PK index covers uniqueness).
-                            let is_rowid_alias = cols.len() == 1
-                                && table.rowid_alias.is_some()
-                                && columns
-                                    .iter()
-                                    .position(|cc| cc.name.eq_ignore_ascii_case(&cols[0].name))
-                                    .map(|ci| table.rowid_alias == Some(ci))
-                                    .unwrap_or(false);
-                            if !is_rowid_alias && !without_rowid {
-                                implicit.push(cols.clone());
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                for (n, cols) in implicit.iter().enumerate() {
+                let implicit = implicit_constraint_indexes(&table, &columns, &constraints);
+                for (n, imp) in implicit.iter().enumerate() {
                     let idx_name = format!("sqlite_autoindex_{}_{}", name.name, n + 1);
+                    if imp.wr_pk {
+                        create_without_rowid_pk_index(ctx, catalog, &table, idx_name, temp)?;
+                        continue;
+                    }
+                    let (cols, on_conflict) = (&imp.cols, &imp.on_conflict);
                     // Synthesized SQL: emit each column's COLLATE so the
                     // implicit index round-trips with its collation on
                     // reopen (the catalog IndexColumn carries it too).
@@ -13571,6 +13655,7 @@ impl Database {
                         create_sql: idx_sql.clone(),
                         origin: crate::schema::IndexOrigin::Autoindex,
                         kind: crate::schema::IndexKind::Btree,
+                        on_conflict: *on_conflict,
                     };
                     // SQLite stores NULL sql for auto-indexes; the catalog
                     // keeps the synthesized DDL for reopen (load_schema
@@ -13590,77 +13675,6 @@ impl Database {
                         catalog.mark_temp(&index.name);
                     }
                     catalog.add_index(index);
-                }
-                // WITHOUT ROWID PRIMARY KEY uniqueness: the internal
-                // storage is a rowid table, so the PK needs an index
-                // backing it. SQLite files never carry one (the table
-                // b-tree IS the PK index there) — this index is
-                // engine-internal (`IndexOrigin::WithoutRowidPk`): no
-                // schema row, hidden from sqlite_master and every
-                // file-format dump, rebuilt from the DDL on reopen.
-                // SQLite-faithful effects: duplicate PK inserts fail with
-                // UNIQUE, upsert `ON CONFLICT (pk)` resolves, REPLACE
-                // works, PRAGMA index_list reports it with origin 'pk'.
-                if table.without_rowid {
-                    let pk_cols = crate::schema::without_rowid_pk_columns(&table);
-                    if !pk_cols.is_empty() {
-                        // SQLite's naming: the WR-PK's index_list entry is
-                        // `sqlite_autoindex_<t>_<N>` with N allocated AFTER
-                        // every other autoindex of the table (probed:
-                        // no uniques -> _1; one UNIQUE -> _2; two -> _3).
-                        let idx_name =
-                            format!("sqlite_autoindex_{}_{}", name.name, implicit.len() + 1);
-                        let col_list = pk_cols
-                            .iter()
-                            .map(|c| {
-                                let coll = match &c.collation {
-                                    Some(c) => format!(" COLLATE \"{}\"", c),
-                                    None => String::new(),
-                                };
-                                let ord = if c.order == crate::sql::ast::Order::Desc {
-                                    " DESC"
-                                } else {
-                                    ""
-                                };
-                                format!("\"{}\"{}{}", c.name, coll, ord)
-                            })
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let idx_sql = format!(
-                            "CREATE UNIQUE INDEX \"{}\" ON \"{}\"({})",
-                            idx_name, name.name, col_list
-                        );
-                        let idx_root = ctx.pager.allocate_page()?;
-                        {
-                            let page = ctx.pager.get_page(idx_root)?;
-                            page.lock().init_leaf_index();
-                        }
-                        let idx_columns = crate::schema::build_index_columns(&pk_cols, &table)?;
-                        // Persist the root in a hidden schema row (see
-                        // WRPK_SCHEMA_TYPE) so reopen adopts this tree.
-                        if !temp {
-                            let schema_row = crate::schema::encode_schema_row_opt(
-                                crate::schema::WRPK_SCHEMA_TYPE,
-                                &idx_name,
-                                &table.name,
-                                idx_root,
-                                None,
-                            );
-                            insert_schema_row(ctx.pager, &schema_row)?;
-                            ctx.pager.stamp_current_format()?;
-                        }
-                        catalog.add_index(crate::schema::Index {
-                            name: idx_name,
-                            table: table.name.clone(),
-                            columns: idx_columns,
-                            root_page: idx_root,
-                            unique: true,
-                            partial_expr: None,
-                            create_sql: idx_sql,
-                            origin: crate::schema::IndexOrigin::WithoutRowidPk,
-                            kind: crate::schema::IndexKind::Btree,
-                        });
-                    }
                 }
                 // AUTOINCREMENT bookkeeping: the FIRST autoincrement table
                 // creates `sqlite_sequence` (a real, user-visible table —
@@ -13736,7 +13750,7 @@ impl Database {
                         table: table_arc,
                         source: Box::new(crate::planner::plan::Plan::Values { rows: values }),
                         columns: None,
-                        on_conflict: crate::sql::ast::ConflictResolution::Abort,
+                        on_conflict: None,
                         upsert: None,
                         returning: None,
                     };
@@ -13789,6 +13803,7 @@ impl Database {
                     create_sql: original_sql.to_string(),
                     origin: crate::schema::IndexOrigin::CreateIndex,
                     kind,
+                    on_conflict: None,
                 };
                 // SQLite's sqlite3DefaultRowEst runs here, at parse time:
                 // the table's in-memory row estimate is floored even when
@@ -14645,7 +14660,7 @@ impl Database {
                 let has_unique = column
                     .constraints
                     .iter()
-                    .any(|c| matches!(c, crate::sql::ast::ColumnConstraint::Unique));
+                    .any(|c| matches!(c, crate::sql::ast::ColumnConstraint::Unique { .. }));
                 if has_pk || has_unique {
                     return Err(Error::semantic(
                         "Cannot add a PRIMARY KEY or UNIQUE column with ALTER TABLE",
@@ -14658,7 +14673,7 @@ impl Database {
                 let not_null = column
                     .constraints
                     .iter()
-                    .any(|c| matches!(c, crate::sql::ast::ColumnConstraint::NotNull));
+                    .any(|c| matches!(c, crate::sql::ast::ColumnConstraint::NotNull { .. }));
                 if not_null && !has_default {
                     return Err(Error::semantic(
                         "Cannot add a NOT NULL column with no DEFAULT value",
@@ -16848,61 +16863,7 @@ fn rewrite_create_table_name(sql: &str, new_name: &str) -> String {
 /// before the closing paren).
 fn rewrite_create_table_add_column(sql: &str, column: &crate::sql::ast::ColumnDef) -> String {
     // Render the column definition back to SQL text.
-    let mut col_sql = column.name.clone();
-    if !column.type_name.is_empty() {
-        col_sql.push(' ');
-        col_sql.push_str(&column.type_name);
-    }
-    for c in &column.constraints {
-        use crate::sql::ast::ColumnConstraint::*;
-        col_sql.push(' ');
-        match c {
-            PrimaryKey { autoincrement, .. } => {
-                col_sql.push_str("PRIMARY KEY");
-                if *autoincrement {
-                    col_sql.push_str(" AUTOINCREMENT");
-                }
-            }
-            NotNull => col_sql.push_str("NOT NULL"),
-            Null => col_sql.push_str("NULL"),
-            Unique => col_sql.push_str("UNIQUE"),
-            Check(e) => col_sql.push_str(&format!("CHECK ({})", expr_to_sql(e))),
-            Default(e) => col_sql.push_str(&format!("DEFAULT {}", expr_to_sql(e))),
-            Collate(c) => col_sql.push_str(&format!("COLLATE {}", c)),
-            References {
-                table,
-                columns,
-                on_delete,
-                on_update,
-            } => {
-                col_sql.push_str(&format!("REFERENCES {}", table));
-                if !columns.is_empty() {
-                    col_sql.push_str(&format!("({})", columns.join(", ")));
-                }
-                use crate::sql::ast::ForeignKeyAction::*;
-                let act = |a: &crate::sql::ast::ForeignKeyAction| match a {
-                    NoAction => "NO ACTION".to_string(),
-                    Restrict => "RESTRICT".to_string(),
-                    SetNull => "SET NULL".to_string(),
-                    SetDefault => "SET DEFAULT".to_string(),
-                    Cascade => "CASCADE".to_string(),
-                };
-                if !matches!(on_delete, NoAction) {
-                    col_sql.push_str(&format!(" ON DELETE {}", act(on_delete)));
-                }
-                if !matches!(on_update, NoAction) {
-                    col_sql.push_str(&format!(" ON UPDATE {}", act(on_update)));
-                }
-            }
-            GeneratedAs { expr, stored } => {
-                col_sql.push_str(&format!(
-                    "GENERATED ALWAYS AS ({}){}",
-                    expr_to_sql(expr),
-                    if *stored { " STORED" } else { "" }
-                ));
-            }
-        }
-    }
+    let col_sql = column_def_to_sql(column);
     // Insert into the column list. SQLite semantics: the added column
     // belongs WITH the column definitions — BEFORE any table-level
     // constraint clause (PRIMARY KEY(…)/UNIQUE(…)/CHECK(…)/FOREIGN KEY/
@@ -17445,7 +17406,8 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
         std::collections::HashMap::new();
     // Hidden WITHOUT ROWID PK index rows (WRPK_SCHEMA_TYPE), keyed by the
     // lowercased table name: the persisted root the table branch adopts.
-    let mut wrpk_root_by_table: std::collections::HashMap<String, u32> =
+    // table -> (root, name) of its WITHOUT ROWID PK index's hidden row.
+    let mut wrpk_root_by_table: std::collections::HashMap<String, (u32, String)> =
         std::collections::HashMap::new();
     for row in entries {
         if let Some((kind, _name, tbl_name, rootpage, sql)) = crate::schema::decode_schema_row(&row)
@@ -17453,7 +17415,10 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
             if kind == crate::schema::WRPK_SCHEMA_TYPE {
                 wrpk_root_by_table.insert(
                     tbl_name.to_ascii_lowercase(),
-                    crate::schema::rootpage_to_internal(rootpage),
+                    (
+                        crate::schema::rootpage_to_internal(rootpage),
+                        _name.to_string(),
+                    ),
                 );
                 continue;
             }
@@ -17518,36 +17483,16 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
                         // (Rows WITH sql text are handled by the "index"
                         // branch below — legacy files.)
                         rebuild_implicit_indexes(
+                            pager,
                             &table,
                             &columns,
                             &constraints,
                             &index_row_by_name,
+                            wrpk_root_by_table
+                                .get(&table.name.to_ascii_lowercase())
+                                .cloned(),
                             catalog,
-                        );
-                        // WITHOUT ROWID PK uniqueness (engine-internal
-                        // index, no schema row): allocate a fresh root and
-                        // backfill it from the table's rows. Numbered
-                        // after every other autoindex of the table
-                        // (SQLite's index_list naming rule).
-                        if table.without_rowid {
-                            let pk_cols = crate::schema::without_rowid_pk_columns(&table);
-                            if !pk_cols.is_empty() {
-                                let prefix = format!(
-                                    "sqlite_autoindex_{}_",
-                                    table.name.to_ascii_lowercase()
-                                );
-                                let n_autoidx = index_row_by_name
-                                    .keys()
-                                    .filter(|k| k.to_ascii_lowercase().starts_with(&prefix))
-                                    .count();
-                                let persisted = wrpk_root_by_table
-                                    .get(&table.name.to_ascii_lowercase())
-                                    .copied();
-                                rebuild_without_rowid_pk_index(
-                                    pager, &table, &pk_cols, n_autoidx, catalog, persisted,
-                                )?;
-                            }
-                        }
+                        )?;
                     } else if let Ok(Statement::Create(CreateStatement::VirtualTable {
                         name: tn,
                         module,
@@ -17610,6 +17555,7 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
                             create_sql: sql.to_string(),
                             origin: crate::schema::IndexOrigin::CreateIndex,
                             kind,
+                            on_conflict: None,
                         });
                     }
                 }
@@ -17754,6 +17700,81 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
     Ok(())
 }
 
+/// CREATE TABLE's WITHOUT ROWID PRIMARY KEY uniqueness: the internal
+/// storage is a rowid table, so the PK needs an index backing it. SQLite
+/// files never carry one (the table b-tree IS the PK index there) — this
+/// index is engine-internal (`IndexOrigin::WithoutRowidPk`): no regular
+/// schema row, hidden from sqlite_master and every file-format dump. It
+/// takes the `sqlite_autoindex_<t>_<N>` name of the PRIMARY KEY's textual
+/// position (see `implicit_constraint_indexes`), as PRAGMA index_list
+/// reports it, and duplicate keys fail with UNIQUE, upserts and REPLACE
+/// resolve against it.
+fn create_without_rowid_pk_index(
+    ctx: &mut ExecContext,
+    catalog: &mut Catalog,
+    table: &Table,
+    idx_name: String,
+    temp: bool,
+) -> Result<()> {
+    {
+        let pk_cols = crate::schema::without_rowid_pk_columns(table);
+        if !pk_cols.is_empty() {
+            let col_list = pk_cols
+                .iter()
+                .map(|c| {
+                    let coll = match &c.collation {
+                        Some(c) => format!(" COLLATE \"{}\"", c),
+                        None => String::new(),
+                    };
+                    let ord = if c.order == crate::sql::ast::Order::Desc {
+                        " DESC"
+                    } else {
+                        ""
+                    };
+                    format!("\"{}\"{}{}", c.name, coll, ord)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let idx_sql = format!(
+                "CREATE UNIQUE INDEX \"{}\" ON \"{}\"({})",
+                idx_name, table.name, col_list
+            );
+            let idx_root = ctx.pager.allocate_page()?;
+            {
+                let page = ctx.pager.get_page(idx_root)?;
+                page.lock().init_leaf_index();
+            }
+            let idx_columns = crate::schema::build_index_columns(&pk_cols, table)?;
+            // Persist the root in a hidden schema row (see
+            // WRPK_SCHEMA_TYPE) so reopen adopts this tree.
+            if !temp {
+                let schema_row = crate::schema::encode_schema_row_opt(
+                    crate::schema::WRPK_SCHEMA_TYPE,
+                    &idx_name,
+                    &table.name,
+                    idx_root,
+                    None,
+                );
+                insert_schema_row(ctx.pager, &schema_row)?;
+                ctx.pager.stamp_current_format()?;
+            }
+            catalog.add_index(crate::schema::Index {
+                name: idx_name,
+                table: table.name.clone(),
+                columns: idx_columns,
+                root_page: idx_root,
+                unique: true,
+                partial_expr: None,
+                create_sql: idx_sql,
+                origin: crate::schema::IndexOrigin::WithoutRowidPk,
+                kind: crate::schema::IndexKind::Btree,
+                on_conflict: table.pk_conflict,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Register a WITHOUT ROWID table's engine-internal PK index on reopen
 /// (`IndexOrigin::WithoutRowidPk`). A file that recorded the index's root
 /// in its hidden schema row (`WRPK_SCHEMA_TYPE`) ADOPTS that tree as is.
@@ -17765,13 +17786,10 @@ fn rebuild_without_rowid_pk_index(
     pager: &Pager,
     table: &crate::schema::Table,
     pk_cols: &[crate::sql::ast::IndexedColumn],
-    n_autoindexes: usize,
+    idx_name: String,
     catalog: &mut Catalog,
     persisted_root: Option<u32>,
 ) -> Result<()> {
-    // SQLite's naming: N runs after every other autoindex of the table
-    // (see the CREATE-time synthesis above — no uniques -> _1, etc.).
-    let idx_name = format!("sqlite_autoindex_{}_{}", table.name, n_autoindexes + 1);
     if let Some(root) = persisted_root {
         let idx_columns = crate::schema::build_index_columns(pk_cols, table)?;
         catalog.add_index(crate::schema::Index {
@@ -17784,6 +17802,7 @@ fn rebuild_without_rowid_pk_index(
             create_sql: String::new(),
             origin: crate::schema::IndexOrigin::WithoutRowidPk,
             kind: crate::schema::IndexKind::Btree,
+            on_conflict: table.pk_conflict,
         });
         return Ok(());
     }
@@ -17803,6 +17822,7 @@ fn rebuild_without_rowid_pk_index(
         create_sql: String::new(),
         origin: crate::schema::IndexOrigin::WithoutRowidPk,
         kind: crate::schema::IndexKind::Btree,
+        on_conflict: table.pk_conflict,
     };
     // Backfill from the table's existing rows (native-format files keep
     // the index pages; this index is invisible, so its pages are not in
@@ -17867,33 +17887,24 @@ fn rebuild_without_rowid_pk_index(
     Ok(())
 }
 
-/// Rebuild the implicit `sqlite_autoindex_<table>_<n>` indexes for one
-/// table during `load_schema`. Their schema rows carry NULL sql (SQLite
-/// stores NULL for auto-indexes), so the TABLE's DDL is the source of
-/// truth: column-level UNIQUE (in column order), then table-level
-/// UNIQUE, then non-rowid-alias PRIMARY KEY — the exact collection order
-/// `execute_create` uses, so the numbering matches. Rows carrying DDL
-/// text (legacy files) are skipped here — the "index" branch parses them.
-fn rebuild_implicit_indexes(
-    table: &crate::schema::Table,
+/// One index a CREATE TABLE's constraints imply, in SQLite's creation
+/// order (sqlite3CreateIndex runs as each UNIQUE / PRIMARY KEY is parsed:
+/// column constraints in column order, then table constraints). Each is
+/// `sqlite_autoindex_<table>_<position + 1>`. `wr_pk` marks a WITHOUT ROWID
+/// table's PRIMARY KEY — numbered in place, backed by the engine-internal
+/// PK index; an INTEGER PRIMARY KEY (the rowid) implies none.
+struct ImplicitIndex {
+    cols: Vec<crate::sql::ast::IndexedColumn>,
+    on_conflict: Option<ConflictResolution>,
+    wr_pk: bool,
+}
+
+fn implicit_constraint_indexes(
+    table: &Table,
     columns: &[crate::sql::ast::ColumnDef],
     constraints: &[crate::sql::ast::TableConstraint],
-    index_rows: &std::collections::HashMap<String, (u32, String)>,
-    catalog: &mut Catalog,
-) {
-    let mut implicit: Vec<Vec<crate::sql::ast::IndexedColumn>> = Vec::new();
-    // Mirror `execute_create`'s collection order EXACTLY (SQLite numbers
-    // autoindexes in textual constraint order): per column, constraints in
-    // declaration order — column-level UNIQUE **and** column-level
-    // PRIMARY KEY that is not the rowid alias — then table-level UNIQUE,
-    // then table-level non-alias PRIMARY KEY.
-    //
-    // The column-level `PrimaryKey` arm is the critical one: a TEXT-PK
-    // (e.g. `user_id uuid_text NOT NULL PRIMARY KEY`) gets an implicit
-    // autoindex at CREATE time; skipping it here meant that after ANY
-    // reopen the table's PK autoindex vanished from the catalog —
-    // breaking `INSERT … ON CONFLICT (pk)` upserts AND, worse, silently
-    // disabling PK uniqueness enforcement for the whole session.
+) -> Vec<ImplicitIndex> {
+    let mut out = Vec::new();
     for (ci, col) in columns.iter().enumerate() {
         let collate = col.constraints.iter().find_map(|c| {
             if let crate::sql::ast::ColumnConstraint::Collate(name) = c {
@@ -17904,23 +17915,31 @@ fn rebuild_implicit_indexes(
         });
         for constraint in &col.constraints {
             match constraint {
-                crate::sql::ast::ColumnConstraint::Unique => {
-                    implicit.push(vec![crate::sql::ast::IndexedColumn {
-                        name: col.name.clone(),
-                        order: crate::sql::ast::Order::Asc,
-                        collation: collate.clone(),
-                        expr: None,
-                    }]);
+                crate::sql::ast::ColumnConstraint::Unique { on_conflict } => {
+                    out.push(ImplicitIndex {
+                        cols: vec![crate::sql::ast::IndexedColumn {
+                            name: col.name.clone(),
+                            order: crate::sql::ast::Order::Asc,
+                            collation: collate.clone(),
+                            expr: None,
+                        }],
+                        on_conflict: *on_conflict,
+                        wr_pk: false,
+                    });
                 }
-                crate::sql::ast::ColumnConstraint::PrimaryKey { order, .. }
-                    if !table.without_rowid && table.rowid_alias != Some(ci) =>
-                {
-                    implicit.push(vec![crate::sql::ast::IndexedColumn {
-                        name: col.name.clone(),
-                        order: *order,
-                        collation: collate.clone(),
-                        expr: None,
-                    }]);
+                crate::sql::ast::ColumnConstraint::PrimaryKey {
+                    order, on_conflict, ..
+                } if table.without_rowid || table.rowid_alias != Some(ci) => {
+                    out.push(ImplicitIndex {
+                        cols: vec![crate::sql::ast::IndexedColumn {
+                            name: col.name.clone(),
+                            order: *order,
+                            collation: collate.clone(),
+                            expr: None,
+                        }],
+                        on_conflict: *on_conflict,
+                        wr_pk: table.without_rowid,
+                    });
                 }
                 _ => {}
             }
@@ -17928,34 +17947,103 @@ fn rebuild_implicit_indexes(
     }
     for c in constraints {
         match c {
-            crate::sql::ast::TableConstraint::Unique(cols) => {
-                implicit.push(cols.clone());
-            }
-            crate::sql::ast::TableConstraint::PrimaryKey { columns: cols } => {
-                let is_rowid_alias = cols.len() == 1
+            crate::sql::ast::TableConstraint::Unique {
+                columns: cols,
+                on_conflict,
+            } => out.push(ImplicitIndex {
+                cols: cols.clone(),
+                on_conflict: *on_conflict,
+                wr_pk: false,
+            }),
+            crate::sql::ast::TableConstraint::PrimaryKey {
+                columns: cols,
+                on_conflict,
+            } => {
+                let is_rowid_alias = !table.without_rowid
+                    && cols.len() == 1
                     && table.rowid_alias.is_some()
                     && columns
                         .iter()
                         .position(|cc| cc.name.eq_ignore_ascii_case(&cols[0].name))
                         .map(|ci| table.rowid_alias == Some(ci))
                         .unwrap_or(false);
-                // WITHOUT ROWID PKs: the table b-tree IS the PK index —
-                // no autoindex row (mirrors execute_create).
-                if !is_rowid_alias && !table.without_rowid {
-                    implicit.push(cols.clone());
+                if !is_rowid_alias {
+                    out.push(ImplicitIndex {
+                        cols: cols.clone(),
+                        on_conflict: *on_conflict,
+                        wr_pk: table.without_rowid,
+                    });
                 }
             }
             _ => {}
         }
     }
-    for (n, cols) in implicit.iter().enumerate() {
-        let idx_name = format!("sqlite_autoindex_{}_{}", table.name, n + 1);
+    out
+}
+
+/// Rebuild the implicit `sqlite_autoindex_<table>_<n>` indexes for one
+/// table during `load_schema`. Their schema rows carry NULL sql (SQLite
+/// stores NULL for auto-indexes), so the TABLE's DDL is the source of
+/// truth: column-level UNIQUE (in column order), then table-level
+/// UNIQUE, then non-rowid-alias PRIMARY KEY — the exact collection order
+/// `execute_create` uses, so the numbering matches. Rows carrying DDL
+/// text (legacy files) are skipped here — the "index" branch parses them.
+#[allow(clippy::too_many_arguments)]
+fn rebuild_implicit_indexes(
+    pager: &Pager,
+    table: &Table,
+    columns: &[crate::sql::ast::ColumnDef],
+    constraints: &[crate::sql::ast::TableConstraint],
+    index_rows: &std::collections::HashMap<String, (u32, String)>,
+    wrpk: Option<(u32, String)>,
+    catalog: &mut Catalog,
+) -> Result<()> {
+    let implicit = implicit_constraint_indexes(table, columns, constraints);
+    // Files written before a WITHOUT ROWID PRIMARY KEY took its textual
+    // number named the other autoindexes as if it did not exist and gave
+    // the PK the number after them. Such a file keeps that layout: its PK
+    // row carries the legacy name (or it has none at all — older still).
+    let pk_pos = implicit.iter().position(|i| i.wr_pk);
+    let legacy = pk_pos.is_some_and(|p| {
+        let textual = format!("sqlite_autoindex_{}_{}", table.name, p + 1);
+        wrpk.as_ref()
+            .map_or(true, |(_, n)| !n.eq_ignore_ascii_case(&textual))
+    });
+    let n_plain = implicit.iter().filter(|i| !i.wr_pk).count();
+    let mut plain_n = 0usize;
+    for (n, imp) in implicit.into_iter().enumerate() {
+        if imp.wr_pk {
+            let pk_cols = crate::schema::without_rowid_pk_columns(table);
+            if !pk_cols.is_empty() {
+                let idx_name = match (&wrpk, legacy) {
+                    (Some((_, name)), _) => name.clone(),
+                    (None, true) => format!("sqlite_autoindex_{}_{}", table.name, n_plain + 1),
+                    (None, false) => format!("sqlite_autoindex_{}_{}", table.name, n + 1),
+                };
+                rebuild_without_rowid_pk_index(
+                    pager,
+                    table,
+                    &pk_cols,
+                    idx_name,
+                    catalog,
+                    wrpk.as_ref().map(|(r, _)| *r),
+                )?;
+            }
+            continue;
+        }
+        plain_n += 1;
+        let idx_name = if legacy {
+            format!("sqlite_autoindex_{}_{}", table.name, plain_n)
+        } else {
+            format!("sqlite_autoindex_{}_{}", table.name, n + 1)
+        };
         let Some((root, sql_text)) = index_rows.get(&idx_name) else {
             continue;
         };
         if !sql_text.is_empty() {
             continue; // legacy row with DDL text — parsed by the index branch
         }
+        let cols = &imp.cols;
         let idx_columns = match crate::schema::build_index_columns(cols, table) {
             Ok(c) => c,
             Err(_) => continue,
@@ -17985,8 +18073,10 @@ fn rebuild_implicit_indexes(
             create_sql: idx_sql,
             origin: crate::schema::IndexOrigin::Autoindex,
             kind: crate::schema::IndexKind::Btree,
+            on_conflict: imp.on_conflict,
         });
     }
+    Ok(())
 }
 
 // Heuristic: does this SQL string start a DDL statement (CREATE/DROP/ALTER)?
