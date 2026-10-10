@@ -18949,7 +18949,24 @@ fn exec_index_nested_loop_join(
 /// (multiSelectCollSeq). Rows equal under the collation are duplicates —
 /// `SELECT DISTINCT b` over a NOCASE column used to keep 'a' AND 'A'.
 fn plan_output_collations(plan: &Plan) -> Vec<Option<String>> {
-    fn scope_tables(plan: &Plan, out: &mut Vec<(String, Arc<Table>)>) {
+    plan_output_collations_defined(plan)
+        .into_iter()
+        .map(|c| c.filter(|c| !c.eq_ignore_ascii_case("BINARY")))
+        .collect()
+}
+
+/// [`plan_output_collations`] before BINARY is folded away: `Some("BINARY")`
+/// is a column that DEFINES the default collation (any table column but
+/// the rowid), `None` an expression defining none. A compound takes the
+/// first arm that defines one (multiSelectCollSeq stops at a non-NULL
+/// sqlite3ExprCollSeq) — `SELECT a … EXCEPT SELECT x COLLATE RTRIM …`
+/// compares BINARY, not RTRIM.
+fn plan_output_collations_defined(plan: &Plan) -> Vec<Option<String>> {
+    fn scope_tables<'p>(
+        plan: &'p Plan,
+        out: &mut Vec<(String, Arc<Table>)>,
+        derived: &mut Vec<&'p Plan>,
+    ) {
         match plan {
             Plan::Scan { table, alias, .. }
             | Plan::RowidLookup { table, alias, .. }
@@ -18969,7 +18986,7 @@ fn plan_output_collations(plan: &Plan) -> Vec<Option<String>> {
                 inner_alias,
                 ..
             } => {
-                scope_tables(outer, out);
+                scope_tables(outer, out, derived);
                 out.push((
                     inner_alias
                         .clone()
@@ -18978,19 +18995,54 @@ fn plan_output_collations(plan: &Plan) -> Vec<Option<String>> {
                 ));
             }
             Plan::Join { left, right, .. } => {
-                scope_tables(left, out);
-                scope_tables(right, out);
+                scope_tables(left, out, derived);
+                scope_tables(right, out, derived);
             }
             Plan::Filter { input, .. }
             | Plan::Sort { input, .. }
             | Plan::Limit { input, .. }
-            | Plan::Window { input, .. } => scope_tables(input, out),
-            // Project / Aggregate / Subquery / compound outputs are new
-            // names — not this scope's table columns.
+            | Plan::Window { input, .. }
+            // A bare column over a GROUP BY is still its table's column
+            // (TK_AGG_COLUMN keeps the column's collation).
+            | Plan::Aggregate { input, .. } => scope_tables(input, out, derived),
+            // A FROM-subquery / view body (or its renaming Project): its
+            // output columns are this scope's derived columns.
+            Plan::Subquery { plan } => derived.push(plan),
+            Plan::Project { .. } => derived.push(plan),
             _ => {}
         }
     }
-    fn declared(e: &Expr, tables: &[(String, Arc<Table>)]) -> Option<String> {
+    /// The position of output column `name` of a derived table's plan.
+    fn derived_position(plan: &Plan, name: &str) -> Option<usize> {
+        match plan {
+            Plan::Distinct { input }
+            | Plan::Sort { input, .. }
+            | Plan::Limit { input, .. }
+            | Plan::Filter { input, .. } => derived_position(input, name),
+            Plan::Union { left, .. } | Plan::Intersect { left, .. } | Plan::Except { left, .. } => {
+                derived_position(left, name)
+            }
+            Plan::Project { columns, .. } => {
+                let hits: Vec<usize> = columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| match (&c.alias, &c.expr) {
+                        (Some(a), _) => {
+                            a.eq_ignore_ascii_case(name)
+                                || a.rsplit_once('.')
+                                    .is_some_and(|(_, n)| n.eq_ignore_ascii_case(name))
+                        }
+                        (None, Expr::Column { name: n, .. }) => n.eq_ignore_ascii_case(name),
+                        _ => false,
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                (hits.len() == 1).then(|| hits[0])
+            }
+            _ => None,
+        }
+    }
+    fn declared(e: &Expr, tables: &[(String, Arc<Table>)], derived: &[&Plan]) -> Option<String> {
         let mut p = e;
         loop {
             match p {
@@ -19008,19 +19060,44 @@ fn plan_output_collations(plan: &Plan) -> Vec<Option<String>> {
                         .filter(|(_, t)| t.find_column(name).is_some())
                         .map(|(_, t)| t)
                         .collect();
+                    // A derived table's column defines its body's collation,
+                    // BINARY when the body defines none (the column's zColl
+                    // is NULL, which sqlite3ExprCollSeq reads as BINARY).
+                    if hits.is_empty() {
+                        let found: Vec<Option<String>> = derived
+                            .iter()
+                            .filter_map(|d| {
+                                let i = derived_position(d, name)?;
+                                Some(plan_output_collations_defined(d).get(i).cloned().flatten())
+                            })
+                            .collect();
+                        return match found.as_slice() {
+                            [c] => Some(c.clone().unwrap_or_else(|| "BINARY".into())),
+                            _ => None,
+                        };
+                    }
                     // Qualified: the named side; bare: unambiguous only.
                     let t = if table.is_some() || hits.len() == 1 {
                         hits.first().copied()?
                     } else {
                         return None;
                     };
-                    return t.find_column(name).map(|i| t.columns[i].collation.clone());
+                    let i = t.find_column(name)?;
+                    // The rowid (an INTEGER PRIMARY KEY) defines none.
+                    if t.rowid_alias == Some(i) {
+                        return None;
+                    }
+                    let c = &t.columns[i].collation;
+                    return Some(if c.is_empty() {
+                        "BINARY".into()
+                    } else {
+                        c.clone()
+                    });
                 }
                 _ => return None,
             }
         }
     }
-    let norm = |c: Option<String>| c.filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("BINARY"));
     match plan {
         Plan::Project { input, columns } => {
             if columns
@@ -19030,24 +19107,25 @@ fn plan_output_collations(plan: &Plan) -> Vec<Option<String>> {
                 return Vec::new(); // star widths: positions not derivable here
             }
             let mut tables = Vec::new();
-            scope_tables(input, &mut tables);
+            let mut derived = Vec::new();
+            scope_tables(input, &mut tables, &mut derived);
             columns
                 .iter()
                 .map(|c| {
-                    norm(crate::executor::expr::explicit_collation(&c.expr))
-                        .or_else(|| norm(declared(&c.expr, &tables)))
+                    crate::executor::expr::explicit_collation(&c.expr)
+                        .or_else(|| declared(&c.expr, &tables, &derived))
                 })
                 .collect()
         }
         Plan::Distinct { input }
         | Plan::Sort { input, .. }
         | Plan::Limit { input, .. }
-        | Plan::Filter { input, .. } => plan_output_collations(input),
+        | Plan::Filter { input, .. } => plan_output_collations_defined(input),
         Plan::Union { left, right, .. }
         | Plan::Intersect { left, right }
         | Plan::Except { left, right } => {
-            let l = plan_output_collations(left);
-            let r = plan_output_collations(right);
+            let l = plan_output_collations_defined(left);
+            let r = plan_output_collations_defined(right);
             (0..l.len().max(r.len()))
                 .map(|i| {
                     l.get(i)
@@ -19104,14 +19182,15 @@ fn exec_distinct(ctx: &mut ExecContext<'_>, input: &Plan) -> Result<ExecResult> 
 
 /// A compound's per-column collations: the left arm's, else the right's.
 fn compound_collations(left: &Plan, right: &Plan) -> Vec<Option<String>> {
-    let l = plan_output_collations(left);
-    let r = plan_output_collations(right);
+    let l = plan_output_collations_defined(left);
+    let r = plan_output_collations_defined(right);
     (0..l.len().max(r.len()))
         .map(|i| {
             l.get(i)
                 .cloned()
                 .flatten()
                 .or_else(|| r.get(i).cloned().flatten())
+                .filter(|c| !c.eq_ignore_ascii_case("BINARY"))
         })
         .collect()
 }

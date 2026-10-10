@@ -3930,6 +3930,8 @@ fn try_index_range(
         let mut end: Option<(Expr, bool)> = None;
         let mut residual: Vec<Expr> = Vec::new();
         let mut matched = false;
+        // (lower bound, optional (upper bound, inclusive)) of the BLOB pass.
+        let mut like_blob: Option<(Vec<u8>, Option<BlobBound>)> = None;
 
         for conjunct in conjuncts {
             let bare_col =
@@ -3998,6 +4000,23 @@ fn try_index_range(
                         && like_prefix_is_sound(table, first_col, &prefix, glob)
                     {
                         matched = true;
+                        // The BLOB twin of the range (see below), with
+                        // SQLite's bytes: a case-insensitive LIKE spans
+                        // UPPER(prefix) .. successor(lower(prefix)) (its
+                        // exprAnalyze bounds), GLOB the prefix itself.
+                        let (lo, hi) = if glob {
+                            (prefix.clone(), prefix.clone())
+                        } else {
+                            (prefix.to_ascii_uppercase(), prefix.to_ascii_lowercase())
+                        };
+                        like_blob = Some((
+                            lo.into_bytes(),
+                            if exact {
+                                Some((hi.into_bytes(), true))
+                            } else {
+                                prefix_successor(&hi).map(|s| (s.into_bytes(), false))
+                            },
+                        ));
                         start = Some((Expr::Literal(Value::Text(prefix.clone().into())), true));
                         if exact {
                             end = Some((Expr::Literal(Value::Text(prefix.into())), true));
@@ -4021,14 +4040,37 @@ fn try_index_range(
         } else {
             Some(combine_and(&residual))
         };
-        return Some(Plan::IndexRange {
+        let range = Plan::IndexRange {
             table: table.clone(),
             alias: alias.clone(),
             index: index.clone(),
             start,
             end,
-            residual: residual_opt,
-        });
+            residual: residual_opt.clone(),
+        };
+        // LIKE / GLOB on a BLOB compares its bytes as text, and BLOB keys
+        // sort AFTER every TEXT key: the text range alone misses a blob
+        // whose bytes carry the prefix (`x'3132' LIKE '1%'`). SQLite's
+        // LIKE optimization runs its range loop twice, the second time
+        // with the bounds as BLOBs (iLikeRepCntr) — here a second range
+        // over the same bytes, concatenated (a row is text or blob, never
+        // both; the residual re-checks every candidate).
+        if let Some((lo, hi)) = like_blob {
+            let blob_range = Plan::IndexRange {
+                table: table.clone(),
+                alias: alias.clone(),
+                index: index.clone(),
+                start: Some((Expr::Literal(Value::Blob(lo)), true)),
+                end: hi.map(|(b, inclusive)| (Expr::Literal(Value::Blob(b)), inclusive)),
+                residual: residual_opt,
+            };
+            return Some(Plan::Union {
+                left: Box::new(range),
+                right: Box::new(blob_range),
+                all: true,
+            });
+        }
+        return Some(range);
     }
     None
 }
@@ -4859,13 +4901,68 @@ fn split_constant_where(s: &SimpleSelect) -> Option<(SimpleSelect, Vec<Expr>)> {
     } else {
         split(&s.having)
     };
+    // An INNER join's ON terms join the WHERE (sqlite3ProcessJoin appends
+    // them in FROM order), so its constant ones are evaluated before the
+    // loop too — unless a RIGHT / FULL join is present (sqlite3WhereBegin's
+    // condition 3: JT_LTORJ keeps EP_InnerON terms in the loop). A LEFT
+    // join's ON terms belong to its inner table and stay.
+    let mut from = s.from.clone();
+    if let Some(f) = from.as_mut() {
+        if !has_right_or_full_join(f) {
+            split_inner_on_constants(f, &mut split);
+        }
+    }
     if !changed {
         return None;
     }
     let mut out = s.clone();
     out.where_clause = where_clause;
     out.having = having;
+    out.from = from;
     Some((out, consts))
+}
+
+/// An index-range bound as BLOB bytes: (bytes, inclusive).
+type BlobBound = (Vec<u8>, bool);
+
+fn has_right_or_full_join(t: &TableExpression) -> bool {
+    match t {
+        TableExpression::Join {
+            left,
+            right,
+            join_type,
+            ..
+        } => {
+            matches!(join_type, JoinType::Right | JoinType::Full)
+                || has_right_or_full_join(left)
+                || has_right_or_full_join(right)
+        }
+        _ => false,
+    }
+}
+
+/// Run `split` over the ON clause of every INNER / CROSS join on the
+/// left-deep FROM spine, leftmost first, replacing each with its
+/// non-constant rest (`ON 1` when nothing is left).
+fn split_inner_on_constants(
+    t: &mut TableExpression,
+    split: &mut impl FnMut(&Option<Expr>) -> Option<Expr>,
+) {
+    if let TableExpression::Join {
+        left,
+        join_type,
+        constraint,
+        ..
+    } = t
+    {
+        split_inner_on_constants(left, split);
+        if matches!(join_type, JoinType::Inner | JoinType::Cross) {
+            if let JoinConstraint::On(on) = constraint {
+                let rest = split(&Some(on.clone()));
+                *on = rest.unwrap_or(Expr::Literal(Value::Integer(1)));
+            }
+        }
+    }
 }
 
 /// The first column reference in `e` outside any subquery (subqueries
