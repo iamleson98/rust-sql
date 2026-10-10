@@ -3092,7 +3092,9 @@ pub fn extract_eq_predicate(predicate: &Expr) -> Option<(String, Expr)> {
 struct IdxCandidate {
     index: std::sync::Arc<crate::schema::Index>,
     key_exprs: Vec<Expr>,
-    bound_cols: Vec<String>,
+    /// Positions (in the conjunct list) of the conjuncts consumed as
+    /// index keys — exactly these leave the residual.
+    consumed: Vec<usize>,
     covered: usize,
     /// Estimated matching rows; `None` when no statistics exist for the
     /// index (the pre-ANALYZE behavior: rank by covered prefix only).
@@ -3447,7 +3449,7 @@ fn apply_where_for_scan_inner(catalog: &Catalog, plan: Plan, predicate: &Expr) -
         // when no compound prefix covers more. (The executor's
         // IndexLookup already builds multi-column order keys.)
         let mut best: Option<IdxCandidate> = None;
-        for conjunct in &conjuncts {
+        for (first_pos, conjunct) in conjuncts.iter().enumerate() {
             let Some((col_name, value_expr)) = extract_eq_predicate(conjunct) else {
                 continue;
             };
@@ -3479,11 +3481,11 @@ fn apply_where_for_scan_inner(catalog: &Catalog, plan: Plan, predicate: &Expr) -
                 // Bind index prefix columns 1.. from OTHER equality
                 // conjuncts, in INDEX column order.
                 let mut key_exprs = vec![value_expr.clone()];
-                let mut bound_cols = vec![first_col.name.to_ascii_lowercase()];
+                let mut consumed = vec![first_pos];
                 for ci in 1..index.columns.len() {
                     let want = &index.columns[ci];
-                    let hit = conjuncts.iter().find_map(|oc| {
-                        if exprs_equal_conjunct(oc, conjunct) {
+                    let hit = conjuncts.iter().enumerate().find_map(|(op, oc)| {
+                        if consumed.contains(&op) {
                             return None;
                         }
                         let (cn, ve) = extract_eq_predicate(oc)?;
@@ -3495,12 +3497,13 @@ fn apply_where_for_scan_inner(catalog: &Catalog, plan: Plan, predicate: &Expr) -
                         if !index_affinity_ok(table, &want.name, &ve) {
                             return None;
                         }
-                        cn.eq_ignore_ascii_case(&want.name).then_some(ve.clone())
+                        cn.eq_ignore_ascii_case(&want.name)
+                            .then(|| (op, ve.clone()))
                     });
                     match hit {
-                        Some(ve) => {
+                        Some((op, ve)) => {
                             key_exprs.push(ve);
-                            bound_cols.push(want.name.to_ascii_lowercase());
+                            consumed.push(op);
                         }
                         None => break,
                     }
@@ -3530,7 +3533,7 @@ fn apply_where_for_scan_inner(catalog: &Catalog, plan: Plan, predicate: &Expr) -
                     best = Some(IdxCandidate {
                         index: index.clone(),
                         key_exprs,
-                        bound_cols,
+                        consumed,
                         covered,
                         est_rows,
                     });
@@ -3540,7 +3543,7 @@ fn apply_where_for_scan_inner(catalog: &Catalog, plan: Plan, predicate: &Expr) -
         if let Some(IdxCandidate {
             index,
             key_exprs,
-            bound_cols,
+            consumed,
             est_rows,
             ..
         }) = best
@@ -3562,17 +3565,15 @@ fn apply_where_for_scan_inner(catalog: &Catalog, plan: Plan, predicate: &Expr) -
                 None => false,
             };
             if !unselective {
-                // Residual: conjuncts NOT consumed as index keys (an
-                // equality conjunct whose column is a bound prefix column was
-                // consumed; everything else survives as a Filter).
+                // Residual: every conjunct NOT consumed as an index key.
+                // A second equality on a bound column (`g = 0.0 AND g = 5`)
+                // is NOT consumed — it used to be dropped with the key's
+                // column (the lookup on g = 0.0 returned the g = 0 rows).
                 let other_conjuncts: Vec<Expr> = conjuncts
                     .iter()
-                    .filter(|c| {
-                        extract_eq_predicate(c)
-                            .map(|(cn, _)| !bound_cols.contains(&cn.to_ascii_lowercase()))
-                            .unwrap_or(true)
-                    })
-                    .cloned()
+                    .enumerate()
+                    .filter(|(i, _)| !consumed.contains(i))
+                    .map(|(_, c)| c.clone())
                     .collect();
                 let lookup = Plan::IndexLookup {
                     table: table.clone(),
