@@ -7,13 +7,19 @@ on:
   pull_request:
     branches: [master]
   workflow_dispatch:
+  # Nightly: the full matrix plus the 100M-row marathons (40-70 min per
+  # OS — too long to ride every push, where each push cancelled the
+  # previous marathon before it could finish).
+  schedule:
+    - cron: "17 3 * * *"
 
 # Group name carries a generation suffix so a zombie run stuck in `queued`
 # (e.g. waiting for a self-hosted runner that no longer exists) can never
 # starve fresh runs: bump -v2 to -v3 etc. to move all future runs into a
 # clean group. cancel-in-progress still supersedes RUNNING older runs.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-v3
+  # The nightly run has its own group: a push must not cancel it.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'schedule' && 'nightly' || 'v3' }}
   cancel-in-progress: true
 
 permissions:
@@ -552,12 +558,13 @@ jobs:
   # reset mid-statement). M9 runs the SAME capped statement on BOTH
   # engines, so the ratio table stays apples-to-apples.
   #
-  # ci-ok deliberately does NOT wait on this job (a 1-3h marathon must
-  # not delay the fast verdict); the per-push verdict for the 100M
-  # contract is this job's own status.
+  # ci-ok deliberately does NOT wait on this job (a 40-70 min marathon
+  # must not delay the fast verdict). It runs NIGHTLY (and on manual
+  # dispatch): on every push it was cancelled by the next push before it
+  # could finish. Its own status is the verdict for the 100M contract.
   mega-scale-100m:
-    name: mega-scale-100m (${{ matrix.os }}, lean, push, vs-sqlite)
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    name: mega-scale-100m (${{ matrix.os }}, lean, nightly, vs-sqlite)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
@@ -604,9 +611,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout }}
     # Job-level concurrency (supersedes the workflow-level group for this
-    # job): a new push cancels the in-flight 100M marathon — the verdict
-    # always belongs to the newest commit, and a burst of pushes must not
-    # queue hours of stale marathons.
+    # job): a newer nightly / dispatched run cancels an in-flight 100M
+    # marathon — the verdict belongs to the newest commit.
     concurrency:
       # Per-OS groups: the three matrix entries must not cancel each
       # other (a shared group lets them contend — only one survives).
