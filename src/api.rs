@@ -5539,6 +5539,9 @@ impl Database {
                 eprintln!("stmt-undo replay failed after fast-insert error: {undo_err}");
             }
         }
+        if result.is_err() {
+            ctx.forget_max_rowids();
+        }
 
         // ── AUTO-COMMIT FAILURE RESTORE (page level) — MUST run BEFORE the
         // map-merge epilogue below. The merge keeps a failed statement's
@@ -7269,6 +7272,9 @@ impl Database {
                 // undoes) — loud on purpose.
                 eprintln!("stmt-undo replay failed after statement error: {undo_err}");
             }
+        }
+        if result.is_err() && !keep_partial {
+            ctx.forget_max_rowids();
         }
         if keep_partial && !ctx.in_transaction && !ctx.deferred_flush {
             if let Err(e) = self.pager.flush() {

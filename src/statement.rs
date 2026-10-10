@@ -1218,6 +1218,9 @@ impl<'a> Statement<'a> {
                 eprintln!("stmt-undo replay failed after a stepped statement's error: {e}");
             }
         }
+        if out.is_err() && !keep_partial {
+            ctx.forget_max_rowids();
+        }
         if keep_partial && !ctx.in_transaction && !ctx.deferred_flush {
             if let Err(e) = db.pager.flush() {
                 eprintln!("commit of a FAIL statement's changes failed: {e}");

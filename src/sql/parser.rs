@@ -1958,8 +1958,9 @@ impl Parser {
                 None
             };
             self.expect_punct('(')?;
-            let select = self.parse_select()?;
+            let mut select = self.parse_select()?;
             self.expect_punct(')')?;
+            alias_rowid_terms(&mut select.body);
             ctes.push(Cte {
                 name,
                 columns,
@@ -2449,6 +2450,8 @@ impl Parser {
                 } else {
                     None
                 };
+                let mut select = select;
+                alias_rowid_terms(&mut select.body);
                 return Ok(TableExpression::Subquery {
                     select: Box::new(select),
                     alias,
@@ -4270,6 +4273,35 @@ fn is_null_expr(left: Expr, negated: bool) -> Expr {
     Expr::IsNull {
         expr: Box::new(left),
         negated,
+    }
+}
+
+/// SQLite names a FROM-subquery's and a CTE's columns from the UNRESOLVED
+/// result terms (sqlite3ColumnsFromExprList runs while the body is being
+/// expanded, before its names resolve): an unaliased `rowid` / `oid` /
+/// `_rowid_` keeps its spelling as the column name, where the resolved
+/// display name follows an INTEGER PRIMARY KEY (`SELECT rowid FROM t`
+/// shows `id`). The explicit alias lets the outer query's `rowid` find
+/// that column — it read the derived table's own (absent) rowid: NULL.
+/// Views name their columns after resolution and keep the display names
+/// (`SELECT rowid FROM v` over `SELECT rowid, ...` is "no such column").
+/// A compound's names come from its leftmost arm.
+fn alias_rowid_terms(body: &mut SelectBody) {
+    match body {
+        SelectBody::Simple(s) => {
+            for c in s.columns.iter_mut() {
+                if let ResultColumn::Expr {
+                    expr: Expr::Column { name, .. },
+                    alias,
+                } = c
+                {
+                    if alias.is_none() && crate::planner::is_rowid_spelling(name) {
+                        *alias = Some(name.clone());
+                    }
+                }
+            }
+        }
+        SelectBody::Binary { left, .. } => alias_rowid_terms(left),
     }
 }
 

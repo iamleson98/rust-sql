@@ -1728,6 +1728,27 @@ impl<'a> ExecContext<'a> {
     /// the same transaction would otherwise reuse `target`), but a missing
     /// entry must stay missing — typically it is missing precisely because
     /// the move's own delete-of-max just invalidated it.
+    /// A failed statement's rows were undone: a max it computed may now be
+    /// BELOW a restored row (it deleted the max holder, rescanned the
+    /// tree, then the undo put the row back), and the next allocation
+    /// would reuse that rowid — a duplicate (stateful seed 293293). Every
+    /// entry the statement wrote becomes an invalidation instead: the next
+    /// allocation rescans the tree. (Raises it made in place in the shared
+    /// map only ever overshoot the true max, which leaves gaps, not
+    /// collisions.)
+    pub fn forget_max_rowids(&mut self) {
+        if self.max_rowids.is_empty() {
+            return;
+        }
+        let keys: Vec<String> = self.max_rowids.drain().map(|(k, _)| k).collect();
+        for k in keys {
+            if !self.max_rowids_invalidated.contains(&k) {
+                self.max_rowids_invalidated.push(k);
+            }
+        }
+        self.max_rowids_changed = true;
+    }
+
     pub fn raise_max_rowid_lc(&mut self, table_name_lc: &str, rowid: i64) {
         // An entry exists (local overlay or shared): a pure monotonic
         // raise. The local overlay is updated in place; a shared entry

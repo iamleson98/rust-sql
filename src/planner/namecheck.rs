@@ -313,6 +313,71 @@ fn view_output_names(ctx: &Ctx<'_>, v: &crate::schema::View) -> Option<Vec<Strin
     DEPTH.with(|d| d.set(d.get() + 1));
     let names = subquery_output_names(ctx, &v.select);
     DEPTH.with(|d| d.set(d.get() - 1));
+    names.map(|n| resolved_rowid_view_names(ctx, &v.select, n))
+}
+
+/// A view names its columns AFTER resolving its body (SQLite's
+/// sqlite3ResultSetOfSelect), so an unaliased rowid term over a table
+/// with an INTEGER PRIMARY KEY is named after that column (`id`) — the
+/// view has no `rowid` column, and `SELECT rowid FROM v` is "no such
+/// column" (it read NULLs here). A FROM-subquery keeps the spelling
+/// instead (see the parser's `alias_rowid_terms`). Applied when the
+/// leftmost arm has no star and the term's table is identifiable (its
+/// qualifier, or the single table of the FROM clause).
+fn resolved_rowid_view_names(
+    ctx: &Ctx<'_>,
+    stmt: &SelectStatement,
+    mut names: Vec<String>,
+) -> Vec<String> {
+    let mut body = &stmt.body;
+    let s = loop {
+        match body {
+            SelectBody::Simple(s) => break s,
+            SelectBody::Binary { left, .. } => body = left,
+        }
+    };
+    if s.columns.len() != names.len() {
+        return names;
+    }
+    let single = match &s.from {
+        Some(TableExpression::Table { name, alias, .. }) => Some((name, alias)),
+        _ => None,
+    };
+    for (i, c) in s.columns.iter().enumerate() {
+        let ResultColumn::Expr {
+            expr: Expr::Column { table, name },
+            alias: None,
+        } = c
+        else {
+            continue;
+        };
+        if !Source::is_rowid_spelling(name) {
+            continue;
+        }
+        let tname = match (table, single) {
+            (Some(q), Some((tn, al))) => {
+                if al.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(q))
+                    || tn.eq_ignore_ascii_case(q)
+                {
+                    Some(tn.clone())
+                } else {
+                    Some(q.clone())
+                }
+            }
+            (Some(q), None) => Some(q.clone()),
+            (None, Some((tn, _))) => Some(tn.clone()),
+            (None, None) => None,
+        };
+        let Some(t) = tname.and_then(|t| ctx.catalog.get_table(&t)) else {
+            continue;
+        };
+        if t.find_column(name).is_some() {
+            continue; // a real column named rowid
+        }
+        if let Some(a) = t.rowid_alias {
+            names[i] = t.columns[a].name.clone();
+        }
+    }
     names
 }
 
