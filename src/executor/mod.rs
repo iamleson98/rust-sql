@@ -2518,7 +2518,7 @@ pub(crate) fn eval_row_where(
     named_params: &HashMap<String, Value>,
 ) -> Result<bool> {
     let ctx = EvalContext::new(row, col_names, params, named_params);
-    evaluate_where(expr, &ctx)
+    crate::executor::expr::evaluate_where_terms(expr, &ctx)
 }
 
 /// `eval_row_where` with the table's column-affinity map attached — the
@@ -2536,7 +2536,7 @@ pub(crate) fn eval_row_aff_where(
 ) -> Result<bool> {
     let ctx =
         EvalContext::new(row, col_names, params, named_params).with_affinities(Some(affinities));
-    evaluate_where(expr, &ctx)
+    crate::executor::expr::evaluate_where_terms(expr, &ctx)
 }
 
 /// Crate-public wrapper around `eval_row` — used by api.rs for VALUE
@@ -22461,7 +22461,7 @@ pub(crate) fn rowid_seek_value(v: &Value) -> Option<i64> {
         Value::Integer(i) => Some(*i),
         Value::Null => None,
         Value::Real(f) => real_int_key(*f),
-        Value::Text(t) => text_int_key(t.trim()),
+        Value::Text(t) => text_int_key(t),
         Value::Blob(_) => None,
     }
 }
@@ -22479,7 +22479,10 @@ pub(crate) fn numeric_rowid_key(v: &Value) -> Option<i64> {
     }
     let f = match v {
         Value::Real(f) => *f,
-        Value::Text(t) => t.trim().parse::<f64>().ok()?,
+        Value::Text(t) => match crate::types::numeric::atof(t.as_bytes()) {
+            (f, rc) if rc > 0 => f,
+            _ => return None,
+        },
         _ => return None,
     };
     (f == -9_223_372_036_854_775_808.0).then_some(i64::MIN)
@@ -22515,31 +22518,21 @@ pub(crate) fn real_int_key(r: f64) -> Option<i64> {
     }
 }
 
-/// sqlite3RealSameAsInt (util.c): the tighter 2^51 bit-identical check
-/// from applyNumericAffinity's alsoAnInt arm (used for TEXT operands —
-/// the ±0.0 special case covers the sign of zero).
-fn real_same_as_int(r: f64, i: i64) -> bool {
-    r == 0.0 || (r == i as f64 && (-(1i64 << 51)..(1i64 << 51)).contains(&i))
-}
-
 /// TEXT → rowid key under applyNumericAffinity(bTryForInt = 1) — the
 /// conversion for rowid EQUALITY seeks and rowid INSERT assignment:
 /// a full integer parse (Atoi64 == 0) first, else a full numeric parse
 /// with the RealSameAsInt squeeze, else the IntegerAffinity #3922 gate.
-fn text_int_key(trimmed: &str) -> Option<i64> {
-    if let Ok(i) = trimmed.parse::<i64>() {
-        return Some(i);
+///
+/// SQLite's own parse (`types::numeric`, a port of applyNumericAffinity):
+/// its whitespace set, and an embedded NUL ending the text (`'1' ||
+/// x'0041'` seeks rowid 1 — a Rust parse refused it, so `id = …` and
+/// `id IN (…)` matched nothing where SQLite matches; strict-fuzz seed
+/// 709220). A REAL result never seeks (OP_SeekRowid wants MEM_Int).
+fn text_int_key(text: &str) -> Option<i64> {
+    match crate::types::numeric::apply_numeric_affinity(text.as_bytes())? {
+        crate::types::numeric::NumericAffinity::Integer(i) => Some(i),
+        crate::types::numeric::NumericAffinity::Real(_) => None,
     }
-    if let Ok(f) = trimmed.parse::<f64>() {
-        if f.is_finite() {
-            let ix = real_to_i64(f);
-            if real_same_as_int(f, ix) {
-                return Some(ix);
-            }
-            return real_int_key(f);
-        }
-    }
-    None
 }
 
 /// OP_MustBeInt semantics (vdbe.c) for an explicitly assigned rowid
@@ -22553,7 +22546,7 @@ fn rowid_from_value(v: &Value) -> Result<Option<i64>> {
         Value::Integer(r) => Ok(Some(*r)),
         Value::Null => Ok(None),
         Value::Real(f) => real_int_key(*f).map(Some).ok_or_else(mismatch),
-        Value::Text(t) => text_int_key(t.trim()).map(Some).ok_or_else(mismatch),
+        Value::Text(t) => text_int_key(t).map(Some).ok_or_else(mismatch),
         Value::Blob(_) => Err(mismatch()),
     }
 }
@@ -22639,21 +22632,21 @@ pub(crate) fn rowid_range_bound(v: &Value, lower: bool) -> RowidRangeBound {
                 }
             }
         }
-        Value::Text(t) => {
-            // INTEGER affinity applied to a TEXT operand: numeric text
-            // converts ('5' == rowid 5, leading/trailing spaces trimmed);
-            // anything else stays TEXT, and INTEGER < TEXT is constant.
-            let trimmed = t.trim();
-            if trimmed.is_empty() {
-                return unbounded_side(lower);
+        Value::Text(_) => {
+            // INTEGER affinity applied to a TEXT operand — the comparison
+            // path's own conversion (numeric text converts, surrounding
+            // spaces trimmed, an embedded NUL ends the text as in
+            // SQLite's sqlite3AtoF); anything else stays TEXT, and
+            // INTEGER < TEXT is constant. A Rust parse here refused
+            // `'-81' || x'00…'`, so `id <= …` matched every row where the
+            // column comparison (and SQLite) saw -81 (strict-fuzz seed
+            // 709220).
+            match crate::executor::expr::apply_operand_affinity(crate::types::Affinity::Integer, v)
+            {
+                Value::Integer(i) => RowidRangeBound::Val(i),
+                Value::Real(f) => rowid_range_bound(&Value::Real(f), lower),
+                _ => unbounded_side(lower),
             }
-            if let Ok(i) = trimmed.parse::<i64>() {
-                return RowidRangeBound::Val(i);
-            }
-            if let Ok(f) = trimmed.parse::<f64>() {
-                return rowid_range_bound(&Value::Real(f), lower);
-            }
-            unbounded_side(lower)
         }
         Value::Blob(_) => unbounded_side(lower),
     }

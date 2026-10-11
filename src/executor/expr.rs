@@ -1027,6 +1027,17 @@ fn simplified_and_or(e: &Expr) -> &Expr {
 /// EP_Subquery: does the expression tree hold a subquery anywhere? A
 /// non-allocating walk (the evaluator asks per operand, per row).
 pub(crate) fn contains_subquery(e: &Expr) -> bool {
+    subquery_in(e, true)
+}
+
+/// A subquery still to run per row (a correlated one): the materialized
+/// carriers of uncorrelated subqueries do not count.
+pub(crate) fn contains_live_subquery(e: &Expr) -> bool {
+    subquery_in(e, false)
+}
+
+fn subquery_in(e: &Expr, markers: bool) -> bool {
+    let contains_subquery = |x: &Expr| subquery_in(x, markers);
     match e {
         Expr::Subquery(_) | Expr::Exists(_) => true,
         Expr::In { expr, source, .. } => {
@@ -1043,7 +1054,7 @@ pub(crate) fn contains_subquery(e: &Expr) -> bool {
                 || type_name.starts_with(AFF_MARKER)
                 || type_name.starts_with(IN_RHS_MARKER) =>
         {
-            true
+            markers
         }
         Expr::Unary { expr, .. }
         | Expr::IsNull { expr, .. }
@@ -1107,6 +1118,62 @@ fn and_or_order<'a>(left: &'a Expr, right: &'a Expr) -> (&'a Expr, &'a Expr) {
 /// operands instead.
 pub fn evaluate_where(expr: &Expr, ctx: &EvalContext<'_>) -> Result<bool> {
     Ok(!cond_if_false(expr, ctx, true)?)
+}
+
+/// A whole WHERE clause (ON terms folded in): SQLite splits it into its
+/// top-level AND terms (whereSplit) and codes each as its own
+/// jump-if-false-or-NULL, in order — the right-operand-first rule of an
+/// AND *expression* (`and_or_order`) does not reorder the terms, and a
+/// term holding a correlated subquery is coded after the others
+/// (codeOneLoopStart's last pass). So in `(x IN (SELECT …)) != 11 AND
+/// abs(a)`, a NULL first term rejects the row before `abs` runs (the
+/// expression rule ran `abs(i64::MIN)` first and raised; strict-fuzz seed
+/// 745212).
+pub fn evaluate_where_terms(expr: &Expr, ctx: &EvalContext<'_>) -> Result<bool> {
+    // The split is of the RAW clause: `(A AND B) OR 0` is one term, which
+    // only its own coding simplifies (to `A AND B`, right operand first).
+    if !matches!(
+        expr,
+        Expr::Binary {
+            op: BinaryOp::And,
+            ..
+        }
+    ) {
+        return evaluate_where(expr, ctx);
+    }
+    fn split<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+        match e {
+            Expr::Binary {
+                op: BinaryOp::And,
+                left,
+                right,
+            } => {
+                split(left, out);
+                split(right, out);
+            }
+            other => out.push(other),
+        }
+    }
+    let mut terms: Vec<&Expr> = Vec::new();
+    split(expr, &mut terms);
+    // sqlite3ExprAnd's parse-time fold: an always-false operand (a 32-bit
+    // integer literal 0 or FALSE) makes the whole AND chain `0`.
+    if terms.iter().any(|t| {
+        crate::planner::fold::is_truth_literal(t) && matches!(t, Expr::Literal(Value::Integer(0)))
+    }) {
+        return Ok(false);
+    }
+    for live_pass in [false, true] {
+        for t in &terms {
+            if contains_live_subquery(t) != live_pass {
+                continue;
+            }
+            if cond_if_false(t, ctx, true)? {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// A CHECK constraint: it fails only on FALSE — NULL passes
