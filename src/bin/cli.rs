@@ -114,6 +114,17 @@ fn print_cli_help() {
 }
 
 fn main() {
+    // A closed stdout pipe (`| grep -q`, `| head`, …) must end this
+    // process the Unix way — killed by SIGPIPE — not panic through
+    // println!'s error path: Rust installs SIG_IGN for SIGPIPE at
+    // startup, so a write to a closed pipe returns EPIPE and every
+    // println! turns it into a panic + backtrace spew (CI's
+    // interop_cli.sh flaked exactly there: grep -q matched, exited,
+    // and the CLI's next print panicked with "failed printing to
+    // stdout: Broken pipe"). Restore the default disposition.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let args: Vec<String> = env::args().collect();
     let mut path: Option<String> = None;
     let mut connect: Option<String> = None;

@@ -73,8 +73,26 @@ CREATE INDEX idx_name ON t(name);
 EOF
 [ -s "$DB_A" ] || fail "sqlite3 did not create the file"
 
-printf "SELECT name FROM t WHERE id = 2;\n.quit\n" | "$CLI" "$DB_A" | grep -q "bob" \
-    || fail "engine could not read sqlite3-created data"
+# All stdout checks capture FIRST and match the captured text: a
+# `| grep -q` reader exits on its first match and closes the pipe, and
+# whether the writer still has a pending print then is a scheduling race
+# (run 38130189612's ubuntu interop flaked exactly there — the CLI hit
+# EPIPE and the pipeline failed under pipefail although the data was
+# correct). A `case` over the captured text checks without any early
+# exit, and the capture's own status is checked explicitly (the script
+# has no `set -e`).
+check_out() {
+    # check_out <needle> <description> <exit-status> <output>
+    local needle="$1" desc="$2" rc="$3" out="$4"
+    [ "$rc" -eq 0 ] || fail "$desc (producer exit $rc, output: $out)"
+    case "$out" in
+        *"$needle"*) ;;
+        *) fail "$desc (output: $out)" ;;
+    esac
+}
+
+out="$(printf "SELECT name FROM t WHERE id = 2;\n.quit\n" | "$CLI" "$DB_A")"
+check_out "bob" "engine could not read sqlite3-created data" "$?" "$out"
 
 # The engine's writes ADOPT the path into the native container; the
 # interchange export puts the committed state back into real SQLite
@@ -87,8 +105,8 @@ printf "INSERT INTO t VALUES (4, 'dave', 4.5);\nDELETE FROM t WHERE id = 1;\n.qu
     || fail "engine sqlite-format export failed"
 mv "$DB_A.export" "$DB_A"
 
-"$SQLITE3" "$DB_A" "SELECT count(*) FROM t;" | grep -q 3 \
-    || fail "sqlite3 cannot see the engine's writes"
+out="$("$SQLITE3" "$DB_A" "SELECT count(*) FROM t;")"
+check_out 3 "sqlite3 cannot see the engine's writes" "$?" "$out"
 IC_A="$("$SQLITE3" "$DB_A" "PRAGMA integrity_check;")"
 [ "$IC_A" = "ok" ] || fail "integrity_check after engine writes: $IC_A"
 
@@ -100,8 +118,8 @@ printf "CREATE TABLE u(a INTEGER PRIMARY KEY, b TEXT UNIQUE, c BLOB);\nBEGIN;\nI
     || fail "engine sqlite-format export failed"
 [ -s "$DB_B_EXPORT" ] || fail "engine did not write the sqlite-format export"
 
-"$SQLITE3" "$DB_B_EXPORT" "SELECT a, b FROM u ORDER BY a;" | tr '\n' ' ' | grep -q "1|x 2|y" \
-    || fail "sqlite3 cannot read engine-created file"
+out="$("$SQLITE3" "$DB_B_EXPORT" "SELECT a, b FROM u ORDER BY a;" | tr '\n' ' ')"
+check_out "1|x 2|y" "sqlite3 cannot read engine-created file" "$?" "$out"
 IC_B="$("$SQLITE3" "$DB_B_EXPORT" "PRAGMA integrity_check;")"
 [ "$IC_B" = "ok" ] || fail "integrity_check on engine-created file: $IC_B"
 # UNIQUE constraint still enforced by SQLite itself on the engine's file.
@@ -110,7 +128,7 @@ if "$SQLITE3" "$DB_B_EXPORT" "INSERT INTO u(b) VALUES ('x');" 2>/dev/null; then
 fi
 
 echo "== 3. engine re-reads its own file =="
-printf "SELECT count(*) FROM u;\n.quit\n" | "$CLI" "$DB_B" | grep -q 2 \
-    || fail "engine cannot reopen its own file"
+out="$(printf "SELECT count(*) FROM u;\n.quit\n" | "$CLI" "$DB_B")"
+check_out 2 "engine cannot reopen its own file" "$?" "$out"
 
 echo "PASS: CLI-level SQLite interop verified in both directions."
