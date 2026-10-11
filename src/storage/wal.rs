@@ -911,7 +911,15 @@ impl Wal {
         // WRITTEN frame after the loop (its checksum recomputed — the
         // commit byte participates in it), so a batch that skips its
         // tail entries can never land marker-less.
-        let mut out: Vec<u8> = Vec::with_capacity(pages.len() * frame_size);
+        // CHUNKED: frames go to the file 64 at a time as they are
+        // assembled; the most recent frame always stays buffered, so the
+        // commit-marker fixup below still patches it in memory. One
+        // buffer for the whole batch cost the commit's dirty-page volume
+        // in transient RSS (a full 512-page cache: +2 MB per commit,
+        // torture S14 / S17).
+        const CHUNK_FRAMES: usize = 64;
+        let mut out: Vec<u8> = Vec::with_capacity(pages.len().min(CHUNK_FRAMES + 1) * frame_size);
+        let mut flushed_frames: usize = 0;
         out_offsets.reserve(pages.len());
         let (mut c1, mut c2) = self.checksum;
         let start = self.n_frames;
@@ -926,6 +934,21 @@ impl Wal {
         let mut last_page_id: PageId = 0;
         for (page_id, page_ref) in pages {
             let page_id = *page_id;
+            // Flush every buffered frame but the last before adding one
+            // more (the last may still become the commit frame).
+            if out.len() >= (CHUNK_FRAMES + 1) * frame_size {
+                let keep_from = out.len() - frame_size;
+                if flushed_frames == 0 {
+                    self.file.seek(SeekFrom::Start(start_offset))?;
+                }
+                self.file.write_all(&out[..keep_from])?;
+                flushed_frames += keep_from / frame_size;
+                out.copy_within(keep_from.., 0);
+                out.truncate(frame_size);
+                if last_hdr_at.is_some() {
+                    last_hdr_at = Some(0);
+                }
+            }
             let hdr_at = out.len();
             out.resize(hdr_at + frame_size, 0);
             {
@@ -971,7 +994,7 @@ impl Wal {
                 start_offset + out_offsets.len() as u64 * frame_size as u64,
             ));
         }
-        if out.is_empty() {
+        if out.is_empty() && flushed_frames == 0 {
             return Ok(());
         }
         // COMMIT-MARKER FIXUP: the last WRITTEN frame carries the
@@ -1000,8 +1023,10 @@ impl Wal {
             out[hdr_at..hdr_at + FRAME_HEADER_SIZE as usize].copy_from_slice(&fh);
         }
         self.checksum = (c1, c2);
-        self.n_frames += (out.len() / frame_size) as u32;
-        self.file.seek(SeekFrom::Start(start_offset))?;
+        self.n_frames += (flushed_frames + out.len() / frame_size) as u32;
+        if flushed_frames == 0 {
+            self.file.seek(SeekFrom::Start(start_offset))?;
+        }
         self.file.write_all(&out)?;
         Ok(())
     }

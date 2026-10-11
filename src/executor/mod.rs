@@ -29788,6 +29788,47 @@ fn delete_fk_work(ctx: &ExecContext<'_>, table: &Table) -> bool {
             }))
 }
 
+/// Delete every row with rowid in `[lo, hi]` (except `skip`) in bounded
+/// batches: walk up to `BATCH` rowids, delete them in table order (one
+/// sticky leaf), resume past the last. Returns the rows deleted.
+fn delete_rowid_range_batched(
+    ctx: &mut ExecContext<'_>,
+    table_name_lc: &str,
+    mut root: u32,
+    lo: i64,
+    hi: i64,
+    skip: Option<i64>,
+) -> Result<u64> {
+    const BATCH: usize = 8192;
+    let mut batch: Vec<i64> = Vec::with_capacity(BATCH);
+    let mut cur_lo = lo;
+    let mut total = 0u64;
+    while cur_lo <= hi {
+        batch.clear();
+        Btree::new(ctx.pager, root, false).scan_table_range_borrowed(cur_lo, hi, |rowid, _| {
+            if Some(rowid) != skip {
+                batch.push(rowid);
+            }
+            batch.len() < BATCH
+        })?;
+        let Some(&last) = batch.last() else {
+            break;
+        };
+        ctx.invalidate_max_rowid_if_deleted(table_name_lc, last);
+        let mut bt = Btree::new(ctx.pager, root, false);
+        total += bt.delete_rowids_inorder(&batch)?;
+        if bt.root != root {
+            root = bt.root;
+            ctx.set_table_root_lc(table_name_lc, root);
+        }
+        if batch.len() < BATCH || last == i64::MAX {
+            break;
+        }
+        cur_lo = last + 1;
+    }
+    Ok(total)
+}
+
 fn try_streaming_delete(
     ctx: &mut ExecContext<'_>,
     table: &Arc<Table>,
@@ -30312,6 +30353,31 @@ fn try_streaming_delete(
             }
             _ => None,
         };
+        // Bounded-memory mass DELETE: a pure rowid range (no residual, or
+        // only the strict bound — nothing per row can fail) on a table
+        // with no maintenance to do deletes in batches as it walks, the
+        // way SQLite deletes while scanning. Collecting every target
+        // first held 8 bytes per row (a 450k-row range: +3.6 MB peak RSS,
+        // torture S14). Residuals that can raise keep the collect-first
+        // walk: an error must leave nothing deleted, and a bare DELETE
+        // journals no rows.
+        let maintenance_free = !need_row
+            && !ctx.pager.foreign_keys_enabled()
+            && !crate::preupdate::events_needed()
+            && !table.without_rowid;
+        if maintenance_free && (residual_pred.is_none() || strict_gt.is_some()) {
+            drop(bt);
+            let table_name_lc = table.name.to_ascii_lowercase();
+            let deleted = delete_rowid_range_batched(ctx, &table_name_lc, root, lo, hi, strict_gt)?;
+            ctx.changes += deleted as i64;
+            if !ctx.in_transaction && !ctx.deferred_flush {
+                ctx.pager.flush()?;
+            }
+            return Ok(Some(ExecResult {
+                columns: Arc::from(vec!["deleted".to_string()]),
+                rows: vec![vec![Value::Integer(deleted as i64)]],
+            }));
+        }
         if let Some(b) = strict_gt {
             bt.scan_table_range_borrowed(lo, hi, |rowid, _payload| {
                 if rowid != b {

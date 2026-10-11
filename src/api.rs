@@ -4094,7 +4094,9 @@ impl Database {
             }
             let plan = crate::storage::vacuum::plan_in_place_compaction(&self.pager, &roots)?;
             if let Some(plan) = plan {
-                eprintln!("[vac] path=in-place");
+                if vac_dbg {
+                    eprintln!("[vac] path=in-place");
+                }
                 self.pager.install_in_place_compaction(&plan)?;
                 // Roots did not move (identity layout), but the cookie
                 // changed and every statement-level cache must revalidate
@@ -4145,7 +4147,9 @@ impl Database {
         let compact = {
             let t = std::time::Instant::now();
             let c = self.build_compact_image_src()?;
-            eprintln!("[vac] path={} (build {:?})", c_variant(&c), t.elapsed());
+            if vac_dbg {
+                eprintln!("[vac] path={} (build {:?})", c_variant(&c), t.elapsed());
+            }
             c
         };
         // RSS STAGE BOUNDARY: the compact-image build churned the
@@ -4356,8 +4360,8 @@ impl Database {
     /// materializing the whole compact image in RAM.
     fn build_compact_image_src(&self) -> Result<CompactSrc> {
         if self.pager.active_page_codec().is_none() {
-            if let Some(image) = self.build_compact_image_pages()? {
-                return Ok(CompactSrc::Image(image));
+            if let Some(src) = self.build_compact_image_pages()? {
+                return Ok(src);
             }
         }
         self.build_compact_image_rows_src()
@@ -4382,7 +4386,7 @@ impl Database {
     /// Page-level compact copy (see `build_compact_image`). Returns None
     /// when the source has an object shape the copier declines (caller
     /// falls back to the row-level path).
-    fn build_compact_image_pages(&self) -> Result<Option<Vec<u8>>> {
+    fn build_compact_image_pages(&self) -> Result<Option<CompactSrc>> {
         // Eligibility: the page-level copy preserves each leaf's bytes
         // (it can prune emptied leaves and drop freelist pages, but it
         // cannot re-flow rows). Mass-delete shapes with HOLLOW survivor
@@ -4409,10 +4413,41 @@ impl Database {
                 true
             })?;
         }
-        // 2. Fresh in-memory target; write-back armed so `flush`
-        //    materializes the image into the store.
-        let tmp = Pager::open_memory(DEFAULT_CACHE_PAGES)?;
-        tmp.set_lazy_writeback(false);
+        // 2. Fresh target. A FILE-backed database copies into a disposable
+        //    temp FILE (evicted dirty pages written in place) that the
+        //    install then streams: an in-memory target held every live
+        //    page, then a second full copy as the materialized image —
+        //    twice the compact size in RSS (torture S14's VACUUM: +5 MB
+        //    over a 2.5 MB result; SQLite's own VACUUM builds in a temp
+        //    file). An in-memory database keeps the in-memory image (its
+        //    install seeds a fresh memory pager from the bytes anyway).
+        let file_target = !self.pager.is_memory();
+        let tmp_path = std::env::temp_dir().join(format!(
+            "rustqlite-vacuum-pages-{}-{}.db",
+            std::process::id(),
+            self.pager.instance_id()
+        ));
+        let tmp = if file_target {
+            let _ = std::fs::remove_file(&tmp_path);
+            let t = Pager::open_opts(&tmp_path, DEFAULT_CACHE_PAGES, true)?;
+            t.set_lazy_writeback(true);
+            t
+        } else {
+            let t = Pager::open_memory(DEFAULT_CACHE_PAGES)?;
+            t.set_lazy_writeback(false);
+            t
+        };
+        // Removes the temp file on every early exit; disarmed once the
+        // file is handed to the install as the compact source.
+        struct TempGuard(Option<std::path::PathBuf>);
+        impl Drop for TempGuard {
+            fn drop(&mut self) {
+                if let Some(p) = self.0.take() {
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+        }
+        let mut guard = TempGuard(file_target.then(|| tmp_path.clone()));
         // 3. Copy every object tree (roots from the schema rows, back in
         //    the engine's internal 0-based convention).
         let roots: Vec<u32> = rows
@@ -4428,6 +4463,7 @@ impl Database {
             Err(e) => {
                 // Decline: the caller falls back to the row-level path.
                 let _ = e;
+                drop(tmp);
                 return Ok(None);
             }
         };
@@ -4456,8 +4492,13 @@ impl Database {
         tmp.set_application_id(self.pager.application_id())
             .map_err(|e| Error::Io(std::io::Error::other(format!("vacuum application_id: {e}"))))?;
         tmp.flush()?;
+        if file_target {
+            drop(tmp);
+            guard.0 = None;
+            return Ok(Some(CompactSrc::File(tmp_path)));
+        }
         let image = tmp.memory_store_image()?;
-        Ok(Some(image))
+        Ok(Some(CompactSrc::Image(image)))
     }
 
     /// Row-level compact build in a temp FILE database (codec path /
