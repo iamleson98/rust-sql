@@ -183,6 +183,20 @@ fn sqlite_table_row_logest(catalog: &Catalog, table: &Table) -> i32 {
     catalog.sqlite_row_logest(&table.name)
 }
 
+/// A table's indexes in SQLite's Table.pIndex order (newest first,
+/// REPLACE indexes last) — the order whereLoopAddBtree costs them in.
+/// The order matters: whereLoopAdjustCost raises a full scan inserted
+/// after an equality probe it is a proper subset of (`ix21(e)` created
+/// after ANALYZE on a 1-row `ix14(e)`: the ix14 scan costs 51, not 13).
+fn pindex_list(catalog: &Catalog, table: &str) -> Vec<Arc<Index>> {
+    let created = catalog.indexes_on_table(table);
+    let refs: Vec<&Index> = created.iter().map(|i| i.as_ref()).collect();
+    crate::executor::sqlite_pindex_order(&refs)
+        .into_iter()
+        .map(|i| Arc::clone(&created[i]))
+        .collect()
+}
+
 /// SQLite's access-path choice for `rowid-alias IN (list of n members)`
 /// on a single table — whereLoopAddBtree / whereLoopAddBtreeIndex's loop
 /// costs fed through wherePathSolver, LogEst units: true when the
@@ -300,7 +314,7 @@ pub(super) fn sqlite_rowid_in_seeks(
     let others = n_other_terms as i32;
     let r_size = sqlite_table_row_logest(catalog, table);
     let n_in = log_est(n_members as u64);
-    let indexes = catalog.indexes_on_table(&table.name);
+    let indexes = pindex_list(catalog, &table.name);
     let has_stat4 = catalog.sqlite_has_stat4(&table.name);
     let alias = table
         .rowid_alias
@@ -692,8 +706,8 @@ pub(crate) fn sqlite_join_seeks_alias(catalog: &Catalog, q: &JoinQuery) -> bool 
     let a = q.alias_item;
     let b = 1 - a;
     let index_lists: [Vec<Arc<Index>>; 2] = [
-        catalog.indexes_on_table(&q.items[0].table.name),
-        catalog.indexes_on_table(&q.items[1].table.name),
+        pindex_list(catalog, &q.items[0].table.name),
+        pindex_list(catalog, &q.items[1].table.name),
     ];
     let mut loops: Vec<JLoop> = Vec::new();
     for (item, indexes) in index_lists.iter().enumerate() {

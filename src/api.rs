@@ -6697,7 +6697,8 @@ impl Database {
         self.write_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         let is_ddl = is_ddl_sql(sql);
-        if is_ddl || matches!(cached.stmt.as_ref(), Statement::Analyze { .. }) {
+        let is_analyze = matches!(cached.stmt.as_ref(), Statement::Analyze { .. });
+        if is_ddl || is_analyze {
             self.snapshot_catalog_before_ddl();
         }
 
@@ -7683,7 +7684,11 @@ impl Database {
             }
         }
         // DDL changes the schema → cached plans hold stale Arc<Table>/Arc<Index>.
-        if result.is_ok() && is_ddl {
+        // ANALYZE changes the statistics every plan was costed with, so
+        // SQLite expires every prepared statement (OP_Expire); a plan
+        // cached before it kept its old index choice and its rowid-seek
+        // verdict.
+        if result.is_ok() && (is_ddl || is_analyze) {
             self.invalidate_stmt_cache();
         }
         // If deferred_flush is enabled, force a flush when the dirty-page

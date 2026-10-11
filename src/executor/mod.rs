@@ -24966,6 +24966,17 @@ pub(crate) fn sqlite_unique_check_order(
 /// [`sqlite_unique_check_order`] over plain indexes (creation order in,
 /// positions of the UNIQUE ones out, in Table.pIndex order).
 pub(crate) fn sqlite_index_order(indexes: &[&crate::schema::Index]) -> Vec<usize> {
+    let mut list = sqlite_pindex_order(indexes);
+    list.retain(|&i| indexes[i].unique);
+    list
+}
+
+/// SQLite's whole Table.pIndex list order (creation order in, positions
+/// out): sqlite3CreateIndex PREPENDS each index — at schema load and, via
+/// OP_ParseSchema, at CREATE INDEX — and then moves a REPLACE index after
+/// the last non-REPLACE one. whereLoopAddBtree costs a table's indexes in
+/// this order, which decides whereLoopAdjustCost's subset adjustments.
+pub(crate) fn sqlite_pindex_order(indexes: &[&crate::schema::Index]) -> Vec<usize> {
     let is_replace = |i: usize| indexes[i].on_conflict == Some(ConflictResolution::Replace);
     let mut list: Vec<usize> = Vec::with_capacity(indexes.len());
     for i in 0..indexes.len() {
@@ -24979,7 +24990,6 @@ pub(crate) fn sqlite_index_order(indexes: &[&crate::schema::Index]) -> Vec<usize
             list.insert(at + 1, i);
         }
     }
-    list.retain(|&i| indexes[i].unique);
     list
 }
 
