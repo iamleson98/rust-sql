@@ -1292,19 +1292,33 @@ fn biased_rowid_search(
     bias: u32,
     rowid: i64,
 ) -> Result<Option<usize>> {
-    #[inline]
-    fn cell_rowid(borrowed: &crate::storage::page::Page, i: usize) -> Result<i64> {
-        let ptr = borrowed.cell_pointer(i as u16) as usize;
-        let Some((r, _)) = decode_rowid_only(borrowed.cell_slice_checked(ptr)?) else {
-            return Err(Error::corruption("truncated leaf rowid in biased search"));
-        };
-        Ok(r)
-    }
     if n == 0 {
         return Ok(None);
     }
+    // No position to start from (a fresh descent): the plain binary
+    // search. Probing cell 0 and then cell 1 first cost a random point
+    // lookup two extra cell reads per leaf (SQLite's moveto starts at the
+    // middle).
+    if bias == 0 {
+        return Ok(table_leaf_search(borrowed, rowid)?.ok().map(usize::from));
+    }
+    // The pointer array's base and bounds once, then plain slice reads
+    // per probe (see `table_leaf_search`).
+    let data = borrowed.data.as_slice();
+    let base = borrowed.cell_pointer_base();
+    if base + n * 2 > data.len() {
+        return Err(Error::corruption("cell pointer array overruns the page"));
+    }
+    let cell_rowid = |i: usize| -> Result<i64> {
+        let o = base + i * 2;
+        let ptr = u16::from_be_bytes([data[o], data[o + 1]]) as usize;
+        match data.get(ptr..).and_then(decode_rowid_only) {
+            Some((r, _)) => Ok(r),
+            None => Err(Error::corruption("truncated leaf rowid in biased search")),
+        }
+    };
     let bias = (bias as usize).min(n - 1);
-    let b = cell_rowid(borrowed, bias)?;
+    let b = cell_rowid(bias)?;
     if b == rowid {
         return Ok(Some(bias));
     }
@@ -1314,7 +1328,7 @@ fn biased_rowid_search(
         let mut hi = bias;
         while lo < hi {
             let mid = (lo + hi) / 2;
-            let r = cell_rowid(borrowed, mid)?;
+            let r = cell_rowid(mid)?;
             if r == rowid {
                 return Ok(Some(mid));
             } else if r < rowid {
@@ -1332,7 +1346,7 @@ fn biased_rowid_search(
     let mut lo = bias + 1;
     let mut hi = n;
     if lo < hi {
-        let r = cell_rowid(borrowed, lo)?;
+        let r = cell_rowid(lo)?;
         if r == rowid {
             return Ok(Some(lo));
         }
@@ -1345,7 +1359,7 @@ fn biased_rowid_search(
     // Bounded binary search in [lo, hi).
     while lo < hi {
         let mid = (lo + hi) / 2;
-        let r = cell_rowid(borrowed, mid)?;
+        let r = cell_rowid(mid)?;
         if r == rowid {
             return Ok(Some(mid));
         } else if r < rowid {
@@ -1497,10 +1511,12 @@ fn table_hint_page(root: PageId, rowid: i64, epoch: u64) -> Option<(PageRef, u32
         for slot in pair {
             if let Some(s) = slots.get(slot).and_then(|x| x.as_ref()) {
                 if s.epoch == epoch && s.root == root && rowid >= s.lo && rowid <= s.hi {
+                    TABLE_HINT_MISS_RUN.with(|c| c.set(0));
                     return Some((Arc::clone(&s.page), s.last_cell));
                 }
             }
         }
+        TABLE_HINT_MISS_RUN.with(|c| c.set(c.get().saturating_add(1)));
         None
     })
 }
@@ -1649,6 +1665,28 @@ impl TableHintSlot {
 thread_local! {
     static TABLE_HINTS: std::cell::RefCell<Vec<Option<TableHintSlot>>> =
         std::cell::RefCell::new((0..TABLE_HINT_SLOTS).map(|_| None).collect());
+    /// Consecutive thread-local table-hint MISSES (any root; a hit resets
+    /// it). Scattered point lookups — random rowids over a large table —
+    /// miss on nearly every probe, and writing a fresh thread-local hint
+    /// after each descent (an Arc clone and a slot replacement) was pure
+    /// overhead: ~4% of a 1M-row random lookup. Past `HINT_SCATTER_RUN`
+    /// misses only every 16th descent writes one, so a return to local
+    /// access re-arms the hints within 16 lookups. (The handle's own
+    /// struct-local hint is always recorded.)
+    static TABLE_HINT_MISS_RUN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Misses in a row after which descents record hints only by sampling
+/// (see `TABLE_HINT_MISS_RUN`).
+const HINT_SCATTER_RUN: u32 = 64;
+
+/// Whether a full descent should write its leaf as the thread-local hint.
+#[inline]
+fn table_hint_record_due() -> bool {
+    TABLE_HINT_MISS_RUN.with(|c| {
+        let r = c.get();
+        r < HINT_SCATTER_RUN || r % 16 == 0
+    })
 }
 
 /// Root-children ROUTING cache: for a scattered-access table (join inner
@@ -2420,7 +2458,9 @@ impl<'a> Btree<'a> {
             epoch,
             last_cell: cell,
         });
-        set_table_hint(self.root, page, lo, hi, epoch, probed_rowid, cell);
+        if table_hint_record_due() {
+            set_table_hint(self.root, page, lo, hi, epoch, probed_rowid, cell);
+        }
     }
 
     /// Note a successful cell index on the CURRENT hints (struct-local +

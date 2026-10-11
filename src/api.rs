@@ -8119,18 +8119,32 @@ impl Database {
         cached: &Arc<CachedStmt>,
         params: P,
     ) -> Result<Vec<Row>> {
-        let (_, rows) = self.query_cached_stmt_with_cols(sql, cached, params)?;
+        // Column names unwanted: the fast paths skip cloning them (a
+        // String per output column per call — ~2% of a point lookup).
+        let (_, rows) = self.query_cached_stmt_cols_opt(sql, cached, params, false)?;
         Ok(rows)
     }
 
     /// [`Self::query_cached_stmt`] returning the output column names too
     /// (the ATTACH router surfaces the attached engine's own names).
-    #[allow(clippy::only_used_in_recursion)]
     fn query_cached_stmt_with_cols<P: Params>(
         &self,
         sql: &str,
         cached: &Arc<CachedStmt>,
         params: P,
+    ) -> Result<(Vec<String>, Vec<Row>)> {
+        self.query_cached_stmt_cols_opt(sql, cached, params, true)
+    }
+
+    /// [`Self::query_cached_stmt_with_cols`]; with `want_cols` false the
+    /// fast paths return no column names (empty) instead of cloning them.
+    #[allow(clippy::only_used_in_recursion)]
+    fn query_cached_stmt_cols_opt<P: Params>(
+        &self,
+        sql: &str,
+        cached: &Arc<CachedStmt>,
+        params: P,
+        want_cols: bool,
     ) -> Result<(Vec<String>, Vec<Row>)> {
         // ------------------------------------------------------------------
         // ATTACH ROUTING (query path): SELECT / EXPLAIN / read-PRAGMA /
@@ -8320,7 +8334,14 @@ impl Database {
                 let _plugin_guard = self.plugin_scope();
                 let _corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
                 let res = self.exec_select_with_ctes(&mut ctx, sel, &HashMap::new())?;
-                return Ok((res.columns.to_vec(), res.rows));
+                return Ok((
+                    if want_cols {
+                        res.columns.to_vec()
+                    } else {
+                        Vec::new()
+                    },
+                    res.rows,
+                ));
             }
         }
         // Pre-compiled point-lookup fast path: skips the ExecContext /
@@ -8337,11 +8358,25 @@ impl Database {
             // it's already contiguous (arrays/Vec) — no per-query Vec.
             if let Some(slice) = params.as_slice() {
                 let rows = self.run_fast_path(fp, slice)?;
-                return Ok((fp.output_columns().to_vec(), rows));
+                return Ok((
+                    if want_cols {
+                        fp.output_columns().to_vec()
+                    } else {
+                        Vec::new()
+                    },
+                    rows,
+                ));
             }
             let params_v: Vec<Value> = params.into_iter().collect();
             let rows = self.run_fast_path(fp, &params_v)?;
-            return Ok((fp.output_columns().to_vec(), rows));
+            return Ok((
+                if want_cols {
+                    fp.output_columns().to_vec()
+                } else {
+                    Vec::new()
+                },
+                rows,
+            ));
         }
         // WITH-clause DML is never planned at cache time (its CTE rows are
         // recomputed per call): it runs below through the same execution
@@ -8460,7 +8495,14 @@ impl Database {
                     bk.max_rowids.remove(&k);
                 }
             }
-            Ok((res.columns.to_vec(), res.rows))
+            Ok((
+                if want_cols {
+                    res.columns.to_vec()
+                } else {
+                    Vec::new()
+                },
+                res.rows,
+            ))
         } else {
             Self::query_path_unsupported(cached)
         }
