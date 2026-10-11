@@ -16539,11 +16539,16 @@ impl JExpr {
 /// connection's default order, exactly `apply_binary`).
 pub(crate) enum JTerm {
     Truth(JExpr),
+    /// A comparison: operator, operands, collation, and the comparison
+    /// affinity SQLite applies to the operand values first (resolved at
+    /// compile time from the operand expressions — see
+    /// `compile_join_term`).
     Cmp(
         crate::sql::ast::BinaryOp,
         JExpr,
         JExpr,
         Option<std::sync::Arc<dyn crate::plugin::Collation>>,
+        crate::executor::expr::CmpAffinity,
     ),
     And(Box<JTerm>, Box<JTerm>),
     Or(Box<JTerm>, Box<JTerm>),
@@ -16562,19 +16567,27 @@ impl JTerm {
         use crate::executor::expr::{apply_binary, apply_binary_collated};
         match self {
             JTerm::Truth(e) => e.eval(lrow, rrow, params),
-            JTerm::Cmp(op, l, r, coll) => {
-                // Borrowed-operand fast path for col/literal/param sides.
+            JTerm::Cmp(op, l, r, coll, aff) => {
+                use crate::executor::expr::CmpAffinity;
+                // Borrowed-operand fast path for col/literal/param sides
+                // (affinity only ever converts a TEXT operand — OP_Eq's
+                // conversions are gated on MEM_Str).
                 if let (Some(lv), Some(rv)) = (
                     l.eval_ref(lrow, rrow, params),
                     r.eval_ref(lrow, rrow, params),
                 ) {
-                    return match coll {
-                        Some(c) => apply_binary_collated(*op, lv, rv, c.as_ref()),
-                        None => apply_binary(*op, lv, rv),
-                    };
+                    if *aff == CmpAffinity::None
+                        || !(matches!(lv, Value::Text(_)) || matches!(rv, Value::Text(_)))
+                    {
+                        return match coll {
+                            Some(c) => apply_binary_collated(*op, lv, rv, c.as_ref()),
+                            None => apply_binary(*op, lv, rv),
+                        };
+                    }
                 }
                 let lv = l.eval(lrow, rrow, params);
                 let rv = r.eval(lrow, rrow, params);
+                let (lv, rv) = crate::executor::expr::apply_comparison_affinity(*aff, lv, rv);
                 match coll {
                     Some(c) => apply_binary_collated(*op, &lv, &rv, c.as_ref()),
                     None => apply_binary(*op, &lv, &rv),
@@ -16666,6 +16679,23 @@ fn compile_join_term(
                 };
                 let l = compile_join_jexpr(left, combined, n_left, params_len)?;
                 let r = compile_join_jexpr(right, combined, n_left, params_len)?;
+                // With the row's affinities known, the comparison affinity
+                // is a compile-time fact (sqlite3CompareAffinity over the
+                // operand expressions' affinities, resolved exactly as the
+                // evaluator resolves them against the same affinity list)
+                // and the term applies it to the values per pair. A
+                // cross-affinity key (`a.int_col = b.text_col`) or an
+                // expression operand (`b.y = a.x + 1`, `b.q = 'q' || a.x`)
+                // used to decline to the evaluator, which re-resolved
+                // every column by name for every candidate pair.
+                if let Some(affs) = affinities {
+                    let col = |x: &Expr| join_column_affinity(combined, affs, x);
+                    let aff = crate::executor::expr::comparison_affinity(
+                        crate::executor::expr::expr_affinity_with(left, &col),
+                        crate::executor::expr::expr_affinity_with(right, &col),
+                    );
+                    return Some(JTerm::Cmp(*op, l, r, coll, aff));
+                }
                 // Column-vs-column comparisons that need SQLite's
                 // cross-affinity NUMERIC fold (datatype3 §4.2: INTEGER
                 // column = TEXT column compares numerically) must run
@@ -16731,7 +16761,13 @@ fn compile_join_term(
                 if converts(&l, &r) || converts(&r, &l) {
                     return None;
                 }
-                Some(JTerm::Cmp(*op, l, r, coll))
+                Some(JTerm::Cmp(
+                    *op,
+                    l,
+                    r,
+                    coll,
+                    crate::executor::expr::CmpAffinity::None,
+                ))
             }
             _ => Some(JTerm::Truth(compile_join_jexpr(
                 e, combined, n_left, params_len,
@@ -16747,6 +16783,63 @@ fn compile_join_term(
             e, combined, n_left, params_len,
         )?)),
     }
+}
+
+/// The comparison affinity of a column reference over a join's combined
+/// row — `EvalContext::column_expr_affinity` over the same names and
+/// affinity list (qualified: the exact `t.c`, else the side's hidden
+/// rowid as INTEGER; bare: exact, then the `.c` suffix, then a rowid
+/// spelling as INTEGER), so the compiled term converts exactly as the
+/// evaluator would.
+fn join_column_affinity(
+    combined: &[String],
+    affs: &[crate::types::Affinity],
+    e: &Expr,
+) -> Option<crate::types::Affinity> {
+    let Expr::Column { table, name } = e else {
+        return None;
+    };
+    let at = |i: usize| affs.get(i).copied();
+    if let Some(t) = table.as_deref() {
+        for (i, n) in combined.iter().enumerate() {
+            if n.len() == t.len() + 1 + name.len()
+                && n.as_bytes().get(t.len()) == Some(&b'.')
+                && n[..t.len()].eq_ignore_ascii_case(t)
+                && n[t.len() + 1..].eq_ignore_ascii_case(name)
+            {
+                return at(i);
+            }
+        }
+        if crate::planner::is_rowid_spelling(name)
+            && combined.iter().any(|n| {
+                crate::planner::is_hidden_rowid(n)
+                    && n.rfind('.').is_some_and(|p| n[..p].eq_ignore_ascii_case(t))
+            })
+        {
+            return Some(crate::types::Affinity::Integer);
+        }
+        return None;
+    }
+    for (i, n) in combined.iter().enumerate() {
+        if n.eq_ignore_ascii_case(name) {
+            return at(i);
+        }
+    }
+    for (i, n) in combined.iter().enumerate() {
+        if let Some(pos) = n.rfind('.') {
+            if n[pos + 1..].eq_ignore_ascii_case(name) {
+                return at(i);
+            }
+        }
+    }
+    if crate::planner::is_rowid_spelling(name)
+        && combined
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case("rowid") || crate::planner::is_hidden_rowid(c))
+    {
+        return Some(crate::types::Affinity::Integer);
+    }
+    None
 }
 
 fn compile_join_jexpr(
