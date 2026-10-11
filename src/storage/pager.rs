@@ -5639,12 +5639,6 @@ impl Pager {
         // cached page up front — up to a full 512-page cache = 2 MiB of
         // transient copies on every checkpoint — which stacked on the
         // run buffer's own peak.
-        let cache_read_page =
-            |id: PageId, cached: &std::collections::HashMap<PageId, PageRef>| -> Option<Vec<u8>> {
-                let pr = cached.get(&id)?;
-                let b = pr.lock();
-                Some(b.data.clone())
-            };
         // COALESCED RUNS: consecutive page ids are contiguous in the
         // main file; when their frame offsets are ALSO consecutive
         // (flush_wal appends sorted, so they usually are), one read+write
@@ -5692,20 +5686,6 @@ impl Pager {
             if id == 0 {
                 continue; // header goes LAST (crash safety)
             }
-            let cached_page = cache_read_page(id, &cached);
-            let bytes: &[u8] = if let Some(b) = cached_page.as_deref() {
-                if fold_dbg {
-                    fold_hits += 1;
-                }
-                b
-            } else {
-                let off = state.map[&id];
-                state.wal.read_frame_at(off, &mut frame)?;
-                if fold_dbg {
-                    fold_reads += 1;
-                }
-                &frame[..]
-            };
             let contiguous = match run_start {
                 Some(s) => (s + (run_buf.len() / psz as usize) as u64) == id as u64,
                 None => false,
@@ -5714,9 +5694,23 @@ impl Pager {
                 flush_run(run_start.unwrap_or(0), run_buf)?;
                 run_buf.clear();
                 run_start = Some(id as u64);
-                let _ = state.map[&id];
             }
-            run_buf.extend_from_slice(bytes);
+            // A cached page is copied straight from under its lock into
+            // the run (a per-page clone churned 512 page-sized buffers
+            // through the allocator per checkpoint).
+            if let Some(pr) = cached.get(&id) {
+                if fold_dbg {
+                    fold_hits += 1;
+                }
+                run_buf.extend_from_slice(&pr.lock().data);
+            } else {
+                let off = state.map[&id];
+                state.wal.read_frame_at(off, &mut frame)?;
+                if fold_dbg {
+                    fold_reads += 1;
+                }
+                run_buf.extend_from_slice(&frame);
+            }
         }
         flush_run(run_start.unwrap_or(0), run_buf)?;
         // Header (page 0) LAST (crash safety — see flush_inner_delete's
@@ -5949,7 +5943,9 @@ impl Pager {
         // is a leaf lock). A page that misses the snapshot (spilled and
         // not yet re-cached — the `continue` arm) is covered exactly as
         // before: its spill frame is absorbed into the commit below.
-        let page_refs: std::collections::HashMap<PageId, PageRef> = {
+        // (Gathered straight into the sorted commit list: a keyed map
+        // here only re-ordered the same snapshot.)
+        let commit_pages: Vec<(PageId, PageRef)> = {
             let cache = self.cache.read();
             dirty_ids
                 .iter()
@@ -5973,10 +5969,6 @@ impl Pager {
             // ~750 syscalls + 250 scratch Vecs through the per-frame
             // `append` (seek + header write + page write + check_data
             // allocation EACH).
-            let commit_pages: Vec<(PageId, PageRef)> = dirty_ids
-                .iter()
-                .filter_map(|id| page_refs.get(id).map(|pr| (*id, pr.clone())))
-                .collect();
             debug_assert!(frame_offsets.is_empty());
             state.wal.append_batch(&commit_pages, &mut frame_offsets)?;
             // Durability point. synchronous=NORMAL (the recommended WAL
@@ -5999,9 +5991,6 @@ impl Pager {
                 .wal_frames_total
                 .fetch_add(frame_offsets.len() as u64, Ordering::AcqRel)
                 + frame_offsets.len() as u64;
-            for (id, off) in &frame_offsets {
-                state.map.insert(*id, *off);
-            }
             // Absorb the mid-txn SPILL frames: they sit in the log BEFORE
             // this commit's trailing commit frame, so recovery replays
             // them as part of this commit — register their offsets as the
@@ -6011,14 +6000,27 @@ impl Pager {
             // precedence; the only newer frames are THIS batch's, for
             // pages that spilled and were then re-fetched and re-dirtied
             // (they left `spilled` at get_page time, so the two sets are
-            // disjoint by construction — the guard below is defensive).
-            let batch_ids: std::collections::HashSet<PageId> =
-                frame_offsets.iter().map(|(id, _)| *id).collect();
-            let spilled: Vec<(PageId, u64)> = state.spilled.drain().collect();
-            for (id, off) in spilled {
-                if !batch_ids.contains(&id) {
-                    state.map.insert(id, off);
+            // disjoint by construction — the batch inserts LAST, so it
+            // wins regardless). The SMALLER table folds into the larger:
+            // after a big transaction the spill index simply becomes the
+            // committed map and the few older committed entries fold in
+            // UNDER it (a spill frame is newer, so it keeps its slot). A
+            // 7k-page spill was re-hashed into the committed table by
+            // doubling, through a Vec and a batch-id set (~0.7 MB
+            // transient at a 1M-row commit, torture S17).
+            let WalState { map, spilled, .. } = &mut *state;
+            if map.len() < spilled.len() {
+                std::mem::swap(map, spilled);
+                for (id, off) in spilled.drain() {
+                    map.entry(id).or_insert(off);
                 }
+            } else {
+                for (id, off) in spilled.drain() {
+                    map.insert(id, off);
+                }
+            }
+            for (id, off) in &frame_offsets {
+                state.map.insert(*id, *off);
             }
         }
 

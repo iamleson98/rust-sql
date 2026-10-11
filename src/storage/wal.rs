@@ -911,13 +911,14 @@ impl Wal {
         // WRITTEN frame after the loop (its checksum recomputed — the
         // commit byte participates in it), so a batch that skips its
         // tail entries can never land marker-less.
-        // CHUNKED: frames go to the file 64 at a time as they are
-        // assembled; the most recent frame always stays buffered, so the
-        // commit-marker fixup below still patches it in memory. One
-        // buffer for the whole batch cost the commit's dirty-page volume
-        // in transient RSS (a full 512-page cache: +2 MB per commit,
-        // torture S14 / S17).
-        const CHUNK_FRAMES: usize = 64;
+        // CHUNKED: frames go to the file 16 at a time (~64 KiB writes)
+        // as they are assembled; the most recent frame always stays
+        // buffered, so the commit-marker fixup below still patches it in
+        // memory. One buffer for the whole batch cost the commit's
+        // dirty-page volume in transient RSS (a full 512-page cache:
+        // +2 MB per commit, torture S14 / S17), and a 64-frame chunk
+        // was still a 260 KiB allocation per commit.
+        const CHUNK_FRAMES: usize = 16;
         let mut out: Vec<u8> = Vec::with_capacity(pages.len().min(CHUNK_FRAMES + 1) * frame_size);
         let mut flushed_frames: usize = 0;
         out_offsets.reserve(pages.len());
