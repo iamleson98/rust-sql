@@ -11,9 +11,10 @@
 //! sorting costs and tie-breaks. Every rule here was verified loop by loop
 //! against the bundled SQLite 3.53.4 built with WHERETRACE.
 
-use super::{is_rowid_spelling, ScanColumnUse};
+use super::{is_rowid_spelling, split_and_chain, ScanColumnUse};
 use crate::schema::{Catalog, Index, Table};
 use crate::sql::ast::Expr;
+use crate::sql::ast::{BinaryOp, InSource};
 use std::sync::Arc;
 
 /// sqlite3LogEst: 10*log2(x) in SQLite's integer approximation.
@@ -85,6 +86,118 @@ fn partial_usable(idx: &Index, key: Option<&str>) -> bool {
 /// halved for a partial index.
 fn default_index_rows(r_size: i32, idx: &Index) -> i32 {
     r_size.max(99) - if idx.partial_expr.is_some() { 10 } else { 0 }
+}
+
+/// The best FULL-SCAN loop for a table (whereLoopAddBtree's full-scan
+/// competition): the table scan vs every covering index full scan
+/// (`m==0 && szIdxRow<szTabRow && CoverIdxScan`). Returns
+/// `(rRun, nOut, chosen index)` — the index is `None` when the table
+/// scan wins. Shared by the plan-side scan-variant choice
+/// ([`sqlite_covering_full_scan`]) and the OR-opt decision's non-OR
+/// competitor ([`sqlite_or_takes_multi_index_or`]) — the OR-loop must
+/// beat the same best scan SQLite's earlier-inserted loops hold.
+pub(super) fn best_full_scan_loop(
+    catalog: &Catalog,
+    table: &Table,
+    col_use: &ScanColumnUse,
+    where_conjuncts: &[Expr],
+) -> (i32, i32, Option<Arc<Index>>) {
+    let r_size = sqlite_table_row_logest(catalog, table);
+    let has_stat4 = catalog.sqlite_has_stat4(&table.name);
+    let scan_run = r_size + if has_stat4 { 14 } else { 16 };
+    // The scan is viable only outside one-pass DML and known column
+    // use; otherwise the TABLE scan is the only variant.
+    if col_use.one_pass || table.without_rowid || table.vtab.is_some() {
+        return (scan_run, r_size - 1, None);
+    }
+    let Some(cols) = col_use.cols.as_ref() else {
+        return (scan_run, r_size - 1, None);
+    };
+    if cols.is_empty() {
+        // Nothing but the rowid is read (COUNT(*) over a plain scan):
+        // every index covers and SQLite picks the cheapest by width —
+        // the engine's fused COUNT paths answer these shapes without a
+        // walk, so the loop model keeps the table scan (the COST of the
+        // true winner differs only in EXPLAIN text, never in rows).
+        return (scan_run, r_size - 1, None);
+    }
+    let sz_tab = table_width_logest(table);
+    let indexes = pindex_list(catalog, &table.name);
+    let mut best_run = scan_run;
+    let mut best_n_out = r_size - 1;
+    let mut best_idx: Option<Arc<Index>> = None;
+    for idx in &indexes {
+        // DESC columns are fine: the executor's full-index scan
+        // re-sorts its entries into the declared (col DESC ...,
+        // rowid ASC) order — SQLite's DESC-index emission.
+        if idx.kind != crate::schema::IndexKind::Btree
+            || idx.origin == crate::schema::IndexOrigin::WithoutRowidPk
+            || idx.columns.iter().any(|c| c.expr.is_some())
+        {
+            continue;
+        }
+        // A partial index competes only when the statement's WHERE
+        // carries its predicate (the engine's structural implication
+        // gate — the same rule every other index path applies).
+        if !super::index_serves_conjuncts_partial(idx, where_conjuncts) {
+            continue;
+        }
+        // Covering (m == 0): every referenced column is an index column
+        // (the rowid alias sets no colUsed bit — every rowid-table
+        // index carries the rowid as its trailing key).
+        let covering = cols
+            .iter()
+            .all(|c| idx.columns.iter().any(|ic| ic.name.eq_ignore_ascii_case(c)));
+        if !covering {
+            // A non-covering index full scan competes in SQLite only
+            // through a usable PARTIAL index (the pPartIdxWhere!=0
+            // disjunct) or indexMightHelpWithOrderBy. The partial
+            // corner needs SQLite's estimateWidth calibration to price
+            // faithfully (its lookup cost ties the table scan within
+            // the row-estimate noise); the engine keeps the table scan
+            // there — a ledger'd residual. ORDER-BY shapes ride the
+            // engine's own streaming machinery.
+            continue;
+        }
+        // The width gate: only a narrower index than the table competes
+        // (a usable PARTIAL index always offers its scan, covering or
+        // not — whereLoopAddBtree's pPartIdxWhere!=0 disjunct — paying
+        // the table lookups on top).
+        // The width gate: only a narrower index than the table competes.
+        let sz_idx = index_width_logest(table, idx);
+        if !(sz_idx < sz_tab) {
+            continue;
+        }
+        let a0 = catalog
+            .index_stats(&idx.name)
+            .map(|s| log_est(s.rows.max(0) as u64))
+            .unwrap_or_else(|| default_index_rows(r_size, idx));
+        let k = (15 * sz_idx) / sz_tab;
+        let (run, n_out) = (a0 + 1 + k, a0 - 1);
+        // A strictly lower cost replaces the incumbent (ties keep the
+        // earlier loop: sPk leads the probe chain, so the table scan
+        // holds ties — whereLoopInsert replaces only on <, or == with
+        // fewer nOut / nLTerm, none of which differ between full scans).
+        if run < best_run || (run == best_run && n_out < best_n_out) {
+            best_run = run;
+            best_n_out = n_out;
+            best_idx = Some(Arc::clone(idx));
+        }
+    }
+    (best_run, best_n_out, best_idx)
+}
+
+/// SQLite's FULL-SCAN variant choice (see [`best_full_scan_loop`]):
+/// the winning covering index when it undercuts the table scan — the
+/// plan-side swap that makes an unordered scan's EMISSION ORDER match
+/// SQLite's (index order vs rowid order).
+pub(super) fn sqlite_covering_full_scan(
+    catalog: &Catalog,
+    table: &Table,
+    col_use: &ScanColumnUse,
+    where_conjuncts: &[Expr],
+) -> Option<Arc<Index>> {
+    best_full_scan_loop(catalog, table, col_use, where_conjuncts).2
 }
 
 /// Column::szEst (sqlite3AddColumn / sqlite3AffinityType): the field-size
@@ -230,6 +343,7 @@ pub(super) fn sqlite_rowid_in_seeks(
     n_members: usize,
     n_other_terms: usize,
     col_use: &ScanColumnUse,
+    eq_const_cols: &[String],
 ) -> bool {
     #[derive(Clone)]
     struct Loop {
@@ -468,6 +582,40 @@ pub(super) fn sqlite_rowid_in_seeks(
                     },
                 );
             }
+            // A COVERING non-alias index whose leading column a
+            // `col = const` conjunct constrains takes the rowid IN on
+            // its trailing rowid column — nEq=2, SQLite's
+            // "SEARCH t USING COVERING INDEX i (c=? AND rowid=?)".
+            // rCostIdx = 0 (nOut after the IN adjustment) + 1 + k
+            // against the IPK loop's +16: a narrower index than the
+            // table UNDERCUTS the IPK by the width difference and its
+            // probe COMPARES (the boundary REAL member matches the
+            // i64::MIN row — the 2026-10-11 round: `id IN (-2^63.0, 3)
+            // AND a = 3` on a 4000-row analyzed table, WHERETRACE
+            // t_a=(47,10) vs IPK=(48,9)). The eq's own selectivity is
+            // subsumed (the (c, rowid) pair is unique — nOut = nIn).
+            // Non-covering shapes (a residual reads an uncovered
+            // column) pay nOut+16 in table lookups and never win — the
+            // covering gate below is that rule.
+            if !leads_alias
+                && covering
+                && eq_const_cols
+                    .iter()
+                    .any(|c| idx.columns[0].name.eq_ignore_ascii_case(c))
+            {
+                insert(
+                    &mut loops,
+                    Loop {
+                        run: log_est_add(est_log(r_size), 1 + k) + n_in,
+                        n_out: n_in - others,
+                        sorted: 0,
+                        ipk: false,
+                        constrained: true,
+                        sort_idx: 0,
+                        indexed: Some((pos, 2, 2, true)),
+                    },
+                );
+            }
             if leads_alias {
                 // nOut before the IN multiplier: one row per key (stat1's
                 // "N 1", or the STAT4 per-member estimate on unique keys).
@@ -581,6 +729,191 @@ pub(super) fn sqlite_rowid_in_seeks(
         !first_constrained || l.constrained
     });
     loops[second].ipk
+}
+
+// ---------------------------------------------------------------------------
+// The multi-index OR: does SQLite TAKE it for this OR-clause?
+// ---------------------------------------------------------------------------
+
+/// SQLite's `whereLoopAddOr` decision for one OR-clause, restricted to
+/// the loop families this model knows (whereLoopAddBtree's): the table
+/// scan, the INTEGER PRIMARY KEY eq / IN probes, and index probes on a
+/// leading column the branch constrains by `=` or `IN` — each branch's
+/// CHEAPEST loop contributes (whereOrInsert keeps the best rRun), the
+/// branch runs sum through LogEstAdd, the OR-loop pays +1 (the rounding
+/// penalty), and it must displace the statement's scan loop (the OR as
+/// a residual) through whereLoopInsert's dominance. A branch with no
+/// cheap loop still offers the table scan, so an unindexable sibling
+/// simply prices the OR-opt out — exactly SQLite's outcome.
+///
+/// Ranges (rowid or index) are NOT modeled (a range branch falls to its
+/// table scan); their SQLite costs are STAT4-data-dependent.
+pub(super) fn sqlite_or_takes_multi_index_or(
+    catalog: &Catalog,
+    table: &Table,
+    branches: &[&Expr],
+    col_use: &ScanColumnUse,
+) -> bool {
+    let r_size = sqlite_table_row_logest(catalog, table);
+    let has_stat4 = catalog.sqlite_has_stat4(&table.name);
+    // Each branch's fallback: its own table scan (the OR context prices
+    // branch loops only — a full-scan branch keeps the table-scan cost).
+    let scan_run = r_size + if has_stat4 { 14 } else { 16 };
+    let alias = table
+        .rowid_alias
+        .map(|i| table.columns[i].name.to_ascii_lowercase());
+    let sz_tab = table_width_logest(table);
+    let indexes = pindex_list(catalog, &table.name);
+
+    // Each branch's cheapest loop (rRun, nOut).
+    let mut or_run: i32 = 0;
+    let mut or_n_out: i32 = 0;
+    for (bi, branch) in branches.iter().enumerate() {
+        let conjuncts = split_and_chain(branch);
+        let others = conjuncts.len().saturating_sub(1) as i32;
+        // The branch's table scan (always available).
+        let mut best_run = scan_run;
+        let mut best_n_out = r_size - 1 - others;
+        let mut has_rowid_term = false;
+        for c in &conjuncts {
+            let (col, n_members) = match c {
+                Expr::In {
+                    expr,
+                    source: InSource::List(list),
+                    negated: false,
+                } => (expr.as_ref(), list.len()),
+                Expr::Binary { op, left, right } if *op == BinaryOp::Eq => {
+                    let col = match (left.as_ref(), right.as_ref()) {
+                        (Expr::Column { .. }, _) => left.as_ref(),
+                        (_, Expr::Column { .. }) => right.as_ref(),
+                        _ => continue,
+                    };
+                    (col, 1)
+                }
+                _ => continue,
+            };
+            let Expr::Column { name, .. } = col else {
+                continue;
+            };
+            let is_rowid = match alias.as_deref() {
+                Some(a) => name.eq_ignore_ascii_case(a),
+                None => false,
+            } || is_rowid_spelling(&name.to_ascii_lowercase());
+            if is_rowid {
+                has_rowid_term = true;
+                let n_in = log_est(n_members as u64);
+                let run = log_est_add(est_log(r_size), 16) + n_in;
+                let n_out = n_in - others;
+                if run < best_run || (run == best_run && n_out < best_n_out) {
+                    best_run = run;
+                    best_n_out = n_out;
+                }
+            }
+        }
+        let _ = has_rowid_term;
+        // Index probes: a leading column constrained by `=` / `IN`.
+        for idx in &indexes {
+            if !partial_usable(idx, None) || idx.columns.iter().any(|c| c.expr.is_some()) {
+                continue;
+            }
+            let lead = &idx.columns[0].name;
+            let mut n_members = 0usize;
+            let mut constrained = false;
+            for c in &conjuncts {
+                match c {
+                    Expr::In {
+                        expr,
+                        source: InSource::List(_),
+                        negated: false,
+                    } => {
+                        if let Expr::Column { name, .. } = expr.as_ref() {
+                            if name.eq_ignore_ascii_case(lead) {
+                                constrained = true;
+                                n_members = usize::MAX; // IN: cost handled below
+                            }
+                        }
+                    }
+                    Expr::Binary { op, left, right } if *op == BinaryOp::Eq => {
+                        let l = match left.as_ref() {
+                            Expr::Column { name, .. } => Some(name),
+                            _ => None,
+                        };
+                        let r = match right.as_ref() {
+                            Expr::Column { name, .. } => Some(name),
+                            _ => None,
+                        };
+                        if l.is_some_and(|n| n.eq_ignore_ascii_case(lead))
+                            || r.is_some_and(|n| n.eq_ignore_ascii_case(lead))
+                        {
+                            constrained = true;
+                            if n_members == 0 {
+                                n_members = 1;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if !constrained {
+                continue;
+            }
+            let covering = col_use.cols.as_ref().is_some_and(|cols| {
+                cols.iter()
+                    .all(|c| idx.columns.iter().any(|ic| ic.name.eq_ignore_ascii_case(c)))
+            });
+            let stats = catalog.index_stats(&idx.name);
+            let a0 = match &stats {
+                Some(s) => log_est(s.rows.max(0) as u64),
+                None => default_index_rows(r_size, idx),
+            };
+            let sz_idx = index_width_logest(table, idx);
+            let k = (15 * sz_idx) / sz_tab;
+            let is_in = n_members == usize::MAX;
+            let n_in = if is_in {
+                // An IN's member count is unknown to the OR model (the
+                // branch's list may be long); price it as the stat1 key
+                // rows — whereLoopAddBtree's IN multiplier on the probe.
+                10
+            } else {
+                0
+            };
+            let n_key = match stats.as_ref().and_then(|s| s.distinct_prefix.first()) {
+                Some(&d) => log_est(d.max(0) as u64),
+                None if idx.unique && idx.columns.len() == 1 => 0,
+                None => 33,
+            };
+            let (run, n_out) = if covering {
+                (
+                    log_est_add(est_log(a0), n_key + 1 + k) + n_in,
+                    n_key + n_in - others,
+                )
+            } else {
+                let lookups = a0 + 16 - if others == 0 { 1 } else { 0 };
+                (log_est_add(a0 + 1 + k + n_in, lookups), a0 - 1 - others)
+            };
+            if run < best_run || (run == best_run && n_out < best_n_out) {
+                best_run = run;
+                best_n_out = n_out;
+            }
+        }
+        // whereOrInsert merge: the branch minima sum through LogEstAdd.
+        if bi == 0 {
+            or_run = best_run;
+            or_n_out = best_n_out;
+        } else {
+            or_run = log_est_add(or_run, best_run);
+            or_n_out = log_est_add(or_n_out, best_n_out);
+        }
+    }
+    // The +1 rounding penalty (whereLoopAddOr's TUNING comment), then
+    // whereLoopInsert displacement of the scan loop: the OR-loop must
+    // be at least as good in BOTH cost and rows. The incumbent it must
+    // displace is the BEST full-scan variant — the table scan or a
+    // winning covering-index full scan (both entered SQLite's loop
+    // list in the earlier whereLoopAddBtree pass).
+    let or_run = or_run + 1;
+    let (best_scan_run, best_scan_n_out, _) = best_full_scan_loop(catalog, table, col_use, &[]);
+    or_run <= best_scan_run && or_n_out <= best_scan_n_out
 }
 
 // ---------------------------------------------------------------------------

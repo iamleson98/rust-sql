@@ -68,13 +68,13 @@ pub enum Jb {
     /// Non-canonical real text (`.5`, `1.`, `.5e1`).
     Float5(String),
     /// String needing no escapes: payload is the raw value.
-    Text(String),
+    Text(crate::types::Text),
     /// String whose payload contains RFC 8259 escape sequences verbatim.
-    TextJ(String),
+    TextJ(crate::types::Text),
     /// String whose payload contains JSON5 escape sequences.
-    Text5(String),
+    Text5(crate::types::Text),
     /// Raw payload that needs escapes inserted when rendered to JSON text.
-    TextRaw(String),
+    TextRaw(crate::types::Text),
     Array(Vec<Jb>),
     /// (key, value) pairs; keys are string elements (types 7-10).
     Object(Vec<(Jb, Jb)>),
@@ -104,114 +104,133 @@ impl Jb {
     /// Decode a string element to its actual value (escapes resolved).
     pub fn string_value(&self) -> Option<String> {
         match self {
-            Jb::Text(s) | Jb::TextRaw(s) => Some(s.clone()),
-            Jb::TextJ(s) | Jb::Text5(s) => Some(decode_escapes(s, matches!(self, Jb::Text5(_)))),
+            Jb::Text(s) | Jb::TextRaw(s) => Some(s.as_str().to_string()),
+            Jb::TextJ(s) | Jb::Text5(s) => Some(
+                decode_escapes(s.as_bytes(), matches!(self, Jb::Text5(_)))
+                    .into_iter()
+                    .map(|b| b as char)
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// The string element's RAW bytes (escapes resolved) — byte-exact
+    /// key comparisons and value extraction for payloads holding
+    /// invalid UTF-8.
+    pub fn string_bytes(&self) -> Option<Vec<u8>> {
+        match self {
+            Jb::Text(s) | Jb::TextRaw(s) => Some(s.as_bytes().to_vec()),
+            Jb::TextJ(s) | Jb::Text5(s) => {
+                Some(decode_escapes(s.as_bytes(), matches!(self, Jb::Text5(_))))
+            }
             _ => None,
         }
     }
 
     /// Minified JSON text — SQLite `json()` output.
-    pub fn render(&self) -> String {
-        let mut out = String::new();
+    pub fn render(&self) -> crate::types::Text {
+        let mut out = Vec::new();
         self.write(&mut out);
-        out
+        crate::types::Text::from_bytes(&out)
     }
 
     /// Pretty JSON text — SQLite `json_pretty()` output (4-space indent,
     /// `": "` after keys).
-    pub fn render_pretty(&self) -> String {
-        let mut out = String::new();
+    pub fn render_pretty(&self) -> crate::types::Text {
+        let mut out = Vec::new();
         self.write_pretty(&mut out, 0);
-        out
+        crate::types::Text::from_bytes(&out)
     }
 
-    fn write(&self, out: &mut String) {
+    fn write(&self, out: &mut Vec<u8>) {
         match self {
-            Jb::Null => out.push_str("null"),
-            Jb::True => out.push_str("true"),
-            Jb::False => out.push_str("false"),
-            Jb::Int(s) => out.push_str(s),
-            Jb::Int5(s) => out.push_str(&canonical_int5(s)),
-            Jb::Float(s) => out.push_str(s),
-            Jb::Float5(s) => out.push_str(&canonical_float5(s)),
+            Jb::Null => out.extend_from_slice(b"null"),
+            Jb::True => out.extend_from_slice(b"true"),
+            Jb::False => out.extend_from_slice(b"false"),
+            Jb::Int(s) => out.extend_from_slice(s.as_bytes()),
+            Jb::Int5(s) => out.extend_from_slice(canonical_int5(s).as_bytes()),
+            Jb::Float(s) => out.extend_from_slice(s.as_bytes()),
+            Jb::Float5(s) => out.extend_from_slice(canonical_float5(s).as_bytes()),
             Jb::Text(s) => {
-                out.push('"');
-                out.push_str(s);
-                out.push('"');
+                out.push(b'"');
+                out.extend_from_slice(s.as_bytes());
+                out.push(b'"');
             }
             Jb::TextJ(s) => {
                 // Payload already contains valid RFC 8259 escapes.
-                out.push('"');
-                out.push_str(s);
-                out.push('"');
+                out.push(b'"');
+                out.extend_from_slice(s.as_bytes());
+                out.push(b'"');
             }
             Jb::Text5(s) => {
-                out.push('"');
-                write_escaped_string(&translate_json5_escapes(s), out);
-                out.push('"');
+                out.push(b'"');
+                let t = translate_json5_escapes(s.as_bytes());
+                write_escaped_string(&t, out);
+                out.push(b'"');
             }
             Jb::TextRaw(s) => {
-                out.push('"');
-                write_escaped_string(s, out);
-                out.push('"');
+                out.push(b'"');
+                write_escaped_string(s.as_bytes(), out);
+                out.push(b'"');
             }
             Jb::Array(items) => {
-                out.push('[');
+                out.push(b'[');
                 for (i, item) in items.iter().enumerate() {
                     if i > 0 {
-                        out.push(',');
+                        out.push(b',');
                     }
                     item.write(out);
                 }
-                out.push(']');
+                out.push(b']');
             }
             Jb::Object(pairs) => {
-                out.push('{');
+                out.push(b'{');
                 for (i, (k, v)) in pairs.iter().enumerate() {
                     if i > 0 {
-                        out.push(',');
+                        out.push(b',');
                     }
                     k.write(out);
-                    out.push(':');
+                    out.push(b':');
                     v.write(out);
                 }
-                out.push('}');
+                out.push(b'}');
             }
         }
     }
 
-    fn write_pretty(&self, out: &mut String, indent: usize) {
+    fn write_pretty(&self, out: &mut Vec<u8>, indent: usize) {
         match self {
             Jb::Array(items) if !items.is_empty() => {
-                out.push_str("[\n");
+                out.extend_from_slice(b"[\n");
                 for (i, item) in items.iter().enumerate() {
                     if i > 0 {
-                        out.push_str(",\n");
+                        out.extend_from_slice(b",\n");
                     }
                     push_indent(out, indent + 1);
                     item.write_pretty(out, indent + 1);
                 }
-                out.push('\n');
+                out.push(b'\n');
                 push_indent(out, indent);
-                out.push(']');
+                out.push(b']');
             }
             Jb::Object(pairs) if !pairs.is_empty() => {
-                out.push_str("{\n");
+                out.extend_from_slice(b"{\n");
                 for (i, (k, v)) in pairs.iter().enumerate() {
                     if i > 0 {
-                        out.push_str(",\n");
+                        out.extend_from_slice(b",\n");
                     }
                     push_indent(out, indent + 1);
                     k.write_pretty(out, indent + 1);
-                    out.push_str(": ");
+                    out.extend_from_slice(b": ");
                     v.write_pretty(out, indent + 1);
                 }
-                out.push('\n');
+                out.push(b'\n');
                 push_indent(out, indent);
-                out.push('}');
+                out.push(b'}');
             }
-            Jb::Array(_) => out.push_str("[]"),
-            Jb::Object(_) => out.push_str("{}"),
+            Jb::Array(_) => out.extend_from_slice(b"[]"),
+            Jb::Object(_) => out.extend_from_slice(b"{}"),
             other => other.write(out),
         }
     }
@@ -230,17 +249,26 @@ impl Jb {
             Jb::Float5(s) => num_text_to_real(&canonical_float5(s))
                 .map(Value::Real)
                 .unwrap_or_else(|| Value::Text(s.as_str().into())),
-            Jb::Text(s) | Jb::TextRaw(s) => Value::Text(s.as_str().into()),
-            Jb::TextJ(s) => Value::Text(decode_escapes(s, false).into()),
-            Jb::Text5(s) => Value::Text(decode_escapes(s, true).into()),
-            Jb::Array(_) | Jb::Object(_) => Value::Text(self.render().into()),
+            // A string element's SQL value carries its RAW bytes through
+            // (SQLite's json_extract returns the text as stored — invalid
+            // UTF-8 included).
+            Jb::Text(s) | Jb::TextRaw(s) => Value::Text(s.clone()),
+            Jb::TextJ(s) => Value::Text(crate::types::Text::from_bytes(&decode_escapes(
+                s.as_bytes(),
+                false,
+            ))),
+            Jb::Text5(s) => Value::Text(crate::types::Text::from_bytes(&decode_escapes(
+                s.as_bytes(),
+                true,
+            ))),
+            Jb::Array(_) | Jb::Object(_) => Value::Text(self.render()),
         }
     }
 }
 
-fn push_indent(out: &mut String, n: usize) {
+fn push_indent(out: &mut Vec<u8>, n: usize) {
     for _ in 0..n {
-        out.push_str("    ");
+        out.extend_from_slice(b"    ");
     }
 }
 
@@ -271,8 +299,16 @@ fn num_text_to_real(s: &str) -> Option<f64> {
 /// Parse with SQLite's default leniency. `Err(pos)` is the 1-based byte
 /// position of the syntax error (`json_error_position` semantics).
 pub fn parse_lenient(s: &str) -> Result<Jb, usize> {
+    parse_lenient_bytes(s.as_bytes())
+}
+
+/// Parse over RAW BYTES — SQLite's JSON parser accepts any byte ≥ 0x20
+/// inside a string literal, invalid UTF-8 included (`json(x'22ff22')`
+/// is the string with the raw 0xff byte). The string payload keeps
+/// those bytes as-is.
+pub fn parse_lenient_bytes(b: &[u8]) -> Result<Jb, usize> {
     let mut p = JParser {
-        b: s.as_bytes(),
+        b,
         pos: 0,
         strict: false,
     };
@@ -287,8 +323,14 @@ pub fn parse_lenient(s: &str) -> Result<Jb, usize> {
 /// Parse under strict RFC 8259 rules (json_valid bit 1): no trailing
 /// commas, no `+`/`.5`/`1.`/hex/Infinity/NaN, no unquoted keys.
 pub fn parse_strict(s: &str) -> Result<Jb, usize> {
+    parse_strict_bytes(s.as_bytes())
+}
+
+/// Parse under strict RFC 8259 rules over raw bytes (see
+/// [`parse_lenient_bytes`]).
+pub fn parse_strict_bytes(b: &[u8]) -> Result<Jb, usize> {
     let mut p = JParser {
-        b: s.as_bytes(),
+        b,
         pos: 0,
         strict: true,
     };
@@ -474,26 +516,30 @@ impl<'a> JParser<'a> {
     }
 
     /// Scan a JSON string. Returns (element, saw_json5_escapes).
+    /// The payload accumulates RAW BYTES: SQLite's parser accepts any
+    /// byte ≥ 0x20 inside a string, invalid UTF-8 included — an invalid
+    /// sequence (or a stray lead/continuation byte) copies through as
+    /// its own bytes, exactly as the input holds them.
     fn parse_string(&mut self) -> Result<(Jb, bool), usize> {
         if self.peek() != Some(b'"') {
             return Err(self.err());
         }
         self.pos += 1;
-        let mut payload = String::new();
+        let mut payload: Vec<u8> = Vec::new();
         let mut json5 = false;
         loop {
             let c = self.peek().ok_or(self.pos + 1)?;
             match c {
                 b'"' => {
                     self.pos += 1;
-                    let elem = if payload.contains('\\') {
+                    let elem = if payload.contains(&b'\\') {
                         if json5 {
-                            Jb::Text5(payload)
+                            Jb::Text5(crate::types::Text::from_bytes(&payload))
                         } else {
-                            Jb::TextJ(payload)
+                            Jb::TextJ(crate::types::Text::from_bytes(&payload))
                         }
                     } else {
-                        Jb::Text(payload)
+                        Jb::Text(crate::types::Text::from_bytes(&payload))
                     };
                     return Ok((elem, json5));
                 }
@@ -502,23 +548,23 @@ impl<'a> JParser<'a> {
                     let e = self.peek().ok_or(self.pos + 1)?;
                     match e {
                         b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' | b'u' => {
-                            payload.push('\\');
-                            payload.push(e as char);
+                            payload.push(b'\\');
+                            payload.push(e);
                             self.pos += 1;
                             if e == b'u' {
                                 if self.peek() == Some(b'{') {
                                     // JSON5 \u{XX...} code point
                                     json5 = true;
-                                    payload.push('{');
+                                    payload.push(b'{');
                                     self.pos += 1;
                                     while self.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
-                                        payload.push(self.peek().unwrap() as char);
+                                        payload.push(self.peek().unwrap());
                                         self.pos += 1;
                                     }
                                     if self.peek() != Some(b'}') {
                                         return Err(self.pos + 1);
                                     }
-                                    payload.push('}');
+                                    payload.push(b'}');
                                     self.pos += 1;
                                 } else {
                                     for _ in 0..4 {
@@ -526,7 +572,7 @@ impl<'a> JParser<'a> {
                                         if !h.is_ascii_hexdigit() {
                                             return Err(self.pos + 1);
                                         }
-                                        payload.push(h as char);
+                                        payload.push(h);
                                         self.pos += 1;
                                     }
                                 }
@@ -535,8 +581,8 @@ impl<'a> JParser<'a> {
                         // JSON5 escapes
                         b'x' | b'v' | b'0'..=b'7' | b'\n' | b'\r' => {
                             json5 = true;
-                            payload.push('\\');
-                            payload.push(e as char);
+                            payload.push(b'\\');
+                            payload.push(e);
                             self.pos += 1;
                             if e == b'x' {
                                 for _ in 0..2 {
@@ -544,7 +590,7 @@ impl<'a> JParser<'a> {
                                     if !h.is_ascii_hexdigit() {
                                         return Err(self.pos + 1);
                                     }
-                                    payload.push(h as char);
+                                    payload.push(h);
                                     self.pos += 1;
                                 }
                             }
@@ -554,23 +600,41 @@ impl<'a> JParser<'a> {
                 }
                 c if c < 0x20 => return Err(self.pos + 1),
                 c if c < 0x80 => {
-                    payload.push(c as char);
+                    payload.push(c);
                     self.pos += 1;
                 }
                 _ => {
-                    // Multi-byte UTF-8: copy the whole sequence.
-                    let rest =
-                        std::str::from_utf8(&self.b[self.pos..]).map_err(|_| self.pos + 1)?;
-                    let ch = rest.chars().next().ok_or(self.pos + 1)?;
-                    payload.push(ch);
-                    self.pos += ch.len_utf8();
+                    // Byte ≥ 0x80: copy a VALID multi-byte sequence whole;
+                    // an invalid one (stray lead / continuation, truncated
+                    // sequence) copies the single byte RAW — SQLite's
+                    // parser treats it as an ordinary string byte.
+                    let rest = &self.b[self.pos..];
+                    let step = match std::str::from_utf8(rest) {
+                        Ok(s) => s.chars().next().map(|ch| ch.len_utf8()).unwrap_or(1),
+                        Err(e) => {
+                            let valid = e.valid_up_to();
+                            if valid > 0 {
+                                std::str::from_utf8(&rest[..valid])
+                                    .unwrap()
+                                    .chars()
+                                    .next()
+                                    .map(|ch| ch.len_utf8())
+                                    .unwrap_or(1)
+                            } else {
+                                1
+                            }
+                        }
+                    };
+                    payload.extend_from_slice(&self.b[self.pos..self.pos + step]);
+                    self.pos += step;
                 }
             }
         }
     }
 
-    /// Unquoted JSON5 object key: `{a:1}`.
-    fn parse_ident_key(&mut self) -> Result<String, usize> {
+    /// Unquoted JSON5 object key over bytes (idents are ASCII):
+    /// `{a:1}`.
+    fn parse_ident_key_bytes(&mut self) -> Result<Vec<u8>, usize> {
         let start = self.pos;
         if self.peek() == Some(b'_') || self.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
             self.pos += 1;
@@ -580,9 +644,7 @@ impl<'a> JParser<'a> {
             ) {
                 self.pos += 1;
             }
-            Ok(std::str::from_utf8(&self.b[start..self.pos])
-                .unwrap()
-                .to_string())
+            Ok(self.b[start..self.pos].to_vec())
         } else {
             Err(self.err())
         }
@@ -636,21 +698,22 @@ impl<'a> JParser<'a> {
                 if self.peek() == Some(b'\'') {
                     // JSON5 single-quoted strings: treat as Text5-ish; rare.
                     self.pos += 1;
-                    let mut s = String::new();
+                    let mut s: Vec<u8> = Vec::new();
                     while let Some(c) = self.peek() {
                         if c == b'\'' {
                             break;
                         }
-                        s.push(c as char);
+                        s.push(c);
                         self.pos += 1;
                     }
                     if self.peek() != Some(b'\'') {
                         return Err(self.pos + 1);
                     }
                     self.pos += 1;
-                    Jb::Text5(s)
+                    Jb::Text5(crate::types::Text::from_bytes(&s))
                 } else {
-                    Jb::Text(self.parse_ident_key()?)
+                    let kb = self.parse_ident_key_bytes()?;
+                    Jb::Text(crate::types::Text::from_utf8(&kb).map_err(|_| self.err())?)
                 }
             } else {
                 return Err(self.err());
@@ -688,25 +751,28 @@ impl<'a> JParser<'a> {
 
 /// Decode JSON (and JSON5 when `json5`) escape sequences to the actual
 /// string value.
-pub fn decode_escapes(s: &str, json5: bool) -> String {
-    let b = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
+pub fn decode_escapes(b: &[u8], json5: bool) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let push_cp = |out: &mut Vec<u8>, c: char| {
+        let mut buf = [0u8; 4];
+        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+    };
     let mut i = 0;
     while i < b.len() {
         match b[i] {
             b'\\' if i + 1 < b.len() => {
                 i += 1;
                 match b[i] {
-                    b'"' => out.push('"'),
-                    b'\\' => out.push('\\'),
-                    b'/' => out.push('/'),
-                    b'b' => out.push('\u{0008}'),
-                    b'f' => out.push('\u{000C}'),
-                    b'n' => out.push('\n'),
-                    b'r' => out.push('\r'),
-                    b't' => out.push('\t'),
-                    b'v' => out.push('\u{000B}'),
-                    b'0' => out.push('\0'),
+                    b'"' => out.push(b'"'),
+                    b'\\' => out.push(b'\\'),
+                    b'/' => out.push(b'/'),
+                    b'b' => out.push(0x08),
+                    b'f' => out.push(0x0C),
+                    b'n' => out.push(b'\n'),
+                    b'r' => out.push(b'\r'),
+                    b't' => out.push(b'\t'),
+                    b'v' => out.push(0x0B),
+                    b'0' => out.push(0),
                     b'u' => {
                         if json5 && i + 1 < b.len() && b[i + 1] == b'{' {
                             // \u{XX...}
@@ -717,62 +783,66 @@ pub fn decode_escapes(s: &str, json5: bool) -> String {
                                 j += 1;
                             }
                             if let Some(c) = char::from_u32(v) {
-                                out.push(c);
+                                push_cp(&mut out, c);
                             }
                             i = j; // skip to '}' (loop ++ moves past)
                         } else {
-                            let hex = s
-                                .get(i + 1..i + 5)
-                                .and_then(|h| u32::from_str_radix(h, 16).ok());
+                            let hex = std::str::from_utf8(&b[i + 1..(i + 5).min(b.len())])
+                                .ok()
+                                .and_then(|h| u32::from_str_radix(h, 16).ok())
+                                .filter(|_| i + 5 <= b.len());
                             if let Some(cp) = hex {
                                 if (0xD800..0xDC00).contains(&cp)
                                     && b.get(i + 5) == Some(&b'\\')
                                     && b.get(i + 6) == Some(&b'u')
                                 {
-                                    if let Some(lo) = s
-                                        .get(i + 7..i + 11)
-                                        .and_then(|h| u32::from_str_radix(h, 16).ok())
-                                    {
+                                    let lo_hex =
+                                        std::str::from_utf8(&b[i + 7..(i + 11).min(b.len())])
+                                            .ok()
+                                            .and_then(|h| u32::from_str_radix(h, 16).ok())
+                                            .filter(|_| i + 11 <= b.len());
+                                    if let Some(lo) = lo_hex {
                                         let c = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
                                         if let Some(ch) = char::from_u32(c) {
-                                            out.push(ch);
+                                            push_cp(&mut out, ch);
                                         }
                                         i += 10;
                                     } else {
-                                        out.push('\u{FFFD}');
+                                        push_cp(&mut out, '\u{FFFD}');
                                         i += 4;
                                     }
                                 } else if (0xDC00..0xE000).contains(&cp) {
                                     // Lone low surrogate
-                                    out.push('\u{FFFD}');
+                                    push_cp(&mut out, '\u{FFFD}');
                                 } else {
-                                    out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                                    push_cp(&mut out, char::from_u32(cp).unwrap_or('\u{FFFD}'));
                                     i += 4;
                                 }
                             }
                         }
                     }
                     b'x' if json5 => {
-                        if let Some(cp) = s
-                            .get(i + 1..i + 3)
+                        let cp = std::str::from_utf8(&b[i + 1..(i + 3).min(b.len())])
+                            .ok()
                             .and_then(|h| u32::from_str_radix(h, 16).ok())
-                        {
-                            out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                            .filter(|_| i + 3 <= b.len());
+                        if let Some(cp) = cp {
+                            push_cp(&mut out, char::from_u32(cp).unwrap_or('\u{FFFD}'));
                             i += 2;
                         }
                     }
                     _ => {
                         // Line continuation (backslash newline) or unknown:
                         if b[i] != b'\n' {
-                            out.push('\\');
-                            out.push(b[i] as char);
+                            out.push(b'\\');
+                            out.push(b[i]);
                         }
                     }
                 }
                 i += 1;
             }
             c => {
-                out.push(c as char);
+                out.push(c);
                 i += 1;
             }
         }
@@ -782,35 +852,36 @@ pub fn decode_escapes(s: &str, json5: bool) -> String {
 
 /// Translate JSON5 escapes to RFC 8259 escapes (rendering a TEXT5
 /// payload): decode to the value, re-escape minimally at render time.
-fn translate_json5_escapes(s: &str) -> String {
-    decode_escapes(s, true)
+fn translate_json5_escapes(b: &[u8]) -> Vec<u8> {
+    decode_escapes(b, true)
 }
 
-/// Write a raw string into JSON text, inserting RFC 8259 escapes
+/// Write raw bytes into JSON text, inserting RFC 8259 escapes
 /// (SQLite's minimal set: `\"`, `\\`, `\b`, `\f`, `\n`, `\r`, `\t`,
-/// `\u00xx` for other controls).
-fn write_escaped_string(s: &str, out: &mut String) {
-    for c in s.chars() {
+/// `\u00xx` for other controls — every other byte, invalid UTF-8
+/// included, copies through RAW).
+fn write_escaped_string(b: &[u8], out: &mut Vec<u8>) {
+    for &c in b {
         match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\u{0008}' => out.push_str("\\b"),
-            '\u{000C}' => out.push_str("\\f"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            0x08 => out.extend_from_slice(b"\\b"),
+            0x0C => out.extend_from_slice(b"\\f"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            c if c < 0x20 => {
+                out.extend_from_slice(format!("\\u{:04x}", c).as_bytes());
             }
             c => out.push(c),
         }
     }
 }
 
-/// True when the string needs no escapes at all in JSON text — used to
+/// True when the bytes need no escapes at all in JSON text — used to
 /// classify SQL strings into TEXT vs TEXTJ/TEXTRAW.
-pub fn json_safe(s: &str) -> bool {
-    s.bytes().all(|c| c >= 0x20 && c != b'"' && c != b'\\')
+pub fn json_safe(b: &[u8]) -> bool {
+    b.iter().all(|&c| c >= 0x20 && c != b'"' && c != b'\\')
 }
 
 // ---------------------------------------------------------------------------
@@ -955,14 +1026,12 @@ fn encode_elem(out: &mut Vec<u8>, jb: &Jb) {
         }
     }
     match jb {
-        Jb::Int(s)
-        | Jb::Int5(s)
-        | Jb::Float(s)
-        | Jb::Float5(s)
-        | Jb::Text(s)
-        | Jb::TextJ(s)
-        | Jb::Text5(s)
-        | Jb::TextRaw(s) => out.extend_from_slice(s.as_bytes()),
+        Jb::Int(s) | Jb::Int5(s) | Jb::Float(s) | Jb::Float5(s) => {
+            out.extend_from_slice(s.as_bytes())
+        }
+        Jb::Text(s) | Jb::TextJ(s) | Jb::Text5(s) | Jb::TextRaw(s) => {
+            out.extend_from_slice(s.as_bytes())
+        }
         _ => {}
     }
 }
@@ -1044,18 +1113,19 @@ fn decode_elem(b: &[u8], pos: &mut usize) -> Result<Jb, ()> {
             Ok(Jb::False)
         }
         T_INT | T_INT5 | T_FLOAT | T_FLOAT5 | T_TEXT | T_TEXTJ | T_TEXT5 | T_TEXTRAW => {
-            let s = std::str::from_utf8(&b[payload_start..payload_end])
-                .map_err(|_| ())?
-                .to_string();
+            let raw = &b[payload_start..payload_end];
             Ok(match typ {
-                T_INT => Jb::Int(s),
-                T_INT5 => Jb::Int5(s),
-                T_FLOAT => Jb::Float(s),
-                T_FLOAT5 => Jb::Float5(s),
-                T_TEXT => Jb::Text(s),
-                T_TEXTJ => Jb::TextJ(s),
-                T_TEXT5 => Jb::Text5(s),
-                _ => Jb::TextRaw(s),
+                T_INT => Jb::Int(std::str::from_utf8(raw).map_err(|_| ())?.to_string()),
+                T_INT5 => Jb::Int5(std::str::from_utf8(raw).map_err(|_| ())?.to_string()),
+                T_FLOAT => Jb::Float(std::str::from_utf8(raw).map_err(|_| ())?.to_string()),
+                T_FLOAT5 => Jb::Float5(std::str::from_utf8(raw).map_err(|_| ())?.to_string()),
+                // TEXT payloads hold the bytes as-is — a JSONB text
+                // element may carry invalid UTF-8 (SQLite's jsonb()
+                // accepts it), and it round-trips byte-exact.
+                T_TEXT => Jb::Text(crate::types::Text::from_bytes(raw)),
+                T_TEXTJ => Jb::TextJ(crate::types::Text::from_bytes(raw)),
+                T_TEXT5 => Jb::Text5(crate::types::Text::from_bytes(raw)),
+                _ => Jb::TextRaw(crate::types::Text::from_bytes(raw)),
             })
         }
         T_ARRAY => {
@@ -1160,7 +1230,7 @@ impl Sp {
     pub fn to_value(&self) -> Value {
         match &self.node {
             SpNode::Scalar(jb) => jb.to_value(),
-            SpNode::Array(_) | SpNode::Object(_) => Value::Text(self.to_jb().render().into()),
+            SpNode::Array(_) | SpNode::Object(_) => Value::Text(self.to_jb().render()),
         }
     }
 }
@@ -1203,18 +1273,16 @@ fn decode_sp_elem(b: &[u8], pos: &mut usize) -> Result<Sp, ()> {
             })
         }
         T_INT | T_INT5 | T_FLOAT | T_FLOAT5 | T_TEXT | T_TEXTJ | T_TEXT5 | T_TEXTRAW => {
-            let s = std::str::from_utf8(&b[payload_start..payload_end])
-                .map_err(|_| ())?
-                .to_string();
+            let raw = &b[payload_start..payload_end];
             let jb = match typ {
-                T_INT => Jb::Int(s),
-                T_INT5 => Jb::Int5(s),
-                T_FLOAT => Jb::Float(s),
-                T_FLOAT5 => Jb::Float5(s),
-                T_TEXT => Jb::Text(s),
-                T_TEXTJ => Jb::TextJ(s),
-                T_TEXT5 => Jb::Text5(s),
-                _ => Jb::TextRaw(s),
+                T_INT => Jb::Int(std::str::from_utf8(raw).map_err(|_| ())?.to_string()),
+                T_INT5 => Jb::Int5(std::str::from_utf8(raw).map_err(|_| ())?.to_string()),
+                T_FLOAT => Jb::Float(std::str::from_utf8(raw).map_err(|_| ())?.to_string()),
+                T_FLOAT5 => Jb::Float5(std::str::from_utf8(raw).map_err(|_| ())?.to_string()),
+                T_TEXT => Jb::Text(crate::types::Text::from_bytes(raw)),
+                T_TEXTJ => Jb::TextJ(crate::types::Text::from_bytes(raw)),
+                T_TEXT5 => Jb::Text5(crate::types::Text::from_bytes(raw)),
+                _ => Jb::TextRaw(crate::types::Text::from_bytes(raw)),
             };
             Ok(Sp {
                 off: start,
@@ -1297,14 +1365,17 @@ pub fn value_to_jb(v: &Value) -> Jb {
             }
         }
         Value::Text(t) => {
-            let s: &str = t;
-            if json_safe(s) {
-                Jb::Text(s.to_string())
+            // RAW bytes — SQLite's jsonAppendString copies every byte
+            // except the escaped set (`"`, `\\`, controls < 0x20);
+            // invalid UTF-8 passes through into the JSON text.
+            let raw = t.as_bytes();
+            if json_safe(raw) {
+                Jb::Text(t.clone())
             } else {
                 // Escapes inserted eagerly — SQLite's TEXTJ from SQL values.
-                let mut p = String::with_capacity(s.len() + 8);
-                write_escaped_string(s, &mut p);
-                Jb::TextJ(p)
+                let mut p = Vec::with_capacity(raw.len() + 8);
+                write_escaped_string(raw, &mut p);
+                Jb::TextJ(crate::types::Text::from_bytes(&p))
             }
         }
         Value::Blob(b) => match blob_to_jb(b) {
@@ -1385,7 +1456,7 @@ pub fn jb_set_at(root: Jb, segs: &[PathSeg], new_val: Jb, create: bool, insert_o
                     members[pos].1 = walk(child, &segs[1..], new_val, create, insert_only);
                     Jb::Object(members)
                 } else if create {
-                    let key = Jb::TextRaw(k.clone());
+                    let key = Jb::TextRaw(crate::types::Text::from(k.as_str()));
                     let child = walk(
                         Jb::Object(Vec::new()),
                         &segs[1..],

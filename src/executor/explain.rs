@@ -4,6 +4,7 @@ use crate::planner::plan::Plan;
 use crate::schema::Catalog;
 use crate::sql::ast::Expr;
 use crate::types::{Row, Value};
+use std::sync::Arc;
 
 /// Render a plan into EXPLAIN QUERY PLAN rows, mirroring SQLite's
 /// (id, parent, notused, detail) schema. Children of a node share the
@@ -40,6 +41,7 @@ fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64, cat: &
             table,
             alias,
             index,
+            index_covering: _ic,
             predicate,
         } => {
             let a = alias_of(alias, &table.name);
@@ -76,6 +78,9 @@ fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64, cat: &
                 }
             }
             let detail = match index {
+                Some(idx) if *_ic => {
+                    format!("SCAN {a} USING COVERING INDEX {}", idx.name)
+                }
                 Some(idx) => format!("SCAN {a} USING INDEX {}", idx.name),
                 None => format!("SCAN {a}"),
             };
@@ -252,6 +257,7 @@ fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64, cat: &
                 alias,
                 predicate: scan_pred,
                 index: None,
+                index_covering: false,
             } = &**input
             {
                 if table.vtab.is_some() {
@@ -326,13 +332,29 @@ fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64, cat: &
             if let Some((source, terms)) = sorted.filter(|_| fits(count, 0) && fits(offset, 0)) {
                 if let Some((index, _)) = crate::executor::index_order_source(cat, source, terms) {
                     match source.as_ref() {
-                        Plan::Scan { table, alias, .. } => push_row(
+                        Plan::Scan {
+                            table,
+                            alias,
+                            index: src_index,
+                            index_covering: ic,
+                            ..
+                        } => push_row(
                             parent,
                             rows,
                             next_id,
+                            // SQLite prints the COVERING wording when the
+                            // streaming walk reads no table row — the
+                            // covering variant's own index (the walk it
+                            // declared) or a rowid-only projection.
                             format!(
-                                "SCAN {} USING INDEX {}",
+                                "SCAN {} USING {}INDEX {}",
                                 alias_of(alias, &table.name),
+                                if *ic && src_index.as_ref().is_some_and(|i| Arc::ptr_eq(i, &index))
+                                {
+                                    "COVERING "
+                                } else {
+                                    ""
+                                },
                                 index.name
                             ),
                         ),
@@ -535,10 +557,12 @@ pub(crate) fn node_detail(plan: &Plan) -> Option<String> {
             table,
             alias,
             index,
+            index_covering: ic,
             ..
         } => {
             let a = alias_of(alias, &table.name);
             Some(match index {
+                Some(idx) if *ic => format!("SCAN {a} USING COVERING INDEX {}", idx.name),
                 Some(idx) => format!("SCAN {a} USING INDEX {}", idx.name),
                 None => format!("SCAN {a}"),
             })

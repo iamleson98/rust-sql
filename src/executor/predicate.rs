@@ -1159,31 +1159,49 @@ pub(crate) fn compile_predicate(
     table: &crate::schema::Table,
     prefix: &str,
 ) -> Option<CompiledPredicate> {
-    compile_predicate_at(e, table, prefix, true)
+    compile_predicate_at(e, table, prefix, true, false)
 }
 
 /// `seekable`: `e` sits where SQLite could drive an IN-loop with it — an
-/// AND-conjunct of the WHERE, not under NOT. A rowid-alias IN runs seek
-/// membership only there (see `CompiledPredicate::InList::rowid_seek`);
-/// under NOT the IN is evaluated as an expression, the general numeric
-/// comparison (`NOT (id IN (-2^63.0))` excludes the i64::MIN row). OR
-/// branches keep the seek: SQLite's multi-index OR plan seeks each
-/// indexable branch, and the rowid branch always is.
+/// AND-conjunct of the WHERE, not under NOT. `in_or_branch`: `e` sits
+/// inside an OR branch (an OR-term of the WHERE). Together they decide a
+/// rowid-alias IN's residual semantics: SQLite evaluates an AND-level
+/// residual IN as an EXPRESSION (the general comparison — the boundary
+/// REAL -2^63 equals the i64::MIN row), and only an OR branch's rowid IN
+/// can run under SEEK membership — the multi-index OR's rowid branch
+/// drives OP_SeekRowid per member (`k = 30 OR id IN (-2^63.0)` includes
+/// the row; `a = 1 OR id IN (-2^63.0, 3)` on a big analyzed table takes
+/// the OR-opt and excludes it). The planner rewrites a NOT-taken OR's
+/// rowid IN into its equality chain (compare semantics) — see
+/// `rewrite_or_rowid_in_residuals`.
 fn compile_predicate_at(
     e: &Expr,
     table: &crate::schema::Table,
     prefix: &str,
     seekable: bool,
+    in_or_branch: bool,
 ) -> Option<CompiledPredicate> {
     match e {
         Expr::Binary { op, left, right } => match op {
             BinaryOp::And => Some(CompiledPredicate::And(
-                Box::new(compile_predicate_at(left, table, prefix, seekable)?),
-                Box::new(compile_predicate_at(right, table, prefix, seekable)?),
+                Box::new(compile_predicate_at(
+                    left,
+                    table,
+                    prefix,
+                    seekable,
+                    in_or_branch,
+                )?),
+                Box::new(compile_predicate_at(
+                    right,
+                    table,
+                    prefix,
+                    seekable,
+                    in_or_branch,
+                )?),
             )),
             BinaryOp::Or => Some(CompiledPredicate::Or(
-                Box::new(compile_predicate_at(left, table, prefix, seekable)?),
-                Box::new(compile_predicate_at(right, table, prefix, seekable)?),
+                Box::new(compile_predicate_at(left, table, prefix, seekable, true)?),
+                Box::new(compile_predicate_at(right, table, prefix, seekable, true)?),
             )),
             op if is_cmp_op(*op) => {
                 let lhs = bind_operand(left, table, prefix)?;
@@ -1221,7 +1239,11 @@ fn compile_predicate_at(
             // NOT expr
             if matches!(op, crate::sql::ast::UnaryOp::Not) {
                 Some(CompiledPredicate::Not(Box::new(compile_predicate_at(
-                    expr, table, prefix, false,
+                    expr,
+                    table,
+                    prefix,
+                    false,
+                    in_or_branch,
                 )?)))
             } else {
                 None
@@ -1414,9 +1436,21 @@ fn compile_predicate_at(
                 vals: bound,
                 negated: *negated,
                 int_set,
-                // NOT IN never drives a seek: SQLite evaluates it as an
-                // expression (`id NOT IN (-2^63.0)` excludes i64::MIN).
-                rowid_seek: seekable && !*negated && table.rowid_alias == Some(col),
+                // A rowid-alias IN evaluates with SEEK membership only
+                // inside an OR branch (SQLite's multi-index OR drives
+                // the rowid branch's members through OP_SeekRowid) or
+                // when it materializes a subquery (SQLite's IN-subquery
+                // loop drives OP_SeekRowid per member — the
+                // IN_RHS_MARKER affinity cast marks those) — an
+                // AND-level residual LIST IN is an EXPRESSION in
+                // SQLite and the general comparison applies (the
+                // boundary REAL -2^63 equals the i64::MIN row:
+                // `k = 30 OR id IN (-2^63.0)` includes it, a taken
+                // OR-opt excludes it). NOT IN never seeks either way.
+                rowid_seek: seekable
+                    && !*negated
+                    && table.rowid_alias == Some(col)
+                    && (in_or_branch || rhs_aff.is_some()),
             })
         }
         Expr::Like {

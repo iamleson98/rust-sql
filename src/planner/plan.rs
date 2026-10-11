@@ -18,6 +18,16 @@ pub enum Plan {
         table: Arc<Table>,
         alias: Option<String>,
         index: Option<Arc<Index>>,
+        /// The chosen index is a COVERING index for this statement
+        /// (SQLite's `WHERE_IDX_ONLY` / "SCAN t USING COVERING INDEX"):
+        /// the cost model picked it over the table scan and every
+        /// referenced column resolves to an index column or the rowid
+        /// alias. The walk is an index-b-tree scan in INDEX order —
+        /// which is the observable difference vs the table scan
+        /// (SQLite's full-scan variant choice, whereLoopAddBtree).
+        /// `false` for the INDEXED BY hint form (a forced, possibly
+        /// non-covering walk).
+        index_covering: bool,
         /// Optional predicate that can be evaluated during the scan (pushed-down).
         predicate: Option<Expr>,
     },

@@ -32,7 +32,7 @@ fn arrow_eval(op: BinaryOp, l: &Value, r: &Value) -> Result<Value> {
     };
     let node = crate::executor::jsonb::jb_resolve(&doc, &segs);
     Ok(match (op, node) {
-        (BinaryOp::Arrow, Some(n)) => Value::Text(n.render().into()),
+        (BinaryOp::Arrow, Some(n)) => Value::Text(n.render()),
         (BinaryOp::ArrowText, Some(n)) => n.to_value(),
         _ => Value::Null,
     })
@@ -2232,6 +2232,58 @@ fn evaluate_in(
 /// no column or rowid reference, no subquery, no non-deterministic call.
 /// The member of a one-member IN list SQLite's parser turns into an
 /// equality (`x IN (c)` → `x == +c` when `c` is constant).
+/// Evaluate a CONSTANT expression — literals and pure functions/CAST/
+/// unary operators over literals — with no row and no parameters. This
+/// is the plan-time value of an IN-list member that never reads a
+/// column, never binds a parameter, and is deterministic. `None` for
+/// anything else (the caller must leave those members untouched: their
+/// value exists only at run time).
+pub(crate) fn try_const_value(e: &Expr) -> Option<Value> {
+    fn const_ok(e: &Expr) -> bool {
+        match e {
+            Expr::Literal(_) => true,
+            Expr::Column { .. } | Expr::Parameter(_) | Expr::Subquery(_) | Expr::Exists(_) => false,
+            Expr::Function {
+                name, args, over, ..
+            } => {
+                over.is_none()
+                    && !matches!(
+                        name.to_ascii_lowercase().as_str(),
+                        "random"
+                            | "randomblob"
+                            | "changes"
+                            | "total_changes"
+                            | "last_insert_rowid"
+                            | "date"
+                            | "time"
+                            | "datetime"
+                            | "julianday"
+                            | "unixepoch"
+                            | "strftime"
+                    )
+                    && args.iter().all(const_ok)
+            }
+            Expr::Binary { left, right, .. } | Expr::Is { left, right, .. } => {
+                const_ok(left) && const_ok(right)
+            }
+            Expr::Unary { expr, .. }
+            | Expr::Cast { expr, .. }
+            | Expr::Collate { expr, .. }
+            | Expr::IsNull { expr, .. } => const_ok(expr),
+            _ => false,
+        }
+    }
+    if !const_ok(e) {
+        return None;
+    }
+    let empty_row: Vec<Value> = Vec::new();
+    let empty_cols: Vec<String> = Vec::new();
+    let empty_params: Vec<Value> = Vec::new();
+    let empty_named = std::collections::HashMap::new();
+    let ctx = EvalContext::new(&empty_row, &empty_cols, &empty_params, &empty_named);
+    evaluate(e, &ctx).ok()
+}
+
 pub(crate) fn single_constant_member(source: &InSource) -> Option<&Expr> {
     match source {
         InSource::List(l) if l.len() == 1 && is_constant_member(&l[0]) => Some(&l[0]),
@@ -2794,9 +2846,17 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
         // pair entirely.
         "__json_object_frag" => {
             if args.len() == 2 && !args[0].is_null() {
+                // Raw bytes: a key or value holding invalid UTF-8 must
+                // keep its bytes (SQLite's jsonAppendString), so the
+                // fragment joins the RENDERED BYTES, not the masked
+                // string view.
                 let k = crate::executor::json::json_quote_value(&args[0]);
                 let v = crate::executor::json::json_quote_value(&args[1]);
-                Value::Text(format!("{k}:{v}").into())
+                let mut frag = Vec::with_capacity(k.as_bytes().len() + 1 + v.as_bytes().len());
+                frag.extend_from_slice(k.as_bytes());
+                frag.push(b':');
+                frag.extend_from_slice(v.as_bytes());
+                Value::Text(crate::types::Text::from_bytes(&frag))
             } else {
                 Value::Null
             }
@@ -3178,10 +3238,30 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
         "unicode" => match args.first() {
             Some(Value::Null) | None => Value::Null,
             Some(v) => {
-                let s = v.as_text();
-                match s.chars().next() {
-                    Some(c) if c != '\0' => Value::Integer(c as i64),
-                    _ => Value::Null,
+                // SQLite's unicodeFunc: sqlite3Utf8Read over the raw
+                // text bytes — a truncated sequence decodes LENIENTLY
+                // (`x'e282'` -> 130, a lone 0xff -> 0xFFFD, a stray
+                // continuation `x'80'` -> 128); text whose first byte
+                // is NUL (or empty) is NULL. The masked `as_str` view
+                // read every invalid byte as U+001A instead.
+                let b: Vec<u8> = match v {
+                    Value::Text(t) => {
+                        let raw = t.as_bytes();
+                        let z = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
+                        raw[..z].to_vec()
+                    }
+                    other => other.as_text().into_bytes(),
+                };
+                if b.is_empty() {
+                    Value::Null
+                } else {
+                    let mut i = 0;
+                    let c = utf8_read(&b, &mut i);
+                    if c == 0 {
+                        Value::Null
+                    } else {
+                        Value::Integer(c as i64)
+                    }
                 }
             }
         },
@@ -4086,11 +4166,22 @@ pub fn like_match(
     // scan drops from ~325 ns/row to ~15-30 ns/row.
     if escape.is_none() {
         if let (Value::Text(sv), Value::Text(pv)) = (value, pattern) {
-            if pv.is_ascii() {
+            // RAW bytes on both sides, and the ASCII checks against the
+            // raw bytes too: a raw text's `as_str()` view masks every
+            // invalid byte to U+001A — an ASCII byte — which made
+            // invalid-UTF-8 subjects look ASCII-safe here while `_`
+            // must match one sqlite3Utf8Read CHARACTER (a truncated
+            // sequence is ONE char: `x'e282' LIKE '_'` is TRUE in
+            // SQLite) and a masked pattern byte silently compared as
+            // 0x1A (`x'80' LIKE x'ff'` was a false MATCH). Both
+            // operands must be genuinely ASCII for the byte machine;
+            // anything else falls to the char path below (a faithful
+            // patternCompare + sqlite3Utf8Read port).
+            if pv.as_bytes().is_ascii() && sv.as_bytes().is_ascii() {
                 // C-string operands: both end at their first NUL byte.
                 let cstr =
                     |b: &'_ [u8]| -> usize { b.iter().position(|&c| c == 0).unwrap_or(b.len()) };
-                let (sb, pb) = (sv.as_str().as_bytes(), pv.as_str().as_bytes());
+                let (sb, pb) = (sv.as_bytes(), pv.as_bytes());
                 if let Some(hit) =
                     like_match_bytes(&sb[..cstr(sb)], &pb[..cstr(pb)], case_sensitive)
                 {

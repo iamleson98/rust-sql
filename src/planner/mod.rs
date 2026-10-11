@@ -1356,15 +1356,25 @@ impl<'a> Planner<'a> {
             Plan::Values { rows: vec![vec![]] }
         };
 
+        // The single FROM table's column usage (SQLite's SrcItem::colUsed):
+        // feeds the WHERE pushdown below AND the full-scan variant choice
+        // at the end of planning. Views / missing tables / non-table FROM
+        // atoms carry no usage (the default: unknown).
+        let single_table_use: Option<(Arc<Table>, ScanColumnUse)> = match from_owned
+            .as_ref()
+            .or(s.from.as_ref())
+        {
+            Some(TableExpression::Table { name, .. }) => self.catalog.get_table(name).map(|t| {
+                let cu = ScanColumnUse::of_select(&t, s, order_terms);
+                (t, cu)
+            }),
+            _ => None,
+        };
         // Apply WHERE — with predicate pushdown and index/rowid lookup optimization.
         if let Some(pred) = &where_effective {
-            let col_use = match from_owned.as_ref().or(s.from.as_ref()) {
-                Some(TableExpression::Table { name, .. }) => match self.catalog.get_table(name) {
-                    Some(t) => ScanColumnUse::of_select(&t, s, order_terms),
-                    None => ScanColumnUse::default(),
-                },
-                _ => ScanColumnUse::default(),
-            };
+            let col_use = single_table_use
+                .as_ref()
+                .map_or_else(ScanColumnUse::default, |(_, cu)| cu.clone());
             plan = self.apply_where(plan, pred, &col_use);
         }
 
@@ -1612,6 +1622,35 @@ impl<'a> Planner<'a> {
             plan = Plan::Distinct {
                 input: Box::new(plan),
             };
+        }
+
+        // FULL-SCAN VARIANT (SQLite whereLoopAddBtree's covering-index
+        // full scan): when the final plan still walks the table b-tree
+        // and SQLite's cost model would pick a covering index scan
+        // instead, swap the walk — an unordered scan's EMISSION ORDER
+        // is observable, and the two variants order differently. Runs
+        // LAST: the specialized access paths and the ORDER-BY streaming
+        // rewrites above own their shapes; an INDEXED BY / NOT INDEXED
+        // hint freezes the variant (isIndexedBy / notIndexed gates).
+        if !matches!(
+            from_owned.as_ref().or(s.from.as_ref()),
+            Some(TableExpression::Table {
+                indexed: Some(_),
+                ..
+            })
+        ) {
+            if let Some((table, col_use)) = &single_table_use {
+                // The RAW WHERE conjuncts (pre-collation-rewrite): the
+                // partial-index gate compares them structurally against
+                // the index's own WHERE, which is stored unrewritten.
+                let where_conjuncts: Vec<Expr> = s
+                    .where_clause
+                    .as_ref()
+                    .map(split_and_chain)
+                    .unwrap_or_default();
+                plan =
+                    covering_full_scan_swap(self.catalog, plan, table, col_use, &where_conjuncts);
+            }
         }
 
         Ok(plan)
@@ -1887,6 +1926,7 @@ impl<'a> Planner<'a> {
                     table,
                     alias: alias.clone(),
                     index,
+                    index_covering: false,
                     predicate,
                 })
             }
@@ -3993,6 +4033,218 @@ pub fn apply_where_for_scan(catalog: &Catalog, plan: Plan, predicate: &Expr) -> 
     apply_where_for_scan_with_use(catalog, plan, predicate, &ScanColumnUse::default())
 }
 
+/// parse.y parity: SQLite rewrites a ONE-member constant IN list to the
+/// equality (`x IN (c)` plans and evaluates as `x = c`; `x NOT IN (c)` as
+/// `x <> c`). For the rowid alias this is SEMANTIC, not syntactic sugar:
+/// the equality drives OP_SeekRowid, whose conversion (ticket #3922)
+/// rejects the boundary REAL — `id IN (-9.2233720368547758e18)` matches
+/// NOTHING in SQLite on every plan, where a driven multi-member IN-loop
+/// is the cost model's question and a residual IN compares numerically.
+/// The rewrite runs over the whole predicate (OR branches included —
+/// SQLite's is a parse-time transform), so the driving, residual and
+/// OR-branch contexts all see the equality.
+fn rewrite_rowid_single_member_in(e: &Expr, table: &Table) -> Expr {
+    match e {
+        Expr::In {
+            expr,
+            source,
+            negated,
+        } if matches!(source, InSource::List(l) if l.len() == 1)
+            && crate::executor::expr::single_constant_member(source).is_some() =>
+        {
+            let InSource::List(list) = source else {
+                unreachable!()
+            };
+            let is_rowid = match expr.as_ref() {
+                Expr::Column { table: ref_t, name } => {
+                    let unqualified_or_this = ref_t
+                        .as_ref()
+                        .map(|t| t.eq_ignore_ascii_case(&table.name))
+                        .unwrap_or(true);
+                    unqualified_or_this
+                        && is_rowid_col(
+                            name,
+                            &table
+                                .rowid_alias
+                                .and_then(|idx| table.columns.get(idx))
+                                .map(|c| c.name.clone()),
+                        )
+                }
+                _ => false,
+            };
+            if is_rowid {
+                Expr::Binary {
+                    op: if *negated {
+                        BinaryOp::NotEq
+                    } else {
+                        BinaryOp::Eq
+                    },
+                    left: expr.clone(),
+                    right: Box::new(list[0].clone()),
+                }
+            } else {
+                e.clone()
+            }
+        }
+        Expr::Binary { op, left, right } => Expr::Binary {
+            op: *op,
+            left: Box::new(rewrite_rowid_single_member_in(left, table)),
+            right: Box::new(rewrite_rowid_single_member_in(right, table)),
+        },
+        Expr::Unary { op, expr } => Expr::Unary {
+            op: *op,
+            expr: Box::new(rewrite_rowid_single_member_in(expr, table)),
+        },
+        _ => e.clone(),
+    }
+}
+
+/// Collect an OR-tree's branches (SQLite flattens nested ORs into one
+/// OR-clause for the multi-index optimization).
+fn or_branches<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match e {
+        Expr::Binary {
+            op: BinaryOp::Or,
+            left,
+            right,
+        } => {
+            or_branches(left, out);
+            or_branches(right, out);
+        }
+        _ => out.push(e),
+    }
+}
+
+/// A rowid-alias IN inside a NOT-taken OR evaluates as an EXPRESSION in
+/// SQLite — the general comparison (the boundary REAL -2^63 equals the
+/// i64::MIN row). Rewritten here into its equality chain, the compiled
+/// predicate compares member by member — including PARAMETERS (the
+/// rewrite is structural; each `id = ?` binds and compares at run time).
+fn rowid_in_to_eq_chain(expr: &Expr, list: &[Expr]) -> Expr {
+    let mut chain: Option<Expr> = None;
+    for m in list {
+        let eq = Expr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(expr.clone()),
+            right: Box::new(m.clone()),
+        };
+        chain = Some(match chain {
+            None => eq,
+            Some(prev) => Expr::Binary {
+                op: BinaryOp::Or,
+                left: Box::new(prev),
+                right: Box::new(eq),
+            },
+        });
+    }
+    chain.unwrap_or_else(|| expr.clone())
+}
+
+/// Walk the residual predicate's ORs: for each OR, decide (SQLite's
+/// whereLoopAddOr arithmetic — `sqlite_or_takes_multi_index_or`) whether
+/// SQLite takes the multi-index OR. A NOT-taken OR's rowid-alias INs
+/// rewrite into their equality chains (compare semantics); a taken OR
+/// keeps them (the engine's OR-branch residual runs seek membership,
+/// matching SQLite's OP_SeekRowid rowid branch).
+fn rewrite_or_rowid_in_residuals(
+    e: &Expr,
+    catalog: &Catalog,
+    table: &Table,
+    col_use: &ScanColumnUse,
+) -> Expr {
+    match e {
+        Expr::Binary {
+            op: BinaryOp::Or,
+            left,
+            right,
+        } => {
+            let mut branches = Vec::new();
+            or_branches(e, &mut branches);
+            let taken =
+                sqlite_cost::sqlite_or_takes_multi_index_or(catalog, table, &branches, col_use);
+            // Recurse: nested ORs share this OR-clause's decision.
+            let left = Box::new(rewrite_or_rowid_in_residuals(left, catalog, table, col_use));
+            let right = Box::new(rewrite_or_rowid_in_residuals(
+                right, catalog, table, col_use,
+            ));
+            if taken {
+                Expr::Binary {
+                    op: BinaryOp::Or,
+                    left,
+                    right,
+                }
+            } else {
+                rewrite_or_branches(
+                    &Expr::Binary {
+                        op: BinaryOp::Or,
+                        left,
+                        right,
+                    },
+                    table,
+                )
+            }
+        }
+        Expr::Binary { op, left, right } => Expr::Binary {
+            op: *op,
+            left: Box::new(rewrite_or_rowid_in_residuals(left, catalog, table, col_use)),
+            right: Box::new(rewrite_or_rowid_in_residuals(
+                right, catalog, table, col_use,
+            )),
+        },
+        Expr::Unary { op, expr } => Expr::Unary {
+            op: *op,
+            expr: Box::new(rewrite_or_rowid_in_residuals(expr, catalog, table, col_use)),
+        },
+        _ => e.clone(),
+    }
+}
+
+/// Inside a decided NOT-taken OR: rewrite each non-negated rowid-alias
+/// IN list into its equality chain (deeper expressions — including
+/// nested ORs — recurse).
+fn rewrite_or_branches(e: &Expr, table: &Table) -> Expr {
+    match e {
+        Expr::In {
+            expr,
+            source: InSource::List(list),
+            negated: false,
+        } => {
+            let is_rowid = match expr.as_ref() {
+                Expr::Column { table: ref_t, name } => {
+                    let unqualified_or_this = ref_t
+                        .as_ref()
+                        .map(|t| t.eq_ignore_ascii_case(&table.name))
+                        .unwrap_or(true);
+                    unqualified_or_this
+                        && is_rowid_col(
+                            name,
+                            &table
+                                .rowid_alias
+                                .and_then(|idx| table.columns.get(idx))
+                                .map(|c| c.name.clone()),
+                        )
+                }
+                _ => false,
+            };
+            if is_rowid {
+                rowid_in_to_eq_chain(expr, list)
+            } else {
+                e.clone()
+            }
+        }
+        Expr::Binary { op, left, right } => Expr::Binary {
+            op: *op,
+            left: Box::new(rewrite_or_branches(left, table)),
+            right: Box::new(rewrite_or_branches(right, table)),
+        },
+        Expr::Unary { op, expr } => Expr::Unary {
+            op: *op,
+            expr: Box::new(rewrite_or_branches(expr, table)),
+        },
+        _ => e.clone(),
+    }
+}
+
 /// [`apply_where_for_scan`] with the statement's column usage of the
 /// scanned table (the covering-index input of SQLite's access-path cost
 /// model — see [`ScanColumnUse`]).
@@ -4011,6 +4263,19 @@ pub fn apply_where_for_scan_with_use(
     // evaluated against no row (NULL) — the statement matched NOTHING,
     // and an UPDATE/DELETE with such a WHERE silently touched no rows.
     // Split those conjuncts off into a residual Filter over the rest.
+    // parse.y single-constant IN -> equality (rowid-semantic), then the
+    // OR residual rewrite (a NOT-taken OR's rowid IN compares). Both are
+    // no-ops for non-Scan plans and for predicates without the shapes.
+    let predicate_owned;
+    let predicate: &Expr = match &plan {
+        Plan::Scan { table, .. } => {
+            let step1 = rewrite_rowid_single_member_in(predicate, table);
+            let step2 = rewrite_or_rowid_in_residuals(&step1, catalog, table, col_use);
+            predicate_owned = step2;
+            &predicate_owned
+        }
+        _ => predicate,
+    };
     if let Plan::Scan { table, alias, .. } = &plan {
         let qual = alias.as_deref().unwrap_or(&table.name).to_string();
         let conjuncts = split_and_chain(predicate);
@@ -4046,11 +4311,13 @@ fn attach_residual(plan: Plan, pred: Expr) -> Plan {
             table,
             alias,
             index,
+            index_covering: _ic,
             predicate,
         } => Plan::Scan {
             table,
             alias,
             index,
+            index_covering: _ic,
             predicate: and(predicate),
         },
         Plan::RowidIn {
@@ -4830,12 +5097,52 @@ fn try_rowid_in(
     // applies seek semantics to any rowid-alias IN — the SELECT/UPDATE
     // paths then missed the row the DELETE path's generic evaluator
     // matched.)
-    let numeric_member = |e: &Expr| match e {
-        Expr::Literal(lit) if crate::executor::rowid_seek_value(lit).is_none() => {
-            crate::executor::numeric_rowid_key(lit)
+    // A member that SEEKS differently than it COMPARES: only the
+    // boundary class (-2^63 as REAL / a text parsing to it) — a plain
+    // literal OR any constant EXPRESSION (CAST, unary +/-, arithmetic
+    // over literals: `CAST(-9.2233720368547758e18 AS REAL)` used to miss
+    // the rewrite and seek away the row the compare-mode plan must
+    // match). Parameters have no plan-time value — they keep their
+    // runtime handling (exec_rowid_in seeks the bound value).
+    let numeric_member = |e: &Expr| -> Option<i64> {
+        let v = match e {
+            Expr::Literal(lit) => lit.clone(),
+            other => crate::executor::expr::try_const_value(other)?,
+        };
+        if crate::executor::rowid_seek_value(&v).is_none() {
+            crate::executor::numeric_rowid_key(&v)
+        } else {
+            None
         }
-        _ => None,
     };
+    // Columns with a `col = <constant>` conjunct (the 2-key probe of a
+    // covering index: `a = 3 AND id IN (...)` — SQLite's (c=? AND
+    // rowid=?) loop).
+    let eq_const_cols: Vec<String> = conjuncts
+        .iter()
+        .filter_map(|c| match c {
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                left,
+                right,
+            } => {
+                let (col, val) = match (left.as_ref(), right.as_ref()) {
+                    (Expr::Column { .. }, _) => (left.as_ref(), right.as_ref()),
+                    (_, Expr::Column { .. }) => (right.as_ref(), left.as_ref()),
+                    _ => return None,
+                };
+                let is_const = matches!(val, Expr::Literal(_))
+                    || crate::executor::expr::try_const_value(val).is_some();
+                is_const
+                    .then(|| match col {
+                        Expr::Column { name, .. } => name.to_ascii_lowercase(),
+                        _ => String::new(),
+                    })
+                    .filter(|n| !n.is_empty())
+            }
+            _ => None,
+        })
+        .collect();
     let values = if list.iter().any(|e| numeric_member(e).is_some())
         && !sqlite_cost::sqlite_rowid_in_seeks(
             catalog,
@@ -4843,6 +5150,7 @@ fn try_rowid_in(
             list.len(),
             conjuncts.len() - 1,
             col_use,
+            &eq_const_cols,
         ) {
         Arc::new(
             list.iter()
@@ -7796,6 +8104,85 @@ fn push_on_conjuncts_into_sides(
         Some(combine_and(&kept))
     };
     (new_left, new_right, new_cond)
+}
+
+/// The full-scan variant swap (see `plan_select`'s post-pass): descend
+/// order-neutral wrappers to the single table's residual scan and, when
+/// the cost model picks a covering index over the table scan, swap the
+/// walk. Emission order follows the chosen index — SQLite's observable
+/// full-scan variant choice.
+fn covering_full_scan_swap(
+    catalog: &Catalog,
+    plan: Plan,
+    table: &Arc<Table>,
+    col_use: &ScanColumnUse,
+    where_conjuncts: &[Expr],
+) -> Plan {
+    let descend = |p: Plan| {
+        Box::new(covering_full_scan_swap(
+            catalog,
+            p,
+            table,
+            col_use,
+            where_conjuncts,
+        ))
+    };
+    match plan {
+        Plan::Project { input, columns } => Plan::Project {
+            input: descend(*input),
+            columns,
+        },
+        Plan::Filter { input, predicate } => Plan::Filter {
+            input: descend(*input),
+            predicate,
+        },
+        Plan::Limit {
+            input,
+            count,
+            offset,
+        } => Plan::Limit {
+            input: descend(*input),
+            count,
+            offset,
+        },
+        Plan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => Plan::Aggregate {
+            input: descend(*input),
+            group_by,
+            aggregates,
+        },
+        Plan::Distinct { input } => Plan::Distinct {
+            input: descend(*input),
+        },
+        Plan::Scan {
+            table: t,
+            alias,
+            index: None,
+            index_covering: false,
+            predicate,
+        } if Arc::ptr_eq(&t, table) => {
+            match sqlite_cost::sqlite_covering_full_scan(catalog, table, col_use, where_conjuncts) {
+                Some(index) => Plan::Scan {
+                    table: t,
+                    alias,
+                    index: Some(index),
+                    index_covering: true,
+                    predicate,
+                },
+                None => Plan::Scan {
+                    table: t,
+                    alias,
+                    index: None,
+                    index_covering: false,
+                    predicate,
+                },
+            }
+        }
+        other => other,
+    }
 }
 
 pub fn pushdown_filter(catalog: &Catalog, plan: Plan, predicate: &Expr) -> Plan {
@@ -11550,6 +11937,7 @@ fn scan_table_of(input: &Plan) -> Option<(std::sync::Arc<Table>, Option<String>)
             table,
             alias,
             index: None,
+            index_covering: false,
             predicate: _,
         } if table.vtab.is_none() => Some((table.clone(), alias.clone())),
         Plan::RowidRange { table, alias, .. } => Some((table.clone(), alias.clone())),

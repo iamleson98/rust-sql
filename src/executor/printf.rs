@@ -17,8 +17,9 @@
 //! convert with SQLite's `sqlite3_value_int64` / `_double` / `_text`.
 //!
 //! Output is accumulated as BYTES (precision and width count bytes unless
-//! the `!` flag asks for characters, as in C) and converted to text with
-//! lossy UTF-8 repair only if a byte-precision cut split a character.
+//! the `!` flag asks for characters, as in C) and returned as TEXT with
+//! the bytes exactly as accumulated — invalid UTF-8 from a raw text
+//! argument passes through unchanged, as in SQLite.
 
 use crate::types::Value;
 
@@ -584,8 +585,10 @@ pub(crate) fn sql_printf(fmt: &[u8], vals: &[Value]) -> Value {
             out.extend_from_slice(&buf);
         }
     }
-    match String::from_utf8(out) {
-        Ok(s) => Value::Text(s.into()),
-        Err(e) => Value::Text(String::from_utf8_lossy(e.as_bytes()).into_owned().into()),
-    }
+    // SQLite's printf returns the accumulated BYTES as TEXT as-is: a
+    // `%s` of raw (invalid-UTF-8) text passes the raw bytes straight
+    // through (`hex(printf('%s', CAST(x'ff' AS TEXT)))` = "ff"). The
+    // from_utf8_lossy here used to rewrite every invalid byte to
+    // U+FFFD — `Text::from_bytes` stores them raw, exactly as given.
+    Value::Text(crate::types::Text::from_bytes(&out))
 }

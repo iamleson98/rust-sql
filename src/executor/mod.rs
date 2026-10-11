@@ -2075,16 +2075,40 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             table,
             alias,
             index,
+            index_covering: _ic,
             predicate: Some(p),
         } => {
             let bare = Plan::Scan {
                 table: table.clone(),
                 alias: alias.clone(),
                 index: index.clone(),
+                index_covering: *_ic,
                 predicate: None,
             };
             exec_filter(ctx, &bare, p)
         }
+        // A scan whose variant the cost model (or an INDEXED BY hint)
+        // fixed to an INDEX: walk the index b-tree in key order — the
+        // emission order SQLite's chosen plan has. Values still come
+        // from the table rows (the engine's index keys fold collations
+        // and blur INTEGER/REAL; exec_index_range's merge-scan fetch
+        // keeps it to ONE sequential table walk).
+        Plan::Scan {
+            table,
+            alias,
+            index: Some(index),
+            index_covering: _,
+            predicate: None,
+        } => exec_index_range(
+            ctx,
+            table.clone(),
+            alias.clone(),
+            Arc::clone(index),
+            None,
+            None,
+            None,
+            true,
+        ),
         Plan::Scan { table, alias, .. } => exec_scan(ctx, table.clone(), alias.clone()),
         Plan::Values { rows } => exec_values(ctx, rows),
         Plan::TableFunction { name, args, alias } => {
@@ -2275,6 +2299,7 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
                 table,
                 alias: _,
                 index: None,
+                index_covering: _ic,
                 predicate: None,
             } = &**input
             {
@@ -2404,6 +2429,7 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             start.as_ref(),
             end.as_ref(),
             residual.as_ref(),
+            false,
         ),
         Plan::InvertedIndexScan {
             table,
@@ -6439,7 +6465,13 @@ fn scan_filter_limit(
     let Plan::Scan {
         table,
         alias,
+        // Bare table walks only: a scan whose declared variant is an
+        // INDEX walk (the covering swap / INDEXED BY) emits in INDEX
+        // order — observable when a Filter feeds no order-owning
+        // consumer — so the fused filter path must not replace it with
+        // a table walk.
         index: None,
+        index_covering: _ic,
         predicate: scan_pred,
     } = input
     else {
@@ -6653,7 +6685,8 @@ fn exec_project(
         if let Plan::Scan {
             table,
             alias,
-            index: None,
+            index: _,
+            index_covering: _ic,
             predicate: None,
         } = &**sort_input
         {
@@ -7475,7 +7508,11 @@ fn exec_sort(ctx: &mut ExecContext<'_>, input: &Plan, terms: &[OrderTerm]) -> Re
     if let Plan::Scan {
         table,
         alias,
-        index: None,
+        // Any declared walk variant: the parallel sort split walks the
+        // table b-tree (the merge reproduces the serial stable order
+        // over the table walk — the same order this path always had).
+        index: _,
+        index_covering: _ic,
         predicate: None,
     } = input
     {
@@ -8715,7 +8752,47 @@ pub(crate) fn index_order_source(
         Plan::Scan {
             table,
             alias,
+            index: Some(index),
+            index_covering: true,
+            predicate: None,
+        } => (
+            table,
+            // The cost model's covering walk: the ORDER BY may stream
+            // from the plan's OWN index (the walk it declared), or —
+            // when its key does not match the terms — from any other
+            // matching index of the table (the same freedom the bare
+            // scan has: sort avoidance picks the order-matching index,
+            // covering or not).
+            index_order_matches(table, alias.as_deref(), index, terms)
+                .map(|d| (Arc::clone(index), d))
+                .or_else(|| {
+                    catalog
+                        .indexes_on_table(&table.name)
+                        .into_iter()
+                        .find_map(|ix| {
+                            index_order_matches(table, alias.as_deref(), &ix, terms)
+                                .map(|d| (ix, d))
+                        })
+                }),
+        ),
+        Plan::Scan {
+            table,
+            alias,
+            index: Some(index),
+            index_covering: false,
+            predicate: None,
+        } => (
+            // An INDEXED BY-forced walk: the hint freezes the variant —
+            // the ORDER BY streams from the FORCED index or not at all.
+            table,
+            index_order_matches(table, alias.as_deref(), index, terms)
+                .map(|d| (Arc::clone(index), d)),
+        ),
+        Plan::Scan {
+            table,
+            alias,
             index: None,
+            index_covering: _ic,
             predicate: None,
         } => (
             table,
@@ -9083,7 +9160,11 @@ fn exec_limit(
                         Plan::Scan {
                             table,
                             alias,
-                            index: None,
+                            // Any declared walk variant: the keep-heap
+                            // walks the table b-tree (order-insensitive
+                            // by construction — the heap owns the order).
+                            index: _,
+                            index_covering: _ic,
                             predicate: None,
                         } => Some((table, alias, None)),
                         Plan::RowidRange {
@@ -9517,6 +9598,10 @@ struct AggCold {
     /// JSONB element fragments for jsonb_group_array / jsonb_group_object
     /// (raw byte accumulation; finalized as an array/object container).
     concat_blob: Option<Vec<u8>>,
+    /// Rendered JSON bytes for json_group_array / json_group_object (the
+    /// json_* TEXT family — raw bytes, so invalid-UTF-8 values keep
+    /// their bytes through the accumulation, as in SQLite).
+    concat_json: Option<Vec<u8>>,
     /// Collected numeric values for the percentile family (median /
     /// percentile_cont / percentile_disc / stddev). Materialized only
     /// when one of those aggregates actually fires.
@@ -11508,8 +11593,13 @@ pub(crate) fn scan_groupby_grouper(
         .map(|a| AggFunc::from_name(&a.func))
         .collect();
 
-    let all_resolved =
-        key_col_indices.iter().all(|x| x.is_some()) && agg_col_indices.iter().all(|x| x.is_some());
+    // COUNT(*) maps to None here but needs no column — only a genuinely
+    // non-column ARG (an expression) keeps the general loop (as before).
+    let all_resolved = key_col_indices.iter().all(|x| x.is_some())
+        && aggregates
+            .iter()
+            .zip(agg_col_indices.iter())
+            .all(|(agg, idx)| agg.arg.is_none() || idx.is_some());
     // Per-aggregate FILTER opts out of the selective fast paths (no
     // per-aggregate gating there); the general loop below evaluates it.
     let has_agg_filter = aggregates.iter().any(|a| a.filter.is_some());
@@ -12729,6 +12819,7 @@ fn try_text_count(
     table: &Arc<Table>,
     prefix: &str,
     filter: Option<&Expr>,
+    range: Option<(i64, i64)>,
 ) -> Result<Option<i64>> {
     use crate::sql::ast::LikeOp;
     let pred = match filter {
@@ -12826,7 +12917,7 @@ fn try_text_count(
     let mut bt = Btree::new(ctx.pager, root, false);
     let mut count: i64 = 0;
     let mut bailed = false;
-    bt.scan_table_borrowed(|_rowid, payload| {
+    let mut visitor = |_rowid: i64, payload: &[u8]| -> bool {
         match payload_text_at(payload, n_cols, col) {
             Some(body) => {
                 let hit = match &tf {
@@ -12848,7 +12939,13 @@ fn try_text_count(
             }
         }
         true
-    })?;
+    };
+    // Range-bounded when the plan carries one (same bounds as every
+    // other machine here — a full-table count would over-count).
+    match range {
+        Some((s, e)) => bt.scan_table_range_borrowed_opts(s, e, &mut visitor, false)?,
+        None => bt.scan_table_borrowed(&mut visitor)?,
+    }
     if bailed {
         return Ok(None);
     }
@@ -13097,6 +13194,7 @@ fn try_fused_aggregate(
     alias: Option<&str>,
     filter_predicate: Option<&Expr>,
     aggregates: &[AggExpr],
+    range: Option<(i64, i64)>,
 ) -> Result<Option<ExecResult>> {
     if aggregates.is_empty() {
         return Ok(None);
@@ -13116,7 +13214,7 @@ fn try_fused_aggregate(
         && aggregates[0].arg.is_none()
         && !aggregates[0].distinct
     {
-        if let Some(n) = try_text_count(ctx, table, prefix, filter_predicate)? {
+        if let Some(n) = try_text_count(ctx, table, prefix, filter_predicate, range)? {
             let row: Vec<Value> = vec![Value::Integer(n)];
             return Ok(Some(ExecResult {
                 columns: Arc::from(vec!["__agg_0".to_string()]),
@@ -13203,7 +13301,21 @@ fn try_fused_aggregate(
         filter,
         filter_slot,
     );
-    bt.scan_table_borrowed(|rowid, payload| walk.row(rowid, payload))?;
+    // The walk's leaf discipline: the fused visitor never re-enters
+    // the pager (pure payload decode + typed accumulation), so the
+    // zero-copy form is safe for both the full-table and the bounded
+    // range walk. Range bounds are the SAME (start, end) tuple the
+    // streaming loops carry (inclusive rowid bounds, from
+    // `rowid_range_bounds`) — identical row sets by construction.
+    match range {
+        Some((s, e)) => bt.scan_table_range_borrowed_opts(
+            s,
+            e,
+            |rowid, payload| walk.row(rowid, payload),
+            false,
+        )?,
+        None => bt.scan_table_borrowed(|rowid, payload| walk.row(rowid, payload))?,
+    }
 
     if walk.bailed {
         return Ok(None);
@@ -13308,10 +13420,10 @@ fn exec_aggregate_no_group_by(
     // never produce a divergent answer.
     // Per-aggregate FILTER opts out (same reason as the serial fused
     // machine below — no per-aggregate gating there either).
-    // A rowid RANGE opts out too: the parallel/fused machines split and
-    // walk the FULL rowid space and have no range plumbing — the
-    // streaming loops below already carry the range (found by the mega
-    // suite: the fallback materialized every row in the range).
+    // A rowid RANGE still opts out here (the parallel splitters walk the
+    // FULL rowid space — range plumbing for them is follow-up work;
+    // the serial fused machine below now carries the range, so a range
+    // no longer forces the generic streaming loop).
     let has_agg_filter = aggregates.iter().any(|a| a.filter.is_some());
     if !has_agg_filter && range.is_none() {
         if let Some(res) = crate::executor::parallel::try_parallel_fused_aggregate(
@@ -13350,13 +13462,22 @@ fn exec_aggregate_no_group_by(
     // take over (identical results, slower decode/dispatch).
     // Per-aggregate FILTER (WHERE ...) opts out: the fused machine has
     // no per-aggregate row gating (its filter is statement-wide).
-    // A rowid RANGE opts out (full-table machine — see the parallel
-    // note above).
+    // A rowid RANGE is carried by the machine's walk
+    // (`scan_table_range_borrowed_opts` — same bounds as the streaming
+    // loops below; the 2026-10-11 round: `WHERE id <= N` used to fall
+    // to the generic full-decode loop at ~17M rows/s where the fused
+    // machine runs ~57M rows/s — the 100M marathon's headline
+    // aggregate, and the Windows CI fleet's 1.13x draw).
     let has_agg_filter = aggregates.iter().any(|a| a.filter.is_some());
-    if !has_agg_filter && range.is_none() {
-        if let Some(res) =
-            try_fused_aggregate(ctx, &table, alias.as_deref(), filter_predicate, aggregates)?
-        {
+    if !has_agg_filter {
+        if let Some(res) = try_fused_aggregate(
+            ctx,
+            &table,
+            alias.as_deref(),
+            filter_predicate,
+            aggregates,
+            range,
+        )? {
             return Ok(res);
         }
     }
@@ -13528,9 +13649,13 @@ fn exec_aggregate_no_group_by(
     let mut scan_err: Option<crate::error::Error> = None;
 
     // === Selective-decode fast path ===
-    // When ALL aggregate args are bare Column refs (or COUNT(*)) AND the
-    // filter predicate also only references bare Columns, we can decode
-    // only the referenced columns per row instead of the entire row.
+    // When ALL aggregate args are bare Column refs OR COUNT(*) (which
+    // has no arg at all) AND the filter predicate also only references
+    // bare Columns, we can decode only the referenced columns per row
+    // instead of the entire row. COUNT(*) used to knock the whole
+    // statement off this path (its None index read as "unresolved") —
+    // yet it needs NO column; `count(*), sum(k), min(k), max(k)`, the
+    // analytics battery shape, fell to the generic full-decode loop.
     // For `SELECT SUM(val) FROM t` on a 3-col table, we skip decoding 2 cols
     // per row — directly cutting the dominant cost of `decode_row_into`.
     //
@@ -13539,10 +13664,25 @@ fn exec_aggregate_no_group_by(
     // Per-aggregate FILTER opts out (its predicates need eval per row
     // below; the selective buffer lacks their columns).
     let selective_eligible = !has_agg_filter
-        && agg_col_indices.iter().all(|x| x.is_some())
+        && aggregates
+            .iter()
+            .zip(agg_col_indices.iter())
+            .all(|(agg, idx)| agg.arg.is_none() || idx.is_some())
         && filter_predicate
             .map(|p| expr_only_columns(p, &table, prefix))
-            .unwrap_or(true);
+            .unwrap_or(true)
+        // A filter carrying a subquery needs the FULL row: the
+        // correlated references inside it (`o.user_id = u.id`) are
+        // invisible to `collect_column_indices` — a subquery-filtered
+        // COUNT(*) qualified for this path with an EMPTY wanted set
+        // once COUNT(*) stopped requiring a resolved arg, the whole
+        // expanded row decoded NULL, and the subquery matched nothing
+        // (`SELECT count(*) FROM u WHERE (SELECT count(*) FROM o
+        // WHERE o.user_id = u.id) >= 1` returned 0). Same rule as the
+        // GROUP-BY general path: an AST-walked filter decodes every
+        // column it can name — including the ones inside its
+        // subqueries, which is all of them.
+        && !filter_predicate.is_some_and(expr_has_subquery);
 
     if selective_eligible {
         // Build the sorted, deduped list of column indices we need to decode.
@@ -14061,6 +14201,7 @@ fn exec_aggregate(
                 table,
                 alias,
                 index: None,
+                index_covering: _ic,
                 predicate: None,
             } = input
             {
@@ -14238,6 +14379,7 @@ fn exec_aggregate(
                     table,
                     alias,
                     index: None,
+                    index_covering: _ic,
                     predicate: None,
                 } = inner.as_ref()
                 {
@@ -15471,12 +15613,15 @@ fn update_agg_state(
         // NULLs are INCLUDED as JSON null (SQLite: json_group_array over
         // (1, NULL, 2) is [1,null,2]).
         AggFunc::JsonGroupArray => {
+            // RAW byte accumulation: json_quote_value renders a raw
+            // (invalid-UTF-8) text with its bytes as-is, and the masked
+            // string view would rewrite them — accumulate bytes.
             let c = state.cold_mut();
-            let buf = c.concat.get_or_insert_with(|| String::with_capacity(16));
+            let buf = c.concat_json.get_or_insert_with(Vec::new);
             if !buf.is_empty() {
-                buf.push(',');
+                buf.push(b',');
             }
-            buf.push_str(crate::executor::json::json_quote_value(v).as_str());
+            buf.extend_from_slice(crate::executor::json::json_quote_value(v).as_bytes());
         }
         // JSONB_GROUP_ARRAY(x): raw element bytes joined into one array.
         AggFunc::JsonbGroupArray => {
@@ -15502,12 +15647,18 @@ fn update_agg_state(
         // per-row `"key":value` fragment (see __json_object_frag); join
         // with ',' and let finalize wrap in {}.
         AggFunc::JsonGroupObject if !v.is_null() => {
+            // The planner feeds the per-row `"key":value` fragment (raw
+            // bytes, see __json_object_frag); join with ',' as bytes.
+            let frag: Vec<u8> = match v {
+                Value::Text(t) => t.as_bytes().to_vec(),
+                other => other.as_text().into_bytes(),
+            };
             let c = state.cold_mut();
-            let buf = c.concat.get_or_insert_with(|| String::with_capacity(16));
+            let buf = c.concat_json.get_or_insert_with(Vec::new);
             if !buf.is_empty() {
-                buf.push(',');
+                buf.push(b',');
             }
-            buf.push_str(&v.as_text());
+            buf.extend_from_slice(&frag);
         }
         // Percentile family (Turso percentile-extension parity): collect
         // numeric non-NULL inputs; NULLs are skipped (SQL aggregate
@@ -15627,16 +15778,17 @@ pub(crate) fn finalize_agg(state: &AggState, func: &str) -> Result<Value> {
                 .unwrap_or(Value::Null),
             None => Value::Null,
         }),
-        "json_group_array" => Ok(Value::Text(
-            format!(
-                "[{}]",
-                state
+        "json_group_array" => {
+            let mut out = vec![b'['];
+            out.extend_from_slice(
+                &state
                     .cold()
-                    .and_then(|c| c.concat.clone())
-                    .unwrap_or_default()
-            )
-            .into(),
-        )),
+                    .and_then(|c| c.concat_json.clone())
+                    .unwrap_or_default(),
+            );
+            out.push(b']');
+            Ok(Value::Text(crate::types::Text::from_bytes(&out)))
+        }
         "jsonb_group_array" => {
             let payload = state
                 .cold()
@@ -15663,16 +15815,17 @@ pub(crate) fn finalize_agg(state: &AggState, func: &str) -> Result<Value> {
             );
             Ok(Value::Blob(out))
         }
-        "json_group_object" => Ok(Value::Text(
-            format!(
-                "{{{}}}",
-                state
+        "json_group_object" => {
+            let mut out = vec![b'{'];
+            out.extend_from_slice(
+                &state
                     .cold()
-                    .and_then(|c| c.concat.clone())
-                    .unwrap_or_default()
-            )
-            .into(),
-        )),
+                    .and_then(|c| c.concat_json.clone())
+                    .unwrap_or_default(),
+            );
+            out.push(b'}');
+            Ok(Value::Text(crate::types::Text::from_bytes(&out)))
+        }
         "stddev" | "stddev_samp" => {
             let nums = state
                 .cold()
@@ -17799,6 +17952,7 @@ fn try_fused_scan_hash_join(
             table,
             alias,
             index: None,
+            index_covering: false,
             predicate: None,
         } if table.vtab.is_none() => (table, alias),
         _ => return Ok(None),
@@ -17808,6 +17962,7 @@ fn try_fused_scan_hash_join(
             table,
             alias,
             index: None,
+            index_covering: _ic,
             predicate: None,
         } if table.vtab.is_none() => (table, alias),
         _ => return Ok(None),
@@ -21750,6 +21905,7 @@ fn exec_index_range(
     start: Option<&(Expr, bool)>,
     end: Option<&(Expr, bool)>,
     residual: Option<&Expr>,
+    full_scan: bool,
 ) -> Result<ExecResult> {
     // Evaluate the bound expressions (they are constants / parameters).
     let empty_row: Vec<Value> = Vec::new();
@@ -21816,14 +21972,36 @@ fn exec_index_range(
     // `col < X` never matches NULL (SQLite OP_SeekGT on NULL). Starting
     // at the empty key used to return the col-IS-NULL rows, and
     // `DELETE ... WHERE col < X` deleted them.
-    let scan_start: Vec<u8> = start_key
-        .as_ref()
-        .map(|(k, _)| k.clone())
-        .unwrap_or_else(|| vec![0x01]);
+    let scan_start: Vec<u8> = if full_scan {
+        // The FULL index: from the very first entry (NULL keys
+        // included — a full scan has no bound to exclude them).
+        Vec::new()
+    } else {
+        start_key
+            .as_ref()
+            .map(|(k, _)| k.clone())
+            .unwrap_or_else(|| vec![0x01])
+    };
     let mut rowids: Vec<i64> = Vec::new();
+    // A FULL scan of an index with DESC columns re-sorts its entries
+    // into the DECLARED order (the engine stores every index b-tree in
+    // ascending key order; SQLite's DESC index emits (col DESC ...,
+    // rowid ASC)). The re-sort is direction-aware over the stored keys
+    // and keeps the trailing rowid ASCENDING — SQLite's index tiebreak.
+    let mut full_entries: Option<Vec<(Vec<u8>, i64)>> = if full_scan
+        && index
+            .columns
+            .iter()
+            .any(|c| c.order == crate::sql::ast::Order::Desc)
+    {
+        Some(Vec::new())
+    } else {
+        None
+    };
     {
         let index_root = ctx.index_root(&index);
         let mut index_bt = Btree::new(ctx.pager, index_root, true);
+        let mut entries = full_entries.take();
         index_bt.scan_index_from(&scan_start, |rowid, cell_key| {
             // Exclusive lower bound: skip entries whose leading column
             // equals the bound (they share the bound's key prefix).
@@ -21840,9 +22018,38 @@ fn exec_index_range(
                     _ => {}
                 }
             }
-            rowids.push(rowid);
+            match entries.as_mut() {
+                Some(v) => v.push((cell_key.to_vec(), rowid)),
+                None => rowids.push(rowid),
+            }
             true
         })?;
+        if let Some(mut v) = entries.take() {
+            let n_cols = index.columns.len();
+            let dirs: Vec<bool> = index
+                .columns
+                .iter()
+                .map(|c| c.order == crate::sql::ast::Order::Desc)
+                .collect();
+            v.sort_by(|a, b| {
+                match (
+                    order_key_column_ranges(&a.0, n_cols),
+                    order_key_column_ranges(&b.0, n_cols),
+                ) {
+                    (Some(ra), Some(rb)) => {
+                        for (i, ((as_, ae), (bs, be))) in ra.iter().zip(rb.iter()).enumerate() {
+                            let ord = a.0[*as_..*ae].cmp(&b.0[*bs..*be]);
+                            if ord != std::cmp::Ordering::Equal {
+                                return if dirs[i] { ord.reverse() } else { ord };
+                            }
+                        }
+                        a.1.cmp(&b.1)
+                    }
+                    _ => a.1.cmp(&b.1),
+                }
+            });
+            rowids = v.into_iter().map(|(_, r)| r).collect();
+        }
     }
 
     // Fetch the rows by rowid and apply the residual predicate.
@@ -22059,6 +22266,54 @@ fn exec_index_range(
 /// `exec_index_range`: sort the rowids, walk the table B+tree once, and
 /// place decoded rows into position-indexed slots so the observable
 /// emission order stays INDEX order.
+/// Byte ranges of the first `n_cols` self-delimiting order-key values
+/// inside an index cell key (NULL `00`; numeric `01` + 10 fixed bytes;
+/// TEXT/BLOB `02`/`03` + escape(00->0001) payload + `00 00` terminator).
+/// `None` on a malformed key (the caller's comparator falls back to
+/// rowid order — a corrupt index is integrity_check's to report).
+fn order_key_column_ranges(key: &[u8], n_cols: usize) -> Option<Vec<(usize, usize)>> {
+    let mut pos = 0usize;
+    let mut out = Vec::with_capacity(n_cols);
+    for _ in 0..n_cols {
+        let start = pos;
+        if pos >= key.len() {
+            return None;
+        }
+        match key[pos] {
+            0x00 => pos += 1,
+            0x01 => {
+                if pos + 11 > key.len() {
+                    return None;
+                }
+                pos += 11;
+            }
+            0x02 | 0x03 => {
+                pos += 1;
+                loop {
+                    if pos >= key.len() {
+                        return None;
+                    }
+                    if key[pos] == 0x00 {
+                        if pos + 1 >= key.len() {
+                            return None;
+                        }
+                        if key[pos + 1] == 0x00 {
+                            pos += 2; // the terminator
+                            break;
+                        }
+                        pos += 2; // the (00 01) escape pair
+                    } else {
+                        pos += 1;
+                    }
+                }
+            }
+            _ => return None,
+        }
+        out.push((start, pos));
+    }
+    Some(out)
+}
+
 fn exec_index_range_projected(
     ctx: &mut ExecContext<'_>,
     table: Arc<Table>,
@@ -29859,6 +30114,7 @@ fn flatten_dml_source(source: &Plan) -> Option<Plan> {
             table,
             alias,
             index,
+            index_covering: _ic,
             predicate: own,
         } if own.is_some() || preds.len() > 1 => {
             if let Some(p) = own {
@@ -29868,6 +30124,7 @@ fn flatten_dml_source(source: &Plan) -> Option<Plan> {
                 table: table.clone(),
                 alias: alias.clone(),
                 index: index.clone(),
+                index_covering: *_ic,
                 predicate: Some(crate::planner::combine_and(&preds)),
             })
         }

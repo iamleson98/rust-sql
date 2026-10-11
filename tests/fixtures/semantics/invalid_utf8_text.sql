@@ -49,3 +49,23 @@ SELECT trim('abc', NULL), ltrim(NULL, 'a'), hex(trim('éaé', 'é')), hex(trim(C
 SELECT hex(ltrim(x'a9a941')), hex(rtrim(x'412020')), hex(trim(x'c3a9', x'a9')), typeof(trim(x'41'));
 SELECT hex(trim('ab' || char(0) || 'ba', 'ab')), hex(trim('aXb', 'ab' || char(0) || 'X')), trim(12.50, '0'), trim(1200, '0');
 SELECT hex(replace(CAST(x'41ff41' AS TEXT), 'A', 'é')), hex(replace('aéa', CAST(x'a9' AS TEXT), 'x')), hex(replace(x'c3a9c3', x'c3', 'Z')), replace('aaa', 'aa', 'b');
+
+-- 2026-10-11 round: the functions that used to see invalid bytes as
+-- U+001A / U+FFFD now see what SQLite sees. LIKE/GLOB compare decoded
+-- CHARACTERS (a truncated sequence is ONE char: sqlite3Utf8Read's
+-- lenient decode), printf passes the raw bytes through (%s stops at the
+-- first NUL), unicode() reads sqlite3Utf8Read's first code point
+-- (x'e282' -> 130, a lone 0xff -> 65533), and the JSON functions pass
+-- raw bytes into and out of JSON text (escaping only ", \ and
+-- controls < 0x20).
+SELECT hex(CAST(x'e282' AS TEXT) LIKE '_'), hex(CAST(x'e282' AS TEXT) LIKE '__'), hex(CAST(x'e282' AS TEXT) LIKE '%' || CAST(x'ff' AS TEXT));
+SELECT hex(CAST(x'80' AS TEXT) LIKE CAST(x'ff' AS TEXT)), hex(CAST(x'80' AS TEXT) LIKE CAST(x'ff' AS TEXT) || '%'), hex(CAST(x'80' AS TEXT) GLOB CAST(x'ff' AS TEXT));
+SELECT hex(printf('%s', CAST(x'ff' AS TEXT))), hex(printf('<%q>', CAST(x'c3' AS TEXT))), hex(printf('%s', CAST(x'41ff42' AS TEXT)));
+SELECT hex(printf('%.*s', 2, CAST(x'e282' AS TEXT))), hex(format('%w', CAST(x'ff' AS TEXT))), hex(printf('%s', CAST(x'41' AS TEXT) || char(0) || CAST(x'42' AS TEXT)));
+SELECT unicode(CAST(x'ff' AS TEXT)), unicode(CAST(x'e282' AS TEXT)), unicode(CAST(x'80' AS TEXT)), unicode(CAST(x'c3a9' AS TEXT));
+SELECT unicode(substr(CAST(x'e282' AS TEXT), 2)), length(CAST(x'e282' AS TEXT));
+SELECT json_valid(CAST(x'22ff22' AS TEXT)), json_valid(CAST(x'22e28222' AS TEXT)), json_valid(CAST(x'ff' AS TEXT));
+SELECT hex(json(CAST(x'22ff22' AS TEXT))), hex(json(CAST(x'22e28222' AS TEXT))), hex(json_quote(CAST(x'ff' AS TEXT))), hex(json_quote(char(0x7f))), hex(json_quote(char(9)));
+SELECT hex(json_array(CAST(x'ff' AS TEXT))), hex(json_object('k', CAST(x'e262' AS TEXT))), hex(json_group_array(CAST(x'ff' AS TEXT)));
+SELECT hex(json_extract(json_array(CAST(x'22ff22' AS TEXT)), '$[0]')), hex(json_extract(json_insert('{"a":1}', '$.b', CAST(x'ff' AS TEXT)), '$.b'));
+SELECT hex(json_quote(CAST(x'80' AS TEXT))), hex(json_quote('a' || char(0) || 'b')), hex(json_array(char(0) || 'a'));

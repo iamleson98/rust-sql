@@ -12,7 +12,7 @@
 
 use crate::error::Error;
 use crate::executor::jsonb::{
-    self, jb_patch, jb_remove_at, jb_set_at, parse_lenient, parse_strict, value_to_jb, Jb,
+    self, jb_patch, jb_remove_at, jb_set_at, parse_lenient, parse_lenient_bytes, value_to_jb, Jb,
 };
 use crate::sql::ast::Expr;
 use crate::types::Value;
@@ -126,10 +126,9 @@ pub(crate) fn load_doc(v: &Value) -> Result<Option<Jb>, Error> {
             match jsonb::jb_from_bytes(b) {
                 Ok(jb) => Ok(Some(jb)),
                 Err(()) => {
-                    if let Ok(s) = std::str::from_utf8(b) {
-                        if let Ok(jb) = parse_lenient(s) {
-                            return Ok(Some(jb));
-                        }
+                    // A non-JSONB blob parses as JSON TEXT bytes.
+                    if let Ok(jb) = parse_lenient_bytes(b) {
+                        return Ok(Some(jb));
                     }
                     Err(Error::Runtime("malformed JSON".to_string()))
                 }
@@ -139,7 +138,11 @@ pub(crate) fn load_doc(v: &Value) -> Result<Option<Jb>, Error> {
         // (SQLite renders JSON numbers from SQL REALs at 15 significant
         // digits — different from the 17-digit REAL→TEXT conversion).
         Value::Integer(_) | Value::Real(_) => Ok(Some(value_to_jb(v))),
-        other => parse_lenient(&other.as_text())
+        // A TEXT argument parses over its RAW BYTES: SQLite's JSON
+        // parser accepts any byte >= 0x20 inside string literals, so
+        // `json(CAST(x'22ff22' AS TEXT))` is the JSON string holding
+        // the raw 0xff byte (not malformed).
+        Value::Text(t) => parse_lenient_bytes(t.as_bytes())
             .map(Some)
             .map_err(|_| Error::Runtime("malformed JSON".to_string())),
     }
@@ -164,7 +167,7 @@ enum Out {
 impl Out {
     fn emit(self, jb: &Jb) -> Value {
         match self {
-            Out::Text => Value::Text(jb.render().into()),
+            Out::Text => Value::Text(jb.render()),
             Out::Blob => Value::Blob(jsonb::jb_to_bytes(jb)),
         }
     }
@@ -186,22 +189,18 @@ pub fn call_json_function(fname: &str, args: &[Value]) -> Result<Option<Value>, 
             Some(Value::Null) | None => Value::Null,
             Some(v) => match load_doc(v)? {
                 None => Value::Null,
-                Some(jb) => Value::Text(jb.render_pretty().into()),
+                Some(jb) => Value::Text(jb.render_pretty()),
             },
         },
         "json_error_position" => match args.first() {
             Some(Value::Null) | None => Value::Null,
             Some(v) => Value::Integer(match v {
-                Value::Text(t) => match parse_lenient(t) {
+                Value::Text(t) => match parse_lenient_bytes(t.as_bytes()) {
                     Ok(_) => 0,
                     Err(pos) => pos as i64,
                 },
                 Value::Blob(b) => {
-                    let ok = (std::str::from_utf8(b)
-                        .ok()
-                        .map(|s| parse_lenient(s).is_ok()))
-                    .unwrap_or(false)
-                        || jsonb::jb_from_bytes(b).is_ok();
+                    let ok = parse_lenient_bytes(b).is_ok() || jsonb::jb_from_bytes(b).is_ok();
                     if ok {
                         0
                     } else {
@@ -304,13 +303,12 @@ fn json_fn(args: &[Value], out: Out) -> Result<Value, Error> {
             match jsonb::jb_from_bytes(b) {
                 Ok(jb) => match out {
                     Out::Blob => Ok(Value::Blob(b.clone())),
-                    Out::Text => Ok(Value::Text(jb.render().into())),
+                    Out::Text => Ok(Value::Text(jb.render())),
                 },
                 Err(()) => {
-                    if let Ok(s) = std::str::from_utf8(b) {
-                        if let Ok(jb) = parse_lenient(s) {
-                            return Ok(out.emit(&jb));
-                        }
+                    // A non-JSONB blob parses as JSON TEXT bytes.
+                    if let Ok(jb) = parse_lenient_bytes(b) {
+                        return Ok(out.emit(&jb));
                     }
                     Err(Error::Runtime("malformed JSON".to_string()))
                 }
@@ -321,7 +319,13 @@ fn json_fn(args: &[Value], out: Out) -> Result<Value, Error> {
                 let jb = value_to_jb(other);
                 return Ok(out.emit(&jb));
             }
-            match parse_lenient(&other.as_text()) {
+            // TEXT parses over its RAW bytes (SQLite's JSON parser
+            // accepts any byte >= 0x20 inside string literals).
+            let bytes: Vec<u8> = match other {
+                Value::Text(t) => t.as_bytes().to_vec(),
+                o => o.as_text().into_bytes(),
+            };
+            match parse_lenient_bytes(&bytes) {
                 Ok(jb) => Ok(out.emit(&jb)),
                 Err(_) => Err(Error::Runtime("malformed JSON".to_string())),
             }
@@ -337,13 +341,13 @@ fn json_quote(args: &[Value]) -> Result<Value, Error> {
         Some(Value::Blob(b)) => {
             // A JSONB blob renders as its JSON text; anything else is null.
             match jsonb::blob_to_jb(b) {
-                Ok(jb) => Ok(Value::Text(jb.render().into())),
+                Ok(jb) => Ok(Value::Text(jb.render())),
                 Err(()) => Ok(Value::Text("null".into())),
             }
         }
         Some(v) => {
             let jb = value_to_jb(v);
-            Ok(Value::Text(jb.render().into()))
+            Ok(Value::Text(jb.render()))
         }
     }
 }
@@ -466,7 +470,10 @@ fn json_mutate(fname: &str, args: &[Value], out: Out) -> Result<Value, Error> {
 fn sql_value_as_raw(jb: Jb) -> Jb {
     match jb {
         Jb::Text(s) => Jb::TextRaw(s),
-        Jb::TextJ(s) => Jb::TextRaw(jsonb::decode_escapes(&s, false)),
+        Jb::TextJ(s) => Jb::TextRaw(crate::types::Text::from_bytes(&jsonb::decode_escapes(
+            s.as_bytes(),
+            false,
+        ))),
         other => other,
     }
 }
@@ -525,14 +532,10 @@ fn json_valid(args: &[Value]) -> Result<Value, Error> {
     let bytes: &[u8] = &bytes;
     let mut valid = false;
     if flags & 1 != 0 {
-        if let Ok(s) = std::str::from_utf8(bytes) {
-            valid |= parse_strict(s).is_ok();
-        }
+        valid |= jsonb::parse_strict_bytes(bytes).is_ok();
     }
     if flags & 2 != 0 {
-        if let Ok(s) = std::str::from_utf8(bytes) {
-            valid |= jsonb::parse_json5(s).is_ok();
-        }
+        valid |= jsonb::parse_lenient_bytes(bytes).is_ok();
     }
     if flags & 12 != 0 {
         valid |= jsonb::jb_from_bytes(bytes).is_ok();
@@ -650,12 +653,14 @@ pub(crate) fn json_extract_subtyped(args: &[Value]) -> Result<Value, Error> {
 // ---------------------------------------------------------------------------
 
 /// JSON-quote a SQL value for embedding in a JSON document text
-/// (json_group_array / json_group_object accumulation).
-pub fn json_quote_value(v: &Value) -> String {
+/// (json_group_array / json_group_object accumulation). Returns the
+/// element's RAW rendered bytes — a raw (invalid-UTF-8) text value
+/// quotes with its bytes as-is, exactly as SQLite's jsonAppendString.
+pub fn json_quote_value(v: &Value) -> crate::types::Text {
     match v {
-        Value::Null => "null".to_string(),
-        Value::Integer(i) => i.to_string(),
-        Value::Real(r) => jsonb::render_sql_f64(*r),
+        Value::Null => crate::types::Text::from("null"),
+        Value::Integer(i) => crate::types::Text::from(i.to_string()),
+        Value::Real(r) => crate::types::Text::from(jsonb::render_sql_f64(*r)),
         Value::Text(_) | Value::Blob(_) => value_to_jb(v).render(),
     }
 }

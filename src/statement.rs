@@ -1937,6 +1937,7 @@ impl GroupByDriver {
                 table,
                 alias,
                 index: None,
+                index_covering: false,
                 predicate: None,
             } if table.vtab.is_none() => Some((table.clone(), alias.clone(), None, (None, None))),
             Plan::RowidRange {
@@ -1957,6 +1958,7 @@ impl GroupByDriver {
                     table,
                     alias,
                     index: None,
+                    index_covering: _ic,
                     predicate: None,
                 } = input.as_ref()
                 {
@@ -2120,6 +2122,7 @@ fn try_build_driver(plan: &Plan) -> Option<Box<dyn Driver>> {
             table,
             alias,
             index: None,
+            index_covering: _ic,
             predicate,
         } => {
             if table.vtab.is_some() {
@@ -2158,6 +2161,7 @@ fn try_build_driver(plan: &Plan) -> Option<Box<dyn Driver>> {
                 table,
                 alias,
                 index: None,
+                index_covering: _ic,
                 predicate: scan_pred,
             } = input.as_ref()
             {
@@ -2187,6 +2191,7 @@ fn try_build_driver(plan: &Plan) -> Option<Box<dyn Driver>> {
                 table,
                 alias: _,
                 index: None,
+                index_covering: _ic,
                 predicate: None,
             } = input.as_ref()
             {

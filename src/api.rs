@@ -12578,7 +12578,12 @@ impl Database {
                 // so absurdly wide ranges (BETWEEN 1 AND 9e18) don't
                 // over-allocate.
                 let est = if hi > lo {
-                    (hi - lo).min(1 << 20) as usize + 1
+                    // saturating: hi=1, lo=i64::MIN overflows the raw
+                    // subtraction — the wrapped NEGATIVE `as usize`
+                    // sign-extends to ~9.2e18 and Vec::with_capacity
+                    // panics (capacity overflow) on the boundary REAL's
+                    // range (`id BETWEEN -9.2233720368547758e18 AND 1`).
+                    hi.saturating_sub(lo).min(1 << 20) as usize + 1
                 } else {
                     0
                 };
@@ -12713,6 +12718,7 @@ impl Database {
             table: table.clone(),
             alias: upd.alias.clone(),
             index: None,
+            index_covering: false,
             predicate: None,
         };
         // `UPDATE ... FROM` (SQLite 3.33+): the target table is joined
@@ -12873,6 +12879,7 @@ impl Database {
             table: table.clone(),
             alias: del.alias.clone(),
             index: None,
+            index_covering: false,
             predicate: None,
         };
         // Constant WHERE terms run once, before the loop (see
