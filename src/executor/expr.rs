@@ -1141,39 +1141,47 @@ pub fn evaluate_where_terms(expr: &Expr, ctx: &EvalContext<'_>) -> Result<bool> 
     ) {
         return evaluate_where(expr, ctx);
     }
-    fn split<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+    // sqlite3ExprAnd's parse-time fold: an always-false operand (a 32-bit
+    // integer literal 0 or FALSE) makes the whole AND chain `0`.
+    fn any_false_term(e: &Expr) -> bool {
         match e {
             Expr::Binary {
                 op: BinaryOp::And,
                 left,
                 right,
-            } => {
-                split(left, out);
-                split(right, out);
+            } => any_false_term(left) || any_false_term(right),
+            t => {
+                crate::planner::fold::is_truth_literal(t)
+                    && matches!(t, Expr::Literal(Value::Integer(0)))
             }
-            other => out.push(other),
         }
     }
-    let mut terms: Vec<&Expr> = Vec::new();
-    split(expr, &mut terms);
-    // sqlite3ExprAnd's parse-time fold: an always-false operand (a 32-bit
-    // integer literal 0 or FALSE) makes the whole AND chain `0`.
-    if terms.iter().any(|t| {
-        crate::planner::fold::is_truth_literal(t) && matches!(t, Expr::Literal(Value::Integer(0)))
-    }) {
+    // Walk the AND chain's terms left to right (no allocation: this runs
+    // per row): `Some(live)` codes only the terms whose correlated-
+    // subquery status is `live`, `None` codes every term. True = a term
+    // took the false exit.
+    fn rejects(e: &Expr, ctx: &EvalContext<'_>, pass: Option<bool>) -> Result<bool> {
+        match e {
+            Expr::Binary {
+                op: BinaryOp::And,
+                left,
+                right,
+            } => Ok(rejects(left, ctx, pass)? || rejects(right, ctx, pass)?),
+            t => {
+                if pass.is_some_and(|live| contains_live_subquery(t) != live) {
+                    return Ok(false);
+                }
+                cond_if_false(t, ctx, true)
+            }
+        }
+    }
+    if any_false_term(expr) {
         return Ok(false);
     }
-    for live_pass in [false, true] {
-        for t in &terms {
-            if contains_live_subquery(t) != live_pass {
-                continue;
-            }
-            if cond_if_false(t, ctx, true)? {
-                return Ok(false);
-            }
-        }
+    if !contains_live_subquery(expr) {
+        return Ok(!rejects(expr, ctx, None)?);
     }
-    Ok(true)
+    Ok(!rejects(expr, ctx, Some(false))? && !rejects(expr, ctx, Some(true))?)
 }
 
 /// A CHECK constraint: it fails only on FALSE — NULL passes
