@@ -121,7 +121,12 @@ fn main() {
     // println! turns it into a panic + backtrace spew (CI's
     // interop_cli.sh flaked exactly there: grep -q matched, exited,
     // and the CLI's next print panicked with "failed printing to
-    // stdout: Broken pipe"). Restore the default disposition.
+    // stdout: Broken pipe"). Restore the default disposition. Unix
+    // only — `libc` is a cfg(unix) dependency (termios), and Windows
+    // pipes signal closure through write errors, which the reader
+    // discipline in tests/interop_cli.sh (capture-then-match, no
+    // early-closing readers) already covers on every platform.
+    #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
