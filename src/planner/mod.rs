@@ -2233,13 +2233,24 @@ impl<'a> Planner<'a> {
                 .iter()
                 .map(|t| {
                     crate::executor::expr::explicit_collation(&t.expr)
-                        .or_else(|| column_declared_collation(self.catalog, &t.expr, &coll_scope))
+                        .or_else(|| {
+                            column_declared_collation(
+                                self.catalog,
+                                strip_cast_pos(&t.expr),
+                                &coll_scope,
+                            )
+                        })
                         .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("BINARY"))
                 })
                 .collect();
             let Some(arg) = &a.arg else { continue };
+            // sqlite3ExprCollSeq looks through CAST and unary `+` to the
+            // column: `max(CAST(h AS TEXT))` over a NOCASE `h` compares
+            // NOCASE.
             a.collation = crate::executor::expr::explicit_collation(arg)
-                .or_else(|| column_declared_collation(self.catalog, arg, &coll_scope))
+                .or_else(|| {
+                    column_declared_collation(self.catalog, strip_cast_pos(arg), &coll_scope)
+                })
                 .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("BINARY"));
         }
         Ok(aggregates)
@@ -5994,11 +6005,20 @@ fn split_constant_where(s: &SimpleSelect) -> Option<(SimpleSelect, Vec<Expr>)> {
     s.from.as_ref()?;
     let mut consts: Vec<Expr> = Vec::new();
     let mut changed = false;
-    let mut split = |clause: &Option<Expr>| -> Option<Expr> {
+    let mut split = |clause: &Option<Expr>, having: bool| -> Option<Expr> {
         let w = clause.as_ref()?;
         let mut rest = Vec::new();
         for term in split_and_chain(w) {
-            if !is_constant_where_term(&term) {
+            // havingToWhere leaves an ALWAYS-FALSE term (EP_IsFalse: a
+            // 32-bit integer 0 literal — `FALSE`, a folded
+            // `<literal> IS NULL`) in the HAVING: the groups are still
+            // built, so their aggregates still evaluate (and can raise)
+            // before the HAVING rejects every one.
+            if !is_constant_where_term(&term)
+                || (having
+                    && fold::is_truth_literal(&term)
+                    && matches!(term, Expr::Literal(Value::Integer(0))))
+            {
                 rest.push(term);
                 continue;
             }
@@ -6016,11 +6036,11 @@ fn split_constant_where(s: &SimpleSelect) -> Option<(SimpleSelect, Vec<Expr>)> {
             Some(combine_and(&rest))
         }
     };
-    let where_clause = split(&s.where_clause);
+    let where_clause = split(&s.where_clause, false);
     let having = if s.group_by.is_empty() {
         s.having.clone()
     } else {
-        split(&s.having)
+        split(&s.having, true)
     };
     if !changed {
         return None;
@@ -11667,6 +11687,20 @@ fn column_declared_collation(
     }
     let _ = catalog;
     None
+}
+
+/// The operand under any CAST / unary `+` wrappers — where
+/// sqlite3ExprCollSeq continues its search for a column's collation.
+fn strip_cast_pos(mut e: &Expr) -> &Expr {
+    while let Expr::Cast { expr: inner, .. }
+    | Expr::Unary {
+        op: UnaryOp::Pos,
+        expr: inner,
+    } = e
+    {
+        e = inner;
+    }
+    e
 }
 
 /// True when `e` is a column reference that resolves to a table in
