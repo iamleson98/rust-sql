@@ -471,6 +471,16 @@ pub struct Trigger {
     pub validated: std::sync::atomic::AtomicBool,
 }
 
+impl Trigger {
+    /// Fires on THIS engine's table: not a TEMP trigger bound to an
+    /// attached table (the parent's routed-DML driver fires those) and
+    /// not killed by DETACH.
+    #[inline]
+    pub fn fires_locally(&self) -> bool {
+        self.bound_schema.is_none() && !self.dormant
+    }
+}
+
 impl Clone for Trigger {
     fn clone(&self) -> Self {
         Self {
@@ -1138,6 +1148,21 @@ impl Catalog {
         Vec::new()
     }
 
+    /// The table's trigger list as stored — INCLUDING the entries
+    /// [`Self::triggers_on_table`] filters out (check [`Trigger::fires_locally`]).
+    /// Allocation-free: the per-row trigger paths call it once per row.
+    pub fn trigger_list(&self, table: &str) -> &[Arc<Trigger>] {
+        if let Some(v) = self.triggers_by_table.get(table) {
+            return v;
+        }
+        if table.bytes().any(|b| b.is_ascii_uppercase()) {
+            if let Some(v) = self.triggers_by_table.get(&table.to_ascii_lowercase()) {
+                return v;
+            }
+        }
+        &[]
+    }
+
     pub fn triggers_on_table(&self, table: &str) -> Vec<Arc<Trigger>> {
         // Same borrowed-name fast path as `indexes_on_table`, but the
         // result is FILTERED: TEMP triggers bound to ATTACHED tables
@@ -1145,10 +1170,7 @@ impl Catalog {
         // the parent's routed-DML driver) and triggers killed by DETACH
         // never fire on THIS engine's table of the same name.
         let filter = |v: &Vec<Arc<Trigger>>| -> Vec<Arc<Trigger>> {
-            v.iter()
-                .filter(|t| t.bound_schema.is_none() && !t.dormant)
-                .cloned()
-                .collect()
+            v.iter().filter(|t| t.fires_locally()).cloned().collect()
         };
         if let Some(v) = self.triggers_by_table.get(table) {
             return filter(v);

@@ -1340,7 +1340,11 @@ impl<'a> Statement<'a> {
 // ---------------------------------------------------------------------------
 
 /// Walk a statement AST collecting the max `?` count and named parameters.
-fn collect_parameters(stmt: &AstStatement, positional: &mut usize, named: &mut Vec<String>) {
+pub(crate) fn collect_parameters(
+    stmt: &AstStatement,
+    positional: &mut usize,
+    named: &mut Vec<String>,
+) {
     // Highest numeric parameter name seen. The COUNT is max index + 1
     // (numeric names are Vec indices — the lexer numbers anonymous `?`
     // as "0","1",...); 0 when no numeric name appears.

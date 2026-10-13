@@ -12,7 +12,7 @@
 //! `trigger_depth` guards against runaway recursion with a clear error.
 
 use crate::executor::{execute, ExecContext};
-use crate::sql::ast::{Expr, Statement, TriggerEvent, TriggerWhen};
+use crate::sql::ast::{ConflictResolution, Expr, Statement, TriggerEvent, TriggerWhen};
 use crate::types::{Row, Value};
 use std::sync::Arc;
 
@@ -81,7 +81,7 @@ pub(crate) fn fire_triggers(
     // chained at depth 2+ still run (SQLite's name-on-stack semantics;
     // pinned by the preupdate differential suite). The per-trigger
     // check lives in the loop below (trigger_stack).
-    let triggers = ctx.catalog().triggers_on_table(&table.name);
+    let triggers = ctx.catalog().trigger_list(&table.name);
     if triggers.is_empty() {
         return Ok(());
     }
@@ -92,7 +92,7 @@ pub(crate) fn fire_triggers(
     // so walk it backwards (deep-sweep: the delete-all with two
     // self-inserting audit triggers produced phase-shifted rows).
     for trig in triggers.iter().rev() {
-        if trig.when != phase {
+        if trig.when != phase || !trig.fires_locally() {
             continue;
         }
         // Event match: UPDATE OF (cols) fires only when the changed columns
@@ -196,7 +196,70 @@ pub(crate) fn fire_triggers(
         // default policy.
         let firing_or = ctx.firing_or;
         let result = (|| {
-            for stmt in &trig.body {
+            for (step_idx, stmt) in trig.body.iter().enumerate() {
+                // Compiled program: plan the step ONCE per statement with
+                // NEW / OLD as positional parameters, then bind this row.
+                if !trig.has_foreign_refs {
+                    let key = (
+                        Arc::as_ptr(trig) as usize,
+                        step_idx,
+                        conflict_code(firing_or),
+                        new_row.is_some(),
+                        old_row.is_some(),
+                    );
+                    let compiled = match ctx.trigger_plans.get(&key) {
+                        Some(c) => c.clone(),
+                        None => {
+                            let c = compile_trigger_step(
+                                ctx,
+                                stmt,
+                                firing_or,
+                                new_row.is_some(),
+                                old_row.is_some(),
+                                col_names,
+                            )?;
+                            ctx.trigger_plans.insert(key, c.clone());
+                            c
+                        }
+                    };
+                    if let Some((plan, step_or, has_subqueries)) = compiled {
+                        let n = col_names.len();
+                        let width = if old_row.is_some() { 2 * n } else { n };
+                        let mut vals = Vec::with_capacity(width);
+                        for i in 0..n {
+                            vals.push(
+                                new_row
+                                    .and_then(|r| r.get(i).cloned())
+                                    .unwrap_or(Value::Null),
+                            );
+                        }
+                        if let Some(r) = old_row {
+                            for i in 0..n {
+                                vals.push(r.get(i).cloned().unwrap_or(Value::Null));
+                            }
+                        }
+                        let saved_params = std::mem::replace(&mut ctx.params, vals);
+                        let saved_named = std::mem::take(&mut ctx.named_params);
+                        let rewritten = if has_subqueries {
+                            crate::executor::rewrite_plan_subqueries(&plan, ctx).map(Some)
+                        } else {
+                            Ok(None)
+                        };
+                        let step = match rewritten {
+                            Ok(r) => {
+                                let saved_or = std::mem::replace(&mut ctx.firing_or, step_or);
+                                let step = execute(r.as_ref().unwrap_or(&plan), ctx);
+                                ctx.firing_or = saved_or;
+                                step.map(|_| ())
+                            }
+                            Err(e) => Err(e),
+                        };
+                        ctx.params = saved_params;
+                        ctx.named_params = saved_named;
+                        step?;
+                        continue;
+                    }
+                }
                 let mut s = stmt.clone();
                 let step_or = match &mut s {
                     Statement::Insert(i) => {
@@ -314,16 +377,17 @@ pub(crate) fn has_triggers_for(
     table: &crate::schema::Table,
     event: &TriggerEvent,
 ) -> bool {
-    let triggers = ctx.catalog().triggers_on_table(&table.name);
+    let triggers = ctx.catalog().trigger_list(&table.name);
     triggers.iter().any(|t| {
-        t.events.iter().any(|e| {
-            matches!(
-                (e, event),
-                (TriggerEvent::Insert, TriggerEvent::Insert)
-                    | (TriggerEvent::Delete, TriggerEvent::Delete)
-                    | (TriggerEvent::Update(_), TriggerEvent::Update(_))
-            )
-        })
+        t.fires_locally()
+            && t.events.iter().any(|e| {
+                matches!(
+                    (e, event),
+                    (TriggerEvent::Insert, TriggerEvent::Insert)
+                        | (TriggerEvent::Delete, TriggerEvent::Delete)
+                        | (TriggerEvent::Update(_), TriggerEvent::Update(_))
+                )
+            })
     })
 }
 
@@ -344,7 +408,7 @@ fn substitute_new_old(
     old_row: Option<&Row>,
     col_names: &[String],
 ) -> crate::error::Result<()> {
-    let lookup = |qual: &str, name: &str| -> Option<Value> {
+    let lookup = |qual: &str, name: &str| -> Option<Expr> {
         let row = match qual.to_ascii_lowercase().as_str() {
             "new" => new_row,
             "old" => old_row,
@@ -353,11 +417,47 @@ fn substitute_new_old(
         let idx = col_names
             .iter()
             .position(|c| c.eq_ignore_ascii_case(name))?;
-        row.get(idx).cloned()
+        row.get(idx).cloned().map(Expr::Literal)
     };
+    rewrite_new_old(stmt, &lookup)
+}
+
+/// Rewrite every `NEW.col` / `OLD.col` reference into positional
+/// parameter `?i` (NEW column i) / `?(n + i)` (OLD column i, n = the
+/// table's column count) — the per-statement compiled trigger program's
+/// registers (see `ExecContext::trigger_plans`). Same coverage and the
+/// same unknown-column error as the literal substitution.
+fn parametrize_new_old(
+    stmt: &mut Statement,
+    has_new: bool,
+    has_old: bool,
+    col_names: &[String],
+) -> crate::error::Result<()> {
+    let n = col_names.len();
+    let lookup = |qual: &str, name: &str| -> Option<Expr> {
+        let base = match qual.to_ascii_lowercase().as_str() {
+            "new" if has_new => 0,
+            "old" if has_old => n,
+            _ => return None,
+        };
+        let idx = col_names
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(name))?;
+        Some(Expr::Parameter((base + idx).to_string()))
+    };
+    rewrite_new_old(stmt, &lookup)
+}
+
+/// The NEW / OLD reference walker behind both rewrites: `lookup` yields
+/// the replacement for a bound reference, `None` for an unbound one
+/// (SQLite's "no such column" when it names NEW / OLD).
+fn rewrite_new_old(
+    stmt: &mut Statement,
+    lookup: &dyn Fn(&str, &str) -> Option<Expr>,
+) -> crate::error::Result<()> {
     fn walk_expr(
         e: &mut Expr,
-        lookup: &dyn Fn(&str, &str) -> Option<Value>,
+        lookup: &dyn Fn(&str, &str) -> Option<Expr>,
     ) -> crate::error::Result<()> {
         match e {
             Expr::Column {
@@ -365,7 +465,7 @@ fn substitute_new_old(
                 name,
             } => {
                 if let Some(v) = lookup(t, name) {
-                    *e = Expr::Literal(v);
+                    *e = v;
                 } else if t.eq_ignore_ascii_case("new") || t.eq_ignore_ascii_case("old") {
                     // SQLite-exact text (the same error covers both an
                     // unknown column AND the not-bound-here case).
@@ -454,7 +554,7 @@ fn substitute_new_old(
     }
     fn walk_body(
         body: &mut crate::sql::ast::SelectBody,
-        lookup: &dyn Fn(&str, &str) -> Option<Value>,
+        lookup: &dyn Fn(&str, &str) -> Option<Expr>,
     ) -> crate::error::Result<()> {
         match body {
             crate::sql::ast::SelectBody::Simple(s) => {
@@ -483,7 +583,7 @@ fn substitute_new_old(
 
     fn walk_select(
         sel: &mut crate::sql::ast::SelectStatement,
-        lookup: &dyn Fn(&str, &str) -> Option<Value>,
+        lookup: &dyn Fn(&str, &str) -> Option<Expr>,
     ) -> crate::error::Result<()> {
         walk_body(&mut sel.body, lookup)?;
         for t in sel.order_by.iter_mut() {
@@ -497,12 +597,12 @@ fn substitute_new_old(
                 crate::sql::ast::InsertSource::Values(rows) => {
                     for row in rows {
                         for e in row {
-                            walk_expr(e, &lookup)?;
+                            walk_expr(e, lookup)?;
                         }
                     }
                 }
                 crate::sql::ast::InsertSource::Select(sel) => {
-                    walk_select(sel, &lookup)?;
+                    walk_select(sel, lookup)?;
                 }
                 _ => {}
             }
@@ -511,10 +611,10 @@ fn substitute_new_old(
                 if let crate::sql::ast::UpsertAction::DoUpdate { set, where_clause } = &mut u.action
                 {
                     for (_, e) in set.iter_mut() {
-                        walk_expr(e, &lookup)?;
+                        walk_expr(e, lookup)?;
                     }
                     if let Some(w) = where_clause.as_mut() {
-                        walk_expr(w, &lookup)?;
+                        walk_expr(w, lookup)?;
                     }
                 }
             }
@@ -522,22 +622,91 @@ fn substitute_new_old(
         }
         Statement::Update(upd) => {
             for (_, e) in upd.set.iter_mut() {
-                walk_expr(e, &lookup)?;
+                walk_expr(e, lookup)?;
             }
             if let Some(w) = upd.where_clause.as_mut() {
-                walk_expr(w, &lookup)?;
+                walk_expr(w, lookup)?;
             }
             Ok(())
         }
         Statement::Delete(del) => {
             if let Some(w) = del.where_clause.as_mut() {
-                walk_expr(w, &lookup)?;
+                walk_expr(w, lookup)?;
             }
             Ok(())
         }
-        Statement::Select(sel) => walk_select(sel, &lookup),
+        Statement::Select(sel) => walk_select(sel, lookup),
         _ => Ok(()),
     }
+}
+
+/// A firing policy as a cache-key byte.
+fn conflict_code(c: Option<ConflictResolution>) -> u8 {
+    match c {
+        None => 0,
+        Some(ConflictResolution::Rollback) => 1,
+        Some(ConflictResolution::Abort) => 2,
+        Some(ConflictResolution::Fail) => 3,
+        Some(ConflictResolution::Ignore) => 4,
+        Some(ConflictResolution::Replace) => 5,
+    }
+}
+
+/// Compile one trigger body step for the per-statement program cache:
+/// the step with the firing policy applied and NEW / OLD rewritten to
+/// positional parameters, planned once. `None` keeps the step on the
+/// per-row literal-substitution path (a body that holds parameters of
+/// its own — SQLite rejects those at CREATE TRIGGER — or a statement
+/// kind the cache does not plan).
+#[allow(clippy::type_complexity)]
+fn compile_trigger_step(
+    ctx: &ExecContext<'_>,
+    stmt: &Statement,
+    firing_or: Option<ConflictResolution>,
+    has_new: bool,
+    has_old: bool,
+    col_names: &[String],
+) -> crate::error::Result<
+    Option<(
+        Arc<crate::planner::plan::Plan>,
+        Option<ConflictResolution>,
+        bool,
+    )>,
+> {
+    let (mut positional, mut named) = (0usize, Vec::new());
+    crate::statement::collect_parameters(stmt, &mut positional, &mut named);
+    if positional > 0 || !named.is_empty() {
+        return Ok(None);
+    }
+    let mut s = stmt.clone();
+    let step_or = match &mut s {
+        Statement::Insert(i) => {
+            if firing_or.is_some() {
+                i.or = firing_or;
+            }
+            i.or
+        }
+        Statement::Update(u) => {
+            if firing_or.is_some() {
+                u.or = firing_or;
+            }
+            u.or
+        }
+        _ => None,
+    };
+    parametrize_new_old(&mut s, has_new, has_old, col_names)?;
+    let plan = match &s {
+        Statement::Insert(_) => crate::api::Database::plan_insert(ctx.catalog(), &s)?,
+        Statement::Update(_) => crate::api::Database::plan_update(ctx.catalog(), &s)?,
+        Statement::Delete(_) => crate::api::Database::plan_delete(ctx.catalog(), &s)?,
+        Statement::Select(sel) => {
+            let mut planner = crate::planner::Planner::new(ctx.catalog());
+            planner.plan_select(sel)?
+        }
+        _ => return Ok(None),
+    };
+    let has_subqueries = crate::executor::plan_has_subqueries(&plan);
+    Ok(Some((Arc::new(plan), step_or, has_subqueries)))
 }
 
 /// Convenience: fire AFTER-INSERT triggers for a freshly inserted row.

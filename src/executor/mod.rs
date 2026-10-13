@@ -1227,6 +1227,18 @@ pub struct ExecContext<'a> {
     /// trigger firing a log2 trigger must run at depth 2). This stack
     /// is the "is this trigger already active" check.
     pub trigger_stack: Vec<String>,
+    /// Trigger-body plans compiled ONCE per statement (SQLite codes each
+    /// trigger program once per statement and runs it per row): keyed by
+    /// (trigger identity, body step, firing policy, NEW / OLD bound), the
+    /// plan reads NEW / OLD through positional parameters. `None` marks a
+    /// step that keeps the per-row literal-substitution path. Valid for
+    /// this context's lifetime — the catalog cannot change under a DML
+    /// statement.
+    #[allow(clippy::type_complexity)]
+    pub trigger_plans: HashMap<
+        (usize, usize, u8, bool, bool),
+        Option<(Arc<Plan>, Option<ConflictResolution>, bool)>,
+    >,
     /// SQLite's `orconf` for the trigger programs the executing statement
     /// fires: its ON CONFLICT policy when it has one (`INSERT OR
     /// REPLACE`), which then REPLACES each trigger step's own policy
@@ -1291,6 +1303,7 @@ impl<'a> ExecContext<'a> {
             subquery_plans: HashMap::new(),
             trigger_depth: 0,
             trigger_stack: Vec::new(),
+            trigger_plans: HashMap::new(),
             firing_or: None,
             halt_action: None,
             trigger_changes: 0,
@@ -1344,6 +1357,7 @@ impl<'a> ExecContext<'a> {
             subquery_plans: HashMap::new(),
             trigger_depth: 0,
             trigger_stack: Vec::new(),
+            trigger_plans: HashMap::new(),
             firing_or: None,
             halt_action: None,
             trigger_changes: 0,
@@ -3886,17 +3900,59 @@ pub fn expr_has_subquery(e: &Expr) -> bool {
             source: InSource::Subquery(_),
             ..
         } => true,
-        _ => {
-            let mut found = false;
-            map_expr_children(e, &mut |child| {
-                if expr_has_subquery(child) {
-                    found = true;
-                }
-                Ok(child.clone())
-            })
-            .ok();
-            found
+        // The same children `map_expr_children` visits, without rebuilding
+        // the tree: the cloning walk allocated the whole expression at
+        // every level, and this check runs per execution (every UPDATE /
+        // trigger-step run).
+        _ => any_expr_child(e, &mut expr_has_subquery),
+    }
+}
+
+/// Whether `f` holds for any immediate child expression of `e` — exactly
+/// the children [`map_expr_children`] rewrites (a subquery source, a
+/// function's OVER / ORDER BY and a subquery body are not visited).
+fn any_expr_child(e: &Expr, f: &mut dyn FnMut(&Expr) -> bool) -> bool {
+    match e {
+        Expr::Literal(_)
+        | Expr::Parameter(_)
+        | Expr::Column { .. }
+        | Expr::Subquery(_)
+        | Expr::Exists(_) => false,
+        Expr::Binary { left, right, .. } | Expr::Is { left, right, .. } => f(left) || f(right),
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. } => f(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => f(expr) || f(low) || f(high),
+        Expr::In { expr, source, .. } => {
+            let in_list = match source {
+                InSource::List(list) => list.iter().any(&mut *f),
+                _ => false,
+            };
+            in_list || f(expr)
         }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => escape.as_deref().is_some_and(&mut *f) || f(expr) || f(pattern),
+        Expr::Function { args, filter, .. } => {
+            args.iter().any(&mut *f) || filter.as_deref().is_some_and(&mut *f)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            operand.as_deref().is_some_and(&mut *f)
+                || whens.iter().any(|(w, v)| f(w) || f(v))
+                || else_.as_deref().is_some_and(&mut *f)
+        }
+        Expr::Row(items) => items.iter().any(f),
+        Expr::Raise { message, .. } => message.as_deref().is_some_and(&mut *f),
     }
 }
 
