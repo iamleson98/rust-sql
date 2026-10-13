@@ -34,7 +34,16 @@ An embedded SQL database written from scratch in Rust, built to match SQLite's b
 
 ## Known bugs and open work
 
-Numbers come from the last full Tcl-suite run, which predates the latest join and WAL fixes. Re-run the `SQLite suites` workflow for current numbers.
+Numbers come from the last full Tcl-suite run, which predates the latest join and WAL fixes. Re-run the `SQLite suites` workflow for current numbers (Actions → SQLite suites → Run workflow; `tcl_files` takes globs such as `window*.test`). To reproduce one file locally against a checkout of SQLite's repository:
+
+```bash
+python3 tests/tcl/run.py <sqlite>/test window3.test -j 1 -o out.json
+```
+
+`out.json` holds each failing test's expected and actual output. Before committing a fix, run `cargo test --lib --tests`, clippy (`--all-targets -- -D warnings`) and `cargo test --release --test sqlite_semantics_battery`. Pin regressions as tests or as fixtures under `tests/fixtures/semantics/`.
+
+- **CI**: the first Tcl-suite smoke job on Linux runners hadn't finished when last checked; confirm the `SQLite suites` workflow runs green end to end.
+- **Speed and memory losses**: see "Still loses to SQLite" above.
 
 - **Tcl suite timeouts**:
   - `withM`: its fault loops run at about 83% of SQLite's speed and hit the time limit;
