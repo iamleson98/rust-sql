@@ -32,4 +32,29 @@ An embedded SQL database written from scratch in Rust, built to match SQLite's b
   - statements spanning attached databases don't use the attached databases' indexes;
   - `sqlite_dbdata` exposes a different page layout.
 
+## Known bugs and open work
+
+Numbers come from the last full Tcl-suite run, which predates the latest join and WAL fixes. Re-run the `SQLite suites` workflow for current numbers.
+
+- **Tcl suite timeouts**:
+  - `withM`: its fault loops run at about 83% of SQLite's speed and hit the time limit;
+  - `tkt-9f2eb3abac`: times out on SQLite too;
+  - `tkt-313723c356`: was a real stale-read bug, fixed in 53a0353; needs a re-run to confirm.
+- **Tcl suite divergences** (number of failing tests in brackets):
+  - window functions: `window3` (417), `window8` (144);
+  - foreign keys: `fkey2` (243), `without_rowid3` (240), `e_fkey` (175);
+  - SELECT: `selectB` (169), `e_select` (93), `selectA` (82), `select1` (50, e.g. `min()` / `max()` with the wrong number of arguments isn't an error);
+  - DDL: `e_createtable` (159), `alter*`;
+  - other: `keyword1` (116, keyword parsing), `json501` (114, JSON5), `e_insert` (100), `sidedelete` (98), `ctime` (66), `pragma` (56), `upsert5`, `strict1`, `literal`, `nulls1`, `rowvalue`, `autoinc`, plus a tail of under 50 per file across about 350 more files.
+- **Tcl files not run**: the fault-injection files (`malloc*`, `*fault*`, `crash*`, `ioerr*`, `oom*`). They need testfixture C hooks that the test shim doesn't provide.
+- **Behaviour differences**:
+  - positional parameters (`?`) don't fill named ones (`:a`, `$a`) by index;
+  - an unused CTE that contains an error is still evaluated, so it raises an error SQLite doesn't;
+  - `UNION ALL` push-down can apply column affinity differently;
+  - the same unaliased table joined to itself with `NATURAL` behaves differently;
+  - after `ROLLBACK TO` inside `BEGIN CONCURRENT`, rowids aren't reused (by design: the allocator is shared).
+- **Concurrency**:
+  - two connections in one process can't take turns writing: the first writer keeps the writer role until it closes, while SQLite lets them alternate;
+  - a two-connection open / read / update / close cycle takes 6 ms, against 1.3 ms for SQLite.
+
 License: MIT OR Apache-2.0.
