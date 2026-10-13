@@ -135,6 +135,19 @@ fn is_queryish(sql: &str) -> bool {
 
 /// Run one statement on our engine; Err = the engine rejected it.
 fn our_run(db: &mut Database, sql: &str) -> Result<Vec<Vec<Value>>, String> {
+    // RUSTQLITE_STATEFUL_TRACE=<file>: append every statement (U+001E
+    // separated) BEFORE running it — the only way to recover the script
+    // of a case that hangs instead of diverging.
+    if let Ok(path) = std::env::var("RUSTQLITE_STATEFUL_TRACE") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = write!(f, "{sql}\u{1e}");
+        }
+    }
     if is_queryish(sql) {
         db.query(sql, []).map_err(|e| e.to_string())
     } else {

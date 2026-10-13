@@ -281,6 +281,15 @@ impl Page {
         self.epoch = self.epoch.wrapping_add(1);
     }
 
+    /// Void every pin on this object without dirtying it: the page's
+    /// bytes are unchanged but a proof drawn from them no longer holds —
+    /// an append split gives the right-most leaf a NEW right sibling
+    /// while leaving the leaf itself byte-identical, so "this leaf is the
+    /// right edge" (what an append pin certifies) became false.
+    pub fn bump_epoch(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
     /// Read the B+tree page type. Page 0 is special — it has a 100-byte
     /// file header before the B+tree header, so we offset by `DB_HEADER_SIZE`.
     pub fn page_type(&self) -> Result<PageType> {

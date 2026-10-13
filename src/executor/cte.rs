@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
+use crate::planner::plan::Plan;
 use crate::planner::Planner;
 use crate::sql::ast::{Cte, SelectBody, SelectStatement, SetOp, WithClause};
 use crate::types::{CteMaterialization, Row};
@@ -121,25 +122,45 @@ pub(crate) fn materialize_ctes(
     Ok(map)
 }
 
-/// WITH RECURSIVE: the CTE body is `base UNION [ALL] recursive`. The
-/// base arm executes once; the recursive arm (which references the CTE
-/// by name) executes repeatedly, each time seeing ALL rows accumulated
-/// so far, until it produces no new rows. UNION dedups against the
-/// accumulated set; UNION ALL appends everything. A hard iteration cap
-/// guards against non-terminating recursions (SQLite errors too).
+/// WITH RECURSIVE (SQLite's generateWithRecursiveQuery): the CTE body is
+/// `setup UNION [ALL] recursive`. The setup rows seed a QUEUE; each row is
+/// taken off the queue, output (after the compound's OFFSET, until its
+/// LIMIT), and then the recursive arm runs with the CTE table holding just
+/// that row, its results joining the queue (UNION drops rows already seen).
+/// The compound's ORDER BY makes the queue a priority queue (ties in
+/// insertion order); LIMIT and OFFSET count OUTPUT rows — the recursion
+/// stops the moment the LIMIT is reached.
+///
+/// Without an ORDER BY the queue is FIFO, so rows leave it level by level:
+/// a whole level (the frontier) runs through the recursive arm at once —
+/// row for row the same output when the arm reads only the CTE (it then
+/// emits each frontier row's results in frontier order). The arm is
+/// planned ONCE and re-pointed at each new frontier (see
+/// `retarget_cte_rows`).
 fn materialize_recursive_cte(
     cte: &Cte,
     outer_ctes: &CteMap,
     ctx: &mut ExecContext<'_>,
 ) -> Result<(Vec<Row>, Arc<[String]>)> {
     let name_lc = cte.name.to_ascii_lowercase();
-    // Split the compound body: the LAST UNION [ALL] arm is the
-    // recursive one; everything before it is the base. (SQLite's rule:
-    // exactly one recursive reference, in the arm after the UNION.)
-    let (base, recursive_op, recursive_arm) = split_compound_cte(&cte.select)?;
-    // Base: execute with the CTE visible but EMPTY (a recursive
-    // reference in the base arm is an error in SQLite; empty keeps it
-    // simple and correct for well-formed queries).
+    let Some(split) = split_compound_cte(&cte.select, &name_lc)? else {
+        // Never recurses: an ordinary CTE.
+        let res = exec_select_with_ctes(ctx, &cte.select, outer_ctes)?;
+        return Ok((res.rows, res.columns));
+    };
+    let (base, recursive_op, recursive_arms) = (split.setup, split.op, split.arms);
+    let sel = &cte.select;
+    // computeLimitRegisters: LIMIT first, then (unless it is 0) OFFSET.
+    let limit = match &sel.limit {
+        Some(e) => super::limit_operand(ctx, e)?,
+        None => -1,
+    };
+    let offset = match &sel.offset {
+        Some(e) if limit != 0 => super::limit_operand(ctx, e)?.max(0),
+        _ => 0,
+    };
+    // Setup: executed with the CTE visible but EMPTY. LIMIT 0 runs
+    // nothing (the setup's own LIMIT 0 keeps its column names).
     let mut scope = outer_ctes.clone();
     scope.insert(
         name_lc.clone(),
@@ -148,8 +169,16 @@ fn materialize_recursive_cte(
             Arc::from(vec![format!("{}.", cte.name)]),
         ),
     );
-    let base_res = exec_select_with_ctes(ctx, &base, &scope)?;
-    let mut rows: Vec<Row> = base_res.rows;
+    let base_res = if limit == 0 {
+        let mut b = base.clone();
+        b.limit = Some(crate::sql::ast::Expr::Literal(
+            crate::types::Value::Integer(0),
+        ));
+        b.offset = None;
+        exec_select_with_ctes(ctx, &b, &scope)?
+    } else {
+        exec_select_with_ctes(ctx, &base, &scope)?
+    };
     let base_cols: Arc<[String]> = base_res.columns;
     // Canonical output columns for the CTE.
     let out_cols: Arc<[String]> = match &cte.columns {
@@ -175,71 +204,487 @@ fn materialize_recursive_cte(
             .collect::<Vec<String>>()
             .into(),
     };
-    // Dedup set for UNION semantics.
-    let mut seen: std::collections::HashSet<String> =
-        rows.iter().map(|r| format!("{:?}", r)).collect();
-    // Iterate the recursive arm with QUEUE semantics (SQLite's model):
-    // each iteration's arm sees ONLY the rows produced by the PREVIOUS
-    // iteration (the frontier), not the full accumulation — otherwise
-    // UNION ALL recursions never terminate (every iteration re-derives
-    // rows that are "new" again as duplicates).
-    let mut frontier: Vec<Row> = rows.clone();
-    const MAX_ITERS: usize = 1_000_000;
-    for _ in 0..MAX_ITERS {
-        if rows.len() > 10_000_000 {
+    if limit == 0 {
+        return Ok((Vec::new(), out_cols));
+    }
+    let order = resolve_queue_order(&sel.order_by, &out_cols)?;
+    let union = recursive_op == SetOp::Union;
+    // UNION's distinct set (the queue only admits unseen rows).
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut admit = |r: &Row| -> bool { !union || seen.insert(format!("{:?}", r)) };
+    let mut out: Vec<Row> = Vec::new();
+    let mut skipped = 0i64;
+    let mut arm_plans: Vec<Option<ArmPlan>> = recursive_arms.iter().map(|_| None).collect();
+    // Output one queue row; `false` once the LIMIT is reached.
+    let mut emit = |r: &Row, out: &mut Vec<Row>| -> Result<bool> {
+        if skipped < offset {
+            skipped += 1;
+            return Ok(true);
+        }
+        if out.len() >= MAX_RECURSIVE_ROWS {
             return Err(Error::semantic(format!(
-                "recursive CTE {} exceeded 10,000,000 rows",
-                cte.name
+                "recursive CTE {} exceeded {} rows",
+                cte.name, MAX_RECURSIVE_ROWS
             )));
         }
-        if frontier.is_empty() {
+        out.push(r.clone());
+        Ok(limit < 0 || (out.len() as i64) < limit)
+    };
+    let setup: Vec<Row> = base_res.rows.into_iter().filter(|r| admit(r)).collect();
+    // Whole-frontier steps reproduce the one-row-at-a-time output order
+    // when a single arm reads only the CTE; otherwise only the output
+    // SET is the same, which is all that matters without LIMIT / OFFSET.
+    let batch = order.is_empty()
+        && ((recursive_arms.len() == 1 && simple_recursive_arm(&recursive_arms[0], &name_lc))
+            || (limit < 0 && offset == 0));
+    if batch {
+        let mut frontier = setup;
+        while !frontier.is_empty() {
+            for r in &frontier {
+                if !emit(r, &mut out)? {
+                    return Ok((out, out_cols));
+                }
+            }
+            let mut frontier_rows = Some(frontier);
+            let mut next_frontier = Vec::new();
+            let n_arms = recursive_arms.len();
+            for (i, (arm, plan)) in recursive_arms.iter().zip(arm_plans.iter_mut()).enumerate() {
+                // The last arm takes the frontier itself.
+                let rows = if i + 1 == n_arms {
+                    frontier_rows.take().unwrap_or_default()
+                } else {
+                    frontier_rows.clone().unwrap_or_default()
+                };
+                let next =
+                    run_recursive_arm(ctx, arm, &mut scope, &name_lc, &out_cols, rows, plan)?;
+                next_frontier.extend(next.into_iter().filter(|r| admit(r)));
+            }
+            frontier = next_frontier;
+        }
+        return Ok((out, out_cols));
+    }
+    // One row at a time: FIFO, or ordered by the compound's ORDER BY
+    // (ties in insertion order).
+    let mut queue = RecursiveQueue::new(order);
+    for r in setup {
+        queue.push(r);
+    }
+    while let Some(row) = queue.pop() {
+        if !emit(&row, &mut out)? {
             break;
         }
-        let mut scope = outer_ctes.clone();
-        scope.insert(name_lc.clone(), (Arc::new(frontier), out_cols.clone()));
-        let new_res = exec_select_with_ctes(ctx, &recursive_arm, &scope)?;
-        let mut next_frontier: Vec<Row> = Vec::with_capacity(new_res.rows.len());
-        for r in new_res.rows {
-            if recursive_op == SetOp::Union {
-                let key = format!("{:?}", r);
-                if seen.contains(&key) {
-                    continue;
+        for (arm, plan) in recursive_arms.iter().zip(arm_plans.iter_mut()) {
+            let next = run_recursive_arm(
+                ctx,
+                arm,
+                &mut scope,
+                &name_lc,
+                &out_cols,
+                vec![row.clone()],
+                plan,
+            )?;
+            for r in next {
+                if admit(&r) {
+                    queue.push(r);
                 }
-                seen.insert(key);
             }
-            next_frontier.push(r.clone());
-            rows.push(r);
         }
-        frontier = next_frontier;
     }
-    Ok((rows, out_cols))
+    Ok((out, out_cols))
 }
 
-/// Split a recursive CTE's compound SELECT into (base, set-op, recursive arm).
-/// The body must be `... UNION [ALL] <recursive>`; more than two arms or a
-/// non-UNION top-level operator is rejected (SQLite requires the same shape).
-fn split_compound_cte(sel: &SelectStatement) -> Result<(SelectStatement, SetOp, SelectStatement)> {
-    // Rebuild a plain SelectStatement from a SelectBody by cloning the
-    // statement shell with the body swapped.
-    fn with_body(s: &SelectStatement, body: SelectBody) -> SelectStatement {
-        let mut out = s.clone();
-        out.body = body;
-        out.with = None; // the outer WITH doesn't apply to inner arms
-        out
+/// Output-row guard for a recursion that never ends (SQLite would run
+/// until memory runs out).
+const MAX_RECURSIVE_ROWS: usize = 10_000_000;
+
+/// The recursive arm's plan, kept across iterations.
+struct ArmPlan {
+    plan: Plan,
+    /// The frontier the plan's `CteRows` currently read.
+    current: Arc<Vec<Row>>,
+    /// Frontier size the plan was costed with.
+    planned_len: usize,
+    /// The plan reads the CTE through `CteRows` nodes that can be
+    /// re-pointed; false = re-plan every iteration.
+    reusable: bool,
+    has_subqueries: bool,
+}
+
+/// Run the recursive arm with the CTE table holding `frontier`.
+fn run_recursive_arm(
+    ctx: &mut ExecContext<'_>,
+    arm: &SelectStatement,
+    scope: &mut CteMap,
+    name_lc: &str,
+    cols: &Arc<[String]>,
+    frontier: Vec<Row>,
+    cache: &mut Option<ArmPlan>,
+) -> Result<Vec<Row>> {
+    let f = Arc::new(frontier);
+    scope.insert(name_lc.to_string(), (Arc::clone(&f), Arc::clone(cols)));
+    let reused = match cache.as_mut() {
+        // Re-plan when the frontier outgrows the size the plan was costed
+        // for (join order and algorithm follow the CTE's row count).
+        Some(c) if c.reusable && f.len() <= c.planned_len.saturating_mul(4) + 16 => {
+            let old = Arc::clone(&c.current);
+            if retarget_cte_rows(&mut c.plan, &old, &f) > 0 {
+                c.current = Arc::clone(&f);
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    };
+    if !reused {
+        let mut planner = Planner::new(ctx.catalog());
+        planner.set_ctes(scope.clone());
+        if let Some(fr) = ctx.foreign.clone() {
+            planner.set_foreign(fr);
+        }
+        let mut plan = planner.plan_select(arm)?;
+        let refs = retarget_cte_rows(&mut plan, &f, &f);
+        let has_subqueries = super::plan_has_subqueries(&plan);
+        *cache = Some(ArmPlan {
+            plan,
+            current: Arc::clone(&f),
+            planned_len: f.len(),
+            reusable: refs > 0,
+            has_subqueries,
+        });
     }
-    match &sel.body {
-        SelectBody::Binary { op, left, right } => match op {
-            SetOp::Union | SetOp::UnionAll => Ok((
-                with_body(sel, (**left).clone()),
-                *op,
-                with_body(sel, (**right).clone()),
-            )),
-            _ => Err(Error::semantic(
+    let c = cache.as_ref().expect("arm plan just set");
+    // The CTE scope is visible to subquery planning while the arm runs.
+    let saved = ctx.ctes.replace(std::mem::take(scope));
+    let res = if c.has_subqueries {
+        super::rewrite_plan_subqueries(&c.plan, ctx).and_then(|p| super::execute(&p, ctx))
+    } else {
+        super::execute(&c.plan, ctx)
+    };
+    *scope = ctx.ctes.take().unwrap_or_default();
+    ctx.ctes = saved;
+    Ok(res?.rows)
+}
+
+/// Point every `CteRows` node reading `old` (the previous frontier) at
+/// `new`; returns how many nodes it re-pointed (`old == new` counts them).
+fn retarget_cte_rows(plan: &mut Plan, old: &Arc<Vec<Row>>, new: &Arc<Vec<Row>>) -> usize {
+    match plan {
+        Plan::CteRows { rows, .. } => {
+            if Arc::ptr_eq(rows, old) {
+                *rows = Arc::clone(new);
+                1
+            } else {
+                0
+            }
+        }
+        Plan::Filter { input, .. }
+        | Plan::Project { input, .. }
+        | Plan::Sort { input, .. }
+        | Plan::Limit { input, .. }
+        | Plan::Aggregate { input, .. }
+        | Plan::Window { input, .. }
+        | Plan::Distinct { input } => retarget_cte_rows(input, old, new),
+        Plan::Join { left, right, .. }
+        | Plan::Union { left, right, .. }
+        | Plan::Intersect { left, right }
+        | Plan::Except { left, right } => {
+            retarget_cte_rows(left, old, new) + retarget_cte_rows(right, old, new)
+        }
+        Plan::IndexNestedLoopJoin { outer, .. } => retarget_cte_rows(outer, old, new),
+        Plan::Subquery { plan } => retarget_cte_rows(plan, old, new),
+        Plan::Insert { source, .. } | Plan::Update { source, .. } | Plan::Delete { source, .. } => {
+            retarget_cte_rows(source, old, new)
+        }
+        _ => 0,
+    }
+}
+
+/// The arm reads ONLY the CTE (one FROM item, no grouping): its results
+/// over a whole frontier come out frontier row by frontier row.
+fn simple_recursive_arm(arm: &SelectStatement, name_lc: &str) -> bool {
+    let SelectBody::Simple(s) = &arm.body else {
+        return false;
+    };
+    matches!(
+        &s.from,
+        Some(crate::sql::ast::TableExpression::Table { name, schema: None, .. })
+            if name.eq_ignore_ascii_case(name_lc)
+    ) && s.group_by.is_empty()
+        && s.having.is_none()
+        && !s.distinct
+}
+
+/// One ORDER BY term of the recursive queue: the output column, the
+/// direction, NULLS placement and an explicit collation.
+struct QueueTerm {
+    col: usize,
+    desc: bool,
+    nulls_first: bool,
+    coll: Option<Arc<dyn crate::plugin::Collation>>,
+}
+
+/// Resolve the compound's ORDER BY against the CTE's output columns —
+/// a compound ORDER BY term must name (or number) a result column.
+fn resolve_queue_order(
+    terms: &[crate::sql::ast::OrderTerm],
+    cols: &[String],
+) -> Result<Vec<QueueTerm>> {
+    use crate::sql::ast::{Expr, NullsOrder, Order};
+    let mut out = Vec::with_capacity(terms.len());
+    for (i, t) in terms.iter().enumerate() {
+        let (expr, coll) = match &t.expr {
+            Expr::Collate { expr, collation } => (expr.as_ref(), Some(collation.clone())),
+            e => (e, None),
+        };
+        let col = match expr {
+            Expr::Literal(crate::types::Value::Integer(k))
+                if *k >= 1 && (*k as usize) <= cols.len() =>
+            {
+                Some(*k as usize - 1)
+            }
+            Expr::Column { table, name } => cols.iter().position(|c| {
+                let (q, n) = c.rsplit_once('.').unwrap_or(("", c));
+                n.eq_ignore_ascii_case(name)
+                    && table.as_deref().map_or(true, |t| t.eq_ignore_ascii_case(q))
+            }),
+            _ => None,
+        };
+        let Some(col) = col else {
+            return Err(Error::semantic(format!(
+                "{} ORDER BY term does not match any column in the result set",
+                crate::planner::sqlite_ordinal(i as i64 + 1)
+            )));
+        };
+        let coll = match coll {
+            None => None,
+            Some(n) if n.eq_ignore_ascii_case("binary") => None,
+            Some(n) => match crate::plugin::lookup_collation(&n) {
+                Some(c) => Some(c),
+                None => {
+                    return Err(Error::semantic(format!("no such collation sequence: {n}")));
+                }
+            },
+        };
+        let desc = matches!(t.order, Order::Desc);
+        let nulls_first = match t.nulls {
+            NullsOrder::First => true,
+            NullsOrder::Last => false,
+            NullsOrder::Default => !desc,
+        };
+        out.push(QueueTerm {
+            col,
+            desc,
+            nulls_first,
+            coll,
+        });
+    }
+    Ok(out)
+}
+
+/// The recursion queue: FIFO without an ORDER BY, else a min-heap on the
+/// ORDER BY terms with ties broken by insertion order.
+struct RecursiveQueue {
+    order: Vec<QueueTerm>,
+    fifo: std::collections::VecDeque<Row>,
+    heap: Vec<(u64, Row)>,
+    seq: u64,
+}
+
+impl RecursiveQueue {
+    fn new(order: Vec<QueueTerm>) -> Self {
+        Self {
+            order,
+            fifo: std::collections::VecDeque::new(),
+            heap: Vec::new(),
+            seq: 0,
+        }
+    }
+
+    fn less(&self, a: &(u64, Row), b: &(u64, Row)) -> bool {
+        use std::cmp::Ordering;
+        for t in &self.order {
+            let (x, y) = (&a.1[t.col], &b.1[t.col]);
+            let ord = match (x.is_null(), y.is_null()) {
+                (true, true) => Ordering::Equal,
+                (true, false) => {
+                    if t.nulls_first {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    }
+                }
+                (false, true) => {
+                    if t.nulls_first {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Less
+                    }
+                }
+                (false, false) => {
+                    let o = match (&t.coll, x, y) {
+                        (Some(c), crate::types::Value::Text(p), crate::types::Value::Text(q)) => {
+                            c.compare(p.as_str(), q.as_str())
+                        }
+                        _ => x.cmp(y),
+                    };
+                    if t.desc {
+                        o.reverse()
+                    } else {
+                        o
+                    }
+                }
+            };
+            if ord != Ordering::Equal {
+                return ord == Ordering::Less;
+            }
+        }
+        a.0 < b.0
+    }
+
+    fn push(&mut self, r: Row) {
+        if self.order.is_empty() {
+            self.fifo.push_back(r);
+            return;
+        }
+        self.seq += 1;
+        self.heap.push((self.seq, r));
+        let mut i = self.heap.len() - 1;
+        while i > 0 {
+            let p = (i - 1) / 2;
+            if self.less(&self.heap[i], &self.heap[p]) {
+                self.heap.swap(i, p);
+                i = p;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn pop(&mut self) -> Option<Row> {
+        if self.order.is_empty() {
+            return self.fifo.pop_front();
+        }
+        if self.heap.is_empty() {
+            return None;
+        }
+        let last = self.heap.len() - 1;
+        self.heap.swap(0, last);
+        let top = self.heap.pop().map(|(_, r)| r);
+        let n = self.heap.len();
+        let mut i = 0;
+        loop {
+            let (l, r) = (2 * i + 1, 2 * i + 2);
+            let mut m = i;
+            if l < n && self.less(&self.heap[l], &self.heap[m]) {
+                m = l;
+            }
+            if r < n && self.less(&self.heap[r], &self.heap[m]) {
+                m = r;
+            }
+            if m == i {
+                break;
+            }
+            self.heap.swap(i, m);
+            i = m;
+        }
+        top
+    }
+}
+
+/// A recursive CTE's compound body split as SQLite's
+/// generateWithRecursiveQuery reads it: the SETUP arms (a prefix that does
+/// not reference the CTE, kept as one compound), the operator joining the
+/// first recursive arm, and the RECURSIVE arms (every arm from the first
+/// one that reads the CTE to the end). The compound's ORDER BY / LIMIT /
+/// OFFSET belong to the recursion, not to any arm.
+struct RecursiveSplit {
+    setup: SelectStatement,
+    op: SetOp,
+    arms: Vec<SelectStatement>,
+}
+
+/// `None` when no arm reads the CTE: a WITH RECURSIVE CTE that never
+/// recurses is an ordinary one.
+fn split_compound_cte(sel: &SelectStatement, name_lc: &str) -> Result<Option<RecursiveSplit>> {
+    fn stmt(body: SelectBody) -> SelectStatement {
+        SelectStatement {
+            with: None,
+            body,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        }
+    }
+    // Flatten the left-deep compound: arms in order, each with the
+    // operator that joins it to the arms before it.
+    fn flatten(body: &SelectBody, out: &mut Vec<(Option<SetOp>, SelectBody)>) {
+        match body {
+            SelectBody::Binary { op, left, right } => {
+                flatten(left, out);
+                out.push((Some(*op), (**right).clone()));
+            }
+            simple => out.push((None, simple.clone())),
+        }
+    }
+    let mut arms = Vec::new();
+    flatten(&sel.body, &mut arms);
+    let Some(first_rec) = arms.iter().position(|(_, b)| body_reads_table(b, name_lc)) else {
+        return Ok(None);
+    };
+    let circular = || Error::semantic(format!("circular reference: {name_lc}"));
+    if first_rec == 0
+        || arms[first_rec..]
+            .iter()
+            .any(|(_, b)| !body_reads_table(b, name_lc))
+    {
+        return Err(circular());
+    }
+    let op = match arms[first_rec].0 {
+        Some(op @ (SetOp::Union | SetOp::UnionAll)) => op,
+        _ => {
+            return Err(Error::semantic(
                 "WITH RECURSIVE requires UNION or UNION ALL as the compound operator",
-            )),
-        },
-        SelectBody::Simple(_) => Err(Error::semantic(
-            "WITH RECURSIVE requires a compound SELECT (base UNION [ALL] recursive)",
-        )),
+            ))
+        }
+    };
+    let rec: Vec<SelectStatement> = arms.drain(first_rec..).map(|(_, b)| stmt(b)).collect();
+    let mut setup_body: Option<SelectBody> = None;
+    for (op, b) in arms {
+        setup_body = Some(match (setup_body, op) {
+            (Some(left), Some(op)) => SelectBody::Binary {
+                op,
+                left: Box::new(left),
+                right: Box::new(b),
+            },
+            _ => b,
+        });
+    }
+    Ok(Some(RecursiveSplit {
+        setup: stmt(setup_body.expect("first_rec > 0")),
+        op,
+        arms: rec,
+    }))
+}
+
+/// Whether an arm's FROM reads the table `name_lc` (directly, in a join,
+/// or inside a FROM subquery).
+fn body_reads_table(body: &SelectBody, name_lc: &str) -> bool {
+    fn te_reads(t: &crate::sql::ast::TableExpression, name_lc: &str) -> bool {
+        use crate::sql::ast::TableExpression as T;
+        match t {
+            T::Table {
+                name, schema: None, ..
+            } => name.eq_ignore_ascii_case(name_lc),
+            T::Join { left, right, .. } => te_reads(left, name_lc) || te_reads(right, name_lc),
+            T::Subquery { select, .. } => body_reads_table(&select.body, name_lc),
+            _ => false,
+        }
+    }
+    match body {
+        SelectBody::Simple(s) => s.from.as_ref().is_some_and(|f| te_reads(f, name_lc)),
+        SelectBody::Binary { left, right, .. } => {
+            body_reads_table(left, name_lc) || body_reads_table(right, name_lc)
+        }
     }
 }

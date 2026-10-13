@@ -4023,8 +4023,12 @@ impl<'a> Btree<'a> {
                 return Ok(None);
             }
         }
-        // The new right leaf holds just this row.
+        // The new right leaf holds just this row; the old one keeps its
+        // bytes but stops being the right edge — void its other pins (an
+        // older append pin on it would place a larger rowid past the new
+        // separator: stateful seed 878878, rows out of order).
         let new_id = self.pager.allocate_page()?;
+        leaf.lock().bump_epoch();
         let (serial, epoch) = {
             let np = self.pager.get_page(new_id)?;
             let mut b = np.lock();
@@ -6609,6 +6613,10 @@ impl<'a> Btree<'a> {
         self.pager.note_decision_read(page_id);
         // Write ONLY the new cell into the new page.
         self.insert_cell_into_page(new_page_id, &new_cell)?;
+        // The old page stays byte-identical but is no longer the right
+        // edge: void every append pin on it (an older pin would append a
+        // larger key past the new separator — stateful seed 878878).
+        self.pager.get_page(page_id)?.lock().bump_epoch();
 
         if pt == PageType::LeafIndex {
             // Separator = the old page's last (max) entry, exactly as the

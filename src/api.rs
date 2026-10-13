@@ -7620,6 +7620,18 @@ impl Database {
                     // ROLLBACK already restored the snapshot above).
                     *self.txn_catalog_snap.lock() = None;
                     self.savepoint_catalogs.lock().clear();
+                    // Every savepoint dies with the transaction — the
+                    // pager's stack was cleared above, and the per-
+                    // savepoint map snapshots must go with it. A stale
+                    // one (SAVEPOINT a; ROLLBACK; …; SAVEPOINT b;
+                    // ROLLBACK TO b) was restored by the later ROLLBACK
+                    // TO: its OLD table roots and max rowids hid the rows
+                    // committed in between, and the next INSERT reused
+                    // their rowids (stateful seed 878878). Likewise a
+                    // savepoint-started flag left set made RELEASE of a
+                    // savepoint inside a later BEGIN commit it.
+                    self.savepoint_maps.lock().clear();
+                    self.savepoint_txn.store(false, Ordering::Release);
                     self.txn_owner_tid.store(0, Ordering::Release);
                     // Committed-view entries: `clear_savepoints` (run by
                     // the COMMIT/ROLLBACK machinery above) already removed
