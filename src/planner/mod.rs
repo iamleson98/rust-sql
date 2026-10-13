@@ -99,6 +99,27 @@ impl<'a> Planner<'a> {
             },
             _ => stmt,
         };
+        // NATURAL / USING joins rewrite here — before ORDER BY terms
+        // resolve — so `ORDER BY id` (or `ORDER BY 1`) over a RIGHT / FULL
+        // merged column sorts by coalesce(left, right), like the column.
+        let using_stmt;
+        let stmt = match &stmt.body {
+            SelectBody::Simple(sb) => match self.resolve_using_joins_map(sb) {
+                Some((r, merged)) => {
+                    let mut st = stmt.clone();
+                    st.body = SelectBody::Simple(r);
+                    if !merged.is_empty() {
+                        for t in st.order_by.iter_mut() {
+                            t.expr = using::coalesce_bare(&t.expr, &merged);
+                        }
+                    }
+                    using_stmt = st;
+                    &using_stmt
+                }
+                None => stmt,
+            },
+            _ => stmt,
+        };
         // ORDER BY terms resolve BEFORE body planning: the aggregate
         // branch needs them (ORDER-ONLY aggregates + bare-column
         // representatives must be part of the Aggregate node's output so

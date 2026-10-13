@@ -2551,6 +2551,49 @@ impl Parser {
             } else {
                 let inner = self.parse_table_expression()?;
                 self.expect_punct(')')?;
+                // `(a JOIN b ...) AS j`: SQLite makes the aliased join group
+                // a subquery — `SELECT * FROM (a JOIN b ...)` named j.
+                let alias = if self.peek().is_keyword("AS") {
+                    self.advance();
+                    Some(self.parse_ident()?)
+                } else if matches!(&inner, TableExpression::Join { .. })
+                    && matches!(self.peek().token, Token::Ident(_))
+                {
+                    Some(self.parse_ident()?)
+                } else {
+                    None
+                };
+                if let (Some(alias), TableExpression::Join { .. }) = (&alias, &inner) {
+                    let body = SimpleSelect {
+                        distinct: false,
+                        columns: vec![ResultColumn::Star],
+                        from: Some(inner),
+                        where_clause: None,
+                        group_by: Vec::new(),
+                        having: None,
+                        window: Vec::new(),
+                    };
+                    let select = SelectStatement {
+                        with: None,
+                        body: SelectBody::Simple(body),
+                        order_by: Vec::new(),
+                        limit: None,
+                        offset: None,
+                    };
+                    return Ok(TableExpression::Subquery {
+                        select: Box::new(select),
+                        alias: Some(alias.clone()),
+                        column_aliases: None,
+                    });
+                }
+                if let (Some(alias), TableExpression::Table { alias: a, .. }) = (alias, &inner) {
+                    let mut inner = inner.clone();
+                    if let TableExpression::Table { alias: slot, .. } = &mut inner {
+                        *slot = Some(alias);
+                    }
+                    let _ = a;
+                    return Ok(inner);
+                }
                 return Ok(inner);
             }
         }

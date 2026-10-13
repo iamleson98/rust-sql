@@ -24,6 +24,16 @@ impl Planner<'_> {
     /// USING join (or one whose sides' columns are not statically known
     /// — it then plans as before).
     pub(super) fn resolve_using_joins(&self, s: &SimpleSelect) -> Option<SimpleSelect> {
+        self.resolve_using_joins_map(s).map(|(s, _)| s)
+    }
+
+    /// [`Self::resolve_using_joins`] plus the RIGHT / FULL merged columns
+    /// (name -> coalesce): the caller rewrites bare references to them in
+    /// the ORDER BY too.
+    pub(super) fn resolve_using_joins_map(
+        &self,
+        s: &SimpleSelect,
+    ) -> Option<(SimpleSelect, Vec<(String, Expr)>)> {
         let from = s.from.as_ref()?;
         let table_star = matches!(from, TableExpression::Join { .. })
             && s.columns
@@ -86,7 +96,7 @@ impl Planner<'_> {
                 *g = sub(g);
             }
         }
-        Some(out)
+        Some((out, coalesced))
     }
 
     fn rewrite_from(
@@ -164,17 +174,29 @@ impl Planner<'_> {
             // raises SQLite's error.
             let (li, lc) = find(start_l..start_r, out, c)?;
             let (ri, rc) = find(start_r..out.len(), out, c)?;
-            let l = Expr::Column {
+            // The left side's CURRENT value of the column: a column merged
+            // by an earlier RIGHT / FULL join is coalesce(left, right) —
+            // `t4 NATURAL RIGHT JOIN t5 NATURAL RIGHT JOIN t6` matches
+            // t6.id against the merged id, not t4's NULL-extended copy.
+            let l = out[li].star[lc].clone().unwrap_or_else(|| Expr::Column {
                 table: Some(out[li].qualifier.clone()),
                 name: out[li].columns[lc].clone(),
-            };
-            let r = Expr::Column {
+            });
+            // Same on the right: a parenthesized join group's merged
+            // column is its own coalesce.
+            let r = out[ri].star[rc].clone().unwrap_or_else(|| Expr::Column {
                 table: Some(out[ri].qualifier.clone()),
                 name: out[ri].columns[rc].clone(),
-            };
+            });
             out[ri].star[rc] = None;
-            if matches!(join_type, JoinType::Right | JoinType::Full) {
-                let merged = Expr::Function {
+            // What a bare reference to the merged name means after this
+            // join: the left copy, or coalesce(left, right) for RIGHT /
+            // FULL. Joins are rewritten innermost first, so the outermost
+            // merge of a name is the last recorded — and the one that
+            // counts (`t1 LEFT JOIN (t4 RIGHT JOIN t5 USING(a)) USING(a)`:
+            // bare `a` is t1's).
+            let merged = if matches!(join_type, JoinType::Right | JoinType::Full) {
+                let m = Expr::Function {
                     name: "coalesce".to_string(),
                     distinct: false,
                     args: vec![l.clone(), r.clone()],
@@ -182,9 +204,13 @@ impl Planner<'_> {
                     over: None,
                     order_by: Vec::new(),
                 };
-                out[li].star[lc] = Some(merged.clone());
-                coalesced.push((c.clone(), merged));
-            }
+                out[li].star[lc] = Some(m.clone());
+                m
+            } else {
+                l.clone()
+            };
+            coalesced.retain(|(n, _)| !n.eq_ignore_ascii_case(c));
+            coalesced.push((c.clone(), merged));
             let term = Expr::Binary {
                 op: BinaryOp::Eq,
                 left: Box::new(l),
@@ -281,7 +307,7 @@ impl Planner<'_> {
 
 /// Replace each bare reference to a RIGHT / FULL merged column (outside
 /// subqueries, which are their own scope) with its coalesce.
-fn coalesce_bare(e: &Expr, merged: &[(String, Expr)]) -> Expr {
+pub(super) fn coalesce_bare(e: &Expr, merged: &[(String, Expr)]) -> Expr {
     if let Expr::Column { table: None, name } = e {
         if let Some((_, m)) = merged.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
             return m.clone();
