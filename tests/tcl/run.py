@@ -7,7 +7,7 @@ are ignored.
 
     python3 tests/tcl/run.py SQLITE_TEST_DIR [FILE_GLOB...] [-j N] [-o OUT.json]
 """
-import argparse, glob, json, os, re, signal, subprocess, sys, tempfile
+import argparse, glob, json, os, re, resource, signal, subprocess, sys, tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -24,6 +24,8 @@ def run_one(testdir, path, backend, timeout):
             ["tclsh", SHIM, SERVER, backend, testdir, path],
             cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             start_new_session=True,
+            # A runaway test must not fill the disk: files stop at 1 GiB.
+            preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_FSIZE, (1 << 30, 1 << 30)),
         )
         try:
             o, e = p.communicate(timeout=timeout)

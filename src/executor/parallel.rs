@@ -1030,6 +1030,38 @@ pub(crate) fn merge_agg_state(
         AggFunc::Count => {
             dst.count = dst.count.saturating_add(src.count);
         }
+        // Per-row separators: src joins behind dst with the separator of
+        // src's first row (kept in its concat_sep).
+        AggFunc::GroupConcat if sep == Some(crate::executor::GC_DYN_SEP) => {
+            let Some(sc) = src.cold() else { return };
+            let src_bytes: Option<Vec<u8>> = sc
+                .concat_blob
+                .clone()
+                .or_else(|| sc.concat.clone().map(String::into_bytes));
+            let Some(b) = src_bytes else { return };
+            let joiner = sc.concat_sep.clone().unwrap_or_default();
+            let c = dst.cold_mut();
+            let had_terms = c.concat.is_some() || c.concat_blob.is_some();
+            if !had_terms {
+                c.concat_sep = Some(joiner.clone());
+            }
+            if c.concat_blob.is_none() && sc.concat_blob.is_none() {
+                let buf = c.concat.get_or_insert_with(String::new);
+                if had_terms {
+                    buf.push_str(&joiner);
+                }
+                buf.push_str(sc.concat.as_deref().unwrap_or_default());
+            } else {
+                let prior = c.concat.take();
+                let buf = c
+                    .concat_blob
+                    .get_or_insert_with(|| prior.map(String::into_bytes).unwrap_or_default());
+                if had_terms {
+                    buf.extend_from_slice(joiner.as_bytes());
+                }
+                buf.extend_from_slice(&b);
+            }
+        }
         AggFunc::GroupConcat
             if src.cold().is_some_and(|c| c.concat_blob.is_some())
                 || dst.cold().is_some_and(|c| c.concat_blob.is_some()) =>

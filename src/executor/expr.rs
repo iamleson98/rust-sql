@@ -2632,6 +2632,25 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
                 }
             }
         }
+        // group_concat / string_agg with a per-row separator expression:
+        // the planner passes `__gc_dyn(x, sep)` as the argument — NULL
+        // when x is (the row adds nothing), else the pair encoded as
+        // [sep length u32 LE][sep bytes][x bytes] (see GC_DYN_SEP).
+        "__gc_dyn" => match (args.first(), args.get(1)) {
+            (Some(Value::Null) | None, _) => Value::Null,
+            (Some(x), sep) => {
+                let sep = match sep {
+                    Some(Value::Null) | None => Vec::new(),
+                    Some(s) => s.text_bytes().into_owned(),
+                };
+                let x = x.text_bytes();
+                let mut b = Vec::with_capacity(4 + sep.len() + x.len());
+                b.extend_from_slice(&(sep.len() as u32).to_le_bytes());
+                b.extend_from_slice(&sep);
+                b.extend_from_slice(&x);
+                Value::Blob(b)
+            }
+        },
         // LIKELY(x) / UNLIKELY(x) — query-planner no-ops, identity.
         "likely" | "unlikely" => match args.first() {
             Some(v) => v.clone(),

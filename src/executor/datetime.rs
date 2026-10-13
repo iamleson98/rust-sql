@@ -766,11 +766,10 @@ fn parse_numeric_modifier(z: &str, p: &mut DateTime) -> bool {
         }
         let tail = &z[tail_start..];
         let tail_bytes = tail.as_bytes();
-        if tail_bytes[0].is_ascii_whitespace() {
-            if let Some(hhmm) = parse_hhmm_value(&tail[1..]) {
-                apply_hhmm_shift(p, hhmm, z0 == b'-');
-                return true;
-            }
+        // date.c: a space and `HH:MM` continue as the `(+|-)HH:MM:SS.FFF`
+        // form — seconds and fraction included.
+        if tail_bytes[0].is_ascii_whitespace() && parse_hhmm_value(&tail[1..]).is_some() {
+            return shift_hms(p, &tail[1..], z0 == b'-');
         }
         return false;
     }
@@ -781,23 +780,7 @@ fn parse_numeric_modifier(z: &str, p: &mut DateTime) -> bool {
         if !bytes[0].is_ascii_digit() {
             start = 1; // skip sign
         }
-        // Build a "HH:MM:SS" string to parse with parse_hhmmss.
-        let tail = &z[start..];
-        let mut tx = DateTime::default();
-        if !parse_hhmmss(tail.as_bytes(), &mut tx) {
-            return false;
-        }
-        compute_jd(&mut tx);
-        tx.i_jd -= 43200000;
-        let day = tx.i_jd / 86400000;
-        tx.i_jd -= day * 86400000;
-        if z0 == b'-' {
-            tx.i_jd = -tx.i_jd;
-        }
-        compute_jd(p);
-        clear_ymd_hms_tz(p);
-        p.i_jd += tx.i_jd;
-        return true;
+        return shift_hms(p, &z[start..], z0 == b'-');
     }
 
     // `+NNN unit` form
@@ -872,6 +855,26 @@ fn split_ymd(s: &str, ylen: usize) -> Option<(u32, u32, u32)> {
     Some((y, m, d))
 }
 
+/// Shift by an `HH:MM[:SS[.FFF]]` interval (date.c's `(+|-)HH:MM:SS.FFF`
+/// modifier).
+fn shift_hms(p: &mut DateTime, hms: &str, negative: bool) -> bool {
+    let mut tx = DateTime::default();
+    if !parse_hhmmss(hms.as_bytes(), &mut tx) {
+        return false;
+    }
+    compute_jd(&mut tx);
+    tx.i_jd -= 43200000;
+    let day = tx.i_jd / 86400000;
+    tx.i_jd -= day * 86400000;
+    if negative {
+        tx.i_jd = -tx.i_jd;
+    }
+    compute_jd(p);
+    clear_ymd_hms_tz(p);
+    p.i_jd += tx.i_jd;
+    true
+}
+
 /// Parse `HH:MM` for the tail of a `+YYYY-MM-DD HH:MM` modifier.
 fn parse_hhmm_value(s: &str) -> Option<(i32, i32)> {
     let b = s.as_bytes();
@@ -881,17 +884,6 @@ fn parse_hhmm_value(s: &str) -> Option<(i32, i32)> {
     }
     let m = digits(b, 3, 2)? as i32;
     Some((h, m))
-}
-
-fn apply_hhmm_shift(p: &mut DateTime, hhmm: (i32, i32), negative: bool) {
-    let (h, m) = hhmm;
-    let mut ms = (h as i64) * 3600000 + (m as i64) * 60000;
-    if negative {
-        ms = -ms;
-    }
-    compute_jd(p);
-    clear_ymd_hms_tz(p);
-    p.i_jd += ms;
 }
 
 /// Shift a UTC DateTime to local time using the OS timezone database.

@@ -119,8 +119,25 @@ impl<'a> Planner<'a> {
         // in the projection. SQLite semantics: ORDER BY may reference any
         // column in the FROM clause, or any projection alias.
         let plan = if !stmt.order_by.is_empty() {
+            // A window call in ORDER BY (directly or through an alias)
+            // reads the Window node's `__win_N` column.
+            let windowed: Vec<OrderTerm>;
+            let resolved_order: &[OrderTerm] = match plan_window_exprs(&plan) {
+                Some(ws) if resolved_order.iter().any(|t| expr_has_window(&t.expr)) => {
+                    windowed = resolved_order
+                        .iter()
+                        .map(|t| OrderTerm {
+                            expr: rewrite_window_refs(&t.expr, ws),
+                            order: t.order,
+                            nulls: t.nulls,
+                        })
+                        .collect();
+                    &windowed
+                }
+                _ => &resolved_order,
+            };
             let terms =
-                self.rewrite_order_terms_aggregate(&stmt.body, &resolved_order, &stmt.order_by)?;
+                self.rewrite_order_terms_aggregate(&stmt.body, resolved_order, &stmt.order_by)?;
             let sorted = insert_sort_below_top(plan, terms);
             // ROWID-ORDER ELISION: a table b-tree scan emits rows in
             // rowid order by construction — an ORDER BY that resolves to
@@ -1506,6 +1523,45 @@ impl<'a> Planner<'a> {
                 };
             }
 
+            // Window functions over the groups: the Window node reads the
+            // Aggregate's output (its expressions rewritten to the group
+            // keys / aggregate columns); the projection reads `__win_N`.
+            let agg_windows: Vec<WindowExpr> = if self.expr_list_has_windows(&s.columns)
+                || order_terms.iter().any(|t| expr_has_window(&t.expr))
+            {
+                let windows = self.collect_windows_with(&s.columns, &s.window, order_terms)?;
+                let rw = |e: &Expr| {
+                    rewrite_aggregates_and_groups(e, &aggregates, &resolved_group_by, n_group)
+                };
+                let exec_windows: Vec<WindowExpr> = windows
+                    .iter()
+                    .map(|w| {
+                        let mut w = w.clone();
+                        w.arg = w.arg.as_ref().map(rw);
+                        w.extra_args = w.extra_args.iter().map(rw).collect();
+                        w.partition_by = w.partition_by.iter().map(rw).collect();
+                        w.order_by = w
+                            .order_by
+                            .iter()
+                            .map(|t| OrderTerm {
+                                expr: rw(&t.expr),
+                                order: t.order,
+                                nulls: t.nulls,
+                            })
+                            .collect();
+                        w.filter = w.filter.as_ref().map(rw);
+                        w
+                    })
+                    .collect();
+                plan = Plan::Window {
+                    input: Box::new(plan),
+                    windows: exec_windows,
+                };
+                windows
+            } else {
+                Vec::new()
+            };
+
             // Star/expr arms; stars expand to N columns, exprs stay one.
             enum StarArm {
                 Expanded(Vec<ProjectExpr>),
@@ -1540,6 +1596,13 @@ impl<'a> Planner<'a> {
                         }
                     }
                     ResultColumn::Expr { expr, alias } => {
+                        let windowed;
+                        let expr = if agg_windows.is_empty() {
+                            expr
+                        } else {
+                            windowed = rewrite_window_refs(expr, &agg_windows);
+                            &windowed
+                        };
                         let rewritten = rewrite_aggregates_and_groups(
                             expr,
                             &aggregates,
@@ -1548,6 +1611,12 @@ impl<'a> Planner<'a> {
                         );
                         let alias = alias.clone().or_else(|| {
                             if let Expr::Column { name, .. } = &rewritten {
+                                if let Some(i) = name
+                                    .strip_prefix("__win_")
+                                    .and_then(|n| n.parse::<usize>().ok())
+                                {
+                                    return agg_windows.get(i).map(|w| w.display_name.clone());
+                                }
                                 if name.starts_with("__agg_") {
                                     let idx: usize =
                                         name.trim_start_matches("__agg_").parse().ok()?;
@@ -1589,10 +1658,11 @@ impl<'a> Planner<'a> {
             return Ok(plan);
         }
 
-        let has_windows = self.expr_list_has_windows(&s.columns);
+        let has_windows = self.expr_list_has_windows(&s.columns)
+            || order_terms.iter().any(|t| expr_has_window(&t.expr));
         let mut collected_windows: Option<Vec<WindowExpr>> = None;
         if has_windows {
-            let windows = self.collect_windows(&s.columns, &s.window)?;
+            let windows = self.collect_windows_with(&s.columns, &s.window, order_terms)?;
             plan = Plan::Window {
                 input: Box::new(plan),
                 windows: windows.clone(),
@@ -2713,10 +2783,14 @@ impl<'a> Planner<'a> {
             .collect())
     }
 
-    fn collect_windows(
+    /// The window calls of the SELECT list plus those of the ORDER BY
+    /// terms (`ORDER BY rank() OVER (...)`): one Window node computes
+    /// them all.
+    fn collect_windows_with(
         &self,
         cols: &[ResultColumn],
         defs: &[WindowDef],
+        order_terms: &[OrderTerm],
     ) -> Result<Vec<WindowExpr>> {
         // The WINDOW clause, resolved in order (a definition may build on
         // an EARLIER one: `WINDOW w1 AS (PARTITION BY g), w2 AS (w1 ORDER
@@ -2740,6 +2814,15 @@ impl<'a> Planner<'a> {
         for c in cols {
             if let ResultColumn::Expr { expr, alias } = c {
                 collect_windows_rec(expr, alias, &named, &mut out)?;
+            }
+        }
+        for t in order_terms {
+            let mut extra = Vec::new();
+            collect_windows_rec(&t.expr, &None, &named, &mut extra)?;
+            for w in extra {
+                if !out.iter().any(|o| o.expr_key == w.expr_key) {
+                    out.push(w);
+                }
             }
         }
         if out.iter().any(|w| w.distinct) {
@@ -2997,12 +3080,23 @@ pub fn rewrite_aggregates_and_groups(
                 {
                     synthesized = Some(wrapped);
                     synthesized.as_ref()
+                } else if let Some((input, _)) = group_concat_input(name, args) {
+                    synthesized = Some(input);
+                    synthesized.as_ref()
                 } else {
                     args.first()
                 };
+                // A 2-argument group_concat's separator is part of its
+                // identity too.
+                let call_sep = group_concat_input(name, args).map(|(_, sep)| sep);
                 for (i, agg) in aggregates.iter().enumerate() {
                     if agg.func != name.to_ascii_lowercase() || agg.distinct != *distinct {
                         continue;
+                    }
+                    if let Some(sep) = &call_sep {
+                        if agg.sep.as_ref() != Some(sep) {
+                            continue;
+                        }
                     }
                     // FILTER is part of the aggregate's identity: two
                     // calls differing only in FILTER are different
@@ -3542,6 +3636,39 @@ fn aggregate_display_name(name: &str, distinct: bool, args: &[crate::sql::ast::E
     }
 }
 
+/// A 2-argument group_concat / string_agg's (input, separator): a
+/// constant separator as its text (NULL = none), any other separator
+/// evaluated per row — the input is then `__gc_dyn(x, sep)` and the
+/// separator the GC_DYN_SEP marker. `None` for every other call.
+fn group_concat_input(name: &str, args: &[Expr]) -> Option<(Expr, String)> {
+    if args.len() != 2
+        || !(name.eq_ignore_ascii_case("group_concat") || name.eq_ignore_ascii_case("string_agg"))
+    {
+        return None;
+    }
+    let constant = match &args[1] {
+        Expr::Literal(Value::Text(t)) => Some(t.to_string()),
+        Expr::Literal(Value::Integer(i)) => Some(i.to_string()),
+        Expr::Literal(Value::Real(r)) => Some(crate::types::value::format_real(*r)),
+        Expr::Literal(Value::Null) => Some(String::new()),
+        _ => None,
+    };
+    Some(match constant {
+        Some(s) => (args[0].clone(), s),
+        None => (
+            Expr::Function {
+                name: "__gc_dyn".to_string(),
+                distinct: false,
+                args: args.to_vec(),
+                filter: None,
+                over: None,
+                order_by: Vec::new(),
+            },
+            crate::executor::GC_DYN_SEP.to_string(),
+        ),
+    })
+}
+
 fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExpr>) {
     match e {
         Expr::Function {
@@ -3567,17 +3694,14 @@ fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExp
                     // (SQLite's own constraint in windowed form; the
                     // non-windowed form evaluates it once per group —
                     // literal separators cover the practical universe).
-                    let sep = match &args[1] {
-                        Expr::Literal(Value::Text(t)) => Some(t.to_string()),
-                        Expr::Literal(Value::Integer(i)) => Some(i.to_string()),
-                        Expr::Literal(Value::Real(r)) => Some(r.to_string()),
-                        _ => None,
-                    };
+                    let (arg, sep) =
+                        group_concat_input(name, args).expect("2-argument group_concat");
+                    let sep = Some(sep);
                     out.push(AggExpr {
                         func: fname,
                         order_by: order_by.clone(),
                         order_coll: Vec::new(),
-                        arg: Some(args[0].clone()),
+                        arg: Some(arg),
                         sep,
                         distinct: *distinct,
                         alias: alias.clone(),
@@ -3680,6 +3804,18 @@ fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExp
             }
             if let Some(f) = filter {
                 collect_aggregates_rec(f, &None, out);
+            }
+            // A window over an aggregate query reads the groups:
+            // `row_number() OVER (ORDER BY sum(a))`.
+            if let Some(spec) = over {
+                if let WindowSpec::Inline(d) = spec.as_ref() {
+                    for e in &d.partition_by {
+                        collect_aggregates_rec(e, &None, out);
+                    }
+                    for t in &d.order_by {
+                        collect_aggregates_rec(&t.expr, &None, out);
+                    }
+                }
             }
         }
         Expr::Binary { left, right, .. } => {
@@ -12048,6 +12184,20 @@ fn scan_table_of(input: &Plan) -> Option<(std::sync::Arc<Table>, Option<String>)
 /// This preserves correctness for `SELECT a FROM t ORDER BY b` where `b` is
 /// not in the projection but is in the underlying table. SQLite semantics:
 /// ORDER BY may reference any column in the FROM clause or any projection alias.
+/// The window expressions of the Window node directly under a select's
+/// top (Project / Distinct / Filter / Limit wrappers).
+fn plan_window_exprs(plan: &Plan) -> Option<&[WindowExpr]> {
+    match plan {
+        Plan::Window { windows, .. } => Some(windows),
+        Plan::Project { input, .. }
+        | Plan::Distinct { input }
+        | Plan::Filter { input, .. }
+        | Plan::Limit { input, .. }
+        | Plan::Sort { input, .. } => plan_window_exprs(input),
+        _ => None,
+    }
+}
+
 pub fn insert_sort_below_top(plan: Plan, terms: Vec<OrderTerm>) -> Plan {
     match plan {
         // The constant-WHERE marker stays on top; the Sort goes where it

@@ -15497,6 +15497,11 @@ fn ordered_agg_unique(agg: &AggExpr) -> bool {
             .is_some_and(|a| format!("{:?}", a) == format!("{:?}", agg.order_by[0].expr))
 }
 
+/// The `AggExpr::sep` marking a per-row separator expression: the
+/// aggregate's argument is `__gc_dyn(x, sep)` (see the GroupConcat arm of
+/// `update_agg_state`).
+pub(crate) const GC_DYN_SEP: &str = "\0gc-dyn";
+
 /// Per-aggregate constant separator (group_concat(x, sep)) if any.
 #[inline]
 fn agg_sep_at(aggregates: &[AggExpr], i: usize) -> Option<&str> {
@@ -15667,13 +15672,50 @@ fn update_agg_state(
                 c.max = Some(v.clone());
             }
         }
+        // A per-row separator: `v` is `__gc_dyn(x, sep)`'s encoded pair
+        // (groupConcatStep reads the separator of EACH row, and puts it
+        // before every term but the first).
+        AggFunc::GroupConcat if sep == Some(GC_DYN_SEP) => {
+            let Value::Blob(b) = v else { return };
+            if b.len() < 4 {
+                return;
+            }
+            let n = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
+            let (sep_bytes, x_bytes) = b[4..].split_at(n.min(b.len() - 4));
+            let c = state.cold_mut();
+            let first_term = c.concat.is_none() && c.concat_blob.is_none();
+            if first_term {
+                // The separator of the group's FIRST row: a parallel merge
+                // joins a partial state behind another with it.
+                c.concat_sep = Some(String::from_utf8_lossy(sep_bytes).into_owned());
+            }
+            let text = c.concat_blob.is_none()
+                && std::str::from_utf8(sep_bytes).is_ok()
+                && std::str::from_utf8(x_bytes).is_ok();
+            if text {
+                let buf = c.concat.get_or_insert_with(String::new);
+                if !first_term {
+                    buf.push_str(std::str::from_utf8(sep_bytes).unwrap_or_default());
+                }
+                buf.push_str(std::str::from_utf8(x_bytes).unwrap_or_default());
+            } else {
+                let prior = c.concat.take();
+                let buf = c
+                    .concat_blob
+                    .get_or_insert_with(|| prior.map(String::into_bytes).unwrap_or_default());
+                if !first_term {
+                    buf.extend_from_slice(sep_bytes);
+                }
+                buf.extend_from_slice(x_bytes);
+            }
+        }
         AggFunc::GroupConcat if !v.is_null() => {
             let c = state.cold_mut();
-            let sep_next = c
-                .concat_sep
-                .as_deref()
+            // groupConcatStep reads THIS row's separator (window frames
+            // pass one per row); the cached one serves merges.
+            let sep_next = sep
                 .map(|s| s.to_string())
-                .or_else(|| sep.map(|s| s.to_string()));
+                .or_else(|| c.concat_sep.as_deref().map(|s| s.to_string()));
             // groupConcatStep: a separator precedes every term but the
             // FIRST — an empty-string term is still a term (`''`, `''`,
             // `''` concatenate to ",,").
@@ -16021,6 +16063,19 @@ fn exec_window(
         }
         row.append(&mut tail);
     }
+    // SQLite computes window functions over a sorter keyed on the first
+    // window's PARTITION BY + ORDER BY: without an outer ORDER BY the
+    // rows come out in that order (ties in input order).
+    if let Some(w) = windows.first() {
+        if !w.partition_by.is_empty() || !w.order_by.is_empty() {
+            let order = window_output_order(w, &inner.rows, &inner.columns, params, named_params)?;
+            let mut rows: Vec<Option<Row>> = std::mem::take(&mut inner.rows)
+                .into_iter()
+                .map(Some)
+                .collect();
+            inner.rows = order.into_iter().filter_map(|i| rows[i].take()).collect();
+        }
+    }
     let mut out_cols: Vec<String> = inner.columns.to_vec();
     for w_idx in 0..windows.len() {
         out_cols.push(format!("__win_{w_idx}"));
@@ -16028,6 +16083,61 @@ fn exec_window(
     inner.columns = out_cols.into();
 
     Ok(inner)
+}
+
+/// The row order of a window's sorter: PARTITION BY keys ascending, then
+/// the ORDER BY terms, each under its collation; a stable sort (ties
+/// keep input order).
+fn window_output_order(
+    w: &WindowExpr,
+    rows: &[Row],
+    columns: &[String],
+    params: &[Value],
+    named_params: &HashMap<String, Value>,
+) -> Result<Vec<usize>> {
+    let coll_ctx = crate::executor::expr::EvalContext::new(&[], columns, params, named_params);
+    let mut colls: Vec<Option<Arc<dyn crate::plugin::Collation>>> = Vec::new();
+    let mut desc: Vec<bool> = Vec::new();
+    for e in &w.partition_by {
+        colls.push(crate::executor::expr::resolve_collation(
+            coll_ctx.expr_collation(e),
+        )?);
+        desc.push(false);
+    }
+    for t in &w.order_by {
+        colls.push(crate::executor::expr::resolve_collation(
+            coll_ctx.expr_collation(&t.expr),
+        )?);
+        desc.push(t.order == Order::Desc);
+    }
+    let mut keys: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut k = Vec::with_capacity(desc.len());
+        for e in &w.partition_by {
+            k.push(eval_row(e, row, columns, params, named_params)?);
+        }
+        for t in &w.order_by {
+            k.push(eval_row(&t.expr, row, columns, params, named_params)?);
+        }
+        keys.push(k);
+    }
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    order.sort_by(|&a, &b| {
+        for i in 0..desc.len() {
+            let mut ord = match &colls[i] {
+                Some(c) => crate::plugin::compare_collated(&keys[a][i], &keys[b][i], c.as_ref()),
+                None => value_cmp_conn(&keys[a][i], &keys[b][i]),
+            };
+            if desc[i] {
+                ord = ord.reverse();
+            }
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+    Ok(order)
 }
 
 /// Evaluate one window expression over the full input row set.
@@ -20495,8 +20605,32 @@ fn exec_union(
             }
         }
         rows = out;
+        compound_sort(&mut rows, &colls);
     }
     Ok(ExecResult { columns, rows })
+}
+
+/// multiSelectByMerge's output order: a UNION / INTERSECT / EXCEPT is a
+/// merge of two sorted co-routines, so its rows come out sorted by every
+/// column (each under the compound's collation for it), ascending. A
+/// stable sort — an ORDER BY above it breaks its ties the same way.
+fn compound_sort(rows: &mut [Row], colls: &[Option<String>]) {
+    let resolved: Vec<Option<Arc<dyn crate::plugin::Collation>>> = colls
+        .iter()
+        .map(|c| c.as_deref().and_then(crate::plugin::lookup_collation))
+        .collect();
+    rows.sort_by(|a, b| {
+        for i in 0..a.len().min(b.len()) {
+            let ord = match resolved.get(i).and_then(|c| c.as_ref()) {
+                Some(c) => crate::plugin::compare_collated(&a[i], &b[i], c.as_ref()),
+                None => value_cmp_conn(&a[i], &b[i]),
+            };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
 }
 
 fn exec_intersect(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan) -> Result<ExecResult> {
@@ -20526,6 +20660,7 @@ fn exec_intersect(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan) -> Resul
             out.push(row);
         }
     }
+    compound_sort(&mut out, &colls);
     Ok(ExecResult { columns, rows: out })
 }
 
@@ -20556,6 +20691,7 @@ fn exec_except(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan) -> Result<E
             out.push(row);
         }
     }
+    compound_sort(&mut out, &colls);
     Ok(ExecResult { columns, rows: out })
 }
 

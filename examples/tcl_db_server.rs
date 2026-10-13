@@ -347,7 +347,14 @@ fn eval(c: &mut Conn, script: &str, vars: &HashMap<String, Value>) -> Result<Vec
             Conn::Ours(db) => {
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     if returns_rows(&sql) {
-                        db.query_with_columns(&sql, params.clone())
+                        match db.query_with_columns(&sql, params.clone()) {
+                            // PRAGMA assignments and the like run through
+                            // execute (no result set here).
+                            Err(rustqlite::Error::Unsupported(_)) => db
+                                .execute(&sql, params.clone())
+                                .map(|_| (Vec::new(), Vec::new())),
+                            other => other,
+                        }
                     } else {
                         db.execute(&sql, params.clone())
                             .map(|_| (Vec::new(), Vec::new()))
