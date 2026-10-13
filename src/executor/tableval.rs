@@ -20,7 +20,6 @@ use crate::error::Error;
 use crate::executor::{eval_row, ExecContext, ExecResult};
 use crate::sql::ast::Expr;
 use crate::types::Value;
-use std::sync::Arc;
 
 /// Evaluate a `Plan::TableFunction`: dispatch on the function name,
 /// evaluate the argument expressions against the statement's bound
@@ -75,12 +74,23 @@ pub(crate) fn exec_table_function(
     // evaluator's suffix fallback serves bare references (same contract
     // as table scans).
     let prefix = alias.cloned().unwrap_or_else(|| name.to_string());
-    let columns: Arc<[String]> = bare_cols
+    let mut columns: Vec<String> = bare_cols
         .iter()
         .map(|c| format!("{}.{}", prefix, c))
-        .collect::<Vec<String>>()
-        .into();
-    Ok(ExecResult { columns, rows })
+        .collect();
+    let mut rows = rows;
+    // json_each / json_tree rows have a rowid: their 0-based ordinal (the
+    // hidden trailing slot `rowid` resolves to; `*` skips it).
+    if matches!(fname.as_str(), "json_each" | "json_tree") {
+        columns.push(crate::planner::hidden_rowid_slot(&prefix));
+        for (i, r) in rows.iter_mut().enumerate() {
+            r.push(Value::Integer(i as i64));
+        }
+    }
+    Ok(ExecResult {
+        columns: columns.into(),
+        rows,
+    })
 }
 
 // ---------------------------------------------------------------------------

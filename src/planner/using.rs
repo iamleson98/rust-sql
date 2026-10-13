@@ -267,6 +267,13 @@ impl Planner<'_> {
                 };
                 Some((q, names))
             }
+            TableExpression::Function { name, alias, .. } => {
+                let cols = super::namecheck::tvf_columns(&name.to_ascii_lowercase())?;
+                Some((
+                    alias.clone().unwrap_or_else(|| name.clone()),
+                    cols.iter().map(|c| c.to_string()).collect(),
+                ))
+            }
             _ => None,
         }
     }

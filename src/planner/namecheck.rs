@@ -215,7 +215,7 @@ fn collation_exists(ctx: &Ctx<'_>, name: &str) -> bool {
 }
 
 /// Table-valued function output columns (tableval.rs's fixed schemas).
-fn tvf_columns(name: &str) -> Option<Vec<&'static str>> {
+pub(crate) fn tvf_columns(name: &str) -> Option<Vec<&'static str>> {
     match name.to_ascii_lowercase().as_str() {
         "json_each" | "json_tree" => Some(vec![
             "key", "value", "type", "atom", "id", "parent", "fullkey", "path",
@@ -1144,7 +1144,8 @@ fn build_from_expr(
             scope.cur().sources.push(Source {
                 qualifier: alias.clone().or_else(|| Some(name.clone())),
                 columns: cols.iter().map(|c| c.to_string()).collect(),
-                rowid_table: false,
+                // json_each / json_tree expose a rowid (the row's ordinal).
+                rowid_table: matches!(fname.as_str(), "json_each" | "json_tree"),
                 qualified_only: false,
                 bare_hidden: Vec::new(),
                 pending_vtab: false,

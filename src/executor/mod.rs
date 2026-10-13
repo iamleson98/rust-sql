@@ -151,7 +151,7 @@ mod corr {
 
     /// Push one outer scope while a correlated subquery executes.
     /// Returns a guard that pops it.
-    struct FrameGuard;
+    pub(crate) struct FrameGuard;
     impl Drop for FrameGuard {
         fn drop(&mut self) {
             CORR.with(|c| {
@@ -160,7 +160,7 @@ mod corr {
         }
     }
 
-    fn push_outer(row: *const [Value], names: *const [String]) -> FrameGuard {
+    pub(crate) fn push_outer(row: *const [Value], names: *const [String]) -> FrameGuard {
         CORR.with(|c| {
             c.borrow_mut().outer.push(OuterFrame { row, names });
         });
@@ -497,6 +497,89 @@ pub(crate) fn corr_exec_rows(
         eval_ctx.column_names as *const [String],
         limit_one,
     )
+}
+
+/// A join side that reads the OTHER side's columns: a table-valued
+/// function whose arguments reference columns (`FROM t, json_each(t.j)`),
+/// possibly under the filters pushed into it.
+pub(crate) fn plan_is_lateral(plan: &Plan) -> bool {
+    match plan {
+        Plan::TableFunction { args, .. } => args.iter().any(|a| {
+            let mut refs = Vec::new();
+            collect_expr_refs(a, &mut refs);
+            !refs.is_empty()
+        }),
+        Plan::Filter { input, .. } => plan_is_lateral(input),
+        _ => false,
+    }
+}
+
+/// A join whose right side is lateral (see `plan_is_lateral`): the right
+/// side runs once per left row, with that row in scope as the outer
+/// frame its arguments read — SQLite's nested loop over a table-valued
+/// function with constraints from the left table.
+fn exec_lateral_join(
+    ctx: &mut ExecContext<'_>,
+    left: &Plan,
+    right: &Plan,
+    join_type: crate::sql::ast::JoinType,
+    condition: &Option<Expr>,
+) -> Result<ExecResult> {
+    use crate::sql::ast::JoinType;
+    if matches!(join_type, JoinType::Right | JoinType::Full) {
+        return Err(Error::semantic(
+            "RIGHT and FULL OUTER JOINs cannot have a table-valued function on the right",
+        ));
+    }
+    let left_res = execute(left, ctx)?;
+    let mut columns: Option<Vec<String>> = None;
+    let mut right_width = 0usize;
+    let mut out: Vec<Row> = Vec::new();
+    for lrow in &left_res.rows {
+        let right_res = {
+            let _frame = corr::push_outer(&lrow[..], &left_res.columns[..]);
+            execute(right, ctx)?
+        };
+        if columns.is_none() {
+            let mut c: Vec<String> = left_res.columns.to_vec();
+            c.extend(right_res.columns.iter().cloned());
+            right_width = right_res.columns.len();
+            columns = Some(c);
+        }
+        let cols = columns.as_deref().unwrap_or_default();
+        let mut matched = false;
+        for rrow in right_res.rows {
+            let mut row = lrow.clone();
+            row.extend(rrow);
+            let keep = match condition {
+                Some(c) => eval_row(c, &row, cols, &ctx.params, &ctx.named_params)?.is_truthy(),
+                None => true,
+            };
+            if keep {
+                matched = true;
+                out.push(row);
+            }
+        }
+        if !matched && join_type == JoinType::Left {
+            let mut row = lrow.clone();
+            row.extend(std::iter::repeat(Value::Null).take(right_width));
+            out.push(row);
+        }
+    }
+    let columns: Arc<[String]> = match columns {
+        Some(c) => c.into(),
+        None => {
+            // No left row: the right side's names from an empty run.
+            let right_res = execute(right, ctx).unwrap_or(ExecResult {
+                columns: Arc::from(Vec::<String>::new()),
+                rows: Vec::new(),
+            });
+            let mut c: Vec<String> = left_res.columns.to_vec();
+            c.extend(right_res.columns.iter().cloned());
+            c.into()
+        }
+    };
+    Ok(ExecResult { columns, rows: out })
 }
 
 /// Outer-scope lookup for a qualified column ref (unqualified refs go
@@ -2176,7 +2259,9 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
                 alias_seek,
             } = &**input
             {
-                if *algorithm == crate::planner::plan::JoinAlgorithm::Hash {
+                if *algorithm == crate::planner::plan::JoinAlgorithm::Hash
+                    && !plan_is_lateral(right)
+                {
                     return exec_hash_join(
                         ctx,
                         left,
@@ -2359,7 +2444,9 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
                     algorithm, join_type
                 );
             }
-            if *algorithm == crate::planner::plan::JoinAlgorithm::Hash {
+            if plan_is_lateral(right) {
+                exec_lateral_join(ctx, left, right, *join_type, condition)
+            } else if *algorithm == crate::planner::plan::JoinAlgorithm::Hash {
                 exec_hash_join(ctx, left, right, *join_type, condition, None, *alias_seek)
             } else {
                 exec_join(ctx, left, right, *join_type, condition)
@@ -6394,7 +6481,8 @@ fn exec_filter(ctx: &mut ExecContext<'_>, input: &Plan, predicate: &Expr) -> Res
         if matches!(
             join_type,
             crate::sql::ast::JoinType::Inner | crate::sql::ast::JoinType::Cross
-        ) {
+        ) && !plan_is_lateral(right)
+        {
             let cond = Some(predicate.clone());
             let left_res = execute(left, ctx)?;
             let right_res = execute(right, ctx)?;
@@ -14780,7 +14868,8 @@ fn exec_aggregate(
                 if matches!(
                     join_type,
                     crate::sql::ast::JoinType::Inner | crate::sql::ast::JoinType::Cross
-                ) {
+                ) && !plan_is_lateral(right)
+                {
                     if let Some(res) = try_fused_scan_hash_join(
                         ctx,
                         left,
