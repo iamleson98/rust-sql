@@ -1,0 +1,106 @@
+-- A derived table (FROM-subquery, view, CTE) has typed columns, as in
+-- SQLite's sqlite3SubqueryColumnTypes: each column takes the AFFINITY and
+-- COLLATION of the leftmost arm's result expression (a later arm's when
+-- the leftmost has no affinity; BLOB when the arms mix text and numbers).
+-- They used to be untyped: `x = '5'` over `SELECT i AS x` (INTEGER i) was
+-- false, a NOCASE column lost NOCASE in WHERE / ORDER BY / GROUP BY /
+-- min / max, and a recursive UNION over a NOCASE setup never ended.
+-- Derived-table outputs are also qualified by the atom's alias now, so
+-- two derived tables with the same column names join (`a.k = b.k`).
+CREATE TABLE m(i INTEGER, t TEXT, c TEXT COLLATE NOCASE, r REAL, b BLOB, n NUMERIC, u);
+INSERT INTO m VALUES (5, '5', 'a', 5.0, x'35', '5', '5');
+INSERT INTO m VALUES (7, 'A', 'B', 7.5, '7', 7, 7);
+CREATE VIEW v AS SELECT i AS x, t AS y, c AS z FROM m;
+CREATE VIEW v2(p, q) AS SELECT i, c FROM m;
+SELECT x='5', y=5 FROM (SELECT i AS x, t AS y FROM m);
+SELECT s.x='5', s.y=5 FROM (SELECT i AS x, t AS y FROM m) s;
+SELECT x='5', y=5 FROM v;
+SELECT p='5', q='a' FROM v2;
+WITH w AS (SELECT i AS x, t AS y FROM m) SELECT x='5', y=5 FROM w;
+WITH w(x, y) AS (SELECT i, t FROM m) SELECT x='5', y=5 FROM w;
+SELECT count(*) FROM (SELECT c AS z FROM m) WHERE z='a';
+SELECT count(*) FROM (SELECT c AS z FROM m) WHERE z='A';
+SELECT count(*) FROM v WHERE z='A';
+WITH w AS (SELECT c AS z FROM m) SELECT count(*) FROM w WHERE z='A';
+SELECT z FROM (SELECT c AS z FROM m) ORDER BY z;
+SELECT DISTINCT z FROM (SELECT c AS z FROM m UNION ALL SELECT upper(c) FROM m);
+SELECT x FROM (SELECT i AS x FROM m) WHERE x IN ('5', '7');
+SELECT x FROM (SELECT CAST(t AS INTEGER) AS x FROM m) WHERE x = '5';
+SELECT x FROM (SELECT i+0 AS x FROM m) WHERE x = '5';
+SELECT x FROM (SELECT r AS x FROM m) WHERE x = '5';
+SELECT x FROM (SELECT n AS x FROM m) WHERE x = '7';
+SELECT x FROM (SELECT u AS x FROM m) WHERE x = 5;
+SELECT x FROM (SELECT b AS x FROM m) WHERE x = '7';
+SELECT x FROM (SELECT i AS x FROM m UNION ALL SELECT t FROM m) WHERE x = '5';
+SELECT x FROM (SELECT t AS x FROM m UNION ALL SELECT i FROM m) WHERE x = 5;
+SELECT x FROM (SELECT NULL AS x UNION ALL SELECT i FROM m) WHERE x = '5';
+SELECT x FROM (SELECT * FROM (SELECT i AS x FROM m)) WHERE x = '5';
+SELECT * FROM (SELECT * FROM m) WHERE i = '5' AND c = 'A';
+SELECT a.x, b.i FROM (SELECT i AS x FROM m) a JOIN m b ON a.x = b.t;
+SELECT a.x, b.i FROM (SELECT t AS x FROM m) a JOIN m b ON a.x = b.i;
+SELECT a.x FROM (SELECT i AS x FROM m) a, (SELECT t AS y FROM m) b WHERE a.x = b.y;
+SELECT x, count(*) FROM (SELECT c AS x FROM m UNION ALL SELECT 'A') GROUP BY x;
+SELECT (SELECT count(*) FROM (SELECT c AS z FROM m) WHERE z = o.t) FROM m o;
+SELECT max(z) FROM (SELECT c AS z FROM m);
+SELECT x FROM (SELECT i AS x FROM m) WHERE x BETWEEN '4' AND '6';
+SELECT x FROM (SELECT c AS x FROM m) WHERE x > 'a';
+SELECT x FROM (SELECT c AS x FROM m) WHERE x LIKE 'A';
+SELECT x FROM (SELECT t COLLATE NOCASE AS x FROM m) WHERE x = 'a';
+SELECT x = '5' FROM (SELECT i AS x FROM m LIMIT 1);
+SELECT x = '5' FROM (SELECT i AS x FROM m GROUP BY i);
+SELECT x = '5' FROM (SELECT max(i) AS x FROM m);
+SELECT x = '5' FROM (SELECT DISTINCT i AS x FROM m);
+WITH RECURSIVE r(x) AS (SELECT 'A' COLLATE NOCASE UNION SELECT 'a' FROM r) SELECT count(*) FROM r;
+WITH RECURSIVE r(x) AS (SELECT i FROM m UNION ALL SELECT x+1 FROM r WHERE x < 8) SELECT count(*) FROM r WHERE x = '6';
+SELECT x = '5' FROM (SELECT i AS x FROM m ORDER BY 1);
+SELECT y FROM (SELECT x AS y FROM (SELECT i AS x FROM m)) WHERE y = '5';
+SELECT k FROM (SELECT x AS k FROM v) WHERE k = '7';
+SELECT a.x FROM (SELECT i AS x FROM m) a, (SELECT t AS y FROM m) b WHERE a.x = b.y;
+SELECT a.x FROM (SELECT i AS x FROM m) a JOIN (SELECT t AS y FROM m) b ON a.x = b.y;
+SELECT a.x FROM (SELECT i AS x FROM m) a, m b WHERE a.x = b.t;
+SELECT b.i FROM m b, (SELECT t AS x FROM m) a WHERE a.x = b.i;
+SELECT a.x FROM (SELECT i+0 AS x FROM m) a, m b WHERE a.x = b.t;
+SELECT a.x FROM (SELECT t||'' AS x FROM m) a, m b WHERE a.x = b.i;
+SELECT x, count(*) FROM (SELECT c AS x FROM m UNION ALL SELECT 'A') GROUP BY x;
+SELECT x, count(*) FROM (SELECT c AS x FROM m) GROUP BY x;
+SELECT count(DISTINCT x) FROM (SELECT c AS x FROM m UNION ALL SELECT 'A');
+SELECT x FROM (SELECT c AS x FROM m) WHERE x IN (SELECT 'A');
+SELECT x FROM (SELECT i AS x FROM m) WHERE x IN (SELECT '5');
+SELECT x FROM (SELECT c AS x FROM m) ORDER BY x DESC;
+SELECT min(x), max(x) FROM (SELECT c AS x FROM m);
+SELECT group_concat(DISTINCT x) FROM (SELECT c AS x FROM m UNION ALL SELECT 'A');
+SELECT x FROM (SELECT c AS x FROM m) a WHERE a.x BETWEEN 'A' AND 'A';
+SELECT y.x FROM (SELECT * FROM (SELECT c AS x FROM m)) y WHERE y.x = 'A';
+WITH w AS (SELECT c AS x FROM m) SELECT x FROM w ORDER BY x;
+WITH w AS (SELECT c AS x FROM m) SELECT x, count(*) FROM w GROUP BY x;
+WITH w AS (SELECT i AS x FROM m) SELECT a.x FROM w a JOIN m ON a.x = m.t;
+CREATE VIEW vv AS SELECT c AS x, i AS k FROM m;
+SELECT x FROM vv ORDER BY x;
+SELECT x, count(*) FROM vv GROUP BY x;
+SELECT k FROM vv WHERE k = '7';
+SELECT x FROM vv JOIN m ON vv.k = m.t;
+SELECT * FROM vv a JOIN vv b ON a.x = upper(b.x);
+SELECT k FROM vv WHERE k IN ('5');
+SELECT (SELECT x FROM vv WHERE x='A');
+SELECT x FROM (SELECT c AS x FROM m LIMIT 5) WHERE x = 'A';
+SELECT DISTINCT x FROM (SELECT c AS x FROM m UNION ALL SELECT 'A');
+SELECT x FROM (SELECT c AS x FROM m) UNION SELECT 'A';
+SELECT x FROM (SELECT c AS x FROM m) INTERSECT SELECT 'A';
+SELECT x FROM (SELECT i AS x FROM m) WHERE x > '6';
+SELECT x FROM (SELECT t AS x FROM m) WHERE x > 6;
+SELECT x FROM (SELECT t AS x FROM m) WHERE x < 6;
+SELECT x FROM (SELECT b AS x FROM m) WHERE x > 6;
+SELECT typeof(x) FROM (SELECT i AS x FROM m) WHERE x = '7';
+SELECT x FROM (SELECT r AS x FROM m) WHERE x = '7.5';
+SELECT x FROM (SELECT CAST(t AS REAL) AS x FROM m) WHERE x = '5';
+SELECT x FROM (SELECT CAST(i AS TEXT) AS x FROM m) WHERE x = 5;
+SELECT x FROM (SELECT i AS x FROM m UNION SELECT 'z') WHERE x = '5';
+SELECT x FROM (SELECT i AS x FROM m EXCEPT SELECT 7) WHERE x = '5';
+CREATE VIEW vv AS SELECT c AS x, i AS k FROM m;
+SELECT * FROM vv a JOIN vv b ON a.k = b.k + 2;
+SELECT * FROM (SELECT i AS k FROM m) a JOIN (SELECT i AS k FROM m) b ON a.k = b.k + 2;
+SELECT * FROM (SELECT i AS k FROM m) a JOIN (SELECT i AS j FROM m) b ON a.k = b.j + 2;
+SELECT * FROM (SELECT i AS k FROM m) a, (SELECT i AS j FROM m) b WHERE a.k = b.j + 2;
+SELECT * FROM (SELECT i AS x FROM m) a JOIN (SELECT t AS y FROM m) b ON a.x = b.y;
+SELECT * FROM (SELECT i AS x FROM m) a JOIN (SELECT t AS y FROM m) b ON a.x = b.y || '';
+SELECT * FROM (SELECT i AS x FROM m) a JOIN (SELECT t AS y FROM m) b ON b.y = a.x;

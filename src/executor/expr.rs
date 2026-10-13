@@ -915,6 +915,9 @@ pub(crate) fn comparison_affinity(
 ) -> CmpAffinity {
     use crate::types::Affinity as A;
     let numeric = |x: A| matches!(x, A::Integer | A::Real | A::Numeric);
+    // A derived-table column of an expression with no affinity
+    // (SQLITE_AFF_NONE) carries none: the other operand's applies.
+    let (la, ra) = (la.filter(|a| *a != A::None), ra.filter(|a| *a != A::None));
     match (la, ra) {
         (Some(a), Some(b)) => {
             if numeric(a) || numeric(b) {

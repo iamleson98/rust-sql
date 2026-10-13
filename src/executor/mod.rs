@@ -13,6 +13,7 @@
 
 pub(crate) mod cte;
 pub mod datetime;
+pub(crate) mod derived;
 pub(crate) mod explain;
 pub mod expr;
 pub mod fts;
@@ -1991,7 +1992,11 @@ pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
     // Comparison-affinity registry frame for this subtree's base-table
     // sources (see EvalContext::comparison_column_affinity).
     let mut sources = Vec::new();
-    collect_affinity_sources(plan, &mut sources);
+    // A derived table's own column types are its PARENTS' scope: inside
+    // the body only the body's sources resolve.
+    if !matches!(plan, Plan::Subquery { .. }) {
+        collect_affinity_sources(plan, &mut sources);
+    }
     let _aff_scope = crate::executor::expr::AffinityScope::push(sources);
     if ctx.explain_stats.is_some() {
         let depth = ctx.explain_depth;
@@ -2066,6 +2071,11 @@ fn collect_affinity_sources(plan: &Plan, out: &mut Vec<(String, Arc<Table>)>) {
         // references (the source plan pushes its own frame when it runs).
         Plan::Insert { table, .. } | Plan::Update { table, .. } | Plan::Delete { table, .. } => {
             out.push((table.name.to_ascii_lowercase(), table.clone()));
+        }
+        // Derived tables: their result-set description (SQLite's
+        // sqlite3SubqueryColumnTypes table).
+        Plan::Subquery { meta: Some(m), .. } | Plan::CteRows { meta: Some(m), .. } => {
+            out.push((m.table.name.clone(), m.table.clone()));
         }
         Plan::Values { .. }
         | Plan::Subquery { .. }
@@ -2376,9 +2386,31 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
         Plan::Union { left, right, all } => exec_union(ctx, left, right, *all),
         Plan::Intersect { left, right } => exec_intersect(ctx, left, right),
         Plan::Except { left, right } => exec_except(ctx, left, right),
-        Plan::Subquery { plan } => execute(plan, ctx),
+        Plan::Subquery { plan, meta } => {
+            let mut res = execute(plan, ctx)?;
+            // Output columns answer to the atom's FROM qualifier (`a.k`
+            // vs `b.k` over two derived tables with the same names).
+            if let Some(q) = meta.as_ref().map(|m| m.table.name.as_str()) {
+                if !q.is_empty() {
+                    res.columns = res
+                        .columns
+                        .iter()
+                        .map(|c| {
+                            if crate::planner::is_hidden_rowid(c) {
+                                c.clone()
+                            } else {
+                                let n = c.rsplit_once('.').map_or(c.as_str(), |(_, n)| n);
+                                format!("{q}.{n}")
+                            }
+                        })
+                        .collect::<Vec<String>>()
+                        .into();
+                }
+            }
+            Ok(res)
+        }
         Plan::NestedSelect { select, view } => exec_nested_select(select, view.as_deref(), ctx),
-        Plan::CteRows { rows, columns } => Ok(ExecResult {
+        Plan::CteRows { rows, columns, .. } => Ok(ExecResult {
             columns: columns.clone(),
             rows: rows.as_ref().clone(),
         }),
@@ -3958,7 +3990,10 @@ fn any_expr_child(e: &Expr, f: &mut dyn FnMut(&Expr) -> bool) -> bool {
 
 /// Apply a function to each immediate child expression of `e`, rebuilding
 /// the node with the (possibly replaced) children.
-fn map_expr_children(e: &Expr, f: &mut dyn FnMut(&Expr) -> Result<Expr>) -> Result<Expr> {
+pub(crate) fn map_expr_children(
+    e: &Expr,
+    f: &mut dyn FnMut(&Expr) -> Result<Expr>,
+) -> Result<Expr> {
     macro_rules! r {
         ($x:expr) => {
             f($x)?
@@ -4314,7 +4349,7 @@ pub fn plan_has_subqueries(plan: &Plan) -> bool {
                 exprs_in_plan(right, out);
             }
             Plan::IndexNestedLoopJoin { outer, .. } => exprs_in_plan(outer, out),
-            Plan::Subquery { plan } => exprs_in_plan(plan, out),
+            Plan::Subquery { plan, .. } => exprs_in_plan(plan, out),
             // Planned (and its subqueries substituted) when it runs.
             Plan::NestedSelect { .. } => {}
             Plan::Distinct { input } => exprs_in_plan(input, out),
@@ -4554,7 +4589,7 @@ fn rewrite_plan_subqueries_in_place(plan: &mut Plan, ctx: &mut ExecContext<'_>) 
         Plan::IndexNestedLoopJoin { outer, .. } => {
             rewrite_plan_subqueries_in_place(outer, ctx)?;
         }
-        Plan::Subquery { plan } => {
+        Plan::Subquery { plan, .. } => {
             rewrite_plan_subqueries_in_place(plan, ctx)?;
         }
         Plan::NestedSelect { .. } => {}
@@ -5462,7 +5497,7 @@ fn cte_scope_of(
     let mut names = std::collections::HashSet::new();
     let mut cols = HashMap::new();
     if let Some(ctes) = &ctx.ctes {
-        for (k, (_, c)) in ctes {
+        for (k, (_, c, _)) in ctes {
             names.insert(k.clone());
             cols.insert(k.clone(), c.clone());
         }
@@ -8478,6 +8513,7 @@ pub(crate) fn empty_input_plan(plan: &Plan) -> Option<Plan> {
     let empty = |columns: Arc<[String]>| Plan::CteRows {
         rows: Arc::new(Vec::new()),
         columns,
+        meta: None,
     };
     let sub = |p: &Plan| empty_input_plan(p).map(Box::new);
     Some(match plan {
@@ -8564,7 +8600,10 @@ pub(crate) fn empty_input_plan(plan: &Plan) -> Option<Plan> {
             outer_key_col: *outer_key_col,
             covering: *covering,
         },
-        Plan::Subquery { plan: inner } => Plan::Subquery { plan: sub(inner)? },
+        Plan::Subquery { plan: inner, meta } => Plan::Subquery {
+            plan: sub(inner)?,
+            meta: meta.clone(),
+        },
         Plan::Distinct { input } => Plan::Distinct { input: sub(input)? },
         Plan::Union { left, right, all } => Plan::Union {
             left: sub(left)?,
@@ -11516,10 +11555,12 @@ fn collect_plan_tables(
             ));
         }
         Plan::IndexNestedLoopJoin {
+            outer,
             inner_table,
             inner_alias,
             ..
         } => {
+            collect_plan_tables(outer, out);
             out.push((
                 inner_alias
                     .clone()
@@ -11527,12 +11568,16 @@ fn collect_plan_tables(
                 inner_table.clone(),
             ));
         }
+        // A derived table: its result columns' collations.
+        Plan::Subquery { meta: Some(m), .. } | Plan::CteRows { meta: Some(m), .. } => {
+            out.push((m.table.name.clone(), m.table.clone()));
+        }
         Plan::Filter { input, .. }
         | Plan::Project { input, .. }
         | Plan::Sort { input, .. }
         | Plan::Limit { input, .. }
         | Plan::Distinct { input }
-        | Plan::Subquery { plan: input }
+        | Plan::Subquery { plan: input, .. }
         | Plan::Aggregate { input, .. }
         | Plan::Window { input, .. } => collect_plan_tables(input, out),
         Plan::Join { left, right, .. } => {
@@ -17141,6 +17186,9 @@ pub(crate) fn plan_output_affinities(plan: &Plan) -> Option<Vec<crate::types::Af
             Some(v)
         }
         Plan::Filter { input, .. } => plan_output_affinities(input),
+        Plan::Subquery { meta: Some(m), .. } | Plan::CteRows { meta: Some(m), .. } => {
+            m.positional_affinities()
+        }
         Plan::Join { left, right, .. } => {
             let mut l = plan_output_affinities(left)?;
             let r = plan_output_affinities(right)?;
@@ -20216,7 +20264,7 @@ fn plan_output_collations_defined(plan: &Plan) -> Vec<Option<String>> {
             | Plan::Aggregate { input, .. } => scope_tables(input, out, derived),
             // A FROM-subquery / view body (or its renaming Project): its
             // output columns are this scope's derived columns.
-            Plan::Subquery { plan } => derived.push(plan),
+            Plan::Subquery { plan, .. } => derived.push(plan),
             Plan::Project { .. } => derived.push(plan),
             _ => {}
         }
@@ -20419,13 +20467,31 @@ fn exec_union(
     } else {
         let colls = compound_collations(left, right);
         // O(n) dedup of the concatenation, first-seen order (the old
-        // Vec::contains scan was O(n^2)).
-        let mut seen: std::collections::HashSet<SqlRowKey> =
-            std::collections::HashSet::with_capacity(rows.len() + r.rows.len());
+        // Vec::contains scan was O(n^2)). Which of several equal rows
+        // (`1` / `1.0`, `'a'` / `'A'` under NOCASE) represents them is
+        // SQLite's multiSelectByMerge's: on A == B it drops the LEFT
+        // arm's row and outputs the right one's — the right arm's first
+        // row wins, else the left arm's first.
+        let mut seen: std::collections::HashMap<SqlRowKey, (usize, bool)> =
+            std::collections::HashMap::with_capacity(rows.len() + r.rows.len());
         let mut out: Vec<Row> = Vec::with_capacity(rows.len() + r.rows.len());
-        for row in rows.into_iter().chain(r.rows) {
-            if seen.insert(collated_row_key(&row, &colls)) {
-                out.push(row);
+        for (row, from_right) in rows
+            .into_iter()
+            .map(|x| (x, false))
+            .chain(r.rows.into_iter().map(|x| (x, true)))
+        {
+            match seen.entry(collated_row_key(&row, &colls)) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert((out.len(), from_right));
+                    out.push(row);
+                }
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    let (at, right_row) = *o.get();
+                    if from_right && !right_row {
+                        out[at] = row;
+                        o.insert((at, true));
+                    }
+                }
             }
         }
         rows = out;

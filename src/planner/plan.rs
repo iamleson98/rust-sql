@@ -246,6 +246,9 @@ pub enum Plan {
     /// Subquery (materialized).
     Subquery {
         plan: Box<Plan>,
+        /// The result set's column types (affinity / collation) under the
+        /// atom's FROM qualifier — SQLite's derived-table `Table`.
+        meta: Option<Arc<crate::executor::derived::DerivedMeta>>,
     },
     /// A FROM-subquery atom or view body that carries its OWN WITH
     /// clause: its CTEs can only be materialized at execution time, so
@@ -266,6 +269,8 @@ pub enum Plan {
     CteRows {
         rows: std::sync::Arc<Vec<Row>>,
         columns: Arc<[String]>,
+        /// The CTE's result-set column types (see `Plan::Subquery`).
+        meta: Option<Arc<crate::executor::derived::DerivedMeta>>,
     },
     /// Table-valued function in FROM (`json_each`, `json_tree`,
     /// `pragma_table_info`, ...). Arguments are evaluated at EXECUTION

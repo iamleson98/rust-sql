@@ -449,7 +449,7 @@ fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64, cat: &
                 format!("SEARCH {a} {kind} {} ({cols}=?)", inner_index.name),
             );
         }
-        Plan::Subquery { plan } => {
+        Plan::Subquery { plan, .. } => {
             // Give the subquery its own top-level id group, like SQLite.
             walk(plan, parent, rows, next_id, cat);
         }

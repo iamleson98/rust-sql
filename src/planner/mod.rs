@@ -9,6 +9,7 @@ pub(crate) mod fold;
 pub mod namecheck;
 pub mod plan;
 pub(crate) mod sqlite_cost;
+mod using;
 
 pub use plan::*;
 
@@ -747,7 +748,7 @@ impl<'a> Planner<'a> {
                         }
                         if let Expr::Column { .. } = base {
                             s.from.as_ref().and_then(|from| {
-                                let scope = collect_collation_scope(self.catalog, from);
+                                let scope = self.collation_scope(from);
                                 column_declared_collation(self.catalog, base, &scope)
                             })
                         } else {
@@ -810,6 +811,16 @@ impl<'a> Planner<'a> {
     }
 
     fn plan_simple_select(&mut self, s: &SimpleSelect, order_terms: &[OrderTerm]) -> Result<Plan> {
+        // NATURAL / USING joins become qualified ON terms, and `*` lists
+        // each merged column once (sqlite3ProcessJoin).
+        let using_resolved;
+        let s = match self.resolve_using_joins(s) {
+            Some(r) => {
+                using_resolved = r;
+                &using_resolved
+            }
+            None => s,
+        };
         // INNER JOIN ON terms are WHERE terms (sqlite3ProcessJoin appends
         // each to the WHERE, in FROM order): planned as one conjunct list
         // they are tested in SQLite's order — the WHERE's own terms first
@@ -1316,7 +1327,7 @@ impl<'a> Planner<'a> {
         let coll_scope: Vec<(std::sync::Arc<crate::schema::Table>, String)> = s
             .from
             .as_ref()
-            .map(|from| collect_collation_scope(self.catalog, from))
+            .map(|from| self.collation_scope(from))
             .unwrap_or_default();
         let where_rewritten = s
             .where_clause
@@ -1712,7 +1723,7 @@ impl<'a> Planner<'a> {
                     let lc = s.to_ascii_lowercase();
                     if lc != "main" && lc != "temp" {
                         if let Some(foreign) = &self.foreign {
-                            if let Some((rows, cols)) =
+                            if let Some((rows, cols, _)) =
                                 foreign.get_qualified(&lc, &name.to_ascii_lowercase())
                             {
                                 let prefix = alias.clone().unwrap_or_else(|| name.clone());
@@ -1726,6 +1737,7 @@ impl<'a> Planner<'a> {
                                 return Ok(Plan::CteRows {
                                     rows: Arc::clone(rows),
                                     columns: ql,
+                                    meta: None,
                                 });
                             }
                         }
@@ -1740,7 +1752,8 @@ impl<'a> Planner<'a> {
                 // CTE reference? (WITH ... name AS (...)). CTEs shadow real
                 // tables of the same name.
                 if indexed.is_none() {
-                    if let Some((rows, cols)) = self.effective_cte(&name.to_ascii_lowercase()) {
+                    if let Some((rows, cols, meta)) = self.effective_cte(&name.to_ascii_lowercase())
+                    {
                         // Rebind the column names to the effective alias so
                         // `SELECT c.x FROM cte c` resolves: qualify with the
                         // alias when present, else the CTE name.
@@ -1756,9 +1769,17 @@ impl<'a> Planner<'a> {
                                 .collect::<Vec<String>>()
                                 .into()
                         };
+                        let meta = meta.map(|m| {
+                            if prefix.eq_ignore_ascii_case(&m.table.name) {
+                                m
+                            } else {
+                                m.renamed(&prefix, None)
+                            }
+                        });
                         return Ok(Plan::CteRows {
                             rows: rows.clone(),
                             columns: ql,
+                            meta,
                         });
                     }
                 }
@@ -1793,6 +1814,11 @@ impl<'a> Planner<'a> {
                         };
                         self.view_depth -= 1;
                         let inner = inner?;
+                        let prefix = alias.clone().unwrap_or_else(|| name.clone());
+                        let meta =
+                            crate::executor::derived::derived_meta(&inner, &prefix).or_else(|| {
+                                Some(crate::executor::derived::DerivedMeta::opaque(&prefix))
+                            });
                         // Optional column rename (CREATE VIEW v(a, b) AS
                         // ...): wrap in a Project aliasing the view select's
                         // top-level output columns positionally.
@@ -1800,7 +1826,6 @@ impl<'a> Planner<'a> {
                             (Some(renames), Some(inner_names))
                                 if renames.len() == inner_names.len() =>
                             {
-                                let prefix = alias.clone().unwrap_or_else(|| name.clone());
                                 let cols: Vec<crate::planner::plan::ProjectExpr> = renames
                                     .iter()
                                     .zip(inner_names.iter())
@@ -1815,6 +1840,7 @@ impl<'a> Planner<'a> {
                                 Plan::Project {
                                     input: Box::new(Plan::Subquery {
                                         plan: Box::new(inner),
+                                        meta: meta.map(|m| m.renamed(&prefix, Some(renames))),
                                     }),
                                     columns: cols,
                                 }
@@ -1828,6 +1854,7 @@ impl<'a> Planner<'a> {
                             }
                             _ => Plan::Subquery {
                                 plan: Box::new(inner),
+                                meta,
                             },
                         };
                         return Ok(plan);
@@ -1853,7 +1880,7 @@ impl<'a> Planner<'a> {
                         // table of this name serves the scan.
                         if indexed.is_none() {
                             if let Some(foreign) = &self.foreign {
-                                if let Some((rows, cols)) =
+                                if let Some((rows, cols, _)) =
                                     foreign.get_unqualified(&name.to_ascii_lowercase())
                                 {
                                     let prefix = alias.clone().unwrap_or_else(|| name.clone());
@@ -1871,6 +1898,7 @@ impl<'a> Planner<'a> {
                                     return Ok(Plan::CteRows {
                                         rows: Arc::clone(rows),
                                         columns: ql,
+                                        meta: None,
                                     });
                                 }
                             }
@@ -1946,6 +1974,13 @@ impl<'a> Planner<'a> {
                 } else {
                     self.plan_select(select)?
                 };
+                let meta =
+                    crate::executor::derived::derived_meta(&inner, alias.as_deref().unwrap_or(""))
+                        .or_else(|| {
+                            alias
+                                .as_deref()
+                                .map(crate::executor::derived::DerivedMeta::opaque)
+                        });
                 // FROM-subquery column list (`FROM (…) s(a, b)`, an engine
                 // superset — SQLite itself does not parse this syntax):
                 // rename the body's output columns positionally, exactly
@@ -1981,12 +2016,14 @@ impl<'a> Planner<'a> {
                         Plan::Project {
                             input: Box::new(Plan::Subquery {
                                 plan: Box::new(inner),
+                                meta: meta.map(|m| m.renamed(&prefix, Some(list))),
                             }),
                             columns: cols,
                         }
                     }
                     None => Plan::Subquery {
                         plan: Box::new(inner),
+                        meta,
                     },
                 };
                 Ok(plan)
@@ -2005,8 +2042,8 @@ impl<'a> Planner<'a> {
                 let l = self.plan_table_expression(left)?;
                 let r = self.plan_table_expression(right)?;
                 // Collation scope for the join condition spans BOTH sides.
-                let mut join_scope = collect_collation_scope(self.catalog, left);
-                join_scope.extend(collect_collation_scope(self.catalog, right));
+                let mut join_scope = self.collation_scope(left);
+                join_scope.extend(self.collation_scope(right));
                 let condition = match constraint {
                     JoinConstraint::On(e) => {
                         Some(rewrite_column_collations(self.catalog, e, &join_scope))
@@ -2258,7 +2295,7 @@ impl<'a> Planner<'a> {
         let coll_scope: Vec<(std::sync::Arc<crate::schema::Table>, String)> = s
             .from
             .as_ref()
-            .map(|from| collect_collation_scope(self.catalog, from))
+            .map(|from| self.collation_scope(from))
             .unwrap_or_default();
         for a in aggregates.iter_mut() {
             if a.func == "bare" {
@@ -6760,7 +6797,7 @@ pub fn plan_column_refs(plan: &Plan) -> Vec<(Option<String>, String)> {
                 .map(|c| (Some(prefix.clone()), c.name.clone()))
                 .collect()
         }
-        Plan::Filter { input, .. } | Plan::Subquery { plan: input } => plan_column_refs(input),
+        Plan::Filter { input, .. } | Plan::Subquery { plan: input, .. } => plan_column_refs(input),
         Plan::Join { left, right, .. } => {
             let mut v = plan_column_refs(left);
             v.extend(plan_column_refs(right));
@@ -8628,8 +8665,9 @@ pub(crate) fn reorder_inner_joins(catalog: &Catalog, plan: Plan) -> Plan {
         Plan::Distinct { input } => Plan::Distinct {
             input: Box::new(reorder_inner_joins(catalog, *input)),
         },
-        Plan::Subquery { plan } => Plan::Subquery {
+        Plan::Subquery { plan, meta } => Plan::Subquery {
             plan: Box::new(reorder_inner_joins(catalog, *plan)),
+            meta,
         },
         Plan::Union { left, right, all } => Plan::Union {
             left: Box::new(reorder_inner_joins(catalog, *left)),
@@ -8743,7 +8781,9 @@ pub(crate) fn atom_out_cols(plan: &Plan) -> Option<Vec<String>> {
         | Plan::RowidIn { table, .. }
         | Plan::IndexIn { table, .. } => table.col_names.iter().cloned().collect(),
         Plan::IndexRange { table, alias, .. } => scan_qualified_cols(table, alias),
-        Plan::Filter { input, .. } | Plan::Subquery { plan: input } => return atom_out_cols(input),
+        Plan::Filter { input, .. } | Plan::Subquery { plan: input, .. } => {
+            return atom_out_cols(input)
+        }
         Plan::Join { left, right, .. } => {
             let mut v = atom_out_cols(left)?;
             v.extend(atom_out_cols(right)?);
@@ -12018,32 +12058,139 @@ pub fn insert_sort_below_top(plan: Plan, terms: Vec<OrderTerm>) -> Plan {
 /// Collect the (table, effective-alias) pairs visible in a FROM scope for
 /// collation resolution. Subqueries / CTEs have no declared collations and
 /// are skipped.
-pub(crate) fn collect_collation_scope(
-    catalog: &Catalog,
-    te: &TableExpression,
-) -> Vec<(std::sync::Arc<crate::schema::Table>, String)> {
-    let mut out = Vec::new();
-    collect_scope_rec(catalog, te, &mut out);
-    out
-}
+impl Planner<'_> {
+    /// The FROM sources whose columns can carry a declared collation, as
+    /// (table, qualifier): base tables, and derived tables (CTEs, views,
+    /// FROM-subqueries) described by their result columns' collations
+    /// (sqlite3SubqueryColumnTypes: the leftmost arm's expression
+    /// collation, BINARY when it defines none).
+    pub(crate) fn collation_scope(
+        &self,
+        te: &TableExpression,
+    ) -> Vec<(std::sync::Arc<crate::schema::Table>, String)> {
+        let mut out = Vec::new();
+        self.collation_scope_rec(te, &mut out, 0);
+        out
+    }
 
-fn collect_scope_rec(
-    catalog: &Catalog,
-    te: &TableExpression,
-    out: &mut Vec<(std::sync::Arc<crate::schema::Table>, String)>,
-) {
-    match te {
-        TableExpression::Table { name, alias, .. } => {
-            if let Some(t) = catalog.get_table(name) {
-                out.push((t, alias.clone().unwrap_or_else(|| name.clone())));
+    fn collation_scope_rec(
+        &self,
+        te: &TableExpression,
+        out: &mut Vec<(std::sync::Arc<crate::schema::Table>, String)>,
+        depth: usize,
+    ) {
+        match te {
+            TableExpression::Table {
+                name,
+                alias,
+                schema,
+                ..
+            } => {
+                let q = alias.clone().unwrap_or_else(|| name.clone());
+                if schema.is_none() {
+                    if let Some((_, _, meta)) = self.effective_cte(&name.to_ascii_lowercase()) {
+                        if let Some(m) = meta {
+                            out.push((m.table.clone(), q));
+                        }
+                        return;
+                    }
+                }
+                if let Some(t) = self.catalog.get_table(name) {
+                    out.push((t, q));
+                } else if let Some(v) = self.catalog.get_view(name) {
+                    if let Some(t) =
+                        self.select_collation_table(&v.select, v.columns.as_deref(), depth)
+                    {
+                        out.push((t, q));
+                    }
+                }
+            }
+            TableExpression::Subquery {
+                select,
+                alias,
+                column_aliases,
+            } => {
+                if let Some(t) =
+                    self.select_collation_table(select, column_aliases.as_deref(), depth)
+                {
+                    out.push((t, alias.clone().unwrap_or_default()));
+                }
+            }
+            TableExpression::Function { .. } => {}
+            TableExpression::Join { left, right, .. } => {
+                self.collation_scope_rec(left, out, depth);
+                self.collation_scope_rec(right, out, depth);
             }
         }
-        TableExpression::Subquery { .. } => {}
-        TableExpression::Function { .. } => {}
-        TableExpression::Join { left, right, .. } => {
-            collect_scope_rec(catalog, left, out);
-            collect_scope_rec(catalog, right, out);
+    }
+
+    /// A derived table's result columns with their collations (leftmost
+    /// arm; `renames` = a declared column list).
+    fn select_collation_table(
+        &self,
+        sel: &SelectStatement,
+        renames: Option<&[String]>,
+        depth: usize,
+    ) -> Option<std::sync::Arc<crate::schema::Table>> {
+        if depth >= 16 {
+            return None; // circular / absurdly deep views
         }
+        let mut body = &sel.body;
+        let s = loop {
+            match body {
+                SelectBody::Simple(s) => break s,
+                SelectBody::Binary { left, .. } => body = left,
+            }
+        };
+        let mut scope = Vec::new();
+        if let Some(f) = &s.from {
+            self.collation_scope_rec(f, &mut scope, depth + 1);
+        }
+        let declared = |c: &crate::schema::Column| {
+            if c.collation.is_empty() {
+                "BINARY".to_string()
+            } else {
+                c.collation.clone()
+            }
+        };
+        let mut cols: Vec<(String, String)> = Vec::new();
+        for c in &s.columns {
+            match c {
+                ResultColumn::Star => {
+                    for (t, _) in &scope {
+                        cols.extend(t.columns.iter().map(|c| (c.name.clone(), declared(c))));
+                    }
+                }
+                ResultColumn::TableStar(q) => {
+                    for (t, a) in scope.iter().filter(|(_, a)| a.eq_ignore_ascii_case(q)) {
+                        let _ = a;
+                        cols.extend(t.columns.iter().map(|c| (c.name.clone(), declared(c))));
+                    }
+                }
+                ResultColumn::Expr { expr, alias } => {
+                    let name = match (alias, expr) {
+                        (Some(a), _) => a.clone(),
+                        (None, Expr::Column { name, .. }) => name.clone(),
+                        _ => String::new(),
+                    };
+                    let coll = crate::executor::expr::explicit_collation(expr)
+                        .or_else(|| {
+                            column_declared_collation(self.catalog, strip_cast_pos(expr), &scope)
+                        })
+                        .unwrap_or_else(|| "BINARY".to_string());
+                    cols.push((name, coll));
+                }
+            }
+        }
+        if let Some(r) = renames {
+            if r.len() != cols.len() {
+                return None;
+            }
+            for (c, n) in cols.iter_mut().zip(r) {
+                c.0 = n.clone();
+            }
+        }
+        Some(crate::executor::derived::collation_table(cols))
     }
 }
 

@@ -1721,7 +1721,7 @@ pub(crate) fn materialize_foreign(db: &Database, stmt: &Statement) -> Result<For
         // bare names, exactly what a subquery exposes.
         let columns: Arc<[String]> = cols.into();
         let rows: Arc<Vec<Row>> = Arc::new(rows);
-        out.qualified.insert(key.clone(), (rows, columns));
+        out.qualified.insert(key.clone(), (rows, columns, None));
         out.order.push(key);
     }
     Ok(out)
@@ -1876,7 +1876,7 @@ pub(crate) fn prepare_cross_dml(
         };
         let columns: Arc<[String]> = cols.into();
         let rows: Arc<Vec<Row>> = Arc::new(rows);
-        channel.qualified.insert(key.clone(), (rows, columns));
+        channel.qualified.insert(key.clone(), (rows, columns, None));
         channel.order.push(key);
     }
 

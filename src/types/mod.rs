@@ -14,7 +14,11 @@ use std::sync::Arc;
 /// A materialized CTE: (rows, column names). CTE bodies are executed once
 /// up front and handed to the planner/executor as plain row sets; the
 /// column names are qualified (`cte.col`) for name resolution.
-pub type CteMaterialization = (Arc<Vec<Row>>, Arc<[String]>);
+pub type CteMaterialization = (
+    Arc<Vec<Row>>,
+    Arc<[String]>,
+    Option<Arc<crate::executor::derived::DerivedMeta>>,
+);
 
 /// A bare-column projection mapping produced by the planner: which source
 /// columns feed the projection (`None` = all, in declared order) plus the

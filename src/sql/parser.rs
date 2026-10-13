@@ -2350,20 +2350,17 @@ impl Parser {
         let mut left = self.parse_table_primary()?;
         loop {
             // Comma-separated FROM list (`FROM a, b, c`): an implicit CROSS
-            // JOIN per the SQL standard and SQLite's grammar. A WHERE
+            // JOIN per the SQL standard and SQLite's grammar (which also
+            // lets it carry an ON / USING constraint, like JOIN). A WHERE
             // conjunct over both sides gives it inner-join semantics.
-            if self.peek().is_punct(',') {
+            let comma = self.peek().is_punct(',');
+            let natural = !comma && self.peek().is_keyword("NATURAL");
+            if comma || natural {
                 self.advance();
-                let right = self.parse_table_primary()?;
-                left = TableExpression::Join {
-                    left: Box::new(left),
-                    right: Box::new(right),
-                    join_type: JoinType::Cross,
-                    constraint: JoinConstraint::None,
-                };
-                continue;
             }
-            let join_type = if self.peek().is_keyword("JOIN") {
+            let join_type = if comma {
+                JoinType::Cross
+            } else if self.peek().is_keyword("JOIN") {
                 self.advance();
                 JoinType::Inner
             } else if self.peek().is_keyword("INNER") {
@@ -2389,20 +2386,21 @@ impl Parser {
                 self.advance();
                 self.expect_keyword("JOIN")?;
                 JoinType::Cross
-            } else if self.peek().is_keyword("NATURAL") {
-                self.advance();
+            } else if natural {
                 self.expect_keyword("JOIN")?;
-                return Ok(TableExpression::Join {
-                    left: Box::new(left),
-                    right: Box::new(self.parse_table_primary()?),
-                    join_type: JoinType::Inner,
-                    constraint: JoinConstraint::Natural,
-                });
+                JoinType::Inner
             } else {
                 break;
             };
             let right = self.parse_table_primary()?;
-            let constraint = if self.peek().is_keyword("ON") {
+            let constraint = if natural {
+                if self.peek().is_keyword("ON") || self.peek().is_keyword("USING") {
+                    return Err(Error::semantic(
+                        "a NATURAL join may not have an ON or USING clause",
+                    ));
+                }
+                JoinConstraint::Natural
+            } else if self.peek().is_keyword("ON") {
                 self.advance();
                 JoinConstraint::On(self.parse_expr()?)
             } else if self.peek().is_keyword("USING") {
@@ -2413,6 +2411,12 @@ impl Parser {
                 JoinConstraint::Using(cols)
             } else {
                 JoinConstraint::None
+            };
+            // A constrained comma join is an inner join.
+            let join_type = if comma && !matches!(constraint, JoinConstraint::None) {
+                JoinType::Inner
+            } else {
+                join_type
             };
             left = TableExpression::Join {
                 left: Box::new(left),

@@ -13,15 +13,21 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::derived::DerivedMeta;
 use crate::error::{Error, Result};
+use crate::executor::predicate::CompiledExpr;
 use crate::planner::plan::Plan;
 use crate::planner::Planner;
+use crate::sql::ast::Expr;
 use crate::sql::ast::{Cte, SelectBody, SelectStatement, SetOp, WithClause};
 use crate::types::{CteMaterialization, Row};
 
 use super::{ExecContext, ExecResult};
 
 pub(crate) type CteMap = HashMap<String, CteMaterialization>;
+
+/// A materialized CTE: rows, qualified column names, column types.
+type Materialized = (Vec<Row>, Arc<[String]>, Option<Arc<DerivedMeta>>);
 
 /// Plan + execute `select` with `outer_ctes` in scope. The statement's own
 /// WITH clause (if any) is materialized first, layered over the outer
@@ -32,6 +38,18 @@ pub(crate) fn exec_select_with_ctes(
     select: &SelectStatement,
     outer_ctes: &CteMap,
 ) -> Result<ExecResult> {
+    Ok(exec_select_with_ctes_meta(ctx, select, outer_ctes, None)?.0)
+}
+
+/// [`exec_select_with_ctes`], also describing the result set's column
+/// types under FROM qualifier `qualifier` (a CTE body: see
+/// `derived::derived_meta`).
+fn exec_select_with_ctes_meta(
+    ctx: &mut ExecContext<'_>,
+    select: &SelectStatement,
+    outer_ctes: &CteMap,
+    qualifier: Option<&str>,
+) -> Result<(ExecResult, Option<Arc<DerivedMeta>>)> {
     let catalog = ctx.catalog();
     // WHERE pushdown into single-use CTE bodies (the pushDownWhereTerms
     // analog for CTEs): a conjunct over a CTE referenced exactly once
@@ -58,6 +76,7 @@ pub(crate) fn exec_select_with_ctes(
         planner.set_foreign(f);
     }
     let plan = planner.plan_select(select_ref)?;
+    let meta = qualifier.and_then(|q| super::derived::derived_meta(&plan, q));
     // Make the CTEs visible to subquery planning inside this statement.
     let saved = ctx.ctes.replace(cte_map);
     let res = (|| {
@@ -70,7 +89,7 @@ pub(crate) fn exec_select_with_ctes(
         super::execute(&plan, ctx)
     })();
     ctx.ctes = saved;
-    res
+    Ok((res?, meta))
 }
 
 /// Materialize every CTE of `with`, in declaration order (each sees the
@@ -83,11 +102,15 @@ pub(crate) fn materialize_ctes(
     let mut map: CteMap = outer_ctes.clone();
     for cte in &with.ctes {
         let name_lc = cte.name.to_ascii_lowercase();
-        let (rows, cols) = if with.recursive {
+        let (rows, cols, meta) = if with.recursive {
             materialize_recursive_cte(cte, &map, ctx)?
         } else {
-            let res = exec_select_with_ctes(ctx, &cte.select, &map)?;
-            (res.rows, res.columns)
+            let (res, meta) = exec_select_with_ctes_meta(ctx, &cte.select, &map, Some(&name_lc))?;
+            (res.rows, res.columns, meta)
+        };
+        let meta = match (&cte.columns, meta) {
+            (Some(list), Some(m)) => Some(m.renamed(&name_lc, Some(list))),
+            (_, m) => m,
         };
         // Apply the explicit column list (WITH name(a, b) AS ...) — the
         // rename happens at the CTE boundary.
@@ -117,7 +140,7 @@ pub(crate) fn materialize_ctes(
                     .into()
             }
         };
-        map.insert(name_lc, (Arc::new(rows), cols));
+        map.insert(name_lc, (Arc::new(rows), cols, meta));
     }
     Ok(map)
 }
@@ -141,12 +164,12 @@ fn materialize_recursive_cte(
     cte: &Cte,
     outer_ctes: &CteMap,
     ctx: &mut ExecContext<'_>,
-) -> Result<(Vec<Row>, Arc<[String]>)> {
+) -> Result<Materialized> {
     let name_lc = cte.name.to_ascii_lowercase();
     let Some(split) = split_compound_cte(&cte.select, &name_lc)? else {
         // Never recurses: an ordinary CTE.
-        let res = exec_select_with_ctes(ctx, &cte.select, outer_ctes)?;
-        return Ok((res.rows, res.columns));
+        let (res, meta) = exec_select_with_ctes_meta(ctx, &cte.select, outer_ctes, Some(&name_lc))?;
+        return Ok((res.rows, res.columns, meta));
     };
     let (base, recursive_op, recursive_arms) = (split.setup, split.op, split.arms);
     let sel = &cte.select;
@@ -167,6 +190,7 @@ fn materialize_recursive_cte(
         (
             Arc::new(Vec::new()),
             Arc::from(vec![format!("{}.", cte.name)]),
+            None,
         ),
     );
     let base_res = if limit == 0 {
@@ -175,9 +199,17 @@ fn materialize_recursive_cte(
             crate::types::Value::Integer(0),
         ));
         b.offset = None;
-        exec_select_with_ctes(ctx, &b, &scope)?
+        exec_select_with_ctes_meta(ctx, &b, &scope, Some(&name_lc))?
     } else {
-        exec_select_with_ctes(ctx, &base, &scope)?
+        exec_select_with_ctes_meta(ctx, &base, &scope, Some(&name_lc))?
+    };
+    // The CTE's column types come from its setup (the leftmost arms) —
+    // the recursive self-reference and the outer query compare through
+    // them.
+    let (base_res, meta) = base_res;
+    let meta = match (&cte.columns, meta) {
+        (Some(list), Some(m)) => Some(m.renamed(&name_lc, Some(list))),
+        (_, m) => m,
     };
     let base_cols: Arc<[String]> = base_res.columns;
     // Canonical output columns for the CTE.
@@ -205,13 +237,57 @@ fn materialize_recursive_cte(
             .into(),
     };
     if limit == 0 {
-        return Ok((Vec::new(), out_cols));
+        return Ok((Vec::new(), out_cols, meta));
     }
     let order = resolve_queue_order(&sel.order_by, &out_cols)?;
+    // Arms that compile to positional expressions run without the planner
+    // and executor (see `CompiledArm`) — only when the CTE's columns carry
+    // no affinity or collation, so a raw comparison is SQLite's.
+    let compiled_arms: Vec<Option<CompiledArm>> = if setup_is_plain(&base) {
+        let bare: Vec<String> = out_cols
+            .iter()
+            .map(|c| {
+                c.rsplit_once('.')
+                    .map_or(c.as_str(), |(_, n)| n)
+                    .to_string()
+            })
+            .collect();
+        recursive_arms
+            .iter()
+            .map(|a| CompiledArm::compile(a, &name_lc, &bare, ctx.params.len()))
+            .collect()
+    } else {
+        recursive_arms.iter().map(|_| None).collect()
+    };
     let union = recursive_op == SetOp::Union;
     // UNION's distinct set (the queue only admits unseen rows).
+    // Rows equal under the columns' collations are duplicates.
+    let colls: Vec<Option<String>> = meta.as_ref().map_or_else(Vec::new, |m| {
+        m.table
+            .columns
+            .iter()
+            .map(|c| Some(c.collation.clone()).filter(|c| !c.eq_ignore_ascii_case("BINARY")))
+            .collect()
+    });
+    let collated = colls.iter().any(|c| c.is_some());
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut admit = |r: &Row| -> bool { !union || seen.insert(format!("{:?}", r)) };
+    let mut admit = |r: &Row| -> bool {
+        if !union {
+            return true;
+        }
+        if collated {
+            let key: Row = r
+                .iter()
+                .enumerate()
+                .map(|(i, v)| match colls.get(i).and_then(|c| c.as_deref()) {
+                    Some(c) => crate::plugin::collation_fold_key(c, v),
+                    None => v.clone(),
+                })
+                .collect();
+            return seen.insert(format!("{:?}", key));
+        }
+        seen.insert(format!("{:?}", r))
+    };
     let mut out: Vec<Row> = Vec::new();
     let mut skipped = 0i64;
     let mut arm_plans: Vec<Option<ArmPlan>> = recursive_arms.iter().map(|_| None).collect();
@@ -242,26 +318,36 @@ fn materialize_recursive_cte(
         while !frontier.is_empty() {
             for r in &frontier {
                 if !emit(r, &mut out)? {
-                    return Ok((out, out_cols));
+                    return Ok((out, out_cols, meta));
                 }
             }
             let mut frontier_rows = Some(frontier);
             let mut next_frontier = Vec::new();
             let n_arms = recursive_arms.len();
             for (i, (arm, plan)) in recursive_arms.iter().zip(arm_plans.iter_mut()).enumerate() {
+                if let Some(c) = &compiled_arms[i] {
+                    let rows = frontier_rows.as_deref().unwrap_or_default();
+                    c.run(rows, &ctx.params, &mut |r| {
+                        if admit(&r) {
+                            next_frontier.push(r);
+                        }
+                    });
+                    continue;
+                }
                 // The last arm takes the frontier itself.
                 let rows = if i + 1 == n_arms {
                     frontier_rows.take().unwrap_or_default()
                 } else {
                     frontier_rows.clone().unwrap_or_default()
                 };
-                let next =
-                    run_recursive_arm(ctx, arm, &mut scope, &name_lc, &out_cols, rows, plan)?;
+                let next = run_recursive_arm(
+                    ctx, arm, &mut scope, &name_lc, &out_cols, &meta, rows, plan,
+                )?;
                 next_frontier.extend(next.into_iter().filter(|r| admit(r)));
             }
             frontier = next_frontier;
         }
-        return Ok((out, out_cols));
+        return Ok((out, out_cols, meta));
     }
     // One row at a time: FIFO, or ordered by the compound's ORDER BY
     // (ties in insertion order).
@@ -273,13 +359,22 @@ fn materialize_recursive_cte(
         if !emit(&row, &mut out)? {
             break;
         }
-        for (arm, plan) in recursive_arms.iter().zip(arm_plans.iter_mut()) {
+        for (i, (arm, plan)) in recursive_arms.iter().zip(arm_plans.iter_mut()).enumerate() {
+            if let Some(c) = &compiled_arms[i] {
+                c.run(std::slice::from_ref(&row), &ctx.params, &mut |r| {
+                    if admit(&r) {
+                        queue.push(r);
+                    }
+                });
+                continue;
+            }
             let next = run_recursive_arm(
                 ctx,
                 arm,
                 &mut scope,
                 &name_lc,
                 &out_cols,
+                &meta,
                 vec![row.clone()],
                 plan,
             )?;
@@ -290,7 +385,169 @@ fn materialize_recursive_cte(
             }
         }
     }
-    Ok((out, out_cols))
+    Ok((out, out_cols, meta))
+}
+
+/// A recursive arm that reads only the CTE — `SELECT exprs FROM cte
+/// [WHERE a AND b ...]` — compiled to positional expressions over the
+/// CTE row, run per row without the planner or executor (SQLite runs this
+/// shape as a few VDBE opcodes per row). Built only when the CTE's columns
+/// carry no affinity or collation, so the raw comparisons below are
+/// exactly the evaluator's; compiled expressions cannot fail, so the
+/// conjuncts' order does not matter.
+struct CompiledArm {
+    filters: Vec<CompiledExpr>,
+    /// `None` = `SELECT *` (the row itself).
+    project: Option<Vec<CompiledExpr>>,
+}
+
+impl CompiledArm {
+    fn compile(
+        arm: &SelectStatement,
+        name_lc: &str,
+        cols: &[String],
+        params_len: usize,
+    ) -> Option<Self> {
+        let SelectBody::Simple(s) = &arm.body else {
+            return None;
+        };
+        let alias = match &s.from {
+            Some(crate::sql::ast::TableExpression::Table {
+                name,
+                schema: None,
+                alias,
+                indexed: None,
+            }) if name.eq_ignore_ascii_case(name_lc) => alias.clone(),
+            _ => return None,
+        };
+        if !s.group_by.is_empty() || s.having.is_some() || s.distinct || !s.window.is_empty() {
+            return None;
+        }
+        let qual = alias.unwrap_or_else(|| name_lc.to_string());
+        let compile = |e: &Expr| compile_cte_expr(e, &qual, cols, params_len);
+        let mut filters = Vec::new();
+        if let Some(w) = &s.where_clause {
+            let mut stack = vec![w];
+            while let Some(e) = stack.pop() {
+                match e {
+                    Expr::Binary {
+                        op: crate::sql::ast::BinaryOp::And,
+                        left,
+                        right,
+                    } => {
+                        stack.push(right);
+                        stack.push(left);
+                    }
+                    other => filters.push(compile(other)?),
+                }
+            }
+        }
+        let project = match s.columns.as_slice() {
+            [crate::sql::ast::ResultColumn::Star] => None,
+            items => {
+                let mut out = Vec::with_capacity(items.len());
+                for c in items {
+                    match c {
+                        crate::sql::ast::ResultColumn::Expr { expr, .. } => {
+                            out.push(compile(expr)?)
+                        }
+                        _ => return None,
+                    }
+                }
+                if out.len() != cols.len() {
+                    return None;
+                }
+                Some(out)
+            }
+        };
+        Some(Self { filters, project })
+    }
+
+    fn run(&self, rows: &[Row], params: &[crate::types::Value], sink: &mut dyn FnMut(Row)) {
+        for row in rows {
+            if !self.filters.iter().all(|f| f.eval(row, params).is_truthy()) {
+                continue;
+            }
+            sink(match &self.project {
+                Some(p) => p.iter().map(|e| e.eval(row, params)).collect(),
+                None => row.clone(),
+            });
+        }
+    }
+}
+
+/// Positional compilation over the CTE row: literals, parameters, the
+/// CTE's columns (bare or qualified by the CTE / its alias), unary and
+/// binary operators (comparisons included — the columns carry no
+/// affinity, see `CompiledArm`). AND / OR stay out (value-context
+/// short-circuit rules).
+fn compile_cte_expr(
+    e: &Expr,
+    qual: &str,
+    cols: &[String],
+    params_len: usize,
+) -> Option<CompiledExpr> {
+    use crate::sql::ast::BinaryOp;
+    Some(match e {
+        Expr::Literal(v) => CompiledExpr::Literal(v.clone()),
+        Expr::Column { table, name } => {
+            if table
+                .as_deref()
+                .is_some_and(|t| !t.eq_ignore_ascii_case(qual))
+            {
+                return None;
+            }
+            CompiledExpr::Col(cols.iter().position(|c| c.eq_ignore_ascii_case(name))?)
+        }
+        Expr::Parameter(_) => crate::executor::predicate::compile_expr(e, cols, params_len)?,
+        Expr::Unary { op, expr } => CompiledExpr::Unary(
+            *op,
+            Box::new(compile_cte_expr(expr, qual, cols, params_len)?),
+        ),
+        Expr::Binary { op, left, right } => {
+            if matches!(op, BinaryOp::And | BinaryOp::Or) {
+                return None;
+            }
+            CompiledExpr::Binary(
+                *op,
+                Box::new(compile_cte_expr(left, qual, cols, params_len)?),
+                Box::new(compile_cte_expr(right, qual, cols, params_len)?),
+            )
+        }
+        _ => return None,
+    })
+}
+
+/// Every setup arm's result column is an expression with NO affinity and
+/// no collation (a literal, arithmetic, a function call — not a column,
+/// a CAST or a COLLATE): the CTE's columns then compare raw.
+fn setup_is_plain(setup: &SelectStatement) -> bool {
+    fn body_plain(b: &SelectBody) -> bool {
+        match b {
+            SelectBody::Simple(s) => s.columns.iter().all(|c| match c {
+                crate::sql::ast::ResultColumn::Expr { expr, .. } => {
+                    crate::executor::expr::expr_affinity_with(expr, &|_| {
+                        Some(crate::types::Affinity::Blob)
+                    })
+                    .is_none()
+                        && crate::executor::expr::explicit_collation(expr).is_none()
+                        && !expr_reads_column(expr)
+                }
+                _ => false,
+            }),
+            SelectBody::Binary { left, right, .. } => body_plain(left) && body_plain(right),
+        }
+    }
+    body_plain(&setup.body)
+}
+
+/// Whether an expression references any column (a column-derived value
+/// can carry a declared collation through arithmetic-free shapes; stay
+/// conservative and keep such setups on the general path).
+fn expr_reads_column(e: &Expr) -> bool {
+    let mut refs = Vec::new();
+    crate::executor::collect_expr_refs(e, &mut refs);
+    !refs.is_empty()
 }
 
 /// Output-row guard for a recursion that never ends (SQLite would run
@@ -317,11 +574,15 @@ fn run_recursive_arm(
     scope: &mut CteMap,
     name_lc: &str,
     cols: &Arc<[String]>,
+    meta: &Option<Arc<DerivedMeta>>,
     frontier: Vec<Row>,
     cache: &mut Option<ArmPlan>,
 ) -> Result<Vec<Row>> {
     let f = Arc::new(frontier);
-    scope.insert(name_lc.to_string(), (Arc::clone(&f), Arc::clone(cols)));
+    scope.insert(
+        name_lc.to_string(),
+        (Arc::clone(&f), Arc::clone(cols), meta.clone()),
+    );
     let reused = match cache.as_mut() {
         // Re-plan when the frontier outgrows the size the plan was costed
         // for (join order and algorithm follow the CTE's row count).
@@ -392,7 +653,7 @@ fn retarget_cte_rows(plan: &mut Plan, old: &Arc<Vec<Row>>, new: &Arc<Vec<Row>>) 
             retarget_cte_rows(left, old, new) + retarget_cte_rows(right, old, new)
         }
         Plan::IndexNestedLoopJoin { outer, .. } => retarget_cte_rows(outer, old, new),
-        Plan::Subquery { plan } => retarget_cte_rows(plan, old, new),
+        Plan::Subquery { plan, .. } => retarget_cte_rows(plan, old, new),
         Plan::Insert { source, .. } | Plan::Update { source, .. } | Plan::Delete { source, .. } => {
             retarget_cte_rows(source, old, new)
         }

@@ -664,7 +664,7 @@ pub(crate) fn fold_constants_in_plan(plan: &mut Plan) {
             fold_constants_in_plan(outer);
             Vec::new()
         }
-        Plan::Subquery { plan } => {
+        Plan::Subquery { plan, .. } => {
             fold_constants_in_plan(plan);
             Vec::new()
         }

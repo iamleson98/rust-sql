@@ -54,6 +54,9 @@ struct Source {
     /// upsert `excluded.` pseudo-table — SQLite resolves bare names in
     /// DO UPDATE to the original row only).
     qualified_only: bool,
+    /// Columns a NATURAL / USING join merged into an earlier source's
+    /// copy: reachable qualified only.
+    bare_hidden: Vec<String>,
     /// The source is a virtual table (rowid spellings are legal in SET).
     vtable: bool,
     /// Pending virtual table (module not yet registered): the column
@@ -124,7 +127,9 @@ impl Scope {
                 if src.qualified_only {
                     continue;
                 }
-                if src.has_column(name) {
+                if src.has_column(name)
+                    && !src.bare_hidden.iter().any(|h| h.eq_ignore_ascii_case(name))
+                {
                     matches += 1;
                 }
             }
@@ -479,6 +484,7 @@ impl TriggerScope {
                 columns: columns.clone(),
                 rowid_table,
                 qualified_only: false,
+                bare_hidden: Vec::new(),
                 pending_vtab: false,
                 aux_columns: Vec::new(),
                 vtable: false,
@@ -488,6 +494,7 @@ impl TriggerScope {
                 columns: columns.clone(),
                 rowid_table,
                 qualified_only: true,
+                bare_hidden: Vec::new(),
                 pending_vtab: false,
                 aux_columns: Vec::new(),
                 vtable: false,
@@ -497,6 +504,7 @@ impl TriggerScope {
                 columns,
                 rowid_table,
                 qualified_only: true,
+                bare_hidden: Vec::new(),
                 pending_vtab: false,
                 aux_columns: Vec::new(),
                 vtable: false,
@@ -980,6 +988,7 @@ fn build_from_expr(
                                 columns: cols,
                                 rowid_table,
                                 qualified_only: false,
+                                bare_hidden: Vec::new(),
                                 pending_vtab: wildcard,
                                 aux_columns: Vec::new(),
                                 vtable: false,
@@ -1034,6 +1043,7 @@ fn build_from_expr(
                 columns: cols,
                 rowid_table,
                 qualified_only: false,
+                bare_hidden: Vec::new(),
                 // Wildcard: pending vtab (unknown until xConnect — the
                 // planner's `no such module` fires) or uncomputable view
                 // outputs — every name accepted.
@@ -1064,59 +1074,58 @@ fn build_from_expr(
             constraint,
             ..
         } => {
-            let left_last = build_from_expr(ctx, left, ctes, scope)?;
+            let left_first = scope.cur().sources.len();
+            build_from_expr(ctx, left, ctes, scope)?;
             let before_right = scope.cur().sources.len();
-            let right_first = build_from_expr(ctx, right, ctes, scope)?;
-            let _ = right_first;
-            match constraint {
-                JoinConstraint::Using(names) => {
-                    for n in names {
-                        let (has_l, has_r) = {
-                            let level = scope.cur();
-                            let l = level.sources[left_last].has_column(n);
-                            let r = level.sources[before_right].has_column(n);
-                            (l, r)
-                        };
-                        if !has_l || !has_r {
-                            return Err(Error::NotFound(format!(
-                                "cannot join using column {} - column not present in both tables",
-                                n
-                            )));
-                        }
-                        // Coalesced: the bare name binds to the LEFT copy;
-                        // remove the RIGHT copy from bare search.
-                        if let Some(pos) = scope.cur().sources[before_right]
-                            .columns
-                            .iter()
-                            .position(|c| c.eq_ignore_ascii_case(n))
-                        {
-                            scope.cur().sources[before_right].columns.remove(pos);
-                        }
-                    }
-                }
+            build_from_expr(ctx, right, ctes, scope)?;
+            // A merged column (sqlite3ProcessJoin): the left side's copy
+            // — any left source's — and the right side's; the bare name
+            // binds to the LEFT copy, so the right copy leaves BARE
+            // search (`b.k` stays valid).
+            let find = |level: &Level, range: std::ops::Range<usize>, n: &str| {
+                range.into_iter().find(|&i| {
+                    let src = &level.sources[i];
+                    src.has_column(n) && !src.bare_hidden.iter().any(|h| h.eq_ignore_ascii_case(n))
+                })
+            };
+            let merged: Vec<String> = match constraint {
+                JoinConstraint::Using(names) => names.clone(),
                 JoinConstraint::Natural => {
-                    // Common columns coalesce onto the left copy.
-                    let common: Vec<String> = {
-                        let level = scope.cur();
-                        level.sources[before_right]
-                            .columns
-                            .iter()
-                            .filter(|c| level.sources[left_last].has_column(c))
-                            .cloned()
-                            .collect()
-                    };
-                    for c in common {
-                        if let Some(pos) = scope.cur().sources[before_right]
-                            .columns
-                            .iter()
-                            .position(|x| x.eq_ignore_ascii_case(&c))
-                        {
-                            scope.cur().sources[before_right].columns.remove(pos);
+                    let level = scope.cur();
+                    let mut common: Vec<String> = Vec::new();
+                    for src in &level.sources[before_right..] {
+                        for c in &src.columns {
+                            if find(level, left_first..before_right, c).is_some()
+                                && !common.iter().any(|x| x.eq_ignore_ascii_case(c))
+                            {
+                                common.push(c.clone());
+                            }
                         }
                     }
+                    common
                 }
+                _ => Vec::new(),
+            };
+            for n in &merged {
+                let (l, r) = {
+                    let level = scope.cur();
+                    let len = level.sources.len();
+                    (
+                        find(level, left_first..before_right, n),
+                        find(level, before_right..len, n),
+                    )
+                };
+                let (Some(_), Some(r)) = (l, r) else {
+                    return Err(Error::NotFound(format!(
+                        "cannot join using column {} - column not present in both tables",
+                        n
+                    )));
+                };
+                scope.cur().sources[r].bare_hidden.push(n.clone());
+            }
+            match constraint {
                 JoinConstraint::On(e) => validate_expr(ctx, e, scope, ctes)?,
-                JoinConstraint::None => {}
+                JoinConstraint::None | JoinConstraint::Using(_) | JoinConstraint::Natural => {}
             }
             Ok(scope.cur().sources.len().saturating_sub(1))
         }
@@ -1137,6 +1146,7 @@ fn build_from_expr(
                 columns: cols.iter().map(|c| c.to_string()).collect(),
                 rowid_table: false,
                 qualified_only: false,
+                bare_hidden: Vec::new(),
                 pending_vtab: false,
                 aux_columns: Vec::new(),
                 vtable: false,
@@ -1162,6 +1172,7 @@ fn subquery_source(
             columns,
             rowid_table: false,
             qualified_only: false,
+            bare_hidden: Vec::new(),
             vtable: false,
             pending_vtab: false,
             aux_columns: Vec::new(),
@@ -1174,6 +1185,7 @@ fn subquery_source(
             columns: Vec::new(),
             rowid_table: false,
             qualified_only: false,
+            bare_hidden: Vec::new(),
             vtable: false,
             pending_vtab: true,
             aux_columns: Vec::new(),
@@ -1380,6 +1392,7 @@ fn dml_target_source(ctx: &Ctx<'_>, name: &str, alias: Option<&String>) -> Resul
             columns: t.columns.iter().map(|c| c.name.clone()).collect(),
             rowid_table: !t.without_rowid,
             qualified_only: false,
+            bare_hidden: Vec::new(),
             vtable: t.vtab.is_some(),
             pending_vtab: pending,
             aux_columns: aux,
@@ -1391,6 +1404,7 @@ fn dml_target_source(ctx: &Ctx<'_>, name: &str, alias: Option<&String>) -> Resul
             columns: view_output_names(ctx, &v).unwrap_or_default(),
             rowid_table: false,
             qualified_only: false,
+            bare_hidden: Vec::new(),
             vtable: false,
             // Uncomputable view outputs: every name accepted.
             pending_vtab: view_output_names(ctx, &v).is_none(),
@@ -1469,6 +1483,7 @@ fn validate_insert(ctx: &Ctx<'_>, ins: &InsertStatement, scope: &mut Scope) -> R
                     columns: target.columns.clone(),
                     rowid_table: target.rowid_table,
                     qualified_only: true,
+                    bare_hidden: Vec::new(),
                     pending_vtab: false,
                     aux_columns: Vec::new(),
                     vtable: false,
@@ -1684,6 +1699,7 @@ fn validate_create(ctx: &Ctx<'_>, c: &CreateStatement, scope: &mut Scope) -> Res
                 columns: columns.iter().map(|c| c.name.clone()).collect(),
                 rowid_table: true,
                 qualified_only: false,
+                bare_hidden: Vec::new(),
                 pending_vtab: false,
                 aux_columns: Vec::new(),
                 vtable: false,
@@ -1761,6 +1777,7 @@ fn validate_create(ctx: &Ctx<'_>, c: &CreateStatement, scope: &mut Scope) -> Res
                         columns: table_cols.clone(),
                         rowid_table: !t.without_rowid,
                         qualified_only: false,
+                        bare_hidden: Vec::new(),
                         pending_vtab: false,
                         aux_columns: Vec::new(),
                         vtable: false,
@@ -1786,6 +1803,7 @@ fn validate_create(ctx: &Ctx<'_>, c: &CreateStatement, scope: &mut Scope) -> Res
                     columns: table_cols,
                     rowid_table: !t.without_rowid,
                     qualified_only: false,
+                    bare_hidden: Vec::new(),
                     pending_vtab: false,
                     aux_columns: Vec::new(),
                     vtable: false,
@@ -1865,6 +1883,7 @@ fn validate_alter(ctx: &Ctx<'_>, a: &AlterStatement) -> Result<()> {
                 columns: cols,
                 rowid_table: !t.without_rowid,
                 qualified_only: false,
+                bare_hidden: Vec::new(),
                 pending_vtab: false,
                 aux_columns: Vec::new(),
                 vtable: false,
