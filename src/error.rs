@@ -97,6 +97,29 @@ impl Error {
     pub fn runtime(msg: impl Into<String>) -> Self {
         Error::Runtime(msg.into())
     }
+
+    /// The message as `sqlite3_errmsg` reports it: the text alone, without
+    /// the engine's category prefix (`no such table: t`, `near "x":
+    /// syntax error`). [`fmt::Display`] keeps the prefixed form.
+    pub fn sqlite_message(&self) -> String {
+        match self {
+            Error::Lex { msg, .. } | Error::Parse { msg, .. } => msg.clone(),
+            Error::Semantic(m)
+            | Error::Constraint(m)
+            | Error::Planner(m)
+            | Error::Runtime(m)
+            | Error::NotFound(m)
+            | Error::AlreadyExists(m)
+            | Error::InvalidArgument(m)
+            | Error::Transaction(m) => m.clone(),
+            Error::Unsupported(m) => m.to_string(),
+            Error::Corruption(_) | Error::Btree(_) => {
+                "database disk image is malformed".to_string()
+            }
+            Error::SnapshotConflict(_) => "database is locked".to_string(),
+            Error::Io(_) | Error::Wal(_) => "disk I/O error".to_string(),
+        }
+    }
 }
 
 impl fmt::Display for Error {

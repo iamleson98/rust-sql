@@ -1452,12 +1452,16 @@ impl<'a> Planner<'a> {
         // reference that matches a projection alias, replace it with the
         // projection's expression. This lets `GROUP BY bucket` work where
         // `bucket` is an alias for a CASE expression in the SELECT list.
+        // GROUP BY / HAVING names resolve to a FROM column first, to an
+        // output alias only when no column has the name (SQLite's
+        // resolveOrderGroupBy skips aliases for GROUP BY).
+        let alias_cols = self.unshadowed_aliases(s);
         let resolved_group_by: Vec<Expr> = s
             .group_by
             .iter()
             .map(|g| {
                 if let Expr::Column { table: None, name } = g {
-                    for c in &s.columns {
+                    for c in &alias_cols {
                         if let ResultColumn::Expr {
                             expr,
                             alias: Some(a),
@@ -1489,7 +1493,7 @@ impl<'a> Planner<'a> {
                 // resolves aliases in HAVING). Substitute the alias's
                 // expression first so the aggregate rewrite below sees
                 // the real aggregate call.
-                let having_unaliased = resolve_having_aliases(having, &s.columns);
+                let having_unaliased = resolve_having_aliases(having, &alias_cols);
                 let rewritten_having = rewrite_aggregates_and_groups(
                     &having_unaliased,
                     &aggregates,
@@ -1574,6 +1578,14 @@ impl<'a> Planner<'a> {
                 input: Box::new(plan),
                 columns: rewritten_columns,
             };
+            // `SELECT DISTINCT ... GROUP BY` / `SELECT DISTINCT count(*)`:
+            // the groups' result rows are de-duplicated too (it used to
+            // return one row per group).
+            if s.distinct {
+                plan = Plan::Distinct {
+                    input: Box::new(plan),
+                };
+            }
             return Ok(plan);
         }
 
@@ -2205,6 +2217,29 @@ impl<'a> Planner<'a> {
     /// BY term rewrite — the SAME inputs produce the SAME list, so the
     /// `__agg_i` indices the rewrite emits resolve against the node the
     /// plan built.
+    /// The result columns with each alias that names a FROM column
+    /// dropped (the column wins in GROUP BY and HAVING).
+    fn unshadowed_aliases(&self, s: &SimpleSelect) -> Vec<ResultColumn> {
+        let scope = s
+            .from
+            .as_ref()
+            .map(|f| self.collation_scope(f))
+            .unwrap_or_default();
+        s.columns
+            .iter()
+            .map(|c| match c {
+                ResultColumn::Expr {
+                    expr,
+                    alias: Some(a),
+                } if scope.iter().any(|(t, _)| t.find_column(a).is_some()) => ResultColumn::Expr {
+                    expr: expr.clone(),
+                    alias: None,
+                },
+                other => other.clone(),
+            })
+            .collect()
+    }
+
     fn build_full_agg_set(
         &self,
         s: &SimpleSelect,
@@ -2228,12 +2263,16 @@ impl<'a> Planner<'a> {
             }
         }
         // Bare-column pseudo-aggregates.
+        // GROUP BY / HAVING names resolve to a FROM column first, to an
+        // output alias only when no column has the name (SQLite's
+        // resolveOrderGroupBy skips aliases for GROUP BY).
+        let alias_cols = self.unshadowed_aliases(s);
         let resolved_group_by: Vec<Expr> = s
             .group_by
             .iter()
             .map(|g| {
                 if let Expr::Column { table: None, name } = g {
-                    for c in &s.columns {
+                    for c in &alias_cols {
                         if let ResultColumn::Expr {
                             expr,
                             alias: Some(a),
@@ -2265,7 +2304,7 @@ impl<'a> Planner<'a> {
             // The UNALIASED HAVING — alias substitution happens before the
             // rewrite in plan_simple_select, so the collector sees the
             // same post-substitution shape.
-            let unaliased = resolve_having_aliases(h, &s.columns);
+            let unaliased = resolve_having_aliases(h, &alias_cols);
             collect_bare_refs(&unaliased, &resolved_group_by, &mut bare);
         }
         for t in order_terms {
@@ -2495,12 +2534,16 @@ impl<'a> Planner<'a> {
         }
         let expanded = self.expand_star_exprs(s)?;
         // Rebuild the group-by resolution + aggregate set for the rewrite.
+        // GROUP BY / HAVING names resolve to a FROM column first, to an
+        // output alias only when no column has the name (SQLite's
+        // resolveOrderGroupBy skips aliases for GROUP BY).
+        let alias_cols = self.unshadowed_aliases(s);
         let resolved_group_by: Vec<Expr> = s
             .group_by
             .iter()
             .map(|g| {
                 if let Expr::Column { table: None, name } = g {
-                    for c in &s.columns {
+                    for c in &alias_cols {
                         if let ResultColumn::Expr {
                             expr,
                             alias: Some(a),
@@ -2608,12 +2651,16 @@ impl<'a> Planner<'a> {
             return Ok(resolved_terms.to_vec());
         }
         let aggregates = self.build_full_agg_set(s, resolved_terms)?;
+        // GROUP BY / HAVING names resolve to a FROM column first, to an
+        // output alias only when no column has the name (SQLite's
+        // resolveOrderGroupBy skips aliases for GROUP BY).
+        let alias_cols = self.unshadowed_aliases(s);
         let resolved_group_by: Vec<Expr> = s
             .group_by
             .iter()
             .map(|g| {
                 if let Expr::Column { table: None, name } = g {
-                    for c in &s.columns {
+                    for c in &alias_cols {
                         if let ResultColumn::Expr {
                             expr,
                             alias: Some(a),

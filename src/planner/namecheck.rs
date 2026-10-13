@@ -1296,10 +1296,22 @@ fn validate_expr(ctx: &Ctx<'_>, e: &Expr, scope: &mut Scope, visible: &CteList) 
             filter,
             over,
             order_by,
-            ..
+            distinct,
         } => {
             if let Some(msg) = builtin_arity_error(name, args.len()) {
                 return Err(Error::semantic(msg));
+            }
+            // sqlite3ResolveExprNames: a DISTINCT aggregate takes exactly
+            // one argument (`group_concat(DISTINCT x, ',')`, `count(DISTINCT)`).
+            if *distinct && args.len() != 1 && over.is_none() {
+                let lower = name.to_ascii_lowercase();
+                if crate::planner::is_aggregate_call(&lower, args.len())
+                    || crate::plugin::lookup_aggregate(&lower).is_some()
+                {
+                    return Err(Error::semantic(
+                        "DISTINCT aggregates must have exactly one argument",
+                    ));
+                }
             }
             // `f(x ORDER BY y)` (SQLite 3.44) orders an AGGREGATE's input;
             // a scalar call or a window function cannot take it.
@@ -1949,6 +1961,11 @@ pub(crate) fn builtin_arity_error(name: &str, n: usize) -> Option<String> {
         "like" => (2, 3),
         "ltrim" | "rtrim" | "trim" | "round" | "unhex" | "log" => (1, 2),
         "max" | "min" => (1, usize::MAX),
+        // Aggregates (func.c aBuiltinFunc nArg values).
+        "count" => (0, 1),
+        "sum" | "total" | "avg" | "json_group_array" | "jsonb_group_array" => (1, 1),
+        "group_concat" => (1, 2),
+        "string_agg" | "json_group_object" | "jsonb_group_object" => (2, 2),
         "replace" => (3, 3),
         "substr" | "substring" => (2, 3),
         "acos" | "acosh" | "asin" | "asinh" | "atan" | "atanh" | "ceil" | "ceiling" | "cos"

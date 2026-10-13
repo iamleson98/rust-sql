@@ -3520,11 +3520,14 @@ impl Parser {
         // as plain `min(x)` / `count(x)`; the canonical sqllogictest
         // corpus's random/expr farm uses it heavily. Consumed and
         // ignored (the executor's default IS all-rows).
-        if !distinct {
-            let _ = self.consume_keyword("ALL");
-        }
+        let all = !distinct && self.consume_keyword("ALL");
         let mut args = Vec::new();
         let mut star = false;
+        // `f(*)` takes no quantifier (`idj LP STAR RP` in SQLite's grammar).
+        if (distinct || all) && self.peek().is_op("*") {
+            let t = self.peek().clone();
+            return Err(Error::parse(t.line, t.col, "near \"*\": syntax error"));
+        }
         if self.peek().is_op("*") {
             // COUNT(*) special case
             self.advance();
