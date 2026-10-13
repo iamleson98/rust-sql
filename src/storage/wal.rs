@@ -81,6 +81,39 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()
     file.read_exact(buf)
 }
 
+/// Positioned write of the whole buffer (pwrite on Unix; Windows'
+/// `seek_write` loops for exactness). Callers that later write through
+/// the file CURSOR seek first — every sequential write site does.
+#[cfg(unix)]
+fn write_all_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.write_all_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn write_all_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut done = 0usize;
+    while done < buf.len() {
+        let n = file.seek_write(&buf[done..], offset + done as u64)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "failed to write whole buffer",
+            ));
+        }
+        done += n;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn write_all_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    let mut file = file;
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(buf)
+}
+
 /// WAL header is 32 bytes.
 pub const WAL_HEADER_SIZE: u32 = 32;
 /// Frame header is 24 bytes.
@@ -831,14 +864,19 @@ impl Wal {
         }
         let offset = WAL_HEADER_SIZE as u64
             + self.n_frames as u64 * (FRAME_HEADER_SIZE + self.page_size) as u64;
-        self.file.seek(SeekFrom::Start(offset))?;
 
-        // Compute checksum: include page_id + commit (8 bytes) + page data.
-        let mut check_data = Vec::with_capacity(8 + data.len());
-        check_data.extend_from_slice(&page_id.to_be_bytes());
-        check_data.extend_from_slice(&(if commit { 1u32 } else { 0u32 }).to_be_bytes());
-        check_data.extend_from_slice(data);
-        let (c1, c2) = crc32(self.checksum.0, self.checksum.1, &check_data);
+        // Checksum over page_id + commit (8 bytes) + page data, fed
+        // incrementally (bit-identical to `crc32` over the concatenation).
+        let mut pre = [0u8; 8];
+        pre[0..4].copy_from_slice(&page_id.to_be_bytes());
+        pre[4..8].copy_from_slice(&(if commit { 1u32 } else { 0u32 }).to_be_bytes());
+        let mut h1 = crc32fast::Hasher::new_with_initial(self.checksum.0);
+        let mut h2 = crc32fast::Hasher::new_with_initial(self.checksum.1 ^ 0xA5A5A5A5);
+        h1.update(&pre);
+        h2.update(&pre);
+        h1.update(data);
+        h2.update(data);
+        let (c1, c2) = (h1.finalize(), h2.finalize());
         self.checksum = (c1, c2);
 
         let fh = FrameHeader {
@@ -849,8 +887,12 @@ impl Wal {
             checksum1: c1,
             checksum2: c2,
         };
-        self.file.write_all(&fh.encode())?;
-        self.file.write_all(data)?;
+        // ONE positioned write per frame: a cache spill (every dirty page
+        // a big write transaction evicts) paid a seek and two writes.
+        let mut frame = Vec::with_capacity(FRAME_HEADER_SIZE as usize + data.len());
+        frame.extend_from_slice(&fh.encode());
+        frame.extend_from_slice(data);
+        write_all_at(&self.file, &frame, offset)?;
         self.n_frames += 1;
         Ok(offset)
     }

@@ -26413,10 +26413,11 @@ const INDEX_BATCH_CHUNK_OPS: usize = 1 << 20;
 /// Sort + sweep-apply one index's buffered maintenance ops through the
 /// pinned-leaf sweep (see Btree::delete_index_sorted /
 /// insert_index_sorted). The delete and insert multisets are sorted
-/// independently and applied as two passes — the resulting (key, rowid)
-/// multiset is identical to per-row maintenance for a non-unique index
-/// (an op pair from row R can never alias a pair from row R': rowids
-/// are unique per row).
+/// independently and applied as ONE merged key-ordered sweep
+/// (`Btree::apply_index_sorted`) — the resulting (key, rowid) multiset
+/// is identical to per-row maintenance for a non-unique index (an op
+/// pair from row R can never alias a pair from row R': rowids are
+/// unique per row), and each touched leaf is written once.
 pub(crate) fn flush_index_op_buf(
     ctx: &mut ExecContext<'_>,
     idx: &crate::schema::Index,
@@ -26430,8 +26431,7 @@ pub(crate) fn flush_index_op_buf(
     dels.sort_unstable_by(|a, b| (&a.0[..], a.1).cmp(&(&b.0[..], b.1)));
     ins.sort_unstable_by(|a, b| (&a.0[..], a.1).cmp(&(&b.0[..], b.1)));
     let mut ibt = Btree::new(ctx.pager, *root, true);
-    ibt.delete_index_sorted(dels)?;
-    ibt.insert_index_sorted(ins)?;
+    ibt.apply_index_sorted(dels, ins)?;
     if ibt.root != *root {
         *root = ibt.root;
         ctx.set_index_root(&idx.name, ibt.root);

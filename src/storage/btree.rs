@@ -11045,40 +11045,112 @@ impl<'a> Btree<'a> {
     fn delete_index_sorted_inner(&mut self, entries: &[(Vec<u8>, i64)]) -> Result<()> {
         let mut pin: Option<IndexSweepPin> = None;
         for (key, rowid) in entries {
-            // Pinned fast path: the fence covers the op.
-            let mut handled = false;
-            if let Some(mut p) = pin.take() {
-                if !p.empty && (&key[..], *rowid) <= (&p.max_key[..], p.max_rowid) {
-                    match self.sweep_delete_in_pinned(&mut p, key, *rowid)? {
-                        SweepTry::Done { pin_alive: true } => {
-                            pin = Some(p);
-                            handled = true;
+            self.sweep_apply_one(&mut pin, key, *rowid, false)?;
+        }
+        Ok(())
+    }
+
+    /// One op of a pinned-leaf sweep: the pinned leaf when its fence
+    /// covers the op, else a fresh pin by descent, else the full per-op
+    /// path (splits, overflow chains, absent deletes).
+    fn sweep_apply_one(
+        &mut self,
+        pin: &mut Option<IndexSweepPin>,
+        key: &[u8],
+        rowid: i64,
+        insert: bool,
+    ) -> Result<()> {
+        // Pinned fast path: the fence covers the op.
+        if let Some(mut p) = pin.take() {
+            if !p.empty && (key, rowid) <= (&p.max_key[..], p.max_rowid) {
+                let r = if insert {
+                    self.sweep_insert_in_pinned(&mut p, key, rowid)?
+                } else {
+                    self.sweep_delete_in_pinned(&mut p, key, rowid)?
+                };
+                match r {
+                    SweepTry::Done { pin_alive } => {
+                        if pin_alive {
+                            *pin = Some(p);
                         }
-                        SweepTry::Done { pin_alive: false } => {
-                            handled = true; // leaf emptied + recycled; op applied
-                        }
-                        SweepTry::Declined => {} // stale — re-pin below
+                        return Ok(());
                     }
+                    SweepTry::Declined => {} // stale — re-pin below
                 }
             }
-            if handled {
-                continue;
-            }
-            // Re-pin by descent — a FRESH pin routed THIS op, so the
-            // fence check is unnecessary (append-past-max is legal).
-            if let Some(mut p) = self.find_index_leaf_pinned(key, *rowid)? {
-                if !p.empty {
-                    match self.sweep_delete_in_pinned(&mut p, key, *rowid)? {
-                        SweepTry::Done { pin_alive: true } => {
-                            pin = Some(p);
-                            continue;
+        }
+        // Re-pin by descent — a FRESH pin routed THIS op, so the fence
+        // check is unnecessary (append-past-max is legal).
+        if let Some(mut p) = self.find_index_leaf_pinned(key, rowid)? {
+            if !p.empty {
+                let r = if insert {
+                    self.sweep_insert_in_pinned(&mut p, key, rowid)?
+                } else {
+                    self.sweep_delete_in_pinned(&mut p, key, rowid)?
+                };
+                match r {
+                    SweepTry::Done { pin_alive } => {
+                        if pin_alive {
+                            *pin = Some(p);
                         }
-                        SweepTry::Done { pin_alive: false } => continue,
-                        SweepTry::Declined => {}
+                        return Ok(());
                     }
+                    SweepTry::Declined => {}
                 }
             }
-            let _ = self.delete_index(key, *rowid)?;
+        }
+        if insert {
+            self.insert_index(key, rowid)?;
+        } else {
+            let _ = self.delete_index(key, rowid)?;
+        }
+        Ok(())
+    }
+
+    /// Apply `(key, rowid)`-ascending DELETE and INSERT batches as ONE
+    /// merged pinned-leaf sweep, in key order (a delete first on an
+    /// identical pair — the order the two separate passes applied them
+    /// in). Ops on distinct pairs commute, so the resulting multiset is
+    /// the two passes' exactly; but each touched leaf is dirtied ONCE
+    /// instead of twice. A band UPDATE of an indexed column on a table
+    /// larger than the page cache paid for the second pass in full: the
+    /// delete pass's leaves were spilled to the WAL, read back, and
+    /// written again by the insert pass (36k WAL frames for 24k pages at
+    /// 2M rows).
+    pub fn apply_index_sorted(
+        &mut self,
+        dels: &[(Vec<u8>, i64)],
+        ins: &[(Vec<u8>, i64)],
+    ) -> Result<()> {
+        let _structural = self.pager.structural_scope();
+        if dels.is_empty() && ins.is_empty() {
+            return Ok(());
+        }
+        self.pager.note_write();
+        let r = self.apply_index_sorted_inner(dels, ins);
+        if r.is_err() {
+            self.pager.note_journal_invalidated();
+        }
+        r
+    }
+
+    fn apply_index_sorted_inner(
+        &mut self,
+        dels: &[(Vec<u8>, i64)],
+        ins: &[(Vec<u8>, i64)],
+    ) -> Result<()> {
+        let mut pin: Option<IndexSweepPin> = None;
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < dels.len() || j < ins.len() {
+            let take_del = j >= ins.len()
+                || (i < dels.len() && (&dels[i].0[..], dels[i].1) <= (&ins[j].0[..], ins[j].1));
+            if take_del {
+                self.sweep_apply_one(&mut pin, &dels[i].0, dels[i].1, false)?;
+                i += 1;
+            } else {
+                self.sweep_apply_one(&mut pin, &ins[j].0, ins[j].1, true)?;
+                j += 1;
+            }
         }
         Ok(())
     }
@@ -11103,35 +11175,7 @@ impl<'a> Btree<'a> {
     fn insert_index_sorted_inner(&mut self, entries: &[(Vec<u8>, i64)]) -> Result<()> {
         let mut pin: Option<IndexSweepPin> = None;
         for (key, rowid) in entries {
-            let mut handled = false;
-            if let Some(mut p) = pin.take() {
-                if !p.empty && (&key[..], *rowid) <= (&p.max_key[..], p.max_rowid) {
-                    match self.sweep_insert_in_pinned(&mut p, key, *rowid)? {
-                        SweepTry::Done { pin_alive: true } => {
-                            pin = Some(p);
-                            handled = true;
-                        }
-                        SweepTry::Done { pin_alive: false } => handled = true,
-                        SweepTry::Declined => {}
-                    }
-                }
-            }
-            if handled {
-                continue;
-            }
-            if let Some(mut p) = self.find_index_leaf_pinned(key, *rowid)? {
-                if !p.empty {
-                    match self.sweep_insert_in_pinned(&mut p, key, *rowid)? {
-                        SweepTry::Done { pin_alive: true } => {
-                            pin = Some(p);
-                            continue;
-                        }
-                        SweepTry::Done { pin_alive: false } => continue,
-                        SweepTry::Declined => {}
-                    }
-                }
-            }
-            self.insert_index(key, *rowid)?;
+            self.sweep_apply_one(&mut pin, key, *rowid, true)?;
         }
         Ok(())
     }
