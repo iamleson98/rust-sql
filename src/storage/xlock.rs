@@ -81,6 +81,38 @@ pub(crate) const READ_BYTE: u64 = 2;
 
 const RANGE_LEN: u64 = 1;
 
+/// Offset of the fold-generation counter in the lock file.
+const FOLD_GEN_OFFSET: u64 = 16;
+
+#[cfg(unix)]
+fn read_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(f, buf, off)
+}
+#[cfg(unix)]
+fn write_at(f: &File, buf: &[u8], off: u64) -> io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(f, buf, off)
+}
+#[cfg(windows)]
+fn read_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_read(f, buf, off)
+}
+#[cfg(windows)]
+fn write_at(f: &File, buf: &[u8], off: u64) -> io::Result<()> {
+    let mut done = 0;
+    while done < buf.len() {
+        done += std::os::windows::fs::FileExt::seek_write(f, &buf[done..], off + done as u64)?;
+    }
+    Ok(())
+}
+#[cfg(not(any(unix, windows)))]
+fn read_at(_f: &File, _buf: &mut [u8], _off: u64) -> io::Result<usize> {
+    Ok(0)
+}
+#[cfg(not(any(unix, windows)))]
+fn write_at(_f: &File, _buf: &[u8], _off: u64) -> io::Result<()> {
+    Ok(())
+}
+
 /// The fd-level mode of one lock byte, as this handle last established
 /// it (userspace mirror of the kernel state — see [`XLock::state`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -185,6 +217,94 @@ impl XLock {
         }
     }
 
+    /// Take a shared lock on `byte`, waiting while another descriptor
+    /// holds it exclusively (a checkpoint folding the log) until
+    /// `deadline`. `Ok(false)` = still held exclusively at the deadline.
+    pub fn lock_shared_wait(&self, byte: u64, deadline: Instant) -> io::Result<bool> {
+        let mut pause = Duration::from_micros(50);
+        loop {
+            if self.ofd(byte, true, false)? {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(Duration::from_millis(5));
+        }
+    }
+
+    /// FOLD GATE: take the READ byte EXCLUSIVELY — it succeeds only when
+    /// no other descriptor (any handle, any process) is inside a
+    /// statement or a read transaction. A checkpoint may then fold the
+    /// log into the main file and reset it even while other handles are
+    /// OPEN: idle handles revalidate their view of the log at their next
+    /// statement start (the freshness probe sees the new generation).
+    /// This handle's own shared READ holds (a transaction that read and
+    /// then wrote) upgrade in place; `release_fold_gate` restores them.
+    pub fn try_fold_gate(&self) -> io::Result<bool> {
+        let mut st = self.state.lock();
+        let idx = READ_BYTE as usize;
+        if st.modes[idx] == Mode::Exclusive {
+            return Ok(true);
+        }
+        #[cfg(windows)]
+        if st.modes[idx] == Mode::Shared {
+            // No in-place upgrade on Windows: decline (the fold defers).
+            return Ok(false);
+        }
+        let r = self.raw_ofd(READ_BYTE, false, false);
+        if matches!(r, Ok(true)) {
+            st.modes[idx] = Mode::Exclusive;
+        }
+        r
+    }
+
+    /// End a fold gate: back to shared when this handle still has READ
+    /// holds, else unlocked.
+    pub fn release_fold_gate(&self) -> io::Result<()> {
+        let mut st = self.state.lock();
+        let idx = READ_BYTE as usize;
+        if st.modes[idx] != Mode::Exclusive {
+            return Ok(());
+        }
+        if st.read_holds > 0 {
+            let r = self.raw_ofd(READ_BYTE, true, false);
+            if matches!(r, Ok(true)) {
+                st.modes[idx] = Mode::Shared;
+            }
+            r.map(|_| ())
+        } else {
+            let r = self.raw_ofd(READ_BYTE, false, true);
+            if r.is_ok() {
+                st.modes[idx] = Mode::None;
+            }
+            r.map(|_| ())
+        }
+    }
+
+    /// The FOLD GENERATION (8 bytes at offset 16 of the lock file — past
+    /// the three lock bytes, which carry no data): bumped by every
+    /// checkpoint that rewrites main-file pages. A handle whose view of
+    /// the log is idle compares it at statement start: a change means
+    /// the main file under its cached pages was rewritten (possibly with
+    /// the log removed), so the view must be rebuilt. 0 when absent.
+    pub fn fold_generation(&self) -> u64 {
+        let mut b = [0u8; 8];
+        match read_at(&self.file, &mut b, FOLD_GEN_OFFSET) {
+            Ok(8) => u64::from_le_bytes(b),
+            _ => 0,
+        }
+    }
+
+    /// Advance the fold generation (the checkpointer holds the WRITE
+    /// byte, so bumps never race each other). Returns the new value.
+    pub fn bump_fold_generation(&self) -> u64 {
+        let next = self.fold_generation().wrapping_add(1);
+        let _ = write_at(&self.file, &next.to_le_bytes(), FOLD_GEN_OFFSET);
+        next
+    }
+
     /// Release the lock on `byte` (whatever mode this fd held there).
     pub fn unlock(&self, byte: u64) -> io::Result<()> {
         self.ofd(byte, false, true).map(|_| ())
@@ -226,7 +346,7 @@ impl XLock {
         if byte == READ_BYTE {
             if unlock {
                 st.read_holds = st.read_holds.saturating_sub(1);
-                if st.read_holds == 0 && st.modes[idx] != Mode::None {
+                if st.read_holds == 0 && st.modes[idx] == Mode::Shared {
                     let r = self.raw_ofd(byte, false, true).map(|_| ());
                     if r.is_ok() {
                         st.modes[idx] = Mode::None;
@@ -235,9 +355,10 @@ impl XLock {
                 }
                 return Ok(true);
             }
-            if st.modes[idx] == Mode::Shared {
-                // Held (possibly by an overlapping statement guard) — a
-                // shared take never conflicts with it.
+            if st.modes[idx] == Mode::Shared || st.modes[idx] == Mode::Exclusive {
+                // Held (possibly by an overlapping statement guard, or by
+                // this handle's own fold gate) — a shared take never
+                // conflicts with it.
                 st.read_holds += 1;
                 return Ok(true);
             }
@@ -493,6 +614,24 @@ impl XSoleGuard {
 
     pub(crate) fn none() -> Self {
         Self { lock: None }
+    }
+}
+
+/// Exclusive-READ guard held across a non-sole checkpoint's fold +
+/// reset (see [`XLock::try_fold_gate`]).
+pub struct XFoldGuard {
+    lock: std::sync::Arc<XLock>,
+}
+
+impl XFoldGuard {
+    pub(crate) fn new(lock: std::sync::Arc<XLock>) -> Self {
+        Self { lock }
+    }
+}
+
+impl Drop for XFoldGuard {
+    fn drop(&mut self) {
+        let _ = self.lock.release_fold_gate();
     }
 }
 

@@ -959,6 +959,9 @@ pub struct Pager {
     /// never-ending streak is a frozen reader — see the probe's
     /// power-of-ten trace). Reset on every absorbing or no-growth probe.
     xlock_empty_absorb_streak: std::sync::atomic::AtomicU64,
+    /// The lock file's fold generation as this handle's view last saw it
+    /// (see `XLock::fold_generation`).
+    seen_fold_gen: std::sync::atomic::AtomicU64,
     /// DELETE-mode mid-transaction page spill (see `DeleteSpill`):
     /// `None` until the first cache-pressure eviction of a dirty page
     /// during a write transaction; dropped (file deleted) at COMMIT
@@ -2031,13 +2034,20 @@ impl Drop for Pager {
                 // after an eprintln'd fold failure.)
                 let folded = match self.xlock_sole_gate() {
                     Ok(Some(_sole)) => self.checkpoint_wal_locked(true).is_ok(),
-                    _ => false,
+                    // Other handles open but none mid-statement: fold too
+                    // (they revalidate at their next statement).
+                    _ => match self.xlock_fold_gate() {
+                        Ok(Some(_fold)) => {
+                            let ok = self.checkpoint_wal_locked(true).is_ok();
+                            self.note_fold();
+                            ok
+                        }
+                        _ => false,
+                    },
                 };
                 if !folded {
-                    eprintln!(
-                        "close-time WAL checkpoint deferred (frames stay durable in the \
-                         sidecar; the next sole close or open replays them)"
-                    );
+                    // Deferred: the frames stay durable in the sidecar and
+                    // the next fold (or open) replays them.
                 } else {
                     // Ownership-checked removal: delete the sidecar only
                     // when the path still holds OUR file (same inode). A
@@ -2466,6 +2476,7 @@ impl Pager {
             xlock: std::sync::OnceLock::new(),
             xlock_write_held: AtomicBool::new(false),
             xlock_empty_absorb_streak: AtomicU64::new(0),
+            seen_fold_gen: AtomicU64::new(0),
             delete_spill: Mutex::new(None),
             ckpt_scratch: Mutex::new(Vec::new()),
             del_spill_arena: Mutex::new(Vec::new()),
@@ -4886,14 +4897,68 @@ impl Pager {
     /// overwrites those very pages. Writers skip it entirely (they hold
     /// WRITE, so no foreign checkpoint can exist), which keeps the
     /// single-connection fast path lock-free per statement.
-    pub fn xlock_begin_read(&self) -> Option<crate::storage::xlock::XReadGuard> {
-        let xl = self.xlock.get().cloned()?;
+    pub fn xlock_begin_read(&self) -> Result<Option<crate::storage::xlock::XReadGuard>> {
+        let Some(xl) = self.xlock.get().cloned() else {
+            return Ok(None);
+        };
         if self.xlock_is_writer() {
-            return None;
+            return Ok(None);
         }
-        match xl.lock_shared(crate::storage::xlock::READ_BYTE) {
-            Ok(()) => Some(crate::storage::xlock::XReadGuard::new(xl)),
-            Err(_) => None, // see XReadGuard docs: protocol best-effort on lock-file errors
+        // A checkpoint folding the log holds the byte EXCLUSIVELY for the
+        // fold + reset (milliseconds): wait it out rather than read the
+        // main file it is rewriting.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        match xl.lock_shared_wait(crate::storage::xlock::READ_BYTE, deadline) {
+            Ok(true) => Ok(Some(crate::storage::xlock::XReadGuard::new(xl))),
+            Ok(false) => Err(Error::Transaction(
+                "database is locked (SQLITE_BUSY): a checkpoint is folding the log".into(),
+            )),
+            Err(_) => Ok(None), // see XReadGuard docs: protocol best-effort on lock-file errors
+        }
+    }
+
+    /// A checkpoint rewrote main-file pages: advance the shared fold
+    /// generation (other handles rebuild their view at their next
+    /// statement) and record it as seen — this handle's own view is the
+    /// folded state.
+    fn note_fold(&self) {
+        if let Some(xl) = self.xlock.get() {
+            let g = xl.bump_fold_generation();
+            self.seen_fold_gen.store(g, Ordering::Release);
+        }
+    }
+
+    /// Rebuild this handle's view of the log from scratch: a fresh shared
+    /// open of the sidecar (or none — the main file is then the whole
+    /// committed state), an empty cache, and the header re-read.
+    fn reopen_wal_view(&self) -> Result<()> {
+        let _gate = self.install_gate_write();
+        let mut fresh = crate::storage::wal::Wal::open_shared(&self.path, self.page_size())?;
+        let map = fresh.committed_page_map()?.into_iter().collect();
+        {
+            let mut g = self.wal.write();
+            if let Some(state) = g.as_mut() {
+                state.wal = fresh;
+                state.map = map;
+            }
+        }
+        self.cache.write().clear();
+        self.lru.lock().clear();
+        self.reload_header_from_committed()
+    }
+
+    /// NON-SOLE CHECKPOINT GATE: take the READ byte exclusively — no
+    /// other handle (any process) is inside a statement or a read
+    /// transaction, so the fold may rewrite main-file pages and reset the
+    /// log while they stay open (each revalidates at its next statement).
+    fn xlock_fold_gate(&self) -> Result<Option<crate::storage::xlock::XFoldGuard>> {
+        let Some(xl) = self.xlock.get().cloned() else {
+            return Ok(None);
+        };
+        if xl.try_fold_gate().map_err(Error::Io)? {
+            Ok(Some(crate::storage::xlock::XFoldGuard::new(xl)))
+        } else {
+            Ok(None)
         }
     }
 
@@ -4994,10 +5059,50 @@ impl Pager {
         let Some(expected) = self.xlock_expected_sidecar_len() else {
             return Ok(false);
         };
+        // Another handle FOLDED the log into the main file since this view
+        // was built: the cached pages (and possibly the log offsets) are
+        // stale even when this view held no frames at all.
+        if let Some(xl) = self.xlock.get() {
+            let g = xl.fold_generation();
+            if g != self.seen_fold_gen.load(Ordering::Acquire) {
+                xlock_trace!(|| format!("resync: fold generation moved to {g} -> full reopen"));
+                self.reopen_wal_view()?;
+                self.seen_fold_gen.store(g, Ordering::Release);
+                return Ok(true);
+            }
+        }
         let sidecar = crate::storage::wal::wal_path_for(&self.path);
         let meta = match std::fs::metadata(&sidecar) {
             Ok(m) => m,
-            Err(_) => return Ok(false),
+            Err(e) => {
+                // FOLDED AND REMOVED by another handle (its close-time
+                // fold runs while idle handles stay open): when this
+                // handle's view still holds frames of the removed log,
+                // the main file is now the committed truth — reopen the
+                // view exactly like a replaced sidecar.
+                let has_frames = expected > crate::storage::wal::WAL_HEADER_SIZE as u64;
+                if e.kind() != std::io::ErrorKind::NotFound || !has_frames {
+                    return Ok(false);
+                }
+                xlock_trace!(
+                    || "resync: sidecar REMOVED under a live view -> full reopen".to_string()
+                );
+                let _gate = self.install_gate_write();
+                let mut fresh =
+                    crate::storage::wal::Wal::open_shared(&self.path, self.page_size())?;
+                let map = fresh.committed_page_map()?.into_iter().collect();
+                {
+                    let mut g = self.wal.write();
+                    if let Some(state) = g.as_mut() {
+                        state.wal = fresh;
+                        state.map = map;
+                    }
+                }
+                self.cache.write().clear();
+                self.lru.lock().clear();
+                self.reload_header_from_committed()?;
+                return Ok(true);
+            }
         };
         // CONTENT-AWARE probe — length alone cannot distinguish "nobody
         // appended" from "the log was RESET under us". Two reset shapes
@@ -5276,6 +5381,8 @@ impl Pager {
             );
             xl.lock_shared(crate::storage::xlock::LIVE_BYTE)
                 .map_err(crate::error::Error::Io)?;
+            self.seen_fold_gen
+                .store(xl.fold_generation(), Ordering::Release);
             let _ = self.xlock.set(xl);
         }
         // Flush pending dirty pages in DELETE mode first.
@@ -5536,10 +5643,18 @@ impl Pager {
             // stay durable in the sidecar; the next sole generation folds
             // them — the close-time teardown or an explicit
             // `checkpoint_wal_now` from a sole moment).
-            let r = match self.xlock_sole_gate()? {
-                Some(_sole) => {
-                    xlock_trace!(|| "checkpoint: sole gate OPEN — folding + resetting".to_string());
-                    self.checkpoint_wal_locked(false)
+            let fold = match self.xlock_sole_gate()? {
+                Some(sole) => Some((Some(sole), None)),
+                None => self.xlock_fold_gate()?.map(|f| (None, Some(f))),
+            };
+            let r = match fold {
+                Some(_gates) => {
+                    xlock_trace!(
+                        || "checkpoint: sole / fold gate OPEN — folding + resetting".to_string()
+                    );
+                    let r = self.checkpoint_wal_locked(false);
+                    self.note_fold();
+                    r
                 }
                 None => {
                     xlock_trace!(|| {

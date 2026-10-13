@@ -398,6 +398,11 @@ pub struct Database {
     /// COMMIT skips rewriting a root the rows no longer hold — the file
     /// kept a stale root and a reopen read the wrong tree).
     savepoint_roots: Mutex<Vec<HashMap<String, u32>>>,
+    /// The cross-process READ byte held for a whole explicit transaction
+    /// on a non-writer handle (taken at its first statement, released at
+    /// COMMIT / ROLLBACK): between statements a checkpoint must not fold
+    /// and reset the log under the transaction's view of it.
+    txn_read_guards: Mutex<Vec<crate::storage::xlock::XReadGuard>>,
     /// A ROLLBACK's pre-DDL catalog awaiting reinstatement once the
     /// statement that rolled back returns (see `execute_cached_stmt`).
     catalog_restore_pending: Mutex<Option<Arc<Catalog>>>,
@@ -2610,6 +2615,7 @@ impl Database {
             txn_catalog_snap: Mutex::new(None),
             savepoint_catalogs: Mutex::new(Vec::new()),
             savepoint_roots: Mutex::new(Vec::new()),
+            txn_read_guards: Mutex::new(Vec::new()),
             catalog_restore_pending: Mutex::new(None),
             halt_rollback: std::sync::atomic::AtomicBool::new(false),
             change_counts: Default::default(),
@@ -3016,6 +3022,7 @@ impl Database {
             txn_catalog_snap: Mutex::new(None),
             savepoint_catalogs: Mutex::new(Vec::new()),
             savepoint_roots: Mutex::new(Vec::new()),
+            txn_read_guards: Mutex::new(Vec::new()),
             catalog_restore_pending: Mutex::new(None),
             halt_rollback: std::sync::atomic::AtomicBool::new(false),
             change_counts: Default::default(),
@@ -7683,6 +7690,7 @@ impl Database {
                     // savepoint inside a later BEGIN commit it.
                     self.savepoint_maps.lock().clear();
                     self.savepoint_roots.lock().clear();
+                    self.txn_read_guards.lock().clear();
                     self.savepoint_txn.store(false, Ordering::Release);
                     self.txn_owner_tid.store(0, Ordering::Release);
                     // Committed-view entries: `clear_savepoints` (run by
@@ -8085,8 +8093,26 @@ impl Database {
         // If a resync below fails on a hard error (sidecar unreadable),
         // the statement must not run against silently stale state —
         // propagate. `?` on the outer call sites.
+        if !in_txn {
+            // A transaction's READ hold that outlived it (an exit path
+            // that skipped the epilogue) is released here.
+            self.txn_read_guards.lock().clear();
+        }
         if !self.pager.xlock_is_writer() {
-            if !in_txn {
+            // READ FIRST, then the freshness probe: a checkpoint cannot
+            // fold and reset the log between the probe and the reads.
+            // Inside an explicit transaction the byte is held until it
+            // ends, and the probe runs once — at its first statement,
+            // where the transaction's snapshot begins.
+            let first_in_txn = in_txn && self.txn_read_guards.lock().is_empty();
+            if !in_txn || first_in_txn {
+                if let Some(g) = self.pager.xlock_begin_read()? {
+                    if in_txn {
+                        self.txn_read_guards.lock().push(g);
+                    } else {
+                        guards.push(g);
+                    }
+                }
                 // Foreign committed state advanced: bump the cache
                 // generation — the count memo and the advisory join /
                 // leaf caches key on `write_epoch` and must all miss
@@ -8099,9 +8125,6 @@ impl Database {
                     self.refresh_foreign_roots_and_schema()?;
                 }
             }
-            if let Some(g) = self.pager.xlock_begin_read() {
-                guards.push(g);
-            }
         }
         // Attached engines: a mixed-schema statement walks THEIR pagers
         // too — the same freshness + read byte, per pager.
@@ -8109,14 +8132,14 @@ impl Database {
             for (_, eng) in self.attached_snapshot() {
                 if let Some(db) = eng.try_read() {
                     if !db.pager.xlock_is_writer() {
+                        if let Some(g) = db.pager.xlock_begin_read()? {
+                            guards.push(g);
+                        }
                         if !db.in_transaction.load(Ordering::Acquire)
                             && db.pager.resync_foreign_commits_if_stale()?
                         {
                             db.write_epoch.fetch_add(1, Ordering::AcqRel);
                             db.refresh_foreign_roots_and_schema()?;
-                        }
-                        if let Some(g) = db.pager.xlock_begin_read() {
-                            guards.push(g);
                         }
                     }
                 }
@@ -10318,6 +10341,7 @@ impl Database {
                     self.pager.clear_savepoints();
                     self.savepoint_maps.lock().clear();
                     self.savepoint_roots.lock().clear();
+                    self.txn_read_guards.lock().clear();
                     self.savepoint_catalogs.lock().clear();
                     *self.txn_catalog_snap.lock() = None;
                     self.savepoint_txn.store(false, Ordering::Release);

@@ -239,6 +239,19 @@ fn xproc_helper_dispatch() {
             let _ = db.query("SELECT COUNT(*) FROM sqlite_master", []);
             write_marker(&dir, "p2-ready");
             assert!(wait_gone(&dir, "p2-ready", Duration::from_secs(60)));
+            // Read AFTER the writer is gone (its close-time fold may have
+            // folded and removed the log under this handle): the view
+            // must revalidate — a consistent tree, and the final count
+            // reported back to the parent.
+            let n: i64 = match db.query("SELECT COUNT(*) FROM t", []) {
+                Ok(r) => r[0][0].as_integer(),
+                Err(_) => -1,
+            };
+            let ok = format!(
+                "{:?}",
+                db.query("PRAGMA integrity_check", []).unwrap_or_default()
+            ) == "[[Text(\"ok\")]]";
+            std::fs::write(marker(&dir, "p2-count"), format!("{n} {ok}")).unwrap();
         }
         _ => panic!("unknown role {role}"),
     }
@@ -499,12 +512,14 @@ fn concurrent_reader_never_sees_torn_or_lost_state() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// While a READER process holds the file open, the writer's close-time
-/// fold DEFERS (the sole-handle gate): the sidecar survives, the data
-/// stays correct through the reader's handle, and the next sole open
-/// folds it.
+/// While an IDLE reader process holds the file open, the writer's
+/// close-time fold proceeds — no handle is inside a statement (the READ
+/// byte is free), and the reader revalidates its view of the log at its
+/// next statement (SQLite folds alongside open readers too; it used to
+/// defer here, and a pair of long-lived handles grew the log forever).
+/// The data stays correct through the reader's handle and on reopen.
 #[test]
-fn close_time_checkpoint_defers_while_reader_open() {
+fn close_time_checkpoint_folds_while_idle_reader_open() {
     let dir = tempdir("defer");
     let db_path = dir.join(DB_NAME);
     let mut writer = spawn_helper(&dir, "writer_hammer");
@@ -513,26 +528,16 @@ fn close_time_checkpoint_defers_while_reader_open() {
     let mut reader = spawn_helper(&dir, "plain_reader");
     assert!(wait_marker(&dir, "p2-ready", Duration::from_secs(60)));
 
-    // Stop the writer: its close-time fold must DEFER (reader holds the
-    // LIVE byte), leaving committed frames durable in the sidecar.
     write_marker(&dir, "stop");
     assert!(wait_marker(&dir, "p1-done", Duration::from_secs(60)));
     let _ = writer.wait();
     std::thread::sleep(Duration::from_millis(200));
-    let sidecar = {
-        let mut p = db_path.as_os_str().to_os_string();
-        p.push("-wal");
-        PathBuf::from(p)
-    };
-    assert!(
-        sidecar.exists(),
-        "deferred fold must leave the sidecar (frames durable)"
-    );
 
     // The reader still reads consistent state through its open handle.
     // (It will exit when its marker is removed.)
     std::fs::remove_file(marker(&dir, "p2-ready")).unwrap();
-    let _ = reader.wait();
+    assert!(reader.wait().unwrap().success());
+    let reported = std::fs::read_to_string(marker(&dir, "p2-count")).unwrap();
 
     // Next sole open: recovery replays the sidecar; the close-time fold
     // lands; the state is identical.
@@ -542,6 +547,11 @@ fn close_time_checkpoint_defers_while_reader_open() {
         .unwrap()
         .as_integer();
     assert!(n > 0);
+    assert_eq!(
+        reported,
+        format!("{n} true"),
+        "the open reader's view after the fold"
+    );
     db.execute("PRAGMA integrity_check", []).unwrap();
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
