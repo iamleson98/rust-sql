@@ -392,6 +392,12 @@ pub struct Database {
     /// slot i holds the catalog at the first DDL after savepoint i (the
     /// state ROLLBACK TO i restores); `None` = no DDL since.
     savepoint_catalogs: Mutex<Vec<Option<Arc<Catalog>>>>,
+    /// Per-savepoint `schema_root_pages` snapshots, aligned with
+    /// `savepoint_maps`: ROLLBACK TO reverts the schema rows' pages, so
+    /// the tracker of what those rows say must revert with them (else
+    /// COMMIT skips rewriting a root the rows no longer hold — the file
+    /// kept a stale root and a reopen read the wrong tree).
+    savepoint_roots: Mutex<Vec<HashMap<String, u32>>>,
     /// A ROLLBACK's pre-DDL catalog awaiting reinstatement once the
     /// statement that rolled back returns (see `execute_cached_stmt`).
     catalog_restore_pending: Mutex<Option<Arc<Catalog>>>,
@@ -2603,6 +2609,7 @@ impl Database {
             savepoint_maps: Mutex::new(Vec::new()),
             txn_catalog_snap: Mutex::new(None),
             savepoint_catalogs: Mutex::new(Vec::new()),
+            savepoint_roots: Mutex::new(Vec::new()),
             catalog_restore_pending: Mutex::new(None),
             halt_rollback: std::sync::atomic::AtomicBool::new(false),
             change_counts: Default::default(),
@@ -3008,6 +3015,7 @@ impl Database {
             savepoint_maps: Mutex::new(Vec::new()),
             txn_catalog_snap: Mutex::new(None),
             savepoint_catalogs: Mutex::new(Vec::new()),
+            savepoint_roots: Mutex::new(Vec::new()),
             catalog_restore_pending: Mutex::new(None),
             halt_rollback: std::sync::atomic::AtomicBool::new(false),
             change_counts: Default::default(),
@@ -7674,6 +7682,7 @@ impl Database {
                     // savepoint-started flag left set made RELEASE of a
                     // savepoint inside a later BEGIN commit it.
                     self.savepoint_maps.lock().clear();
+                    self.savepoint_roots.lock().clear();
                     self.savepoint_txn.store(false, Ordering::Release);
                     self.txn_owner_tid.store(0, Ordering::Release);
                     // Committed-view entries: `clear_savepoints` (run by
@@ -10177,6 +10186,9 @@ impl Database {
             .lock()
             .push(std::sync::Arc::new((**self.maps.read()).clone()));
         self.savepoint_catalogs.lock().push(None);
+        self.savepoint_roots
+            .lock()
+            .push(self.schema_root_pages.lock().clone());
         Ok(())
     }
 
@@ -10256,6 +10268,13 @@ impl Database {
                     self.resync_vtabs_after_rollback();
                 }
                 drop(maps_snaps);
+                {
+                    let mut roots = self.savepoint_roots.lock();
+                    roots.truncate(depth);
+                    if let Some(r) = roots.last() {
+                        *self.schema_root_pages.lock() = r.clone();
+                    }
+                }
                 // DDL since the savepoint: its pre-DDL catalog comes back
                 // (the savepoint stays open, with no DDL since).
                 let snap = {
@@ -10293,10 +10312,12 @@ impl Database {
                 let user_remaining = remaining.saturating_sub(internal_levels);
                 self.savepoint_maps.lock().truncate(user_remaining);
                 self.savepoint_catalogs.lock().truncate(user_remaining);
+                self.savepoint_roots.lock().truncate(user_remaining);
                 if remaining == 0 && self.savepoint_txn.load(Ordering::Acquire) {
                     // Outermost savepoint released -> COMMIT.
                     self.pager.clear_savepoints();
                     self.savepoint_maps.lock().clear();
+                    self.savepoint_roots.lock().clear();
                     self.savepoint_catalogs.lock().clear();
                     *self.txn_catalog_snap.lock() = None;
                     self.savepoint_txn.store(false, Ordering::Release);
