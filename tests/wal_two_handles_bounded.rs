@@ -59,3 +59,65 @@ fn wal_stays_bounded_with_two_open_handles() {
     // 40 updates x ~1.5 MB of frames each would be ~60 MB unfolded.
     assert!(max_wal < 8 << 20, "WAL grew to {max_wal} bytes");
 }
+
+/// SQLite's tkt-313723c356.test through the Tcl harness: a handle that
+/// reads only through `query_with_columns` (the column-named surface)
+/// skipped the cross-process read scope, so after a second handle's
+/// close-time fold rewrote the main file and removed the log, it kept
+/// reading pages through its view of the removed log — "index i1 tree
+/// is corrupt: failed to fill whole buffer" on a perfectly good file.
+#[test]
+fn query_with_columns_sees_another_handles_fold() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.db");
+    let saved = dir.path().join("saved");
+    std::fs::create_dir(&saved).unwrap();
+    {
+        let mut db = Database::open(&path).unwrap();
+        for s in [
+            "PRAGMA page_size = 1024",
+            "PRAGMA journal_mode = WAL",
+            "CREATE TABLE t1(a, b)",
+            "CREATE INDEX i1 ON t1(a, b)",
+            "INSERT INTO t1 VALUES(randomblob(400), randomblob(400))",
+        ] {
+            db.execute(s, ()).unwrap();
+        }
+        for _ in 0..4 {
+            db.execute(
+                "INSERT INTO t1 SELECT randomblob(400), randomblob(400) FROM t1",
+                (),
+            )
+            .unwrap();
+        }
+        // Snapshot while open: the committed rows live in the log.
+        for e in std::fs::read_dir(dir.path()).unwrap() {
+            let e = e.unwrap();
+            if e.file_type().unwrap().is_file() {
+                std::fs::copy(e.path(), saved.join(e.file_name())).unwrap();
+            }
+        }
+    }
+    for e in std::fs::read_dir(dir.path()).unwrap() {
+        let e = e.unwrap();
+        if e.file_type().unwrap().is_file() {
+            std::fs::remove_file(e.path()).unwrap();
+        }
+    }
+    for e in std::fs::read_dir(&saved).unwrap() {
+        let e = e.unwrap();
+        std::fs::copy(e.path(), dir.path().join(e.file_name())).unwrap();
+    }
+    let db = Database::open(&path).unwrap();
+    let mut db2 = Database::open(&path).unwrap();
+    db.query_with_columns("SELECT * FROM t1", ()).unwrap();
+    db2.execute("UPDATE t1 SET a = randomblob(399)", ())
+        .unwrap();
+    drop(db2);
+    let (_, r) = db
+        .query_with_columns("SELECT count(*), min(length(a)) FROM t1", ())
+        .unwrap();
+    assert_eq!(r[0], vec![Value::Integer(16), Value::Integer(399)]);
+    let (_, r) = db.query_with_columns("PRAGMA integrity_check", ()).unwrap();
+    assert_eq!(format!("{r:?}"), "[[Text(\"ok\")]]");
+}

@@ -8807,6 +8807,11 @@ impl Database {
         {
             let _ = self.pager.flush();
         }
+        // Cross-process read scope (freshness + READ byte), as in
+        // `query`: without it a handle that only ever read through this
+        // surface kept its view of a log another handle had folded and
+        // removed — reads past the end of the main file.
+        let _xread = self.xread_scope()?;
         let cached = self.get_or_cache_stmt(sql)?;
         // ATTACH routing (see query_cached_stmt): the statement runs on
         // its owning engine or through the foreign channel.

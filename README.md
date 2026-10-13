@@ -19,6 +19,8 @@ An embedded SQL database written from scratch in Rust, built to match SQLite's b
 
 ## Remaining gaps
 
+- **SQLite's own test suites** (run weekly and on demand by the `SQLite suites` workflow): sqllogictest passes in full (5.7M queries); in SQLite's Tcl suite, about 14% of the tests that pass on SQLite still fail here, mostly in 3 files that time out, plus a ~1% tail across about 370 files. The fault-injection Tcl files aren't run yet.
+
 - **Unspecified results can differ**: which of several equal values (`1` / `1.0`, `'a'` / `'A'` under NOCASE) represents a `DISTINCT` / `GROUP BY` group or a `min()`/`max()`, and the order of rows that tie in `ORDER BY`. SQLite doesn't define these either.
 - **Error timing can depend on the plan**: an expression that raises an error inside a join condition, or under `ORDER BY … LIMIT`, can fail here where SQLite's chosen plan never evaluates it. Rows returned never differ.
 - **Storage**: the on-disk format is rustqlite's own. SQLite files are read and written as an interchange format, not used live. WAL-mode files support multiple processes; rollback-journal files support only one.

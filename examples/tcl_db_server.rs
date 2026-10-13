@@ -54,6 +54,16 @@ fn main() {
         }
         let text =
             |i: usize| String::from_utf8_lossy(fields.get(i).map_or(&[][..], |v| v)).into_owned();
+        // TCL_DB_LOG=<file>: append every request (debugging the harness).
+        if let Ok(log) = std::env::var("TCL_DB_LOG") {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log)
+            {
+                let _ = writeln!(f, "{cmd} {handle} {}", text(0).replace('\n', " "));
+            }
+        }
         let reply: Result<Vec<Vec<u8>>, String> = match cmd {
             "OPEN" => {
                 let file = text(0);

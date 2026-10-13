@@ -6,6 +6,7 @@ divergence; tests that fail on both depend on testfixture internals and
 are ignored.
 
     python3 tests/tcl/run.py SQLITE_TEST_DIR [FILE_GLOB...] [-j N] [-o OUT.json]
+                             [--shard I/N]
 """
 import argparse, glob, json, os, re, resource, signal, subprocess, sys, tempfile
 from concurrent.futures import ThreadPoolExecutor
@@ -55,12 +56,17 @@ def main():
     ap.add_argument("--exclude", default=r"malloc|fault|crash|ioerr|oom",
                     help="regex of file names to skip (fault-injection files "
                          "drive testfixture C hooks the shim cannot provide)")
+    ap.add_argument("--shard", default=None,
+                    help="I/N: run only every N-th file starting at I (CI fan-out)")
     a = ap.parse_args()
     files = []
     for g in a.files or ["*.test"]:
         files += glob.glob(os.path.join(a.testdir, g))
     files = sorted(f for f in set(files)
                    if not (a.exclude and re.search(a.exclude, os.path.basename(f))))
+    if a.shard:
+        i, n = (int(x) for x in a.shard.split("/"))
+        files = files[i::n]
 
     def work(f):
         sq, _, _, sq_to = run_one(a.testdir, f, "sqlite", a.timeout)

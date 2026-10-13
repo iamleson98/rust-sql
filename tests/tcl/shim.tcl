@@ -88,6 +88,13 @@ proc sqlite3 {args} {
   set file [lindex $args 1]
   # Options (-vfs, -readonly, ...) are accepted and ignored.
   catch {srv CLOSE $name {}}
+  # The server process keeps the directory it started in; tester.tcl
+  # cds into ./testdir — resolve relative names against the TCL side's
+  # current directory so file operations (forcedelete, db_save, ...) and
+  # the database agree on what "test.db" is.
+  if {$file ne "" && $file ne ":memory:" && ![string match "file:*" $file]} {
+    set file [file normalize $file]
+  }
   srv OPEN $name [list $file]
   set ::shim_null($name) ""
   proc ::$name {method args} [format {
