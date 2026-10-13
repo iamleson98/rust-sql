@@ -7,7 +7,7 @@ are ignored.
 
     python3 tests/tcl/run.py SQLITE_TEST_DIR [FILE_GLOB...] [-j N] [-o OUT.json]
 """
-import argparse, glob, json, os, re, subprocess, sys, tempfile
+import argparse, glob, json, os, re, signal, subprocess, sys, tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -18,18 +18,22 @@ SHIM = os.path.join(HERE, "shim.tcl")
 
 def run_one(testdir, path, backend, timeout):
     with tempfile.TemporaryDirectory(prefix="tcl-") as cwd:
+        # Own process group: on timeout the database server child dies
+        # too (an orphaned server would hold the output pipes open).
+        p = subprocess.Popen(
+            ["tclsh", SHIM, SERVER, backend, testdir, path],
+            cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
         try:
-            p = subprocess.run(
-                ["tclsh", SHIM, SERVER, backend, testdir, path],
-                cwd=cwd, capture_output=True, timeout=timeout,
-            )
-            out = p.stdout.decode("utf-8", "replace")
-            err = p.stderr.decode("utf-8", "replace")
+            o, e = p.communicate(timeout=timeout)
             timed_out = False
-        except subprocess.TimeoutExpired as e:
-            out = (e.stdout or b"").decode("utf-8", "replace")
-            err = (e.stderr or b"").decode("utf-8", "replace")
+        except subprocess.TimeoutExpired:
+            os.killpg(p.pid, signal.SIGKILL)
+            o, e = p.communicate()
             timed_out = True
+        out = o.decode("utf-8", "replace")
+        err = e.decode("utf-8", "replace")
     res = {}
     for line in out.splitlines():
         m = re.match(r"@@(PASS|FAIL) (.*)", line)
@@ -46,20 +50,28 @@ def main():
     ap.add_argument("-j", type=int, default=8)
     ap.add_argument("-o", default=None)
     ap.add_argument("--timeout", type=int, default=300)
+    ap.add_argument("--exclude", default=r"malloc|fault|crash|ioerr|oom",
+                    help="regex of file names to skip (fault-injection files "
+                         "drive testfixture C hooks the shim cannot provide)")
     a = ap.parse_args()
     files = []
     for g in a.files or ["*.test"]:
         files += glob.glob(os.path.join(a.testdir, g))
-    files = sorted(set(files))
+    files = sorted(f for f in set(files)
+                   if not (a.exclude and re.search(a.exclude, os.path.basename(f))))
 
     def work(f):
         sq, _, _, sq_to = run_one(a.testdir, f, "sqlite", a.timeout)
         ours, out, unk, to = run_one(a.testdir, f, "ours", a.timeout)
         diverge = [n for n, r in sq.items() if r == "PASS" and ours.get(n) != "PASS"]
+        # The failing tests' output blocks on `ours` (first 50 only — the
+        # fault-injection files diverge by the thousand).
+        starts = {}
+        for m in re.finditer(r"^(\S+)\.\.\.", out, re.M):
+            starts.setdefault(m.group(1), m.start())
         details = {}
-        for n in diverge:
-            # The failing test's output block on `ours`.
-            i = out.find(n + "...")
+        for n in diverge[:50]:
+            i = starts.get(n, -1)
             details[n] = out[i:i + 1500] if i >= 0 else ("(not reached)" + (" TIMEOUT" if to else ""))
         return f, {
             "sqlite_pass": sum(1 for r in sq.values() if r == "PASS"),

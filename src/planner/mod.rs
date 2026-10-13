@@ -7208,7 +7208,12 @@ impl<'a> Planner<'a> {
         stmt: &SelectStatement,
     ) -> Option<SelectStatement> {
         let with = stmt.with.as_ref()?;
-        if with.recursive {
+        if with.recursive
+            || with
+                .ctes
+                .iter()
+                .any(crate::executor::cte::cte_self_references)
+        {
             return None; // recursive CTEs have their own materialization loop
         }
         let main = match &stmt.body {

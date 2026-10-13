@@ -57,7 +57,10 @@ fn exec_select_with_ctes_meta(
     // body's planning sees it (index ranges, rowid lookups). The
     // modified statement clone carries both the reduced outer WHERE and
     // the augmented bodies.
-    let pushed_stmt: Option<SelectStatement> = if select.with.as_ref().is_some_and(|w| !w.recursive)
+    let pushed_stmt: Option<SelectStatement> = if select
+        .with
+        .as_ref()
+        .is_some_and(|w| !w.recursive && !w.ctes.iter().any(cte_self_references))
     {
         Planner::new(catalog).push_where_into_cte_bodies(select)
     } else {
@@ -102,7 +105,11 @@ pub(crate) fn materialize_ctes(
     let mut map: CteMap = outer_ctes.clone();
     for cte in &with.ctes {
         let name_lc = cte.name.to_ascii_lowercase();
-        let (rows, cols, meta) = if with.recursive {
+        // Any CTE may refer to itself — SQLite does not require the
+        // RECURSIVE keyword (`WITH s(i) AS (SELECT 1 UNION ALL SELECT i+1
+        // FROM s ...)` recurses; it used to read a same-named table or
+        // fail with "no such table: s").
+        let (rows, cols, meta) = if with.recursive || cte_self_references(cte) {
             materialize_recursive_cte(cte, &map, ctx)?
         } else {
             let (res, meta) = exec_select_with_ctes_meta(ctx, &cte.select, &map, Some(&name_lc))?;
@@ -930,6 +937,12 @@ fn split_compound_cte(sel: &SelectStatement, name_lc: &str) -> Result<Option<Rec
 
 /// Whether an arm's FROM reads the table `name_lc` (directly, in a join,
 /// or inside a FROM subquery).
+/// The CTE's body reads the CTE itself (a recursive CTE, with or without
+/// the RECURSIVE keyword).
+pub(crate) fn cte_self_references(cte: &Cte) -> bool {
+    body_reads_table(&cte.select.body, &cte.name.to_ascii_lowercase())
+}
+
 fn body_reads_table(body: &SelectBody, name_lc: &str) -> bool {
     fn te_reads(t: &crate::sql::ast::TableExpression, name_lc: &str) -> bool {
         use crate::sql::ast::TableExpression as T;

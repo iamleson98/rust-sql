@@ -56,6 +56,72 @@ fn validate_trigger_first_fire(
     Ok(())
 }
 
+/// A trigger's WHEN clause and body with SQLite's double-quoted-string
+/// fallback applied: each `"name"` that resolves to no column (NEW/OLD
+/// and the trigger table in scope) is the string 'name' — the CREATE
+/// TRIGGER text re-parses with it as a literal. Anything else that fails
+/// to resolve is kept as written (it errors at first fire, as in SQLite).
+pub(crate) fn trigger_dqs(
+    catalog: &crate::schema::Catalog,
+    create_sql: &str,
+    when_clause: Option<crate::sql::ast::Expr>,
+    body: Vec<crate::sql::ast::Statement>,
+) -> (
+    Option<crate::sql::ast::Expr>,
+    Vec<crate::sql::ast::Statement>,
+) {
+    use crate::sql::ast::{CreateStatement, Statement};
+    let (mut when_clause, mut body) = (when_clause, body);
+    let mut literals: Vec<String> = Vec::new();
+    loop {
+        let Ok((Statement::Create(CreateStatement::Trigger(ct)), seen)) =
+            crate::sql::parser::parse_dqs(create_sql, &literals)
+        else {
+            return (when_clause, body);
+        };
+        if seen.is_empty() {
+            return (when_clause, body);
+        }
+        let Some(table) = catalog.get_table(&ct.table) else {
+            return (when_clause, body);
+        };
+        let probe = crate::schema::Trigger {
+            name: ct.name.clone(),
+            table: ct.table.clone(),
+            when: ct.when,
+            events: ct.events.clone(),
+            for_each_row: ct.for_each_row,
+            when_clause: when_clause.clone(),
+            body: body.clone(),
+            create_sql: create_sql.to_string(),
+            bound_schema: None,
+            dormant: false,
+            has_foreign_refs: false,
+            validated: std::sync::atomic::AtomicBool::new(false),
+        };
+        let name = match validate_trigger_first_fire(catalog, &probe, &table) {
+            Err(crate::error::Error::NotFound(m)) => {
+                m.strip_prefix("no such column: ").map(str::to_string)
+            }
+            _ => None,
+        };
+        let Some(name) = name else {
+            return (when_clause, body);
+        };
+        if !seen.contains(&name) || literals.contains(&name) || literals.len() >= 64 {
+            return (when_clause, body);
+        }
+        literals.push(name);
+        match crate::sql::parser::parse_dqs(create_sql, &literals) {
+            Ok((Statement::Create(CreateStatement::Trigger(t2)), _)) => {
+                when_clause = t2.when_clause;
+                body = t2.body;
+            }
+            _ => return (when_clause, body),
+        }
+    }
+}
+
 pub(crate) fn fire_triggers(
     ctx: &mut ExecContext<'_>,
     table: &crate::schema::Table,

@@ -2252,7 +2252,9 @@ fn rewrite_object_sql_column_refs(
                             crate::schema::View {
                                 name: vname.clone(),
                                 columns,
-                                select: *select,
+                                select: crate::planner::namecheck::view_select_dqs(
+                                    catalog, sql, *select,
+                                ),
                                 create_sql: sql.to_string(),
                             },
                         );
@@ -2261,6 +2263,12 @@ fn rewrite_object_sql_column_refs(
                         crate::sql::ast::CreateStatement::Trigger(ct),
                     ) => {
                         let tname2 = ct.name.clone();
+                        let (when_clause, body) = crate::executor::triggers::trigger_dqs(
+                            catalog,
+                            sql,
+                            ct.when_clause,
+                            ct.body,
+                        );
                         catalog.replace_trigger(
                             &tname2,
                             crate::schema::Trigger {
@@ -2269,8 +2277,8 @@ fn rewrite_object_sql_column_refs(
                                 when: ct.when,
                                 events: ct.events,
                                 for_each_row: ct.for_each_row,
-                                when_clause: ct.when_clause,
-                                body: ct.body,
+                                when_clause,
+                                body,
                                 create_sql: sql.to_string(),
                                 bound_schema: None,
                                 dormant: false,
@@ -5738,7 +5746,7 @@ impl Database {
         if self.stmt_cache_capacity == 0 {
             // Caching disabled — parse + plan every time.
             let t0 = profile::now();
-            let stmt = parse(sql)?;
+            let mut stmt = parse(sql)?;
             profile::span(t0, &profile::PARSE_NS);
             // ATTACH-bearing statements: validated (schemas must exist)
             // but never planned here — the router decides per execution.
@@ -5755,7 +5763,7 @@ impl Database {
             }
             // Prepare-time name resolution (SQLite's resolver contract:
             // unknown columns/tables error BEFORE any row is evaluated).
-            self.namecheck(&stmt)?;
+            self.namecheck_dqs(sql, &mut stmt)?;
             // View-DML targets are never planned (the planner resolves
             // tables only): resolve once and carry the target in the
             // entry — same contract as the cached path below. Without
@@ -5819,7 +5827,7 @@ impl Database {
         }
         // Miss: parse + plan. Then decide whether to populate the cache.
         let t0 = profile::now();
-        let stmt = parse(sql)?;
+        let mut stmt = parse(sql)?;
         profile::span(t0, &profile::PARSE_NS);
         // ATTACH-bearing statements are NEVER cached (and never hit):
         // their plans may embed rows materialized from attached engines,
@@ -5836,7 +5844,7 @@ impl Database {
             }));
         }
         // Prepare-time name resolution — see the cache-disabled branch.
-        self.namecheck(&stmt)?;
+        self.namecheck_dqs(sql, &mut stmt)?;
         // WITH-clause statements are NEVER cached (and never hit): their
         // plans embed materialized CTE rows that must be recomputed per
         // execution. Planning here would also be wrong — the caller
@@ -5927,6 +5935,33 @@ impl Database {
         let mut memo = self.last_stmt.write();
         *memo = Some((sql.to_string(), Arc::clone(&entry)));
         Ok(entry)
+    }
+
+    /// [`Self::namecheck`] with SQLite's double-quoted-string fallback: a
+    /// `"name"` that resolves to no column is the string 'name' — the
+    /// statement re-parses with it as a literal and checks again.
+    fn namecheck_dqs(&self, sql: &str, stmt: &mut Statement) -> Result<()> {
+        let mut literals: Vec<String> = Vec::new();
+        loop {
+            let err = match self.namecheck(stmt) {
+                Ok(()) => return Ok(()),
+                Err(e) => e,
+            };
+            let name = match &err {
+                Error::NotFound(m) => m.strip_prefix("no such column: ").map(str::to_string),
+                _ => None,
+            };
+            let Some(name) = name else { return Err(err) };
+            if literals.contains(&name) || literals.len() >= 64 {
+                return Err(err);
+            }
+            let (_, seen) = crate::sql::parser::parse_dqs(sql, &literals)?;
+            if !seen.contains(&name) {
+                return Err(err);
+            }
+            literals.push(name);
+            *stmt = crate::sql::parser::parse_dqs(sql, &literals)?.0;
+        }
     }
 
     /// Prepare-time name resolution: SQLite's resolver contract applied
@@ -7270,11 +7305,19 @@ impl Database {
             // names pass when replaying a foreign schema; the engine's
             // ANALYZE never comes through here (internal call).
             if !self.pending_active() {
-                if let Statement::Create(CreateStatement::Table { name, .. }) = stmt_ref {
-                    if name.name.to_ascii_lowercase().starts_with("sqlite_") {
+                // sqlite3CheckObjectName: every CREATE's object name.
+                let created: Option<&str> = match stmt_ref {
+                    Statement::Create(CreateStatement::Table { name, .. }) => Some(&name.name),
+                    Statement::Create(CreateStatement::Index { name, .. }) => Some(name),
+                    Statement::Create(CreateStatement::View { name, .. }) => Some(&name.name),
+                    Statement::Create(CreateStatement::Trigger(t)) => Some(&t.name),
+                    _ => None,
+                };
+                if let Some(n) = created {
+                    if n.to_ascii_lowercase().starts_with("sqlite_") {
                         return Err(Error::constraint(format!(
                             "object name reserved for internal use: {}",
-                            name.name
+                            n
                         )));
                     }
                 }
@@ -13550,10 +13593,13 @@ impl Database {
                 let mut columns = columns;
                 let mut ctas_rows: Vec<crate::types::Row> = Vec::new();
                 if let Some(select) = &as_select {
-                    let res = {
+                    let (res, meta) = {
                         let mut planner = Planner::new(catalog);
                         let sel_plan = planner.plan_select(select)?;
-                        execute(&sel_plan, ctx)?
+                        // The result set's column types
+                        // (sqlite3ResultSetOfSelect).
+                        let meta = crate::executor::derived::derived_meta(&sel_plan, "");
+                        (execute(&sel_plan, ctx)?, meta)
                     };
                     let width = res.columns.len();
                     if !columns.is_empty() && columns.len() != width {
@@ -13578,33 +13624,32 @@ impl Database {
                             })
                             .collect();
                     }
-                    // Affinity inference from the materialized values.
-                    // SQLite derives CTAS affinity from the select's
-                    // expression affinity; value-kind inference is the
-                    // runtime equivalent and matches for the shapes that
-                    // matter (`SELECT *` keeps the source column kinds,
-                    // all-NULL columns get no affinity).
+                    // Each column takes its expression's affinity — no
+                    // affinity is BLOB — written as SQLite's
+                    // createTableStmt does: "" / TEXT / NUM / INT / REAL.
+                    // The column's collation carries over (in memory; the
+                    // generated DDL does not spell it, as in SQLite).
+                    let typed = meta.filter(|m| m.table.columns.len() == width);
                     for (ci, col) in columns.iter_mut().enumerate() {
                         if !col.type_name.is_empty() {
                             continue;
                         }
-                        for r in &res.rows {
-                            match r.get(ci) {
-                                Some(crate::types::Value::Integer(_)) => {
-                                    col.type_name = "INTEGER".into();
-                                }
-                                Some(crate::types::Value::Real(_)) => {
-                                    col.type_name = "REAL".into();
-                                }
-                                Some(crate::types::Value::Text(_)) => {
-                                    col.type_name = "TEXT".into();
-                                }
-                                Some(crate::types::Value::Blob(_)) => {
-                                    col.type_name = "BLOB".into();
-                                }
-                                _ => continue,
-                            }
-                            break;
+                        let Some(m) = &typed else { break };
+                        let mc = &m.table.columns[ci];
+                        col.type_name = match mc.affinity {
+                            crate::types::Affinity::Text => "TEXT",
+                            crate::types::Affinity::Numeric => "NUM",
+                            crate::types::Affinity::Integer => "INT",
+                            crate::types::Affinity::Real => "REAL",
+                            _ => "",
+                        }
+                        .to_string();
+                        if !mc.collation.is_empty() && !mc.collation.eq_ignore_ascii_case("BINARY")
+                        {
+                            col.constraints
+                                .push(crate::sql::ast::ColumnConstraint::Collate(
+                                    mc.collation.clone(),
+                                ));
                         }
                     }
                     ctas_rows = res.rows;
@@ -13619,18 +13664,32 @@ impl Database {
                 // instead of re-running the query, so the derived
                 // columns round-trip.
                 let create_sql: String = if as_select.is_some() {
-                    let mut sql = format!("CREATE TABLE \"{}\"(", name.name);
+                    // SQLite's createTableStmt: one line when short, else
+                    // one column per line; identifiers quoted only when
+                    // needed (identPut).
+                    let ident_len = |z: &str| z.len() + z.matches('"').count() + 2;
+                    let n = columns
+                        .iter()
+                        .map(|c| ident_len(&c.name) + 5)
+                        .sum::<usize>()
+                        + ident_len(&name.name);
+                    let (sep, sep2, end) = if n < 50 {
+                        ("", ",", ")")
+                    } else {
+                        ("\n  ", ",\n  ", "\n)")
+                    };
+                    let mut sql = String::from("CREATE TABLE ");
+                    crate::sql::lexer::sqlite_ident_put(&mut sql, &name.name);
+                    sql.push('(');
                     for (i, col) in columns.iter().enumerate() {
-                        if i > 0 {
-                            sql.push_str(", ");
-                        }
-                        sql.push_str(&format!("\"{}\"", col.name.replace('"', "\"\"")));
+                        sql.push_str(if i == 0 { sep } else { sep2 });
+                        crate::sql::lexer::sqlite_ident_put(&mut sql, &col.name);
                         if !col.type_name.is_empty() {
                             sql.push(' ');
                             sql.push_str(&col.type_name);
                         }
                     }
-                    sql.push(')');
+                    sql.push_str(end);
                     sql
                 } else {
                     original_sql.to_string()
@@ -14223,7 +14282,11 @@ impl Database {
                 let view = crate::schema::View {
                     name: name.name.clone(),
                     columns,
-                    select: *select,
+                    select: crate::planner::namecheck::view_select_dqs(
+                        catalog,
+                        original_sql,
+                        *select,
+                    ),
                     create_sql: original_sql.to_string(),
                 };
                 // TEMP views are catalog-only (SQLite temp schema).
@@ -14382,14 +14445,20 @@ impl Database {
                         }
                     }
                 }
+                let (when_clause, body) = crate::executor::triggers::trigger_dqs(
+                    catalog,
+                    original_sql,
+                    t.when_clause,
+                    t.body,
+                );
                 let trig = crate::schema::Trigger {
                     name: t.name.clone(),
                     table: t.table.clone(),
                     when: t.when,
                     events: t.events,
                     for_each_row: t.for_each_row,
-                    when_clause: t.when_clause,
-                    body: t.body,
+                    when_clause,
+                    body,
                     create_sql: original_sql.to_string(),
                     // TEMP triggers on ATTACHED tables never reach this
                     // path (intercepted before routing); a non-temp
@@ -15541,6 +15610,7 @@ impl Database {
                         "wal" => ctx.pager.enable_wal()?,
                         "delete" | "truncate" | "persist" | "memory" | "off" => {
                             ctx.pager.disable_wal()?;
+                            ctx.pager.set_journal_label(&mode);
                         }
                         _ => {}
                     }
@@ -16200,16 +16270,7 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
             // databases are always "memory" (SQLite: WAL/DELETE writes
             // on `:memory:` return "memory" — the only modes it
             // supports are memory and off).
-            let ret = if db.pager.is_memory() {
-                // Memory-backed stores (including a pending-adopt
-                // session — its data lives in memory until the first
-                // write adopts the path) report "memory".
-                "memory".to_string()
-            } else if db.pager.wal_enabled() {
-                "wal".to_string()
-            } else {
-                "delete".to_string()
-            };
+            let ret = db.pager.journal_mode_name().to_string();
             return Some(PragmaRows::single("journal_mode", Value::Text(ret.into())));
         }
         return None;
@@ -16605,14 +16666,7 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
             // data lives in memory until the first write adopts the
             // path) report "memory", SQLite's journal_mode for
             // `:memory:` databases.
-            let mode = if pager.is_memory() {
-                "memory"
-            } else if pager.wal_enabled() {
-                "wal"
-            } else {
-                "delete"
-            };
-            Value::Text(mode.into())
+            Value::Text(pager.journal_mode_name().into())
         }
         "codec" => Value::Text(
             pager
@@ -16683,7 +16737,11 @@ fn apply_journal_mode(db: &Database, mode: &str) -> Result<()> {
     // adopted file comes up in its own mode like every native file).
     match mode {
         "wal" => db.pager.enable_wal(),
-        "delete" | "truncate" | "persist" | "memory" | "off" => db.pager.disable_wal(),
+        "delete" | "truncate" | "persist" | "memory" | "off" => {
+            db.pager.disable_wal()?;
+            db.pager.set_journal_label(mode);
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -17673,24 +17731,32 @@ fn load_schema(pager: &Pager, catalog: &mut Catalog) -> Result<()> {
                         ..
                     })) = parse(sql)
                     {
+                        let select =
+                            crate::planner::namecheck::view_select_dqs(catalog, sql, *select);
                         catalog.add_view(crate::schema::View {
                             name: vn.name,
                             columns,
-                            select: *select,
+                            select,
                             create_sql: sql.to_string(),
                         });
                     }
                 }
                 "trigger" => {
                     if let Ok(Statement::Create(CreateStatement::Trigger(t))) = parse(sql) {
+                        let (when_clause, body) = crate::executor::triggers::trigger_dqs(
+                            catalog,
+                            sql,
+                            t.when_clause,
+                            t.body,
+                        );
                         catalog.add_trigger(crate::schema::Trigger {
                             name: t.name,
                             table: t.table,
                             when: t.when,
                             events: t.events,
                             for_each_row: t.for_each_row,
-                            when_clause: t.when_clause,
-                            body: t.body,
+                            when_clause,
+                            body,
                             create_sql: sql.to_string(),
                             bound_schema: None,
                             dormant: false,

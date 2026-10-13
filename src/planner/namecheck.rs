@@ -1694,6 +1694,50 @@ fn validate_delete(ctx: &Ctx<'_>, del: &DeleteStatement, scope: &mut Scope) -> R
 // DDL
 // ---------------------------------------------------------------------------
 
+/// A view body with SQLite's double-quoted-string fallback applied: each
+/// `"name"` in it that resolves to no column becomes the string 'name'
+/// (the CREATE VIEW text re-parses with it as a literal). A body that
+/// fails to resolve for any other reason is kept as written — views
+/// resolve lazily.
+pub(crate) fn view_select_dqs(
+    catalog: &Catalog,
+    create_sql: &str,
+    select: SelectStatement,
+) -> SelectStatement {
+    let mut select = select;
+    let mut literals: Vec<String> = Vec::new();
+    loop {
+        let stmt = Statement::Select(select.clone());
+        let name = match validate_statement(catalog, &[], &stmt) {
+            Err(Error::NotFound(m)) => m.strip_prefix("no such column: ").map(str::to_string),
+            _ => None,
+        };
+        let Some(name) = name else { return select };
+        if literals.contains(&name) || literals.len() >= 64 {
+            return select;
+        }
+        let Ok((_, seen)) = crate::sql::parser::parse_dqs(create_sql, &literals) else {
+            return select;
+        };
+        if !seen.contains(&name) {
+            return select;
+        }
+        literals.push(name);
+        match crate::sql::parser::parse_dqs(create_sql, &literals) {
+            Ok((Statement::Create(CreateStatement::View { select: s, .. }), _)) => select = *s,
+            _ => return select,
+        }
+    }
+}
+
+/// SQLite's notValidImpl: schema expressions may not hold a subquery.
+fn no_subquery(e: &Expr, what: &str) -> Result<()> {
+    if crate::executor::expr_has_subquery(e) {
+        return Err(Error::semantic(format!("subqueries prohibited in {what}")));
+    }
+    Ok(())
+}
+
 fn validate_create(ctx: &Ctx<'_>, c: &CreateStatement, scope: &mut Scope) -> Result<()> {
     match c {
         CreateStatement::Table {
@@ -1720,9 +1764,11 @@ fn validate_create(ctx: &Ctx<'_>, c: &CreateStatement, scope: &mut Scope) -> Res
                 for con in &def.constraints {
                     match con {
                         ColumnConstraint::Check(e) => {
+                            no_subquery(e, "CHECK constraints")?;
                             validate_expr(ctx, e, &mut col_scope, &EMPTY_CTES)?
                         }
                         ColumnConstraint::GeneratedAs { expr, .. } => {
+                            no_subquery(expr, "generated columns")?;
                             validate_expr(ctx, expr, &mut col_scope, &EMPTY_CTES)?
                         }
                         ColumnConstraint::Collate(name) if !collation_exists(ctx, name) => {
@@ -1739,6 +1785,7 @@ fn validate_create(ctx: &Ctx<'_>, c: &CreateStatement, scope: &mut Scope) -> Res
             for con in constraints {
                 match con {
                     TableConstraint::Check(e) => {
+                        no_subquery(e, "CHECK constraints")?;
                         validate_expr(ctx, e, &mut col_scope, &EMPTY_CTES)?
                     }
                     TableConstraint::Unique { columns: cols, .. }
@@ -1775,9 +1822,21 @@ fn validate_create(ctx: &Ctx<'_>, c: &CreateStatement, scope: &mut Scope) -> Res
             ..
         } => {
             let Some(t) = ctx.catalog.get_table(table) else {
+                if ctx.catalog.get_view(table).is_some() {
+                    return Err(Error::semantic("views may not be indexed"));
+                }
                 // SQLite's CREATE INDEX target error carries the schema.
                 return Err(Error::NotFound(format!("no such table: main.{}", table)));
             };
+            if t.name.len() >= 7 && t.name[..7].eq_ignore_ascii_case("sqlite_") {
+                return Err(Error::semantic(format!(
+                    "table {} may not be indexed",
+                    t.name
+                )));
+            }
+            if t.vtab.is_some() {
+                return Err(Error::semantic("virtual tables may not be indexed"));
+            }
             let table_cols: Vec<String> = t.columns.iter().map(|c| c.name.clone()).collect();
             for ic in columns {
                 if let Some(e) = &ic.expr {
@@ -1794,6 +1853,7 @@ fn validate_create(ctx: &Ctx<'_>, c: &CreateStatement, scope: &mut Scope) -> Res
                         aux_columns: Vec::new(),
                         vtable: false,
                     });
+                    no_subquery(e, "index expressions")?;
                     validate_expr(ctx, e, &mut s, &EMPTY_CTES)?;
                 } else if !table_cols.iter().any(|c| c.eq_ignore_ascii_case(&ic.name)) {
                     return Err(Error::NotFound(format!("no such column: {}", ic.name)));
@@ -1820,6 +1880,7 @@ fn validate_create(ctx: &Ctx<'_>, c: &CreateStatement, scope: &mut Scope) -> Res
                     aux_columns: Vec::new(),
                     vtable: false,
                 });
+                no_subquery(w, "partial index WHERE clauses")?;
                 validate_expr(ctx, w, &mut s, &EMPTY_CTES)?;
             }
             Ok(())
@@ -1868,6 +1929,22 @@ fn validate_drop(ctx: &Ctx<'_>, d: &DropStatement) -> Result<()> {
         };
         return Err(Error::NotFound(format!("no such {}: {}", kind, d.name)));
     }
+    // tableMayNotBeDropped: system tables stay, except the ANALYZE
+    // statistics and sqlite_parameters.
+    if d.kind == DropKind::Table {
+        if let Some(t) = ctx.catalog.get_table(&d.name) {
+            let lc = t.name.to_ascii_lowercase();
+            if lc.starts_with("sqlite_")
+                && !lc[7..].starts_with("stat")
+                && !lc[7..].starts_with("parameters")
+            {
+                return Err(Error::semantic(format!(
+                    "table {} may not be dropped",
+                    t.name
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1875,6 +1952,13 @@ fn validate_alter(ctx: &Ctx<'_>, a: &AlterStatement) -> Result<()> {
     let Some(t) = ctx.catalog.get_table(&a.table) else {
         return Err(Error::NotFound(format!("no such table: {}", a.table)));
     };
+    // isAlterableTable: system tables may not be altered.
+    if t.name.len() >= 7 && t.name[..7].eq_ignore_ascii_case("sqlite_") {
+        return Err(Error::semantic(format!(
+            "table {} may not be altered",
+            t.name
+        )));
+    }
     match &a.action {
         AlterAction::RenameColumn { old, .. } | AlterAction::DropColumn { name: old } => {
             if !t.columns.iter().any(|c| c.name.eq_ignore_ascii_case(old)) {

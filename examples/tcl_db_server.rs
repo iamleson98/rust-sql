@@ -172,6 +172,20 @@ fn sq_err(e: &rusqlite::Error) -> String {
     }
 }
 
+/// Statements that produce a result set: queries, PRAGMAs, EXPLAIN, and
+/// DML with RETURNING (sqlite3_column_count > 0). Unparseable text runs
+/// through `execute`, which reports the error.
+fn returns_rows(sql: &str) -> bool {
+    use rustqlite::sql::ast::Statement as S;
+    match rustqlite::sql::parser::parse(sql) {
+        Ok(S::Select(_)) | Ok(S::Pragma(_)) | Ok(S::Explain { .. }) => true,
+        Ok(S::Insert(i)) => i.returning.is_some(),
+        Ok(S::Update(u)) => u.returning.is_some(),
+        Ok(S::Delete(d)) => d.returning.is_some(),
+        _ => false,
+    }
+}
+
 fn split(sql: &str) -> Vec<String> {
     rustqlite::sql::parser::split_script(sql)
 }
@@ -332,11 +346,11 @@ fn eval(c: &mut Conn, script: &str, vars: &HashMap<String, Value>) -> Result<Vec
         match c {
             Conn::Ours(db) => {
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    match db.query_with_columns(&sql, params.clone()) {
-                        Err(rustqlite::Error::Unsupported(_)) => db
-                            .execute(&sql, params.clone())
-                            .map(|_| (Vec::new(), Vec::new())),
-                        other => other,
+                    if returns_rows(&sql) {
+                        db.query_with_columns(&sql, params.clone())
+                    } else {
+                        db.execute(&sql, params.clone())
+                            .map(|_| (Vec::new(), Vec::new()))
                     }
                 }));
                 match r {

@@ -18,6 +18,12 @@ pub struct Parser {
     /// guard). Deeply nested input — `SELECT ((((...1...))))` — would
     /// otherwise recurse once per paren and overflow the stack.
     expr_depth: usize,
+    /// Unqualified double-quoted identifiers parsed as expressions (the
+    /// candidates of SQLite's double-quoted-string fallback).
+    dq_idents: Vec<String>,
+    /// Double-quoted identifiers to parse as STRING literals (the
+    /// fallback applied: they resolved to no column).
+    dq_literals: Vec<String>,
 }
 
 /// Maximum expression nesting depth, mirroring SQLite's
@@ -40,6 +46,8 @@ impl Parser {
             src: src.to_string(),
             pos: 0,
             expr_depth: 0,
+            dq_idents: Vec::new(),
+            dq_literals: Vec::new(),
         })
         // (expr_depth starts at 0; incremented per nesting level)
     }
@@ -330,18 +338,37 @@ impl Parser {
         let mut columns = Vec::new();
         let mut constraints = Vec::new();
         loop {
-            if self.peek().is_keyword("PRIMARY")
+            // A dangling `CONSTRAINT name` (no constraint after it).
+            let mut dangling = false;
+            while self.peek().is_keyword("CONSTRAINT") && !self.constraint_body_at(2, true) {
+                self.advance();
+                self.parse_ident()?;
+                dangling = true;
+            }
+            if dangling && self.peek().is_punct(')') {
+                break;
+            }
+            let table_constraint = self.peek().is_keyword("PRIMARY")
                 || self.peek().is_keyword("UNIQUE")
                 || self.peek().is_keyword("CHECK")
                 || self.peek().is_keyword("FOREIGN")
-                || self.peek().is_keyword("CONSTRAINT")
-            {
+                || self.peek().is_keyword("CONSTRAINT");
+            if table_constraint {
                 constraints.push(self.parse_table_constraint()?);
             } else {
                 columns.push(self.parse_column_def()?);
             }
             if self.peek().is_punct(',') {
                 self.advance();
+            } else if table_constraint
+                && (self.peek().is_keyword("PRIMARY")
+                    || self.peek().is_keyword("UNIQUE")
+                    || self.peek().is_keyword("CHECK")
+                    || self.peek().is_keyword("FOREIGN")
+                    || self.peek().is_keyword("CONSTRAINT"))
+            {
+                // Table constraints may follow each other without a comma
+                // (SQLite's `conslist ::= conslist tconscomma tcons`).
             } else {
                 break;
             }
@@ -392,6 +419,30 @@ impl Parser {
                 self.advance();
             }
         }
+        // Double-quoted names in CHECK / DEFAULT / generated-column
+        // expressions that name no column of the table are strings
+        // (SQLite's DQS fallback for DDL) — applied here, so the stored
+        // CREATE TABLE text re-parses to the same constraints.
+        if !self.dq_idents.is_empty() {
+            let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+            let dq = std::mem::take(&mut self.dq_idents);
+            let fix = |e: &Expr, in_default: bool| dqs_fix_expr(e, &dq, &names, in_default);
+            for c in columns.iter_mut() {
+                for con in c.constraints.iter_mut() {
+                    match con {
+                        ColumnConstraint::Check(e) => *e = fix(e, false),
+                        ColumnConstraint::Default(e) => *e = fix(e, true),
+                        ColumnConstraint::GeneratedAs { expr, .. } => *expr = fix(expr, false),
+                        _ => {}
+                    }
+                }
+            }
+            for con in constraints.iter_mut() {
+                if let TableConstraint::Check(e) = con {
+                    *e = fix(e, false);
+                }
+            }
+        }
         Ok(Statement::Create(CreateStatement::Table {
             if_not_exists,
             temp,
@@ -417,6 +468,14 @@ impl Parser {
         }
         let mut constraints = Vec::new();
         while self.is_column_constraint_start() {
+            // `CONSTRAINT name` with no constraint after it names nothing
+            // (SQLite's `ccons ::= CONSTRAINT nm`): `x CHECK(...) CONSTRAINT
+            // one`, `x CONSTRAINT a CONSTRAINT b CHECK(...)`.
+            if self.peek().is_keyword("CONSTRAINT") && !self.constraint_body_at(2, false) {
+                self.advance();
+                self.parse_ident()?;
+                continue;
+            }
             constraints.push(self.parse_column_constraint()?);
         }
         Ok(ColumnDef {
@@ -488,6 +547,34 @@ impl Parser {
             self.advance();
         }
         Ok(parts)
+    }
+
+    /// Does a constraint body start at token offset `n` (after
+    /// `CONSTRAINT name`)? `table`: table-constraint keywords, else
+    /// column-constraint ones.
+    fn constraint_body_at(&self, n: usize, table: bool) -> bool {
+        match &self.peek_n(n).token {
+            Token::Keyword(k) => {
+                if table {
+                    matches!(*k, "PRIMARY" | "UNIQUE" | "CHECK" | "FOREIGN")
+                } else {
+                    matches!(
+                        *k,
+                        "PRIMARY"
+                            | "NOT"
+                            | "NULL"
+                            | "UNIQUE"
+                            | "CHECK"
+                            | "DEFAULT"
+                            | "COLLATE"
+                            | "REFERENCES"
+                            | "GENERATED"
+                            | "AS"
+                    )
+                }
+            }
+            _ => false,
+        }
     }
 
     fn is_column_constraint_start(&self) -> bool {
@@ -3478,6 +3565,12 @@ impl Parser {
                         name: col,
                     });
                 }
+                // SQLite's double-quoted-string fallback: a "name" that
+                // resolves to no column is the string 'name'.
+                if self.dq_literals.contains(&name) {
+                    return Ok(Expr::Literal(Value::Text(name.into())));
+                }
+                self.dq_idents.push(name.clone());
                 Ok(Expr::Column { table: None, name })
             }
             Token::Punct('(') => {
@@ -3945,6 +4038,37 @@ fn is_constraint_keyword(s: &str) -> bool {
 /// Parse a single SQL statement from a string.
 pub fn parse(src: &str) -> Result<Statement> {
     Parser::new(src)?.parse()
+}
+
+/// Parse with SQLite's double-quoted-string fallback applied to `literals`
+/// (double-quoted identifiers that resolved to no column parse as string
+/// literals). Also returns every unqualified double-quoted identifier the
+/// statement used as an expression — the names the fallback may apply to.
+pub fn parse_dqs(src: &str, literals: &[String]) -> Result<(Statement, Vec<String>)> {
+    let mut p = Parser::new(src)?;
+    p.dq_literals = literals.to_vec();
+    let stmt = p.parse()?;
+    Ok((stmt, std::mem::take(&mut p.dq_idents)))
+}
+
+/// A double-quoted bare name in a DDL expression that matches none of the
+/// table's columns (nor the rowid) becomes the string literal; in a
+/// DEFAULT every one does (a default cannot read a column).
+fn dqs_fix_expr(e: &Expr, dq: &[String], columns: &[String], in_default: bool) -> Expr {
+    if let Expr::Column { table: None, name } = e {
+        let is_dq = dq.iter().any(|n| n == name);
+        let is_col = !in_default
+            && (columns.iter().any(|c| c.eq_ignore_ascii_case(name))
+                || ["rowid", "oid", "_rowid_"]
+                    .iter()
+                    .any(|r| r.eq_ignore_ascii_case(name)));
+        if is_dq && !is_col {
+            return Expr::Literal(Value::Text(name.clone().into()));
+        }
+        return e.clone();
+    }
+    crate::executor::map_expr_children(e, &mut |c| Ok(dqs_fix_expr(c, dq, columns, in_default)))
+        .unwrap_or_else(|_| e.clone())
 }
 
 /// Split a `;`-separated SQL script into its statement texts

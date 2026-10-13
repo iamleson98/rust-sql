@@ -1228,6 +1228,12 @@ pub struct Pager {
     /// The aggregate grouper's temp-store freeze honors it — see
     /// `executor::HashGrouper::armed_grouper`.
     temp_store: std::sync::atomic::AtomicI64,
+    /// The rollback-journal mode last requested (`PRAGMA journal_mode`):
+    /// 0 delete, 1 truncate, 2 persist, 3 memory, 4 off. The engine keeps
+    /// its own journal in every one of them (OFF/MEMORY trade crash
+    /// safety in SQLite; here they are as safe as DELETE) — the label is
+    /// what the pragma reports.
+    journal_label: std::sync::atomic::AtomicU8,
     /// The opened file carries a PRE-`RSQLDB05` magic (03/04): its index
     /// trees hold the legacy order-key encoding. `Database::open` reacts
     /// by rebuilding the file logically (see
@@ -2505,6 +2511,7 @@ impl Pager {
                 crate::storage::pager::DEFAULT_PARALLEL_SCAN_MIN_ROWS,
             ),
             temp_store: std::sync::atomic::AtomicI64::new(0),
+            journal_label: std::sync::atomic::AtomicU8::new(0),
             legacy_index_format: std::sync::atomic::AtomicBool::new(false),
             v5_magic: std::sync::atomic::AtomicBool::new(false),
         };
@@ -5388,6 +5395,41 @@ impl Pager {
             mine,
         );
         Ok(())
+    }
+
+    /// The journal mode `PRAGMA journal_mode` reports: "wal" in WAL mode;
+    /// for an in-memory store "memory" or "off" (the only two SQLite
+    /// keeps for `:memory:`); otherwise the last requested rollback mode.
+    pub fn journal_mode_name(&self) -> &'static str {
+        let label = self.journal_label.load(Ordering::Acquire);
+        if self.is_memory() {
+            if label == 4 {
+                "off"
+            } else {
+                "memory"
+            }
+        } else if self.wal_enabled() {
+            "wal"
+        } else {
+            ["delete", "truncate", "persist", "memory", "off"][label.min(4) as usize]
+        }
+    }
+
+    /// Record a requested rollback-journal mode (see `journal_label`).
+    /// In-memory stores take only "memory" and "off".
+    pub fn set_journal_label(&self, mode: &str) {
+        let label = match mode {
+            "delete" => 0,
+            "truncate" => 1,
+            "persist" => 2,
+            "memory" => 3,
+            "off" => 4,
+            _ => return,
+        };
+        if self.is_memory() && label != 3 && label != 4 {
+            return;
+        }
+        self.journal_label.store(label, Ordering::Release);
     }
 
     /// Is the pager in WAL mode?
