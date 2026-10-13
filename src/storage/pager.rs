@@ -8034,6 +8034,24 @@ impl Pager {
                 return Ok((next, take));
             }
         }
+        // 1b. A page evicted mid-transaction lives in the UNCOMMITTED
+        // spill (WAL spill frames / the DELETE-mode sidecar), not in the
+        // committed map or the main file: `get_page` knows where. Reading
+        // the file here returned the pre-transaction bytes (or a short
+        // read past its end) for overflow pages a big transaction spilled.
+        let spilled = self
+            .wal
+            .read()
+            .as_ref()
+            .is_some_and(|st| st.spilled.contains_key(&id))
+            || self
+                .delete_spill
+                .lock()
+                .as_ref()
+                .is_some_and(|sp| sp.pages.contains_key(&id));
+        if spilled {
+            return self.read_overflow_page_scoped(id, out);
+        }
         // 2. Cache miss: raw sequential read — no Page allocation, no
         // cache insert, no LRU/eviction churn for read-once pages. The
         // store holds the current committed version here (evictions write

@@ -7748,7 +7748,9 @@ impl Database {
         }
         // If deferred_flush is enabled, force a flush when the dirty-page
         // count exceeds the threshold.
-        if result.is_ok() && deferred_flush {
+        // Never inside an explicit transaction: the main file keeps its
+        // pre-BEGIN bytes until COMMIT (ROLLBACK restores nothing else).
+        if result.is_ok() && deferred_flush && !self.in_transaction.load(Ordering::Acquire) {
             let dirty = self.pager.dirty_page_count();
             if dirty >= deferred_flush_threshold {
                 let _ = self.pager.flush();
@@ -8141,8 +8143,12 @@ impl Database {
         // bench (and production) shape.
         self.maybe_settle_allocator();
         // In deferred_flush mode, a SELECT must see all writes that
-        // happened since the last flush.
-        if self.deferred_flush.load(Ordering::Acquire) && self.pager.has_dirty_pages() {
+        // happened since the last flush (inside a transaction it reads
+        // them through the cache — a flush there would publish them).
+        if self.deferred_flush.load(Ordering::Acquire)
+            && self.pager.has_dirty_pages()
+            && !self.in_transaction.load(Ordering::Acquire)
+        {
             let _ = self.pager.flush();
         }
         // Cross-process read scope (freshness + READ byte) for the whole
@@ -8763,7 +8769,10 @@ impl Database {
         };
         self.break_insert_chain();
         self.maybe_settle_allocator();
-        if self.deferred_flush.load(Ordering::Acquire) && self.pager.has_dirty_pages() {
+        if self.deferred_flush.load(Ordering::Acquire)
+            && self.pager.has_dirty_pages()
+            && !self.in_transaction.load(Ordering::Acquire)
+        {
             let _ = self.pager.flush();
         }
         let cached = self.get_or_cache_stmt(sql)?;
@@ -9122,8 +9131,12 @@ impl Database {
             std::fs::read(&self.path).map_err(Error::from)
         } else {
             // A flush failure on a read-only handle must not fail the
-            // read-back (the file holds the last committed state).
-            let _ = self.pager.flush();
+            // read-back (the file holds the last committed state). Inside
+            // an explicit transaction the file already IS the committed
+            // state — flushing would publish uncommitted pages.
+            if !self.in_transaction.load(Ordering::Acquire) {
+                let _ = self.pager.flush();
+            }
             std::fs::read(&self.path).map_err(Error::from)
         }
     }
@@ -16412,8 +16425,13 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
     // state so the reported file shape is real.
     if name == "integrity_check" || name == "quick_check" {
         // Flush pending dirty pages first: the check validates the file,
-        // and the session's live roots must match what's persisted.
-        if db.pager.has_dirty_pages() {
+        // and the session's live roots must match what's persisted. NEVER
+        // inside a transaction: the main file must keep its pre-BEGIN
+        // bytes until COMMIT (ROLLBACK restores nothing else) — flushing
+        // here published uncommitted pages, and a later ROLLBACK left the
+        // file with trees pointing past its end. The check reads through
+        // the pager, so it sees the transaction's live pages anyway.
+        if db.pager.has_dirty_pages() && !db.in_transaction.load(Ordering::Acquire) {
             let _ = db.pager.flush();
         }
         let (roots, index_roots) = {
