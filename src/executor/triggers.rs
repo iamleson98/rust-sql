@@ -672,7 +672,8 @@ fn rewrite_new_old(
                 }
                 _ => {}
             }
-            if let Some(u) = ins.upsert.as_mut() {
+            let mut next = ins.upsert.as_mut();
+            while let Some(u) = next {
                 // ON CONFLICT ... DO UPDATE SET expr = expr [WHERE expr]
                 if let crate::sql::ast::UpsertAction::DoUpdate { set, where_clause } = &mut u.action
                 {
@@ -683,6 +684,7 @@ fn rewrite_new_old(
                         walk_expr(w, lookup)?;
                     }
                 }
+                next = u.next.as_deref_mut();
             }
             Ok(())
         }

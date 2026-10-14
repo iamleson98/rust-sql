@@ -1573,7 +1573,7 @@ pub(crate) fn collect_parameters(
             // bindable `?` slots. Missing them under-counts
             // `parameter_count`, so `bind_all` rejects the trailing values
             // with "parameter index N out of range".
-            if let Some(u) = &i.upsert {
+            for u in i.upsert.iter().flat_map(|u| u.chain()) {
                 if let Some(w) = &u.target_where {
                     walk_expr(w, &mut max_pos, &mut saw_numeric, named, &mut counter);
                 }

@@ -718,6 +718,7 @@ fn validate_select(
                 for t in &stmt.order_by {
                     validate_expr(ctx, &t.expr, scope, &full)?;
                 }
+                check_order_aggregates(s, &stmt.order_by, scope)?;
                 if let Some(l) = &stmt.limit {
                     reject_limit_columns(l)?;
                     validate_expr(ctx, l, scope, &full)?;
@@ -739,8 +740,26 @@ fn validate_select(
             scope.push_level();
             scope.cur().aliases = output_aliases_of(&stmt.body);
             let r = (|| {
-                for t in &stmt.order_by {
-                    validate_expr(ctx, &t.expr, scope, &full)?;
+                // The ORDER BY terms are matched against EVERY arm's result
+                // columns by the planner (resolveCompoundOrderBy), which
+                // raises SQLite's "does not match any column" — only their
+                // subqueries are checked here.
+                for (i, t) in stmt.order_by.iter().enumerate() {
+                    if crate::executor::expr_has_subquery(&t.expr) {
+                        validate_expr(ctx, &t.expr, scope, &full)?;
+                    }
+                    let mut base = &t.expr;
+                    while let Expr::Collate { expr, .. } = base {
+                        base = expr;
+                    }
+                    if let Expr::Column { table: None, name } = base {
+                        if !compound_names_match(&stmt.body, name) {
+                            return Err(Error::semantic(format!(
+                                "{} ORDER BY term does not match any column in the result set",
+                                crate::planner::sqlite_ordinal(i as i64 + 1)
+                            )));
+                        }
+                    }
                 }
                 if let Some(l) = &stmt.limit {
                     reject_limit_columns(l)?;
@@ -795,6 +814,25 @@ fn output_aliases_of(body: &SelectBody) -> Vec<String> {
     }
 }
 
+/// A bare compound ORDER BY name matches some arm's AS alias or column
+/// (or an arm has a `*`, whose columns the planner expands).
+fn compound_names_match(body: &SelectBody, name: &str) -> bool {
+    match body {
+        SelectBody::Simple(s) => s.columns.iter().any(|c| match c {
+            ResultColumn::Expr { alias: Some(a), .. } if a.eq_ignore_ascii_case(name) => true,
+            ResultColumn::Expr {
+                expr: Expr::Column { name: n, .. },
+                ..
+            } => n.eq_ignore_ascii_case(name),
+            ResultColumn::Expr { .. } => false,
+            _ => true,
+        }),
+        SelectBody::Binary { left, right, .. } => {
+            compound_names_match(left, name) || compound_names_match(right, name)
+        }
+    }
+}
+
 fn validate_select_body(
     ctx: &Ctx<'_>,
     body: &SelectBody,
@@ -829,14 +867,15 @@ fn validate_simple_select(
     // ORDER BY / LIMIT in the same scope, then pops); every error path
     // pops before returning.
     scope.push_level();
+    // Output aliases are visible to ON / WHERE / GROUP BY / HAVING /
+    // ORDER BY (SQLite's alias extension — `SELECT x AS y … WHERE y>0`
+    // resolves; ON terms are WHERE terms in sqlite3ProcessJoin). A real
+    // column still wins: lookup tries the sources first.
+    scope.cur().aliases = simple_output_aliases(s);
     if let Err(e) = build_from_sources(ctx, s.from.as_ref(), ctes, scope) {
         scope.pop_level();
         return Err(e);
     }
-    // Output aliases are visible to WHERE / GROUP BY / HAVING / ORDER BY
-    // (SQLite's documented alias extension — `SELECT x AS y … WHERE y>0`
-    // resolves). Attached AFTER sources so a real column always wins.
-    scope.cur().aliases = simple_output_aliases(s);
     // ---- WHERE ----
     if let Some(w) = &s.where_clause {
         if let Err(e) = validate_expr(ctx, w, scope, ctes) {
@@ -883,9 +922,240 @@ fn validate_simple_select(
             return Err(e);
         }
     }
+    if let Err(e) = check_aggregate_misuse(s, scope) {
+        scope.pop_level();
+        return Err(e);
+    }
     // Level stays pushed — the caller (validate_select) validates ORDER BY
     // / LIMIT in this scope and pops.
     Ok(())
+}
+
+/// SQLite's aggregate-placement errors (resolveExprStep's NC_AllowAgg):
+/// an aggregate in WHERE / ON, or inside another aggregate's arguments,
+/// is a "misuse of aggregate function f()". Only aggregates that belong
+/// to THIS query count — one whose arguments reference only an outer
+/// query's columns aggregates over that query instead.
+fn check_aggregate_misuse(s: &SimpleSelect, scope: &Scope) -> Result<()> {
+    let misuse = |n: &str| {
+        Err(Error::semantic(format!(
+            "misuse of aggregate function {n}()"
+        )))
+    };
+    if let Some(n) = s
+        .where_clause
+        .as_ref()
+        .and_then(|w| find_local_aggregate(w, scope))
+    {
+        return misuse(n);
+    }
+    if let Some(f) = &s.from {
+        if let Some(n) = find_on_aggregate(f, scope) {
+            return misuse(n);
+        }
+    }
+    for c in &s.columns {
+        if let ResultColumn::Expr { expr, .. } = c {
+            if let Some(n) = find_nested_aggregate(expr, scope) {
+                return misuse(n);
+            }
+        }
+    }
+    if let Some(n) = s
+        .having
+        .as_ref()
+        .and_then(|h| find_nested_aggregate(h, scope))
+    {
+        return misuse(n);
+    }
+    Ok(())
+}
+
+/// ORDER BY of `s` (validated in its scope): a nested aggregate is a
+/// misuse as anywhere else, and in a query that is not an aggregate
+/// query any aggregate there is "misuse of aggregate: f()".
+fn check_order_aggregates(s: &SimpleSelect, terms: &[OrderTerm], scope: &Scope) -> Result<()> {
+    for t in terms {
+        if let Some(n) = find_nested_aggregate(&t.expr, scope) {
+            return Err(Error::semantic(format!(
+                "misuse of aggregate function {n}()"
+            )));
+        }
+    }
+    let aggregate_query = !s.group_by.is_empty()
+        || s.having.is_some()
+        || s.columns.iter().any(|c| {
+            matches!(c, ResultColumn::Expr { expr, .. } if find_local_aggregate(expr, scope).is_some())
+        });
+    if !aggregate_query {
+        for t in terms {
+            if let Some(n) = find_local_aggregate(&t.expr, scope) {
+                return Err(Error::semantic(format!("misuse of aggregate: {n}()")));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn find_on_aggregate<'a>(te: &'a TableExpression, scope: &Scope) -> Option<&'a str> {
+    if let TableExpression::Join {
+        left,
+        right,
+        constraint,
+        ..
+    } = te
+    {
+        if let JoinConstraint::On(e) = constraint {
+            if let Some(n) = find_local_aggregate(e, scope) {
+                return Some(n);
+            }
+        }
+        return find_on_aggregate(left, scope).or_else(|| find_on_aggregate(right, scope));
+    }
+    None
+}
+
+/// The name (as written) of `e` when it is a plain aggregate call (no
+/// OVER — that is a window function).
+fn aggregate_call_name(e: &Expr) -> Option<&str> {
+    let Expr::Function {
+        name, args, over, ..
+    } = e
+    else {
+        return None;
+    };
+    let star = matches!(args.as_slice(), [Expr::Column { name, .. }] if name == "*");
+    let n = if star { 0 } else { args.len() };
+    (over.is_none() && crate::planner::is_aggregate_call(&name.to_ascii_lowercase(), n))
+        .then_some(name.as_str())
+}
+
+/// The first aggregate call in `e` (outside subqueries) that belongs to
+/// the current query level.
+fn find_local_aggregate<'a>(e: &'a Expr, scope: &Scope) -> Option<&'a str> {
+    if let Some(n) = aggregate_call_name(e) {
+        if aggregate_is_local(e, scope) {
+            return Some(n);
+        }
+    }
+    expr_children(e)
+        .into_iter()
+        .find_map(|c| find_local_aggregate(c, scope))
+}
+
+/// An aggregate call whose arguments hold another (local) aggregate:
+/// the INNER one's name.
+fn find_nested_aggregate<'a>(e: &'a Expr, scope: &Scope) -> Option<&'a str> {
+    if aggregate_call_name(e).is_some() {
+        if let Expr::Function { args, filter, .. } = e {
+            if let Some(n) = args
+                .iter()
+                .chain(filter.as_deref())
+                .find_map(|a| find_local_aggregate(a, scope))
+            {
+                return Some(n);
+            }
+        }
+        return None;
+    }
+    expr_children(e)
+        .into_iter()
+        .find_map(|c| find_nested_aggregate(c, scope))
+}
+
+/// No column references (`count(*)`), or one that resolves in the
+/// current level's FROM sources.
+fn aggregate_is_local(call: &Expr, scope: &Scope) -> bool {
+    let mut refs = Vec::new();
+    column_refs(call, &mut refs);
+    if refs.is_empty() {
+        return true;
+    }
+    let Some(level) = scope.levels.last() else {
+        return true;
+    };
+    refs.iter().any(|(t, n)| {
+        level.sources.iter().any(|src| match t {
+            None => src.has_column(n),
+            Some(q) => src
+                .qualifier
+                .as_deref()
+                .is_some_and(|x| x.eq_ignore_ascii_case(q)),
+        })
+    })
+}
+
+fn column_refs<'a>(e: &'a Expr, out: &mut Vec<(Option<&'a str>, &'a str)>) {
+    if let Expr::Column { table, name } = e {
+        if name != "*" {
+            out.push((table.as_deref(), name));
+        }
+        return;
+    }
+    for c in expr_children(e) {
+        column_refs(c, out);
+    }
+}
+
+/// `e`'s direct sub-expressions, not looking into subqueries (their own
+/// scope).
+fn expr_children(e: &Expr) -> Vec<&Expr> {
+    match e {
+        Expr::Literal(_) | Expr::Parameter(_) | Expr::Column { .. } => Vec::new(),
+        Expr::Subquery(_) | Expr::Exists(_) => Vec::new(),
+        Expr::Binary { left, right, .. } | Expr::Is { left, right, .. } => vec![left, right],
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. } => vec![expr],
+        Expr::Between {
+            expr, low, high, ..
+        } => vec![expr, low, high],
+        Expr::In { expr, source, .. } => {
+            let mut v: Vec<&Expr> = vec![expr];
+            if let InSource::List(l) = source {
+                v.extend(l.iter());
+            }
+            v
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            let mut v: Vec<&Expr> = vec![expr, pattern];
+            v.extend(escape.as_deref());
+            v
+        }
+        Expr::Function {
+            args,
+            filter,
+            order_by,
+            ..
+        } => {
+            let mut v: Vec<&Expr> = args.iter().collect();
+            v.extend(filter.as_deref());
+            v.extend(order_by.iter().map(|t| &t.expr));
+            v
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            let mut v: Vec<&Expr> = Vec::new();
+            v.extend(operand.as_deref());
+            for (w, t) in whens {
+                v.push(w);
+                v.push(t);
+            }
+            v.extend(else_.as_deref());
+            v
+        }
+        Expr::Row(items) => items.iter().collect(),
+        Expr::Raise { message, .. } => message.as_deref().into_iter().collect(),
+    }
 }
 
 /// One SimpleSelect's output aliases (bare names for SQLite's WHERE /
@@ -1299,8 +1569,14 @@ fn validate_expr(ctx: &Ctx<'_>, e: &Expr, scope: &mut Scope, visible: &CteList) 
             order_by,
             distinct,
         } => {
-            if let Some(msg) = builtin_arity_error(name, args.len()) {
+            // `f(*)` is `f()` (SQLite's `id(*)` rule): only count takes it.
+            let star = matches!(args.as_slice(), [Expr::Column { name, .. }] if name == "*");
+            let n_args = if star { 0 } else { args.len() };
+            if let Some(msg) = builtin_arity_error(name, n_args) {
                 return Err(Error::semantic(msg));
+            }
+            if over.is_none() && !crate::executor::expr::function_exists(name, n_args) {
+                return Err(Error::NotFound(format!("no such function: {name}")));
             }
             // sqlite3ResolveExprNames: a DISTINCT aggregate takes exactly
             // one argument (`group_concat(DISTINCT x, ',')`, `count(DISTINCT)`).
@@ -1469,7 +1745,7 @@ fn validate_insert(ctx: &Ctx<'_>, ins: &InsertStatement, scope: &mut Scope) -> R
     }
 
     // Upsert.
-    if let Some(u) = &ins.upsert {
+    for u in ins.upsert.iter().flat_map(|u| u.chain()) {
         // Conflict target: named columns must exist (unknown → column
         // error; existing-but-not-unique is the executor's contract
         // message, checked there).

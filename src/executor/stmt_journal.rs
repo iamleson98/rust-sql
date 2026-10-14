@@ -182,7 +182,7 @@ impl Model<'_> {
             }
             InsertSource::DefaultValues => {}
         }
-        if let Some(u) = &ins.upsert {
+        for u in ins.upsert.iter().flat_map(|u| u.chain()) {
             if let Some(w) = &u.target_where {
                 self.scan_expr(w);
             }
@@ -233,21 +233,23 @@ impl Model<'_> {
         }
         // Upsert targets: the matching constraint resolves to DO
         // NOTHING / DO UPDATE instead of halting.
-        let upsert_cols: Option<Vec<String>> = ins.upsert.as_ref().map(|u| {
-            u.target
-                .iter()
-                .map(|c| c.name.to_ascii_lowercase())
-                .collect()
-        });
+        let upsert_cols: Vec<Vec<String>> = ins
+            .upsert
+            .iter()
+            .flat_map(|u| u.chain())
+            .map(|u| {
+                u.target
+                    .iter()
+                    .map(|c| c.name.to_ascii_lowercase())
+                    .collect()
+            })
+            .collect();
         let upsert_covers = |cols: &[String]| -> bool {
-            match &upsert_cols {
-                Some(t) if t.is_empty() => true,
-                Some(t) => {
-                    t.len() == cols.len()
-                        && cols.iter().all(|c| t.contains(&c.to_ascii_lowercase()))
-                }
-                None => false,
-            }
+            upsert_cols.iter().any(|t| {
+                t.is_empty()
+                    || (t.len() == cols.len()
+                        && cols.iter().all(|c| t.contains(&c.to_ascii_lowercase())))
+            })
         };
         let mode = effective(or);
         // NOT NULL (every column on INSERT; the rowid alias is exempt —

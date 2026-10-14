@@ -456,7 +456,8 @@ impl Parser {
     }
 
     fn parse_column_def(&mut self) -> Result<ColumnDef> {
-        let name = self.parse_ident()?;
+        // `nm`: a string literal names a column too (`'a b' TEXT`).
+        let name = self.parse_as_name()?;
         let mut type_name = String::new();
         // Type name: 0 or more identifier tokens (some types take args like VARCHAR(10))
         if !self.is_column_constraint_start()
@@ -485,14 +486,28 @@ impl Parser {
         })
     }
 
+    /// One word of a declared type — SQLite's `typename ::= ids`: an
+    /// identifier, a string, or a fallback keyword (`CREATE TABLE
+    /// abort(abort abort)`), except GENERATED, which opens a column
+    /// constraint there.
+    fn type_word(&self) -> Option<String> {
+        match &self.peek().token {
+            Token::Ident(s) | Token::String(s) => Some(s.clone()),
+            Token::Keyword(k) if keyword_is_fallback_ident(k) && *k != "GENERATED" => {
+                Some(k.to_ascii_lowercase())
+            }
+            _ => None,
+        }
+    }
+
     fn parse_type_name_parts(&mut self) -> Result<Vec<String>> {
         let mut parts = Vec::new();
-        // First token must be an identifier.
-        if let Token::Ident(s) = &self.peek().token {
-            parts.push(s.clone());
-            self.advance();
-        } else {
-            return Ok(parts);
+        match self.type_word() {
+            Some(w) => {
+                parts.push(w);
+                self.advance();
+            }
+            None => return Ok(parts),
         }
         // Optional `(n)` or `(n, m)` after the type. The spec is captured
         // into the declared type name (space-free, e.g. `DECIMAL(10,2)`)
@@ -538,12 +553,12 @@ impl Parser {
             }
         }
         // Additional type name parts (e.g. "DOUBLE PRECISION", "UNSIGNED BIG INT")
-        while let Token::Ident(s) = &self.peek().token {
+        while let Some(w) = self.type_word() {
             // Stop at constraint keywords.
-            if is_constraint_keyword(s) {
+            if matches!(self.peek().token, Token::Ident(_)) && is_constraint_keyword(&w) {
                 break;
             }
-            parts.push(s.clone());
+            parts.push(w);
             self.advance();
         }
         Ok(parts)
@@ -981,7 +996,24 @@ impl Parser {
         //   * `Collate { Column }`           → plain column + collation
         //     (the index-column grammar's COLLATE, not an expr wrapper)
         //   * anything else                  → expression index
-        let parsed = self.parse_expr()?;
+        // sqlite3StringToId: a single-quoted string in an index / PRIMARY
+        // KEY / UNIQUE column list names a column (`PRIMARY KEY(x, 'a
+        // b')`) — a double-quoted name the DQS fallback made a string
+        // stays one.
+        let single_quoted = matches!(self.peek().token, Token::String(_));
+        let mut parsed = self.parse_expr()?;
+        if single_quoted {
+            let mut target = &mut parsed;
+            while let crate::sql::ast::Expr::Collate { expr, .. } = target {
+                target = expr.as_mut();
+            }
+            if let crate::sql::ast::Expr::Literal(Value::Text(t)) = &*target {
+                *target = crate::sql::ast::Expr::Column {
+                    table: None,
+                    name: t.to_string(),
+                };
+            }
+        }
         let (name, collation, expr) = match parsed {
             crate::sql::ast::Expr::Column {
                 table: None, name, ..
@@ -1425,7 +1457,7 @@ impl Parser {
         let (dml_schema, table) = self.parse_dml_table_name()?;
         let alias = if self.peek().is_keyword("AS") {
             self.advance();
-            Some(self.parse_ident()?)
+            Some(self.parse_as_name()?)
         } else {
             None
         };
@@ -1528,43 +1560,66 @@ impl Parser {
                     return Err(Error::parse(t.line, t.col, "near \"DO\": syntax error"));
                 }
             }
-            self.advance();
-            self.expect_keyword("CONFLICT")?;
-            let target = if self.peek().is_punct('(') {
+            let mut clauses = Vec::new();
+            loop {
+                let on = self.peek().clone();
                 self.advance();
-                let t = self.parse_indexed_columns()?;
-                self.expect_punct(')')?;
-                t
-            } else {
-                Vec::new()
-            };
-            let target_where = if self.peek().is_keyword("WHERE") {
-                self.advance();
-                Some(self.parse_expr()?)
-            } else {
-                None
-            };
-            self.expect_keyword("DO")?;
-            let action = if self.peek().is_keyword("NOTHING") {
-                self.advance();
-                UpsertAction::DoNothing
-            } else {
-                self.expect_keyword("UPDATE")?;
-                self.expect_keyword("SET")?;
-                let set = self.parse_set_clause()?;
-                let where_clause = if self.peek().is_keyword("WHERE") {
+                self.expect_keyword("CONFLICT")?;
+                // Only the LAST clause may omit its target (parse.y's
+                // upsert rule): a targetless one followed by another is
+                // a syntax error at that ON.
+                if clauses
+                    .last()
+                    .is_some_and(|u: &UpsertClause| u.target.is_empty())
+                {
+                    return Err(Error::parse(on.line, on.col, "near \"ON\": syntax error"));
+                }
+                let target = if self.peek().is_punct('(') {
+                    self.advance();
+                    let t = self.parse_indexed_columns()?;
+                    self.expect_punct(')')?;
+                    t
+                } else {
+                    Vec::new()
+                };
+                let target_where = if self.peek().is_keyword("WHERE") {
                     self.advance();
                     Some(self.parse_expr()?)
                 } else {
                     None
                 };
-                UpsertAction::DoUpdate { set, where_clause }
-            };
-            Some(UpsertClause {
-                target,
-                target_where,
-                action,
-            })
+                self.expect_keyword("DO")?;
+                let action = if self.peek().is_keyword("NOTHING") {
+                    self.advance();
+                    UpsertAction::DoNothing
+                } else {
+                    self.expect_keyword("UPDATE")?;
+                    self.expect_keyword("SET")?;
+                    let set = self.parse_set_clause()?;
+                    let where_clause = if self.peek().is_keyword("WHERE") {
+                        self.advance();
+                        Some(self.parse_expr()?)
+                    } else {
+                        None
+                    };
+                    UpsertAction::DoUpdate { set, where_clause }
+                };
+                clauses.push(UpsertClause {
+                    target,
+                    target_where,
+                    action,
+                    next: None,
+                });
+                if !(self.peek().is_keyword("ON") && self.peek_n(1).is_keyword("CONFLICT")) {
+                    break;
+                }
+            }
+            let mut chain: Option<Box<UpsertClause>> = None;
+            for mut u in clauses.into_iter().rev() {
+                u.next = chain;
+                chain = Some(Box::new(u));
+            }
+            chain.map(|b| *b)
         } else {
             None
         };
@@ -1694,7 +1749,7 @@ impl Parser {
         let (dml_schema, table) = self.parse_dml_table_name()?;
         let alias = if self.peek().is_keyword("AS") {
             self.advance();
-            Some(self.parse_ident()?)
+            Some(self.parse_as_name()?)
         } else if let Token::Ident(_) = &self.peek().token {
             if !self.peek().is_keyword("SET") {
                 Some(self.parse_ident()?)
@@ -1761,7 +1816,7 @@ impl Parser {
         let (dml_schema, from) = self.parse_dml_table_name()?;
         let alias = if self.peek().is_keyword("AS") {
             self.advance();
-            Some(self.parse_ident()?)
+            Some(self.parse_as_name()?)
         } else if let Token::Ident(_) = &self.peek().token {
             if !self.peek().is_keyword("WHERE")
                 && !self.peek().is_keyword("LIMIT")
@@ -2394,12 +2449,15 @@ impl Parser {
                         let span = self.span_alias(&e, start_tok);
                         let alias = if self.peek().is_keyword("AS") {
                             self.advance();
-                            Some(self.parse_ident()?)
+                            Some(self.parse_as_name()?)
                         } else if let Token::Ident(_) = &self.peek().token {
                             // Implicit alias (no AS keyword)
                             Some(self.parse_ident()?)
-                        } else if let Token::QuotedIdent(s) = &self.peek().token {
-                            Some(s.clone())
+                        } else if let Token::QuotedIdent(s) | Token::String(s) = &self.peek().token
+                        {
+                            let s = s.clone();
+                            self.advance();
+                            Some(s)
                         } else {
                             span
                         };
@@ -2412,13 +2470,16 @@ impl Parser {
                 let span = self.span_alias(&e, start_tok);
                 let alias = if self.peek().is_keyword("AS") {
                     self.advance();
-                    Some(self.parse_ident()?)
+                    Some(self.parse_as_name()?)
                 } else if let Token::Ident(_) | Token::QuotedIdent(_) = &self.peek().token {
                     if !is_clause_keyword(&self.peek().token) {
                         Some(self.parse_ident()?)
                     } else {
                         span
                     }
+                } else if let Token::String(_) = &self.peek().token {
+                    // `ids` (SQLite's implicit alias) is ID or STRING.
+                    Some(self.parse_as_name()?)
                 } else {
                     span
                 };
@@ -2527,7 +2588,7 @@ impl Parser {
                 self.expect_punct(')')?;
                 let alias = if self.peek().is_keyword("AS") {
                     self.advance();
-                    Some(self.parse_ident()?)
+                    Some(self.parse_as_name()?)
                 } else if let Token::Ident(_) = &self.peek().token {
                     Some(self.parse_ident()?)
                 } else {
@@ -2555,7 +2616,7 @@ impl Parser {
                 // a subquery — `SELECT * FROM (a JOIN b ...)` named j.
                 let alias = if self.peek().is_keyword("AS") {
                     self.advance();
-                    Some(self.parse_ident()?)
+                    Some(self.parse_as_name()?)
                 } else if matches!(&inner, TableExpression::Join { .. })
                     && matches!(self.peek().token, Token::Ident(_))
                 {
@@ -2617,7 +2678,7 @@ impl Parser {
             self.expect_punct(')')?;
             let fn_alias = if self.peek().is_keyword("AS") {
                 self.advance();
-                Some(self.parse_ident()?)
+                Some(self.parse_as_name()?)
             } else if let Token::Ident(_) = &self.peek().token {
                 if !is_clause_keyword(&self.peek().token) {
                     Some(self.parse_ident()?)
@@ -2635,13 +2696,15 @@ impl Parser {
         }
         let alias = if self.peek().is_keyword("AS") {
             self.advance();
-            Some(self.parse_ident()?)
+            Some(self.parse_as_name()?)
         } else if let Token::Ident(_) = &self.peek().token {
             if !is_clause_keyword(&self.peek().token) {
                 Some(self.parse_ident()?)
             } else {
                 None
             }
+        } else if let Token::String(_) = &self.peek().token {
+            Some(self.parse_as_name()?)
         } else {
             None
         };
@@ -3799,6 +3862,17 @@ impl Parser {
     // Helpers
     // ========================================================================
 
+    /// The name after `AS` — SQLite's `nm`, which admits a string
+    /// literal: `SELECT f1 AS 'x'`, `FROM t AS 'a'`.
+    fn parse_as_name(&mut self) -> Result<String> {
+        if let Token::String(v) = &self.peek().token {
+            let v = v.clone();
+            self.advance();
+            return Ok(v);
+        }
+        self.parse_ident()
+    }
+
     fn parse_ident(&mut self) -> Result<String> {
         let t = self.peek();
         match &t.token {
@@ -4354,6 +4428,25 @@ fn keyword_is_fallback_ident(k: &str) -> bool {
             | "MATERIALIZED"
             | "REINDEX"
             | "RENAME"
+            // parse.y's %fallback ID list also has CAST, COLUMNKW,
+            // LIKE_KW (LIKE / GLOB / REGEXP), PRAGMA, RAISE, CURRENT,
+            // CTIME_KW (CURRENT_DATE / _TIME / _TIMESTAMP), IF and TEMP
+            // (TEMPORARY): `CREATE TABLE cast(cast cast)` is legal. In
+            // expression position CAST / RAISE / CURRENT_* still parse
+            // as their own constructs first.
+            | "CAST"
+            | "COLUMN"
+            | "LIKE"
+            | "GLOB"
+            | "REGEXP"
+            | "PRAGMA"
+            | "RAISE"
+            | "CURRENT"
+            | "CURRENT_DATE"
+            | "CURRENT_TIME"
+            | "CURRENT_TIMESTAMP"
+            | "IF"
+            | "TEMPORARY"
     )
 }
 

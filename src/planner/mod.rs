@@ -5,6 +5,7 @@
 //! 2. **Plan shape**: SELECT → Project → (Filter → (Aggregate → (Sort → (Limit → Source))))
 //! 3. **Optimization**: index selection, predicate pushdown, join reordering.
 
+mod aliases;
 pub(crate) mod fold;
 pub mod namecheck;
 pub mod plan;
@@ -120,6 +121,22 @@ impl<'a> Planner<'a> {
             },
             _ => stmt,
         };
+        // Result aliases inside WHERE / ON / GROUP BY / HAVING — here as
+        // well as in plan_simple_select, since some join paths plan from
+        // the statement.
+        let alias_stmt;
+        let stmt = match &stmt.body {
+            SelectBody::Simple(sb) => match self.resolve_result_aliases(sb)? {
+                Some(r) => {
+                    let mut st = stmt.clone();
+                    st.body = SelectBody::Simple(r);
+                    alias_stmt = st;
+                    &alias_stmt
+                }
+                None => stmt,
+            },
+            _ => stmt,
+        };
         // ORDER BY terms resolve BEFORE body planning: the aggregate
         // branch needs them (ORDER-ONLY aggregates + bare-column
         // representatives must be part of the Aggregate node's output so
@@ -128,7 +145,13 @@ impl<'a> Planner<'a> {
         // rewrite) runs after the body plan, keyed off the same resolved
         // terms.
         let resolved_order: Vec<OrderTerm> = if !stmt.order_by.is_empty() {
-            self.resolve_order_by_terms(&stmt.body, &stmt.order_by)?
+            // Result aliases inside ORDER BY expressions (`ORDER BY -x`).
+            let aliased = match &stmt.body {
+                SelectBody::Simple(sb) => self.resolve_order_aliases(sb, &stmt.order_by)?,
+                // Compound terms become result-column ordinals.
+                body => self.resolve_compound_order(body, &stmt.order_by)?,
+            };
+            self.resolve_order_by_terms(&stmt.body, aliased.as_deref().unwrap_or(&stmt.order_by))?
         } else {
             Vec::new()
         };
@@ -856,6 +879,15 @@ impl<'a> Planner<'a> {
             Some(r) => {
                 using_resolved = r;
                 &using_resolved
+            }
+            None => s,
+        };
+        // Result aliases inside WHERE / ON / GROUP BY / HAVING.
+        let alias_resolved;
+        let s = match self.resolve_result_aliases(s)? {
+            Some(r) => {
+                alias_resolved = r;
+                &alias_resolved
             }
             None => s,
         };

@@ -7505,6 +7505,166 @@ impl<'a> Btree<'a> {
         }
     }
 
+    /// After a delete from leaf `child_id` (a child of `parent_id`): free
+    /// it when empty, else merge it into an adjacent sibling when it is
+    /// underfull and the two fit in one page.
+    fn rebalance_after_delete(&mut self, parent_id: PageId, child_id: PageId) -> Result<()> {
+        if !self.maybe_recycle_empty_child(parent_id, child_id)? {
+            self.maybe_merge_leaf(parent_id, child_id)?;
+        }
+        Ok(())
+    }
+
+    /// The in-page cell bytes of leaf `id`, in key order, with the leaf's
+    /// type — `None` for a non-leaf or a malformed cell.
+    fn leaf_cells(&self, id: PageId) -> Result<Option<(PageType, Vec<Vec<u8>>)>> {
+        let page = self.pager.get_page(id)?;
+        let b = page.lock();
+        let pt = b.page_type()?;
+        if !matches!(pt, PageType::LeafTable | PageType::LeafIndex) {
+            return Ok(None);
+        }
+        let psz = b.page_size();
+        let mut cells = Vec::with_capacity(b.n_cells() as usize);
+        for i in 0..b.n_cells() {
+            let p = b.cell_pointer(i) as usize;
+            // A corrupt pointer leaves the page: no merge (the read paths
+            // report the corruption).
+            if p < PAGE_HEADER_SIZE as usize || p >= b.data.len() {
+                return Ok(None);
+            }
+            let size = match pt {
+                PageType::LeafIndex => index_leaf_cell_size(&b.data[p..], psz),
+                _ => table_leaf_cell_size_paged(&b.data[p..], psz),
+            };
+            match size {
+                Some(n) if n > 0 && p + n <= b.data.len() => cells.push(b.data[p..p + n].to_vec()),
+                _ => return Ok(None),
+            }
+        }
+        Ok(Some((pt, cells)))
+    }
+
+    /// SQLite's underfull rebalance (balance_nonroot after a delete), at
+    /// leaf granularity: a leaf less than a third full is merged into its
+    /// right sibling (its separator dropped — its keys then route to that
+    /// sibling) or, as the rightmost child, into its left sibling (which
+    /// becomes the rightmost), when the two fit in one page. Without it a
+    /// delete-and-append churn — `INSERT OR REPLACE` on a rowid table,
+    /// where every replaced row moves to the right edge — left a trail of
+    /// one-row leaves: SQLite's savepoint6 workload grew the table to
+    /// 1,280 leaves for 751 rows (SQLite: ~100) and every scan slowed
+    /// with it. Not in the BEGIN CONCURRENT regime (its writers' trees
+    /// are validated per page; a merge would widen every conflict).
+    fn maybe_merge_leaf(&mut self, parent_id: PageId, child_id: PageId) -> Result<bool> {
+        if child_id == 0
+            || parent_id == 0
+            || child_id == self.root
+            || self.pager.concurrent_scope_armed()
+        {
+            return Ok(false);
+        }
+        let usable = self.pager.page_size() as usize - PAGE_HEADER_SIZE as usize;
+        let Some((pt, child_cells)) = self.leaf_cells(child_id)? else {
+            return Ok(false);
+        };
+        let footprint = |cells: &[Vec<u8>]| cells.iter().map(|c| c.len() + 2).sum::<usize>();
+        let child_bytes = footprint(&child_cells);
+        if child_cells.is_empty() || child_bytes * 3 > usable {
+            return Ok(false);
+        }
+        // The child's slot in the parent: a separator cell, or rightmost.
+        let (n_cells, idx, sibling) = {
+            let parent_ref = self.pager.get_page(parent_id)?;
+            let b = parent_ref.lock();
+            let ppt = b.page_type()?;
+            if !matches!(ppt, PageType::InteriorTable | PageType::InteriorIndex) {
+                return Ok(false);
+            }
+            let n = b.n_cells();
+            let child_at = |i: u16| -> Result<PageId> {
+                let p = b.cell_pointer(i) as usize;
+                let c = Cell::decode(b.cell_slice_checked(p)?, ppt, b.page_size())?;
+                Ok(c.left_child())
+            };
+            let mut idx = None;
+            for i in 0..n {
+                if child_at(i)? == child_id {
+                    idx = Some(i);
+                    break;
+                }
+            }
+            let sibling = match idx {
+                Some(i) if i + 1 < n => child_at(i + 1)?,
+                Some(_) => b.right_most_pointer(),
+                None if b.right_most_pointer() == child_id && n > 0 => child_at(n - 1)?,
+                None => return Ok(false),
+            };
+            (n, idx, sibling)
+        };
+        if sibling == 0 || sibling == child_id || sibling == self.root {
+            return Ok(false);
+        }
+        let Some((spt, sib_cells)) = self.leaf_cells(sibling)? else {
+            return Ok(false);
+        };
+        if spt != pt || child_bytes + footprint(&sib_cells) > usable {
+            return Ok(false);
+        }
+        // Key order: the child precedes a right sibling, follows a left one.
+        let merged: Vec<&Vec<u8>> = if idx.is_some() {
+            child_cells.iter().chain(sib_cells.iter()).collect()
+        } else {
+            sib_cells.iter().chain(child_cells.iter()).collect()
+        };
+        {
+            let page = self.pager.get_page(sibling)?;
+            let mut b = page.lock();
+            let psz = b.data.len();
+            let mut write_off = psz;
+            for (i, c) in merged.iter().enumerate() {
+                write_off -= c.len();
+                b.data[write_off..write_off + c.len()].copy_from_slice(c);
+                let dst = PAGE_HEADER_SIZE as usize + i * 2;
+                b.data[dst..dst + 2].copy_from_slice(&(write_off as u16).to_be_bytes());
+            }
+            // Pointer order must be key order, cells were laid from the
+            // tail in that order: offsets descend, which the page allows.
+            b.set_n_cells(merged.len() as u16);
+            b.set_cell_content_start(write_off as u32);
+            b.touch();
+        }
+        self.pager.note_dirty(sibling);
+        // Unlink the child: drop its separator (merge right), or the left
+        // sibling's (merge left — the sibling becomes the rightmost).
+        let drop_idx = idx.unwrap_or(n_cells - 1);
+        let dead_chain = {
+            let parent_ref = self.pager.get_page(parent_id)?;
+            let mut b = parent_ref.lock();
+            let ppt = b.page_type()?;
+            let p = b.cell_pointer(drop_idx) as usize;
+            let dead = Cell::decode(b.cell_slice_checked(p)?, ppt, b.page_size())?.index_overflow();
+            let start = PAGE_HEADER_SIZE as usize;
+            let n = n_cells as usize;
+            let i = drop_idx as usize;
+            b.data
+                .copy_within(start + (i + 1) * 2..start + n * 2, start + i * 2);
+            b.set_n_cells(n_cells - 1);
+            if idx.is_none() {
+                b.set_right_most_pointer(sibling);
+            }
+            b.touch();
+            dead
+        };
+        self.pager.note_dirty(parent_id);
+        if dead_chain != 0 {
+            self.free_overflow_chain(dead_chain)?;
+        }
+        self.pager.free_page(child_id)?;
+        self.note_freed(child_id);
+        Ok(true)
+    }
+
     /// If `child_id` is a LEAF page with zero cells, unlink it from its
     /// parent `parent_id` and push it onto the pager freelist.
     ///
@@ -8273,8 +8433,9 @@ impl<'a> Btree<'a> {
                     // interior page and pushed onto the pager freelist, so
                     // future inserts reuse it instead of growing the file
                     // (mirrors SQLite's freelist; without it, delete-heavy
-                    // churn grows the file forever).
-                    let _ = self.maybe_recycle_empty_child(page_id, child_id)?;
+                    // churn grows the file forever); an underfull one is
+                    // merged into a sibling.
+                    self.rebalance_after_delete(page_id, child_id)?;
                 }
                 Ok(deleted)
             }
@@ -10543,7 +10704,7 @@ impl<'a> Btree<'a> {
                 drop(page);
                 let deleted = self.delete_index_from_page(child_id, key, rowid)?;
                 if deleted {
-                    let _ = self.maybe_recycle_empty_child(page_id, child_id)?;
+                    self.rebalance_after_delete(page_id, child_id)?;
                 }
                 Ok(deleted)
             }

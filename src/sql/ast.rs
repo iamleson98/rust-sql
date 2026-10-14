@@ -363,6 +363,17 @@ pub struct UpsertClause {
     pub target: Vec<IndexedColumn>,
     pub target_where: Option<Expr>,
     pub action: UpsertAction,
+    /// The next `ON CONFLICT` clause (SQLite 3.35+: several, tried in
+    /// order; only the last may omit its target) — SQLite's own
+    /// `pNextUpsert` chain.
+    pub next: Option<Box<UpsertClause>>,
+}
+
+impl UpsertClause {
+    /// This clause and every one chained after it, in order.
+    pub fn chain(&self) -> impl Iterator<Item = &UpsertClause> {
+        std::iter::successors(Some(self), |u| u.next.as_deref())
+    }
 }
 
 #[derive(Clone, Debug)]

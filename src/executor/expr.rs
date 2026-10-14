@@ -3479,6 +3479,57 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
 /// `create_function` overrides of engine internals, matching SQLite's
 /// SQLITE_BUSY error for overwriting a core function). Aggregates are
 /// included so user aggregates can't silently shadow them either.
+/// Does `name(...)` with `n_args` arguments resolve to a function —
+/// SQLite's prepare-time "no such function" check (resolveExprStep),
+/// which fires even when no row ever evaluates the call. Aggregates,
+/// window functions, user functions (the CURRENT plugin scope) and the
+/// engine's internal `__` helpers resolve directly; anything else is
+/// probed once through the evaluator itself with NULL arguments — the
+/// same dispatch execution uses, so the two can never disagree. Positive
+/// built-in answers are cached.
+pub(crate) fn function_exists(name: &str, n_args: usize) -> bool {
+    let lc = name.to_ascii_lowercase();
+    // Virtual-table aux functions resolve only during a scan of their
+    // table (FTS5's three; a user module's own are unknowable here).
+    if lc.starts_with("__")
+        || matches!(lc.as_str(), "bm25" | "highlight" | "snippet")
+        || crate::plugin::user_modules_registered()
+        || crate::planner::is_aggregate_call(&lc, n_args)
+        || crate::planner::is_window_only_fn(&lc)
+        || crate::plugin::lookup_scalar(&lc).is_some()
+        || crate::plugin::lookup_aggregate(&lc).is_some()
+    {
+        return true;
+    }
+    type Known = std::sync::Mutex<std::collections::HashSet<(String, usize)>>;
+    static KNOWN: std::sync::OnceLock<Known> = std::sync::OnceLock::new();
+    let known = KNOWN.get_or_init(Default::default);
+    let key = (lc, n_args);
+    if known.lock().map(|k| k.contains(&key)).unwrap_or(false) {
+        return true;
+    }
+    let call = Expr::Function {
+        name: key.0.clone(),
+        distinct: false,
+        args: vec![Expr::Literal(Value::Null); n_args],
+        filter: None,
+        over: None,
+        order_by: Vec::new(),
+    };
+    let named = HashMap::new();
+    let ctx = EvalContext::new(&[], &[], &[], &named);
+    let exists = !matches!(
+        evaluate(&call, &ctx),
+        Err(Error::NotFound(ref m)) if m.starts_with("no such function")
+    );
+    if exists {
+        if let Ok(mut k) = known.lock() {
+            k.insert(key);
+        }
+    }
+    exists
+}
+
 pub(crate) fn is_builtin_scalar(name: &str) -> bool {
     const BUILTIN: &[&str] = &[
         "abs",

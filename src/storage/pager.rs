@@ -725,16 +725,55 @@ struct DeleteSpill {
     file: std::fs::File,
     /// page id -> byte offset of its NEWEST `[id][bytes]` record.
     pages: std::collections::HashMap<PageId, u64, PageIdHashBuild>,
+    /// Offsets of DEAD records (pages read back into the cache, whose
+    /// record no longer serves anything): the next spill reuses one.
+    /// Without reuse a long transaction that keeps evicting and
+    /// re-reading the same pages (SQLite's savepoint6.test: one
+    /// savepoint-held transaction over thousands of random writes) grew
+    /// the sidecar without bound — past 7 GB for a 1 MB database.
+    free: Vec<u64>,
 }
 
 impl DeleteSpill {
-    /// Append a record for `id`; returns the record offset.
-    fn append(&mut self, id: PageId, data: &[u8]) -> Result<u64> {
-        use std::io::{Seek, SeekFrom, Write};
-        let off = self.file.seek(SeekFrom::End(0))?;
-        self.file.write_all(&id.to_le_bytes())?;
-        self.file.write_all(data)?;
-        Ok(off)
+    fn new(file: std::fs::File) -> Self {
+        Self {
+            file,
+            pages: std::collections::HashMap::default(),
+            free: Vec::new(),
+        }
+    }
+
+    /// Store a record for `id` — over its own live record, else in a dead
+    /// slot, else at the end — and map `id` to it.
+    fn store(&mut self, id: PageId, data: &[u8]) -> Result<()> {
+        use std::io::{Seek, SeekFrom};
+        let off = match self.pages.get(&id).copied().or_else(|| self.free.pop()) {
+            Some(off) => off,
+            None => self.file.seek(SeekFrom::End(0))?,
+        };
+        let mut rec = Vec::with_capacity(4 + data.len());
+        rec.extend_from_slice(&id.to_le_bytes());
+        rec.extend_from_slice(data);
+        write_all_at(&mut self.file, off, &rec)?;
+        self.pages.insert(id, off);
+        Ok(())
+    }
+
+    /// Take `id`'s record out of service (its page is back in the cache):
+    /// the offset, whose slot is now free for reuse.
+    fn take(&mut self, id: PageId) -> Option<u64> {
+        let off = self.pages.remove(&id)?;
+        self.free.push(off);
+        Some(off)
+    }
+
+    /// Empty the sidecar (after COMMIT drained it).
+    fn reset(&mut self) {
+        use std::io::Write;
+        self.pages.clear();
+        self.free.clear();
+        let _ = self.file.set_len(0);
+        let _ = self.file.flush();
     }
 
     /// Read the page body of the record at `off` (the `[id][bytes]`
@@ -759,6 +798,21 @@ impl DeleteSpill {
         self.file.read_exact(buf)?;
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn write_all_at(file: &mut std::fs::File, off: u64, buf: &[u8]) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.write_all_at(buf, off)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_all_at(file: &mut std::fs::File, off: u64, buf: &[u8]) -> Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    file.seek(SeekFrom::Start(off))?;
+    file.write_all(buf)?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -3545,7 +3599,7 @@ impl Pager {
             if !spilled_hit {
                 let mut spill_guard = self.delete_spill.lock();
                 if let Some(spill) = spill_guard.as_mut() {
-                    if let Some(off) = spill.pages.remove(&id) {
+                    if let Some(off) = spill.take(id) {
                         spill.read_page_at(off, &mut page.data)?;
                         spilled_hit = true;
                     }
@@ -7514,9 +7568,7 @@ impl Pager {
         if !spilled_index.is_empty() {
             let mut spill_guard = self.delete_spill.lock();
             if let Some(spill) = spill_guard.as_mut() {
-                use std::io::Write;
-                let _ = spill.file.set_len(0);
-                let _ = spill.file.flush();
+                spill.reset();
             }
         }
 
@@ -7759,7 +7811,7 @@ impl Pager {
                             let guard = self.wal.try_write();
                             if let Some(mut guard) = guard {
                                 if let Some(state) = guard.as_mut() {
-                                    match state.wal.append(evict_id, &pg.data, false) {
+                                    match state.wal.spill(evict_id, &pg.data) {
                                         Ok(off) => {
                                             state.spilled.insert(evict_id, off);
                                             true
@@ -7778,13 +7830,7 @@ impl Pager {
                                     // failure keeps the page cached (retry).
                                     let mut spill = self.delete_spill.lock();
                                     match spill.as_mut() {
-                                        Some(s) => match s.append(evict_id, &pg.data) {
-                                            Ok(off) => {
-                                                s.pages.insert(evict_id, off);
-                                                true
-                                            }
-                                            Err(_) => false,
-                                        },
+                                        Some(s) => s.store(evict_id, &pg.data).is_ok(),
                                         None => {
                                             let path = spill_path_for(&self.path);
                                             match OpenOptions::new()
@@ -7795,13 +7841,9 @@ impl Pager {
                                                 .open(&path)
                                             {
                                                 Ok(file) => {
-                                                    let mut s = DeleteSpill {
-                                                        file,
-                                                        pages: std::collections::HashMap::default(),
-                                                    };
-                                                    match s.append(evict_id, &pg.data) {
-                                                        Ok(off) => {
-                                                            s.pages.insert(evict_id, off);
+                                                    let mut s = DeleteSpill::new(file);
+                                                    match s.store(evict_id, &pg.data) {
+                                                        Ok(()) => {
                                                             *spill = Some(s);
                                                             true
                                                         }

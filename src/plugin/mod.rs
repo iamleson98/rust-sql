@@ -532,6 +532,14 @@ pub(crate) fn lookup_scalar(name: &str) -> Option<Arc<dyn ScalarFunction>> {
     scope::current().and_then(|r| r.scalar(name))
 }
 
+/// Is a user virtual-table module registered in the current statement
+/// scope? (Its aux functions resolve only during a scan of its tables.)
+pub(crate) fn user_modules_registered() -> bool {
+    static BUILTIN: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let builtin = BUILTIN.get_or_init(|| PluginRegistry::with_builtins().module_names());
+    scope::current().is_some_and(|r| r.module_names().iter().any(|m| !builtin.contains(m)))
+}
+
 /// Resolve a user aggregate function for the current statement scope.
 pub(crate) fn lookup_aggregate(name: &str) -> Option<Arc<dyn AggregateFunction>> {
     scope::current().and_then(|r| r.aggregate(name))

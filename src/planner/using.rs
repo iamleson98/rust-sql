@@ -241,7 +241,7 @@ impl Planner<'_> {
     /// A FROM atom's qualifier and `*` column names. `None` when either
     /// is not statically known (unaliased subqueries, virtual tables,
     /// table functions, attached tables, star bodies over joins).
-    fn atom_columns(&self, te: &TableExpression) -> Option<(String, Vec<String>)> {
+    pub(super) fn atom_columns(&self, te: &TableExpression) -> Option<(String, Vec<String>)> {
         match te {
             TableExpression::Table {
                 name,

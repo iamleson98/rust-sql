@@ -555,6 +555,20 @@ pub struct Wal {
     /// open. The first `append` writes the header before frame 0; a
     /// 0-byte sidecar at recovery is simply a fresh WAL (0 frames).
     header_dirty: bool,
+    /// The LATEST frame (offset) of each page written since the last
+    /// commit frame — the current transaction's own frames, live or dead
+    /// (a spilled page read back into the cache). A page spilled again
+    /// overwrites that frame in place instead of appending (SQLite's
+    /// sqlite3WalFrames rewrite of a frame the transaction already
+    /// wrote): a long transaction that keeps evicting and re-reading the
+    /// same pages otherwise grew the log by a frame per spill — 970 MB
+    /// for a ~1 MB database (savepoint6.test's shape). The latest frame
+    /// is the only safe slot: recovery applies a page's frames in order.
+    uncommitted: std::collections::HashMap<PageId, u64>,
+    /// First frame index whose checksum an in-place rewrite broke (the
+    /// chain runs through every frame): re-chained before the commit
+    /// frame is written (SQLite's iReCksum / walRewriteChecksums).
+    recksum_from: Option<u32>,
 }
 
 impl Wal {
@@ -606,6 +620,8 @@ impl Wal {
             checksum: (0, 0),
             n_frames: 0,
             header_dirty: false,
+            uncommitted: std::collections::HashMap::new(),
+            recksum_from: None,
         };
 
         wal.recover(truncate_torn)?;
@@ -614,6 +630,8 @@ impl Wal {
 
     /// Recover the WAL: read the header and validate frames.
     fn recover(&mut self, truncate_torn: bool) -> Result<()> {
+        self.uncommitted.clear();
+        self.recksum_from = None;
         let file_size = self.file.metadata()?.len();
         if file_size == 0 {
             // Fresh WAL: header stays IN MEMORY (header_dirty) — the
@@ -740,6 +758,8 @@ impl Wal {
     /// (SQLite's WAL reset under OFF is a plain header rewrite; the
     /// durability point is the caller's to decide).
     pub fn reset_synced(&mut self, sync: bool, full: bool) -> Result<()> {
+        self.uncommitted.clear();
+        self.recksum_from = None;
         self.header = WalHeader::new(self.page_size);
         self.checksum = (self.header.checksum1, self.header.checksum2);
         self.n_frames = 0;
@@ -767,6 +787,8 @@ impl Wal {
     /// the next append cycle) that the auto-checkpoint paid on every
     /// 1000-frame fold of a bulk load (measured ~3% of the whole build).
     pub fn reset_keep_size_synced(&mut self, sync: bool, full: bool) -> Result<()> {
+        self.uncommitted.clear();
+        self.recksum_from = None;
         self.header = WalHeader::new(self.page_size);
         self.checksum = (self.header.checksum1, self.header.checksum2);
         self.n_frames = 0;
@@ -862,6 +884,11 @@ impl Wal {
             self.file.write_all(&self.header.encode())?;
             self.header_dirty = false;
         }
+        // A commit frame seals the chain: frames rewritten in place since
+        // they were chained get their checksums recomputed first.
+        if commit {
+            self.rechain()?;
+        }
         let offset = WAL_HEADER_SIZE as u64
             + self.n_frames as u64 * (FRAME_HEADER_SIZE + self.page_size) as u64;
 
@@ -894,7 +921,82 @@ impl Wal {
         frame.extend_from_slice(data);
         write_all_at(&self.file, &frame, offset)?;
         self.n_frames += 1;
+        if commit {
+            self.uncommitted.clear();
+        } else {
+            self.uncommitted.insert(page_id, offset);
+        }
         Ok(offset)
+    }
+
+    /// Write an UNCOMMITTED page version (a cache spill): over the
+    /// page's latest frame of the current transaction when it has one
+    /// (no log growth — see `uncommitted`), else appended. Returns the
+    /// frame offset.
+    pub fn spill(&mut self, page_id: PageId, data: &[u8]) -> Result<u64> {
+        let Some(&offset) = self.uncommitted.get(&page_id) else {
+            return self.append(page_id, data, false);
+        };
+        if data.len() != self.page_size as usize {
+            return Err(Error::InvalidArgument(format!(
+                "WAL spill: data length {} != page_size {}",
+                data.len(),
+                self.page_size
+            )));
+        }
+        let fh = FrameHeader {
+            page_id,
+            commit: 0,
+            salt1: self.header.salt1,
+            salt2: self.header.salt2,
+            // Re-chained before the commit frame (`rechain`).
+            checksum1: 0,
+            checksum2: 0,
+        };
+        let mut frame = Vec::with_capacity(FRAME_HEADER_SIZE as usize + data.len());
+        frame.extend_from_slice(&fh.encode());
+        frame.extend_from_slice(data);
+        write_all_at(&self.file, &frame, offset)?;
+        let idx = ((offset - WAL_HEADER_SIZE as u64) / (FRAME_HEADER_SIZE + self.page_size) as u64)
+            as u32;
+        self.recksum_from = Some(self.recksum_from.map_or(idx, |k| k.min(idx)));
+        Ok(offset)
+    }
+
+    /// Recompute the checksum chain from the first in-place-rewritten
+    /// frame to the end of the log (SQLite's walRewriteChecksums): each
+    /// frame's checksum covers every frame before it.
+    fn rechain(&mut self) -> Result<()> {
+        let Some(from) = self.recksum_from.take() else {
+            return Ok(());
+        };
+        let frame_size = (FRAME_HEADER_SIZE + self.page_size) as u64;
+        let at = |i: u32| WAL_HEADER_SIZE as u64 + i as u64 * frame_size;
+        let mut chain = if from == 0 {
+            (self.header.checksum1, self.header.checksum2)
+        } else {
+            let mut prev = [0u8; FRAME_HEADER_SIZE as usize];
+            read_exact_at(&self.file, &mut prev, at(from - 1))?;
+            let fh = FrameHeader::decode(&prev)?;
+            (fh.checksum1, fh.checksum2)
+        };
+        let mut buf = vec![0u8; frame_size as usize];
+        for i in from..self.n_frames {
+            read_exact_at(&self.file, &mut buf, at(i))?;
+            let mut h1 = crc32fast::Hasher::new_with_initial(chain.0);
+            let mut h2 = crc32fast::Hasher::new_with_initial(chain.1 ^ 0xA5A5A5A5);
+            h1.update(&buf[0..8]);
+            h2.update(&buf[0..8]);
+            h1.update(&buf[FRAME_HEADER_SIZE as usize..]);
+            h2.update(&buf[FRAME_HEADER_SIZE as usize..]);
+            chain = (h1.finalize(), h2.finalize());
+            let mut sums = [0u8; 8];
+            sums[0..4].copy_from_slice(&chain.0.to_be_bytes());
+            sums[4..8].copy_from_slice(&chain.1.to_be_bytes());
+            write_all_at(&self.file, &sums, at(i) + 16)?;
+        }
+        self.checksum = chain;
+        Ok(())
     }
 
     /// Append a whole commit's frames as ONE positioned write — the
@@ -935,6 +1037,8 @@ impl Wal {
             self.file.write_all(&self.header.encode())?;
             self.header_dirty = false;
         }
+        // This batch ends in the commit frame: seal the chain first.
+        self.rechain()?;
         let psz = self.page_size as usize;
         let frame_size = (FRAME_HEADER_SIZE as usize) + psz;
         // SINGLE-PASS assembly: the dirty check, the byte copy, and the
@@ -1066,7 +1170,11 @@ impl Wal {
             out[hdr_at..hdr_at + FRAME_HEADER_SIZE as usize].copy_from_slice(&fh);
         }
         self.checksum = (c1, c2);
-        self.n_frames += (flushed_frames + out.len() / frame_size) as u32;
+        let written = (flushed_frames + out.len() / frame_size) as u32;
+        self.n_frames += written;
+        if written > 0 {
+            self.uncommitted.clear();
+        }
         if flushed_frames == 0 {
             self.file.seek(SeekFrom::Start(start_offset))?;
         }
@@ -1090,6 +1198,9 @@ impl Wal {
     /// a LIVE-shared reader holds the file, but checked anyway) returns
     /// `Ok(None)`: the caller falls back to a full shared reopen.
     pub fn absorb_foreign_growth(&mut self) -> Result<Option<Vec<(PageId, u64)>>> {
+        // A reader's view: no transaction of its own in flight.
+        self.uncommitted.clear();
+        self.recksum_from = None;
         let frame_size = (FRAME_HEADER_SIZE + self.page_size) as u64;
         let file_len = self.file.metadata()?.len();
         // GENERATION CHECK - re-read the LIVE header before trusting any

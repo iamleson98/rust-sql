@@ -5984,6 +5984,9 @@ impl Database {
     /// cache-fill time — DDL invalidates the cache, so the validation
     /// can never go stale against the schema it checked.
     fn namecheck(&self, stmt: &Statement) -> Result<()> {
+        // User functions resolve through the plugin scope (the "no such
+        // function" check).
+        let _scope = self.plugin_scope();
         // Plugin collations extend the collation universe (CREATE INDEX
         // / COLLATE validation must accept them).
         let extra: Vec<String> = if self.has_plugins.load(Ordering::Relaxed) {

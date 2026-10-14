@@ -6939,7 +6939,47 @@ fn apply_projection(
         .count();
     let mut out_columns: Vec<String> = Vec::new();
     let mut star_expansions: Vec<Vec<String>> = Vec::new(); // for each column, the list of expanded names (or empty)
-    for c in columns {
+                                                            // `q.*` selects q's columns only — by their `q.` prefix, when the
+                                                            // input names carry one (an unaliased subquery beside `t3` has bare
+                                                            // names, which `t3.*` must not pick up). No prefixed match at all
+                                                            // (a single source with bare names) keeps every column.
+    let star_of = |table: &Option<String>| -> Option<Vec<usize>> {
+        let t = table.as_deref()?;
+        let hits: Vec<usize> = inner
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                c.len() > t.len()
+                    && c.as_bytes()[t.len()] == b'.'
+                    && c[..t.len()].eq_ignore_ascii_case(t)
+                    && !crate::planner::is_hidden_rowid(c)
+                    && !crate::executor::vtab_exec::is_aux_slot(c)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        (!hits.is_empty()).then_some(hits)
+    };
+    let qualified_stars: Vec<Option<Vec<usize>>> = columns
+        .iter()
+        .map(|c| match &c.expr {
+            Expr::Column { table, name } if name == "*" => star_of(table),
+            _ => None,
+        })
+        .collect();
+    for (ci, c) in columns.iter().enumerate() {
+        if let Some(hits) = &qualified_stars[ci] {
+            let expanded: Vec<String> = hits
+                .iter()
+                .map(|&i| {
+                    let c = &inner.columns[i];
+                    c.rfind('.').map_or(c.clone(), |p| c[p + 1..].to_string())
+                })
+                .collect();
+            out_columns.extend(expanded.clone());
+            star_expansions.push(expanded);
+            continue;
+        }
         if let Expr::Column { name, .. } = &c.expr {
             if name == "*" {
                 // Expand to all input columns.
@@ -7002,8 +7042,11 @@ fn apply_projection(
     // Vecs — for a 1000-row scan that's 1000 allocations + 2000+ Value
     // clones eliminated. Only the column NAMES can differ (aliases / star
     // unqualification); the values are byte-identical.
-    let single_star =
-        columns.len() == 1 && matches!(&columns[0].expr, Expr::Column { name, .. } if name == "*");
+    let single_star = columns.len() == 1
+        && matches!(&columns[0].expr, Expr::Column { name, .. } if name == "*")
+        && qualified_stars[0]
+            .as_ref()
+            .map_or(true, |h| h.len() == inner.columns.len());
     let identity_projection = single_star
         || (all_resolved
             && resolved.len() == inner.columns.len()
@@ -7046,6 +7089,10 @@ fn apply_projection(
             for (i, c) in columns.iter().enumerate() {
                 if let Some(Some(idx)) = resolved.get(i) {
                     out.push(row[*idx].clone());
+                    continue;
+                }
+                if let Some(hits) = &qualified_stars[i] {
+                    out.extend(hits.iter().map(|&k| row[k].clone()));
                     continue;
                 }
                 if let Expr::Column { name, .. } = &c.expr {
@@ -22102,7 +22149,12 @@ fn exec_index_lookup_impl(
     // The projected variant handles rowid via the ROWID_PROJ sentinel; the
     // full-row (non-projected) path appends the trailing slot so generic
     // projections above can reference it by name.
-    let append_rowid = project.is_none() && crate::planner::wants_rowid_slot(&table);
+    // Only when the reported columns carry the slot: the fused `*`
+    // projection reports the table's columns alone, and an extra value
+    // there leaked into `SELECT * FROM (SELECT * FROM t WHERE k = ?)`
+    // and compound arms as a third column.
+    let append_rowid =
+        project.is_none() && crate::planner::wants_rowid_slot(&table) && out_cols.len() > n_cols;
     fetch_rows_by_rowids(
         &mut table_bt,
         &rowids,
@@ -24928,9 +24980,11 @@ fn exec_insert_one_row(
     // same column. Otherwise the first UNIQUE index whose key columns the
     // target lists exactly; a PARTIAL index matches only when the target
     // repeats its WHERE clause.
-    let upsert_target = match upsert {
-        Some(u) if u.target.is_empty() => UpsertTarget::Any,
-        Some(u) => {
+    let analyze_target = |u: &crate::sql::ast::UpsertClause| -> Result<UpsertTarget> {
+        if u.target.is_empty() {
+            return Ok(UpsertTarget::Any);
+        }
+        {
             let names_rowid = !table.without_rowid
                 && u.target.len() == 1
                 && u.target[0].expr.is_none()
@@ -24957,36 +25011,108 @@ fn exec_insert_one_row(
                                 // A target COLLATE must name the index
                                 // column's collation (sqlite3ExprCompare);
                                 // a bare term matches any.
-                                let coll_ok = t.collation.as_deref().map_or(true, |tc| {
-                                    let ic = if c.collation.is_empty() {
-                                        "BINARY"
+                                // A COLLATE inside an expression term
+                                // is its collation, not part of the
+                                // expression (sqlite3ExprSkipCollate).
+                                let split = |e: &Expr| -> (Expr, Option<String>) {
+                                    let mut e = e;
+                                    let mut coll = None;
+                                    while let Expr::Collate { expr, collation } = e {
+                                        coll.get_or_insert_with(|| collation.clone());
+                                        e = expr;
+                                    }
+                                    (e.clone(), coll)
+                                };
+                                let (ce, c_coll) = match &c.expr {
+                                    Some(e) => {
+                                        let (b, k) = split(e);
+                                        (Some(b), k)
+                                    }
+                                    None => (None, None),
+                                };
+                                let (te, t_coll) = match &t.expr {
+                                    Some(e) => {
+                                        let (b, k) = split(e);
+                                        (Some(b), k)
+                                    }
+                                    None => (None, None),
+                                };
+                                let ic = c_coll.unwrap_or_else(|| {
+                                    if c.collation.is_empty() {
+                                        "BINARY".to_string()
                                     } else {
-                                        c.collation.as_str()
-                                    };
-                                    tc.eq_ignore_ascii_case(ic)
+                                        c.collation.clone()
+                                    }
                                 });
+                                let coll_ok = t
+                                    .collation
+                                    .clone()
+                                    .or(t_coll)
+                                    .map_or(true, |tc| tc.eq_ignore_ascii_case(&ic));
                                 coll_ok
-                                    && match (&c.expr, &t.expr) {
+                                    && match (&ce, &te) {
                                         (None, None) => c.name.eq_ignore_ascii_case(&t.name),
                                         (Some(ce), Some(te)) => render(ce) == render(te),
-                                        _ => false,
+                                        // A bare column target against an
+                                        // expression key over just it.
+                                        (Some(ce), None) => matches!(ce,
+                                            Expr::Column { name, .. } if name.eq_ignore_ascii_case(&t.name)),
+                                        (None, Some(te)) => matches!(te,
+                                            Expr::Column { name, .. } if name.eq_ignore_ascii_case(&c.name)),
                                     }
                             })
                         })
                 })
             };
             match idx_pos {
-                Some(i) => UpsertTarget::Index(i),
-                None if names_rowid => UpsertTarget::RowidPk,
-                None => {
-                    return Err(Error::semantic(
-                        "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint",
-                    ));
-                }
+                Some(i) => Ok(UpsertTarget::Index(i)),
+                None if names_rowid => Ok(UpsertTarget::RowidPk),
+                None => Err(Error::semantic(
+                    "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint",
+                )),
             }
         }
-        None => UpsertTarget::Any,
     };
+    // Every ON CONFLICT clause, in order, with the constraint it targets
+    // (SQLite's pNextUpsert chain): a conflict takes the FIRST clause
+    // naming its constraint, else the trailing targetless one.
+    let mut upsert_clauses: Vec<(UpsertTarget, &crate::sql::ast::UpsertClause)> = Vec::new();
+    if let Some(u) = upsert {
+        for c in u.chain() {
+            upsert_clauses.push((analyze_target(c)?, c));
+        }
+    }
+    let clause_for_rowid = || {
+        upsert_clauses
+            .iter()
+            .find(|(t, _)| matches!(t, UpsertTarget::RowidPk))
+            .or_else(|| {
+                upsert_clauses
+                    .iter()
+                    .find(|(t, _)| matches!(t, UpsertTarget::Any))
+            })
+            .map(|(_, c)| *c)
+    };
+    let clause_for_index = |i: usize| {
+        upsert_clauses
+            .iter()
+            .find(|(t, _)| matches!(t, UpsertTarget::Index(k) if *k == i))
+            .or_else(|| {
+                upsert_clauses
+                    .iter()
+                    .find(|(t, _)| matches!(t, UpsertTarget::Any))
+            })
+            .map(|(_, c)| *c)
+    };
+    // The targeted indexes, in clause order — checked first.
+    let mut targeted: Vec<usize> = Vec::new();
+    for (t, _) in &upsert_clauses {
+        if let UpsertTarget::Index(i) = t {
+            if !targeted.contains(i) {
+                targeted.push(*i);
+            }
+        }
+    }
 
     // ── Constraint checks in SQLite's order (sqlite3GenerateConstraintChecks).
     // The ROWID first, then the UNIQUE indexes in Table.pIndex order
@@ -25013,30 +25139,39 @@ fn exec_insert_one_row(
     };
     let rowid_checkable =
         !table.without_rowid && !rowid_was_autogenerated && !rowid_is_fresh_beyond_max;
-    let early_rowid = rowid_checkable
-        && (!unique_order.is_empty()
-            || matches!(upsert_target, UpsertTarget::Any | UpsertTarget::RowidPk)
-                && upsert.is_some());
+    let early_rowid = rowid_checkable && (!unique_order.is_empty() || clause_for_rowid().is_some());
     #[derive(Clone, Copy, PartialEq)]
     enum Check {
         Rowid,
         Index(usize),
     }
     let mut checks: Vec<Check> = Vec::new();
-    match upsert_target {
-        UpsertTarget::Index(t) if upsert.is_some() => {
-            checks.push(Check::Index(t));
-            if early_rowid {
+    match targeted.is_empty() {
+        false => {
+            // The targeted constraints first, in clause order (the rowid
+            // where a clause names the INTEGER PRIMARY KEY), then the
+            // rest.
+            for (t, _) in &upsert_clauses {
+                let c = match t {
+                    UpsertTarget::Index(i) => Check::Index(*i),
+                    UpsertTarget::RowidPk if early_rowid => Check::Rowid,
+                    _ => continue,
+                };
+                if !checks.contains(&c) {
+                    checks.push(c);
+                }
+            }
+            if early_rowid && !checks.contains(&Check::Rowid) {
                 checks.push(Check::Rowid);
             }
             checks.extend(
                 unique_order
                     .iter()
-                    .filter(|&&i| i != t)
+                    .filter(|i| !targeted.contains(i))
                     .map(|&i| Check::Index(i)),
             );
         }
-        _ => {
+        true => {
             let defer = rowid_policy == ConflictResolution::Replace
                 && stmt_or != Some(ConflictResolution::Replace)
                 && !index_states.is_empty()
@@ -25061,20 +25196,18 @@ fn exec_insert_one_row(
                     }
                     // UPSERT applies when the target is empty (any
                     // constraint) or the rowid PK itself.
-                    if let Some(u) = upsert {
-                        if matches!(upsert_target, UpsertTarget::Any | UpsertTarget::RowidPk) {
-                            return exec_upsert_row(
-                                ctx,
-                                table,
-                                table_name_lc,
-                                current_root,
-                                full_row,
-                                payload_buf,
-                                index_states,
-                                rowid,
-                                u,
-                            );
-                        }
+                    if let Some(u) = clause_for_rowid() {
+                        return exec_upsert_row(
+                            ctx,
+                            table,
+                            table_name_lc,
+                            current_root,
+                            full_row,
+                            payload_buf,
+                            index_states,
+                            rowid,
+                            u,
+                        );
                     }
                     match rowid_policy {
                         ConflictResolution::Ignore => return Ok((InsertOutcome::Skipped, rowid)),
@@ -25128,13 +25261,8 @@ fn exec_insert_one_row(
                     // UPSERT: conflicts on the targeted index (or on any
                     // constraint, for an empty target) take the upsert
                     // action; other constraints resolve as usual.
-                    if let Some(u) = upsert {
-                        let on_target = match upsert_target {
-                            UpsertTarget::Any => true,
-                            UpsertTarget::Index(t) => t == i,
-                            UpsertTarget::RowidPk => false,
-                        };
-                        if on_target {
+                    if let Some(u) = clause_for_index(i) {
+                        {
                             return exec_upsert_row(
                                 ctx,
                                 table,
@@ -25306,8 +25434,8 @@ fn exec_insert_one_row(
                 Some(LookupResult::Found(existing_payload)) => {
                     // Rowid conflict. UPSERT applies when the target is
                     // empty (any constraint) or the rowid PK itself.
-                    if let Some(u) = upsert {
-                        if matches!(upsert_target, UpsertTarget::Any | UpsertTarget::RowidPk) {
+                    if let Some(u) = clause_for_rowid() {
+                        {
                             drop_payload(existing_payload);
                             return exec_upsert_row(
                                 ctx,

@@ -341,7 +341,7 @@ pub(crate) fn collect_table_refs(stmt: &Statement, out: &mut Vec<RefSite>) {
                 }
                 InsertSource::DefaultValues => {}
             }
-            if let Some(u) = &i.upsert {
+            for u in i.upsert.iter().flat_map(|u| u.chain()) {
                 collect_opt_expr(&u.target_where, out);
                 if let UpsertAction::DoUpdate { set, where_clause } = &u.action {
                     for (_, e) in set {
@@ -768,7 +768,8 @@ fn rewrite_statement<R: FnMut(&mut Option<String>, &str)>(stmt: &mut Statement, 
                 }
                 InsertSource::DefaultValues => {}
             }
-            if let Some(u) = &mut i.upsert {
+            let mut next = i.upsert.as_mut();
+            while let Some(u) = next {
                 rewrite_opt_expr(&mut u.target_where, visit);
                 if let UpsertAction::DoUpdate { set, where_clause } = &mut u.action {
                     for (_, e) in set {
@@ -776,6 +777,7 @@ fn rewrite_statement<R: FnMut(&mut Option<String>, &str)>(stmt: &mut Statement, 
                     }
                     rewrite_opt_expr(where_clause, visit);
                 }
+                next = u.next.as_deref_mut();
             }
             if let Some(rcs) = &mut i.returning {
                 for rc in rcs {

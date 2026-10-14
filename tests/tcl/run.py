@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
-SERVER = os.path.join(ROOT, "target", "release", "examples", "tcl_db_server")
+SERVER = os.environ.get("TCL_DB_SERVER") or os.path.join(ROOT, "target", "release", "examples", "tcl_db_server")
 SHIM = os.path.join(HERE, "shim.tcl")
 
 
