@@ -30622,6 +30622,94 @@ fn flatten_dml_source(source: &Plan) -> Option<Plan> {
 
 /// SQLite's `bComplex` for a DELETE beyond triggers: foreign-key work —
 /// the pragma is on and the table is a child or a parent of some FK.
+/// SQLite's truncate optimization (delete.c, OP_Clear): `DELETE FROM t`
+/// with no WHERE, no RETURNING, no DELETE triggers, no foreign-key work
+/// and no preupdate hook empties the table and each of its indexes by
+/// freeing their pages — no row is visited. Each tree keeps its root
+/// page, re-initialized empty, so the schema needs no rewrite. The
+/// change count is the row count, as SQLite reports it. Row by row, a
+/// 50,000-row table with two indexes took 450 ms (speedtest1 190/300).
+fn try_truncate_delete(
+    ctx: &mut ExecContext<'_>,
+    table: &Arc<Table>,
+    source: &Plan,
+    returning: Option<&[crate::sql::ast::ResultColumn]>,
+) -> Result<Option<ExecResult>> {
+    let Plan::Scan {
+        table: src,
+        predicate: None,
+        ..
+    } = source
+    else {
+        return Ok(None);
+    };
+    if returning.is_some()
+        || !(Arc::ptr_eq(src, table) || src.name.eq_ignore_ascii_case(&table.name))
+        || crate::executor::triggers::has_triggers_for(
+            ctx,
+            table,
+            &crate::sql::ast::TriggerEvent::Delete,
+        )
+        || delete_fk_work(ctx, table)
+        || crate::preupdate::events_needed()
+        || ctx.pager.concurrent_scope_armed()
+    {
+        return Ok(None);
+    }
+    let root = ctx.table_root(table);
+    if root == 0 {
+        return Ok(None);
+    }
+    let deleted = Btree::new(ctx.pager, root, false).count_rows()? as i64;
+    let mut roots: Vec<crate::storage::page::PageId> = vec![root];
+    for idx in ctx.catalog().indexes_on_table(&table.name) {
+        roots.push(ctx.index_root(&idx));
+    }
+    // Collect every tree first (an error frees nothing), then clear.
+    let mut trees: Vec<(
+        crate::storage::page::PageId,
+        Vec<crate::storage::page::PageId>,
+    )> = Vec::with_capacity(roots.len());
+    for &r in &roots {
+        if r == 0 {
+            return Ok(None);
+        }
+        let mut pages = Vec::new();
+        crate::storage::btree::collect_tree_pages(ctx.pager, r, &mut pages)?;
+        trees.push((r, pages));
+    }
+    for (r, pages) in trees {
+        {
+            let page = ctx.pager.get_page(r)?;
+            let mut p = page.lock();
+            let leaf_index = p.page_type()?.is_index();
+            p.data.fill(0);
+            if leaf_index {
+                p.init_leaf_index();
+            } else {
+                p.init_leaf_table();
+            }
+        }
+        ctx.pager.note_dirty(r);
+        for pid in pages {
+            if pid != r {
+                ctx.pager.free_page(pid)?;
+            }
+        }
+    }
+    let name_lc = table.name.to_ascii_lowercase();
+    ctx.set_table_root_lc(&name_lc, root);
+    ctx.invalidate_max_rowid_if_deleted(&name_lc, i64::MAX);
+    ctx.changes += deleted;
+    if !ctx.in_transaction && !ctx.deferred_flush {
+        ctx.pager.flush()?;
+    }
+    Ok(Some(ExecResult {
+        columns: Arc::from(vec!["deleted".to_string()]),
+        rows: vec![vec![Value::Integer(deleted)]],
+    }))
+}
+
 fn delete_fk_work(ctx: &ExecContext<'_>, table: &Table) -> bool {
     ctx.pager.foreign_keys_enabled()
         && (!table.foreign_keys.is_empty()
@@ -31516,6 +31604,9 @@ fn exec_delete(
     // to the dedicated point-delete fast path below.
     let flattened = flatten_dml_source(source);
     let source: &Plan = flattened.as_ref().unwrap_or(source);
+    if let Some(result) = try_truncate_delete(ctx, &table, source, returning)? {
+        return Ok(result);
+    }
     if let Some(result) = try_streaming_delete(ctx, &table, source, returning)? {
         return Ok(result);
     }

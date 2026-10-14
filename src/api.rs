@@ -15056,16 +15056,49 @@ impl Database {
                             return Err(e);
                         }
                     }
-                    let mut bt = Btree::new(ctx.pager, live_root, false);
-                    for (rowid, payload) in updates {
-                        let did = bt.update_table(rowid, &payload).unwrap_or(false);
-                        if !did {
-                            bt.delete_table(rowid)?;
-                            bt.insert_table(rowid, &payload)?;
+                    if !table.without_rowid && live_root != 0 {
+                        // COMPACT rebuild: every row grows, so rewriting
+                        // them in place split pages half full (a 700-page
+                        // table came out at 1,188 pages; SQLite's lazy
+                        // default leaves it at 634). Empty the tree —
+                        // keeping its root page, so the schema's rootpage
+                        // stands — and re-insert in rowid order: the
+                        // append path packs every leaf full.
+                        let mut pages = Vec::new();
+                        crate::storage::btree::collect_tree_pages(
+                            ctx.pager, live_root, &mut pages,
+                        )?;
+                        {
+                            let page = ctx.pager.get_page(live_root)?;
+                            let mut p = page.lock();
+                            p.data.fill(0);
+                            p.init_leaf_table();
                         }
-                    }
-                    if bt.root != live_root {
-                        ctx.set_table_root(&table.name, bt.root);
+                        ctx.pager.note_dirty(live_root);
+                        for pid in pages {
+                            if pid != live_root {
+                                ctx.pager.free_page(pid)?;
+                            }
+                        }
+                        let mut bt = Btree::new(ctx.pager, live_root, false);
+                        for (rowid, payload) in &updates {
+                            bt.insert_table(*rowid, payload)?;
+                        }
+                        if bt.root != live_root {
+                            ctx.set_table_root(&table.name, bt.root);
+                        }
+                    } else {
+                        let mut bt = Btree::new(ctx.pager, live_root, false);
+                        for (rowid, payload) in updates {
+                            let did = bt.update_table(rowid, &payload).unwrap_or(false);
+                            if !did {
+                                bt.delete_table(rowid)?;
+                                bt.insert_table(rowid, &payload)?;
+                            }
+                        }
+                        if bt.root != live_root {
+                            ctx.set_table_root(&table.name, bt.root);
+                        }
                     }
                 }
                 ctx.pager.flush()?;

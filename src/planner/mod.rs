@@ -6,6 +6,8 @@
 //! 3. **Optimization**: index selection, predicate pushdown, join reordering.
 
 mod aliases;
+pub(crate) mod expr_eq;
+use expr_eq::expr_eq;
 pub(crate) mod fold;
 pub mod namecheck;
 pub mod plan;
@@ -2378,8 +2380,16 @@ impl<'a> Planner<'a> {
             let dup = aggregates.iter().any(|x| {
                 x.func == oa.func
                     && x.distinct == oa.distinct
-                    && format!("{:?}", x.arg) == format!("{:?}", oa.arg)
-                    && format!("{:?}", x.filter) == format!("{:?}", oa.filter)
+                    && match (&x.arg, &oa.arg) {
+                        (Some(a), Some(b)) => expr_eq(a, b),
+                        (None, None) => true,
+                        _ => false,
+                    }
+                    && match (&x.filter, &oa.filter) {
+                        (Some(a), Some(b)) => expr_eq(a, b),
+                        (None, None) => true,
+                        _ => false,
+                    }
             });
             if !dup {
                 aggregates.push(oa);
@@ -3035,18 +3045,16 @@ pub fn rewrite_aggregates_and_groups(
     let _ = n_group;
     // First, check if this expression matches a GROUP BY expression.
     // We use a structural-equality heuristic (Display-based) since Expr doesn't impl PartialEq.
-    let e_display = format!("{:?}", e);
     for (i, g) in group_by.iter().enumerate() {
-        let g_display = format!("{:?}", g);
         // A group term may carry an explicit COLLATE (`GROUP BY v COLLATE
         // NOCASE`) — the collation shapes grouping, not the term's VALUE:
         // a projection / ORDER BY reference to the bare `v` still means
         // this group key. Unwrap one Collate level for the match.
-        let inner_display = match g {
-            Expr::Collate { expr, .. } => format!("{:?}", expr),
-            _ => g_display.clone(),
+        let inner_match = match g {
+            Expr::Collate { expr, .. } => expr_eq(expr, e),
+            _ => false,
         };
-        if g_display == e_display || inner_display == e_display {
+        if expr_eq(g, e) || inner_match {
             // Match the column-naming convention used by exec_aggregate
             // (named after the source expression, falling back to "colN").
             // Without this consistency, the rewritten column reference
@@ -3072,7 +3080,7 @@ pub fn rewrite_aggregates_and_groups(
         for (i, agg) in aggregates.iter().enumerate() {
             if agg.func == "bare" {
                 if let Some(arg) = &agg.arg {
-                    if format!("{:?}", arg) == e_display {
+                    if expr_eq(arg, e) {
                         return Expr::Column {
                             table: None,
                             name: format!("__agg_{}", i),
@@ -3157,7 +3165,7 @@ pub fn rewrite_aggregates_and_groups(
                     // subset).
                     let filter_match = match (&agg.filter, filter) {
                         (None, None) => true,
-                        (Some(a), Some(c)) => format!("{:?}", a) == format!("{:?}", c),
+                        (Some(a), Some(c)) => expr_eq(a, c),
                         _ => false,
                     };
                     if !filter_match {
@@ -3179,7 +3187,7 @@ pub fn rewrite_aggregates_and_groups(
                     // GROUP BY matcher above.
                     let args_match = match (&agg.arg, call_arg) {
                         (None, None) => true,
-                        (Some(a), Some(c)) => format!("{:?}", a) == format!("{:?}", c),
+                        (Some(a), Some(c)) => expr_eq(a, c),
                         _ => false,
                     };
                     if args_match {
@@ -5035,9 +5043,7 @@ fn apply_where_for_scan_inner(
 /// Compare two expressions for structural equality (used to filter out the
 /// conjunct that became the access-path predicate from the residual list).
 fn exprs_equal_conjunct(a: &Expr, b: &Expr) -> bool {
-    // Cheap structural compare via Debug string. Good enough — this is
-    // only called during planning, not per-row.
-    format!("{:?}", a) == format!("{:?}", b)
+    expr_eq(a, b)
 }
 
 /// Detect `first-indexed-col IN (list-of-expressions)` among the
@@ -11885,23 +11891,15 @@ fn collect_bare_refs(e: &Expr, group_by: &[Expr], out: &mut Vec<Expr>) {
     // COUNT(*) ... GROUP BY val/100` collected a dead `bare(val)` slot
     // whose mere presence declined every fast path (0.71x on the CI
     // GROUP BY bench).
-    {
-        let d = format!("{:?}", e);
-        for g in group_by {
-            let gd = format!("{:?}", g);
-            let inner = match g {
-                Expr::Collate { expr, .. } => format!("{:?}", expr),
-                _ => gd.clone(),
-            };
-            if gd == d || inner == d {
-                return;
-            }
+    for g in group_by {
+        let inner = matches!(g, Expr::Collate { expr, .. } if expr_eq(expr, e));
+        if inner || expr_eq(g, e) {
+            return;
         }
     }
     match e {
         Expr::Column { .. } => {
-            let d = format!("{:?}", e);
-            if !out.iter().any(|x| format!("{:?}", x) == d) {
+            if !out.iter().any(|x| expr_eq(x, e)) {
                 out.push(e.clone());
             }
         }
