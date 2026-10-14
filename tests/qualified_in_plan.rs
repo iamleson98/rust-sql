@@ -296,7 +296,11 @@ fn dml_updates_through_index_in() {
         .into_iter()
         .map(|r| r[0].as_text().to_string())
         .collect();
-    assert_eq!(statuses, vec!["held", "available", "held"], "both IN members must update");
+    assert_eq!(
+        statuses,
+        vec!["held", "available", "held"],
+        "both IN members must update"
+    );
 
     // DELETE through the same shape.
     db.execute(
