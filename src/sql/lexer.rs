@@ -298,6 +298,9 @@ impl<'a> Lexer<'a> {
         // a linear scan over 144 keywords (~900 string compares per INSERT
         // statement). Now: ~7 short memcmps, no allocation.
         if let Some(kw) = keyword_lookup(s) {
+            if kw == "COLLATE" {
+                COLLATE_SEEN.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             Ok(Token::Keyword(kw))
         } else {
             Ok(Token::Ident(s.to_string()))
@@ -605,6 +608,16 @@ pub fn is_keyword(s: &str) -> bool {
 /// Case-insensitive lookup of `s` in the sorted static keyword table.
 /// Returns the canonical uppercase spelling. ~log2(144) ≈ 8 short compares,
 /// zero allocation.
+/// Set once this process has lexed a COLLATE keyword — in a statement,
+/// a schema, a view or a trigger body. Every `Expr::Collate` node comes
+/// from such text (the planner's own wrappers carry DECLARED column
+/// collations, themselves parsed from a schema's COLLATE clause), so
+/// until then no expression can carry an explicit collation: comparison
+/// evaluation skips the operand-tree walk that looks for one (SQLite's
+/// EP_Collate flag, process-wide). Measured: 40% of a correlated
+/// recursive CTE's time (speedtest1's Sudoku) walked those trees.
+pub static COLLATE_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn keyword_lookup(s: &str) -> Option<&'static str> {
     let sb = s.as_bytes();
     KEYWORDS

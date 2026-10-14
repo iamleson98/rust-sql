@@ -24,6 +24,8 @@ struct Section {
     number: u32,
     name: String,
     stmts: Vec<String>,
+    /// `--params`: the lifted literals of each statement (empty = none).
+    params: Vec<Vec<Lit>>,
 }
 
 fn parse_script(text: &str) -> Vec<Section> {
@@ -37,6 +39,7 @@ fn parse_script(text: &str) -> Vec<Section> {
         number: 0,
         name: "(setup)".into(),
         stmts: Vec::new(),
+        params: Vec::new(),
     };
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("-- begin test ") {
@@ -51,6 +54,7 @@ fn parse_script(text: &str) -> Vec<Section> {
                 number,
                 name: name.to_string(),
                 stmts: Vec::new(),
+                params: Vec::new(),
             });
             continue;
         }
@@ -80,6 +84,165 @@ fn parse_script(text: &str) -> Vec<Section> {
     }
     out.insert(0, setup);
     out
+}
+
+/// A literal lifted out of a statement by `--params`.
+#[derive(Clone)]
+enum Lit {
+    Int(i64),
+    Real(f64),
+    Text(String),
+}
+
+/// `--params`: speedtest1 prepares each statement ONCE and binds values;
+/// the script carries the values inline. Lift numeric and string literals
+/// of a DML / SELECT statement into `?` parameters so both engines reuse
+/// one prepared statement per shape — as speedtest1 itself runs. Literals
+/// in ORDER BY / GROUP BY lists stay (they can be column ordinals).
+fn parameterize(sql: &str) -> (String, Vec<Lit>) {
+    let head = sql
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    if !matches!(
+        head.as_str(),
+        "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "REPLACE"
+    ) {
+        return (sql.to_string(), Vec::new());
+    }
+    let b = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut lits = Vec::new();
+    let mut i = 0;
+    let mut prev_word = String::new();
+    let mut in_by = false;
+    let mut depth_at_by = 0i32;
+    let mut depth = 0i32;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\'' {
+            let mut j = i + 1;
+            let mut v = String::new();
+            loop {
+                if j >= b.len() {
+                    return (sql.to_string(), Vec::new());
+                }
+                if b[j] == b'\'' {
+                    if j + 1 < b.len() && b[j + 1] == b'\'' {
+                        v.push('\'');
+                        j += 2;
+                        continue;
+                    }
+                    break;
+                }
+                let ch_len = sql[j..].chars().next().map_or(1, |c| c.len_utf8());
+                v.push_str(&sql[j..j + ch_len]);
+                j += ch_len;
+            }
+            // x'..' blob literals (and ORDER / GROUP BY terms) stay inline.
+            let blob = out.ends_with(['x', 'X'])
+                && !out[..out.len() - 1].ends_with(|c: char| c.is_alphanumeric() || c == '_');
+            if blob || in_by {
+                out.push_str(&sql[i..=j]);
+            } else {
+                out.push('?');
+                lits.push(Lit::Text(v));
+            }
+            i = j + 1;
+            prev_word.clear();
+            continue;
+        }
+        if c == b'"' {
+            let j = sql[i + 1..]
+                .find('"')
+                .map(|k| i + 1 + k)
+                .unwrap_or(b.len() - 1);
+            out.push_str(&sql[i..=j]);
+            i = j + 1;
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == b'_' {
+            let j = (i..b.len())
+                .find(|&k| !(b[k].is_ascii_alphanumeric() || b[k] == b'_' || b[k] == b'$'))
+                .unwrap_or(b.len());
+            let w = sql[i..j].to_ascii_uppercase();
+            if w == "BY" && (prev_word == "ORDER" || prev_word == "GROUP") {
+                in_by = true;
+                depth_at_by = depth;
+            } else if in_by
+                && matches!(
+                    w.as_str(),
+                    "LIMIT"
+                        | "HAVING"
+                        | "WINDOW"
+                        | "UNION"
+                        | "EXCEPT"
+                        | "INTERSECT"
+                        | "ON"
+                        | "WHERE"
+                )
+            {
+                in_by = false;
+            }
+            out.push_str(&sql[i..j]);
+            prev_word = w;
+            i = j;
+            continue;
+        }
+        if c.is_ascii_digit() || (c == b'.' && i + 1 < b.len() && b[i + 1].is_ascii_digit()) {
+            let mut j = i;
+            while j < b.len() && (b[j].is_ascii_digit() || b[j] == b'.') {
+                j += 1;
+            }
+            if j < b.len() && (b[j] == b'e' || b[j] == b'E') {
+                let mut k = j + 1;
+                if k < b.len() && (b[k] == b'+' || b[k] == b'-') {
+                    k += 1;
+                }
+                if k < b.len() && b[k].is_ascii_digit() {
+                    j = k;
+                    while j < b.len() && b[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                }
+            }
+            let tok = &sql[i..j];
+            let ident_tail = j < b.len() && (b[j].is_ascii_alphabetic() || b[j] == b'_');
+            let lit = if tok.contains(['.', 'e', 'E']) {
+                tok.parse::<f64>().ok().map(Lit::Real)
+            } else {
+                tok.parse::<i64>().ok().map(Lit::Int)
+            };
+            match lit {
+                Some(l) if !in_by && !ident_tail && !tok.starts_with("0x") => {
+                    out.push('?');
+                    lits.push(l);
+                }
+                _ => out.push_str(tok),
+            }
+            i = j;
+            prev_word.clear();
+            continue;
+        }
+        if c == b'(' {
+            depth += 1;
+        } else if c == b')' {
+            depth -= 1;
+            if in_by && depth < depth_at_by {
+                in_by = false;
+            }
+        } else if c == b';' {
+            in_by = false;
+        }
+        if !c.is_ascii_whitespace() {
+            prev_word.clear();
+        }
+        let ch_len = sql[i..].chars().next().map_or(1, |c| c.len_utf8());
+        out.push_str(&sql[i..i + ch_len]);
+        i += ch_len;
+    }
+    (out, lits)
 }
 
 fn returns_rows(sql: &str) -> bool {
@@ -136,9 +299,22 @@ fn run_ours(sections: &[Section], dir: &std::path::Path) -> Vec<Outcome> {
         let mut o = Outcome::default();
         let mut h = std::collections::hash_map::DefaultHasher::new();
         let t0 = Instant::now();
-        for sql in &s.stmts {
+        for (k, sql) in s.stmts.iter().enumerate() {
+            let p: Vec<rustqlite::Value> = s
+                .params
+                .get(k)
+                .map(|ls| {
+                    ls.iter()
+                        .map(|l| match l {
+                            Lit::Int(i) => rustqlite::Value::Integer(*i),
+                            Lit::Real(f) => rustqlite::Value::Real(*f),
+                            Lit::Text(t) => rustqlite::Value::Text(t.clone().into()),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             let r = if returns_rows(sql) {
-                db.query(sql, ()).map(|rows| {
+                db.query(sql, p).map(|rows| {
                     let mut v: Vec<Vec<String>> = rows
                         .iter()
                         .map(|r| r.iter().map(ours_value).collect())
@@ -146,7 +322,7 @@ fn run_ours(sections: &[Section], dir: &std::path::Path) -> Vec<Outcome> {
                     hash_rows(&mut v, &mut h);
                 })
             } else {
-                db.execute(sql, ())
+                db.execute(sql, p)
             };
             if let Err(e) = r {
                 o.errors += 1;
@@ -163,14 +339,25 @@ fn run_ours(sections: &[Section], dir: &std::path::Path) -> Vec<Outcome> {
 
 fn run_sqlite(sections: &[Section], dir: &std::path::Path) -> Vec<Outcome> {
     let db = rusqlite::Connection::open(dir.join("sqlite.db")).unwrap();
+    db.set_prepared_statement_cache_capacity(256);
     let mut out = Vec::with_capacity(sections.len());
     for s in sections {
         let mut o = Outcome::default();
         let mut h = std::collections::hash_map::DefaultHasher::new();
         let t0 = Instant::now();
-        for sql in &s.stmts {
+        for (k, sql) in s.stmts.iter().enumerate() {
             let r: rusqlite::Result<()> = (|| {
-                let mut st = db.prepare(sql)?;
+                let lits = s.params.get(k).filter(|l| !l.is_empty());
+                let mut st = db.prepare_cached(sql)?;
+                if let Some(ls) = lits {
+                    for (i, l) in ls.iter().enumerate() {
+                        match l {
+                            Lit::Int(v) => st.raw_bind_parameter(i + 1, v)?,
+                            Lit::Real(v) => st.raw_bind_parameter(i + 1, v)?,
+                            Lit::Text(v) => st.raw_bind_parameter(i + 1, v.as_str())?,
+                        }
+                    }
+                }
                 let n = st.column_count();
                 let mut rows = st.raw_query();
                 let mut v: Vec<Vec<String>> = Vec::new();
@@ -215,7 +402,18 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .cloned();
     let text = std::fs::read_to_string(script).unwrap();
-    let sections = parse_script(&text);
+    let mut sections = parse_script(&text);
+    if args.iter().any(|a| a == "--params") {
+        for s in sections.iter_mut() {
+            let mut params = Vec::with_capacity(s.stmts.len());
+            for sql in s.stmts.iter_mut() {
+                let (t, l) = parameterize(sql);
+                *sql = t;
+                params.push(l);
+            }
+            s.params = params;
+        }
+    }
     let n_stmts: usize = sections.iter().map(|s| s.stmts.len()).sum();
     eprintln!("{} sections, {} statements", sections.len(), n_stmts);
     let mut results: BTreeMap<&str, Vec<Outcome>> = BTreeMap::new();

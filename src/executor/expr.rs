@@ -607,13 +607,8 @@ impl<'a> EvalContext<'a> {
             }
         }
         // Try qualified match by suffix (e.g. "u.id" matches "id").
-        for (i, n) in self.column_names.iter().enumerate() {
-            if let Some(pos) = n.rfind('.') {
-                let suffix = &n[pos + 1..];
-                if suffix.eq_ignore_ascii_case(name) {
-                    return self.row.get(i).cloned().unwrap_or(Value::Null);
-                }
-            }
+        if let Some(i) = suffix_column_index(self.column_names, name) {
+            return self.row.get(i).cloned().unwrap_or(Value::Null);
         }
         // Hidden vtab aux slot (FTS5's `rank` / table-self column): the
         // marked name answers the bare reference after every real column
@@ -630,6 +625,23 @@ impl<'a> EvalContext<'a> {
         }
         Value::Null
     }
+}
+
+/// The first column whose name AFTER ITS LAST '.' is `name` (case-
+/// insensitive). For a dot-free `name` that is "ends with `.name`" — an
+/// O(1) test per column instead of a reverse byte search through each.
+pub(crate) fn suffix_column_index(columns: &[String], name: &str) -> Option<usize> {
+    if name.contains('.') {
+        return columns.iter().position(|n| {
+            n.rfind('.')
+                .is_some_and(|pos| n[pos + 1..].eq_ignore_ascii_case(name))
+        });
+    }
+    let k = name.len();
+    columns.iter().position(|n| {
+        let b = n.as_bytes();
+        b.len() > k && b[b.len() - k - 1] == b'.' && n[b.len() - k..].eq_ignore_ascii_case(name)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -779,6 +791,14 @@ fn collation_scope_lookup_ex(qualifier: Option<&str>, name: &str) -> Option<Opti
 /// sqlite3ExprCollSeq follows it down (left child first, then right,
 /// then list arguments). Subqueries are their own scope.
 pub(crate) fn explicit_collation(e: &Expr) -> Option<String> {
+    if !crate::sql::lexer::COLLATE_SEEN.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    explicit_collation_walk(e)
+}
+
+fn explicit_collation_walk(e: &Expr) -> Option<String> {
+    let explicit_collation = explicit_collation_walk;
     match e {
         Expr::Collate { collation, .. } => Some(collation.clone()),
         Expr::Cast { expr, .. } | Expr::Unary { expr, .. } => explicit_collation(expr),

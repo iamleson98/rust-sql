@@ -182,13 +182,13 @@ mod corr {
                 return None;
             }
             if let Some(t) = table {
-                // Pass 1: exact "qual.name" in each frame, innermost first.
-                let qual_lower =
-                    format!("{}.{}", t.to_ascii_lowercase(), name.to_ascii_lowercase());
+                // Pass 1: exact "qual.name" in each frame, innermost first
+                // (compared in place — the old per-name lowercase copies
+                // allocated on every correlated reference, every row).
                 for frame in c.outer.iter().rev() {
                     let names = frame.names();
                     for (i, n) in names.iter().enumerate() {
-                        if n.to_ascii_lowercase() == qual_lower {
+                        if super::qualified_name_eq(n, t, name) {
                             return frame.row().get(i).cloned();
                         }
                     }
@@ -224,12 +224,8 @@ mod corr {
                             return frame.row().get(i).cloned();
                         }
                     }
-                    for (i, n) in names.iter().enumerate() {
-                        if let Some(pos) = n.rfind('.') {
-                            if n[pos + 1..].eq_ignore_ascii_case(name) {
-                                return frame.row().get(i).cloned();
-                            }
-                        }
+                    if let Some(i) = crate::executor::expr::suffix_column_index(names, name) {
+                        return frame.row().get(i).cloned();
                     }
                 }
             }
@@ -5452,9 +5448,8 @@ fn lookup_outer_frame_value(
     name: &str,
 ) -> Value {
     if let Some(q) = qual {
-        let qual_name = format!("{}.{}", q, name);
         for (i, n) in names.iter().enumerate() {
-            if n.eq_ignore_ascii_case(&qual_name) {
+            if qualified_name_eq(n, q, name) {
                 return row.get(i).cloned().unwrap_or(Value::Null);
             }
         }
@@ -5466,14 +5461,20 @@ fn lookup_outer_frame_value(
             return row.get(i).cloned().unwrap_or(Value::Null);
         }
     }
-    for (i, n) in names.iter().enumerate() {
-        if let Some(pos) = n.rfind('.') {
-            if n[pos + 1..].eq_ignore_ascii_case(name) {
-                return row.get(i).cloned().unwrap_or(Value::Null);
-            }
-        }
+    if let Some(i) = crate::executor::expr::suffix_column_index(names, name) {
+        return row.get(i).cloned().unwrap_or(Value::Null);
     }
     Value::Null
+}
+
+/// `n` equals `"{q}.{name}"`, ASCII case-insensitively — without building
+/// that string.
+pub(crate) fn qualified_name_eq(n: &str, q: &str, name: &str) -> bool {
+    let b = n.as_bytes();
+    b.len() == q.len() + 1 + name.len()
+        && b[q.len()] == b'.'
+        && n[..q.len()].eq_ignore_ascii_case(q)
+        && n[q.len() + 1..].eq_ignore_ascii_case(name)
 }
 
 /// Conservative correlated-subquery detector: collect every column ref in
