@@ -2005,6 +2005,16 @@ pub struct Btree<'a> {
     /// already present returns `InsertResult::Duplicate` (nothing
     /// written) instead of inserting a second cell.
     reject_dup_rowid: bool,
+    /// Set while an insert descends into a child that is NOT its parent's
+    /// right-most: the leaf it reaches is off the tree's right edge, so an
+    /// insert past its last entry is NOT an append — splitting off a page
+    /// holding just the new cell (the append split) would leave a near-
+    /// empty leaf inside the key range (SQLite's balance_quick fires only
+    /// on the right edge).
+    off_right_edge: bool,
+    /// The interior page an insert descended from into the current child
+    /// (0 at the root) — the leaf's parent for a sibling rebalance.
+    leaf_parent: PageId,
     /// Pinned root page for the read path: avoids a page-cache read-lock +
     /// Arc refcount round-trip on EVERY descent (a 10-row join seeks the
     /// tree 10 times; each seek re-fetched the root). Validated against
@@ -2065,6 +2075,10 @@ const TL_HINT_DISABLE_AT: u32 = 16;
 /// entry of the left page — the left child's separator for the parent.
 enum InsertResult {
     Done,
+    /// The leaf shared its cells with a sibling instead of splitting
+    /// (see `try_rebalance_for_insert`): the parent re-routes the cell
+    /// through its updated separators.
+    Retry(Cell),
     /// `reject_dup_rowid` placement: the table leaf already holds the
     /// rowid; nothing was written.
     Duplicate,
@@ -2086,6 +2100,11 @@ enum InsertResult {
         /// for ordinary 2-way splits — the overwhelmingly common case.
         extra_splits: Vec<ExtraSplit>,
     },
+}
+
+/// `InsertResult::Retry` after the retry loop drained it — unreachable.
+fn unreachable_retry<T>() -> Result<T> {
+    Err(Error::corruption("btree insert re-route did not settle"))
 }
 
 /// One additional boundary of a 3+-way split (see `InsertResult::Split`).
@@ -2348,6 +2367,8 @@ impl<'a> Btree<'a> {
             is_index,
             journal_suppress: false,
             reject_dup_rowid: false,
+            off_right_edge: false,
+            leaf_parent: 0,
             pinned_root: None,
             pinned_epoch: 0,
             table_leaf: None,
@@ -2672,6 +2693,8 @@ impl<'a> Btree<'a> {
             is_index,
             journal_suppress: false,
             reject_dup_rowid: false,
+            off_right_edge: false,
+            leaf_parent: 0,
             pinned_root: None,
             pinned_epoch: 0,
             table_leaf: None,
@@ -3432,7 +3455,14 @@ impl<'a> Btree<'a> {
     /// placed (`false` only under `reject_dup_rowid`, for a rowid the
     /// table already holds).
     fn place_cell_root_aware(&mut self, cell: Cell) -> Result<bool> {
-        match self.insert_into_page(self.root, cell)? {
+        let mut placed = self.insert_into_page(self.root, cell)?;
+        // A leaf rebalance asks for a re-route (consumed by the parent;
+        // the root itself never has one to ask, but stay total).
+        while let InsertResult::Retry(c) = placed {
+            placed = self.insert_into_page(self.root, c)?;
+        }
+        match placed {
+            InsertResult::Retry(_) => unreachable_retry(),
             InsertResult::Done => Ok(true),
             InsertResult::Duplicate => Ok(false),
             InsertResult::Split {
@@ -5442,6 +5472,14 @@ impl<'a> Btree<'a> {
                     return Ok(InsertResult::Done);
                 }
                 drop(page);
+                // A full leaf first tries to share its cells with its
+                // siblings (SQLite's balance_nonroot); the parent then
+                // re-routes the cell instead of this leaf splitting.
+                if self.leaf_parent != 0
+                    && self.try_rebalance_for_insert(self.leaf_parent, page_id, &cell)?
+                {
+                    return Ok(InsertResult::Retry(cell));
+                }
                 return self.split_leaf(page_id, cell);
             }
             self.insert_cell_into_ref_at(page_id, &page, &cell, known_pos)?;
@@ -5466,13 +5504,13 @@ impl<'a> Btree<'a> {
             // that's a Vec allocation per cell — ~150-200 per page, per
             // level, per descent).
             let is_idx = pt.is_index();
-            let child_id = {
+            let (child_id, child_is_edge) = {
                 let borrowed = page.lock();
                 let n = borrowed.n_cells();
                 let right_most = borrowed.right_most_pointer();
                 let data = &borrowed.data;
                 let cp = |i: u16| borrowed.cell_pointer(i);
-                if is_idx {
+                let child = if is_idx {
                     // Full target key when the inserted cell overflows (the
                     // variant's index_key() is only the local prefix).
                     let nk_owned: Vec<u8>;
@@ -5521,11 +5559,37 @@ impl<'a> Btree<'a> {
                         let ptr = cp(lo) as usize;
                         decode_table_interior_child(&data[ptr..]).unwrap_or(right_most)
                     }
-                }
+                };
+                // On this page's right edge: its right-most child, or with
+                // right=0 the last cell's child.
+                let edge = if right_most != 0 {
+                    child == right_most
+                } else if n > 0 {
+                    let ptr = cp(n - 1) as usize;
+                    let last = if is_idx {
+                        decode_index_cell(&data[ptr..], true, borrowed.page_size())
+                            .map(|v| v.left_child)
+                    } else {
+                        decode_table_interior_child(&data[ptr..])
+                    };
+                    last == Some(child)
+                } else {
+                    false
+                };
+                (child, edge)
             };
             drop(page);
-            match self.insert_into_page(child_id, cell)? {
+            let saved = (self.off_right_edge, self.leaf_parent);
+            if !child_is_edge {
+                self.off_right_edge = true;
+            }
+            self.leaf_parent = page_id;
+            let child_result = self.insert_into_page(child_id, cell);
+            (self.off_right_edge, self.leaf_parent) = saved;
+            match child_result? {
                 InsertResult::Done => Ok(InsertResult::Done),
+                // The child leaf rebalanced with a sibling: re-route.
+                InsertResult::Retry(cell) => self.insert_into_page(page_id, cell),
                 InsertResult::Duplicate => Ok(InsertResult::Duplicate),
                 InsertResult::Split {
                     new_page,
@@ -6720,6 +6784,11 @@ impl<'a> Btree<'a> {
             let mut packed_ok = true;
             for i in 0..n as u16 {
                 let p = b.cell_pointer(i) as usize;
+                // A corrupt pointer past the page: no compaction (the
+                // split path's validation reports the corruption).
+                if p >= psz {
+                    return Ok(false);
+                }
                 let size = match pt {
                     PageType::LeafIndex => index_leaf_cell_size(&b.data[p..], psz as u32),
                     _ => table_leaf_cell_size_paged(&b.data[p..], psz as u32),
@@ -6864,7 +6933,7 @@ impl<'a> Btree<'a> {
                     }
                 }
             };
-            if is_append_split {
+            if is_append_split && !self.off_right_edge {
                 return self.append_split(page_id, pt, new_cell);
             }
             // Mid split on a PACKED page: byte-view rewrite instead of the
@@ -7516,11 +7585,556 @@ impl<'a> Btree<'a> {
         }
     }
 
+    /// SQLite's balance_nonroot for an insert that would overflow leaf
+    /// `child_id` (a child of `parent_id`): when an ADJACENT sibling under
+    /// the same parent has room, the two leaves' cells are spread evenly
+    /// over both and the separator between them is rewritten — no split,
+    /// no new page. Without it every overflow split 50/50, so random-order
+    /// index maintenance (a REPLACE refill, an index over a shuffled
+    /// column) left leaves ~60% full: speedtest1's t3bc index came out at
+    /// 1,255 pages against SQLite's 681, and the larger working set cost
+    /// cache misses on every lookup. Returns true when cells moved (the
+    /// caller re-routes the insert from the parent). Declines appends at
+    /// the right edge (the append split already packs leaves full),
+    /// overflow-chained boundary cells, page 0 parents and the BEGIN
+    /// CONCURRENT regime.
+    fn try_rebalance_for_insert(
+        &mut self,
+        parent_id: PageId,
+        child_id: PageId,
+        cell: &Cell,
+    ) -> Result<bool> {
+        // INDEX leaves only: random-order insertion is the norm there and
+        // their density is what lookups pay for. A rowid table's inserts
+        // are mostly appends (already packed full by the append split),
+        // and on a random-rowid insert storm the repack cost ~20% per row
+        // for the pages it saved.
+        if !matches!(
+            cell,
+            Cell::IndexLeaf { .. } | Cell::IndexLeafOverflow { .. }
+        ) {
+            return Ok(false);
+        }
+        if parent_id == 0 || child_id == 0 || self.pager.concurrent_scope_armed() {
+            return Ok(false);
+        }
+        let need = cell.encoded_size() + 2;
+        // Cheap gates on the child: a leaf without room for the cell.
+        let (pt, is_last_append) = {
+            let page = self.pager.get_page(child_id)?;
+            let b = page.lock();
+            let pt = b.page_type()?;
+            if !matches!(pt, PageType::LeafTable | PageType::LeafIndex) {
+                return Ok(false);
+            }
+            if b.free_space() as usize >= need || b.n_cells() < 2 {
+                return Ok(false);
+            }
+            // Append past the leaf's last entry (monotonically growing
+            // keys — a rowid table, an index over a growing column, a
+            // sorted index build): the append split's job.
+            let last = b.cell_pointer(b.n_cells() - 1) as usize;
+            let append = match pt {
+                PageType::LeafTable => varint::decode_signed(b.cell_slice_checked(last)?)
+                    .is_some_and(|(k, _)| cell.key() > k),
+                _ => match decode_index_cell(b.cell_slice_checked(last)?, false, b.page_size()) {
+                    Some(v) if v.overflow == 0 && cell.index_overflow() == 0 => {
+                        let nk = cell.index_key();
+                        nk > v.key || (nk == v.key && cell.key() > v.rowid)
+                    }
+                    _ => false,
+                },
+            };
+            (pt, append)
+        };
+        if is_last_append && !self.off_right_edge {
+            return Ok(false);
+        }
+        self.balance_neighbors(parent_id, child_id, pt, need, 2 * need)
+    }
+
+    /// Repack leaf `child_id` with its adjacent leaf siblings under
+    /// `parent_id` (SQLite's balance_nonroot) when they hold at least
+    /// `min_room` spare bytes besides the child: an overflowing insert
+    /// (`need` = its cell) or an underfull leaf after a delete (`need` 0).
+    fn balance_neighbors(
+        &mut self,
+        parent_id: PageId,
+        child_id: PageId,
+        pt: PageType,
+        need: usize,
+        min_room: usize,
+    ) -> Result<bool> {
+        let usable = self.pager.page_size() as usize - PAGE_HEADER_SIZE as usize;
+        // The child's slot and its adjacent siblings.
+        let (n_cells, right_most, children) = {
+            let page = self.pager.get_page(parent_id)?;
+            let b = page.lock();
+            let ppt = b.page_type()?;
+            if !matches!(ppt, PageType::InteriorTable | PageType::InteriorIndex) {
+                return Ok(false);
+            }
+            let n = b.n_cells();
+            let mut children = Vec::with_capacity(n as usize + 1);
+            for i in 0..n {
+                let p = b.cell_pointer(i) as usize;
+                children
+                    .push(Cell::decode(b.cell_slice_checked(p)?, ppt, b.page_size())?.left_child());
+            }
+            (n, b.right_most_pointer(), children)
+        };
+        // right=0 (a legal interior shape: the LAST cell's child is the
+        // de-facto right edge — every child then has a separator).
+        let mut all = children.clone();
+        if right_most != 0 {
+            all.push(right_most);
+        }
+        let Some(pos) = all.iter().position(|&c| c == child_id) else {
+            return Ok(false);
+        };
+        let _ = n_cells;
+        // Candidate pairs (left index into `all`): child with its right
+        // sibling, child with its left sibling — the roomier one first.
+        // A sibling's room counts its DEAD bytes too (deleted cells' space,
+        // reclaimed only by a compaction): the rebalance rewrites both
+        // pages packed, so live bytes are what matter.
+        let free_of = |this: &Self, id: PageId| -> Result<Option<usize>> {
+            let page = this.pager.get_page(id)?;
+            let b = page.lock();
+            if b.page_type()? != pt {
+                return Ok(None);
+            }
+            let psz = b.page_size();
+            let mut live = 0usize;
+            for i in 0..b.n_cells() {
+                let p = b.cell_pointer(i) as usize;
+                if p < PAGE_HEADER_SIZE as usize || p >= b.data.len() {
+                    return Ok(None);
+                }
+                let size = match pt {
+                    PageType::LeafIndex => index_leaf_cell_size(&b.data[p..], psz),
+                    _ => table_leaf_cell_size_paged(&b.data[p..], psz),
+                };
+                live += size.unwrap_or(usable) + 2;
+            }
+            Ok(Some(usable.saturating_sub(live)))
+        };
+        // The sibling group: the child with its roomier leaf neighbour
+        // (SQLite's balance_nonroot takes up to three; with the third page
+        // the repack copied more for no better fill — measured on
+        // speedtest1's REPLACE refill: same time, 962 vs 989 index pages).
+        let left_free = if pos > 0 {
+            free_of(self, all[pos - 1])?
+        } else {
+            None
+        };
+        let right_free = if pos + 1 < all.len() {
+            free_of(self, all[pos + 1])?
+        } else {
+            None
+        };
+        let (mut lo, mut hi) = (
+            if left_free.is_some() { pos - 1 } else { pos },
+            if right_free.is_some() { pos + 1 } else { pos },
+        );
+        if lo < pos && hi > pos {
+            if left_free >= right_free {
+                hi = pos;
+            } else {
+                lo = pos;
+            }
+        }
+        if lo == hi {
+            return Ok(false);
+        }
+        let room: usize = (lo..=hi)
+            .filter(|&i| i != pos)
+            .map(|i| free_of(self, all[i]).map(|f| f.unwrap_or(0)))
+            .sum::<Result<usize>>()?;
+        // Full neighbours: an overflowing insert spreads the group over
+        // ONE more page (three full leaves + the cell -> four at ~75%,
+        // where a lone split left two at 50%); a delete-side balance
+        // never grows.
+        let grow = room < min_room.max(1);
+        if grow && min_room == 0 {
+            return Ok(false);
+        }
+        let group: Vec<PageId> = all[lo..=hi].to_vec();
+        let last_is_right_most = right_most != 0 && hi == all.len() - 1;
+        self.rebalance_group(
+            parent_id,
+            &group,
+            last_is_right_most,
+            pt,
+            need,
+            usable,
+            grow,
+        )
+    }
+
+    /// Repack the cells of the adjacent leaves `group` (key order,
+    /// consecutive children of `parent_id`; the last is the parent's
+    /// right-most child when `last_is_right_most`) into the FEWEST pages
+    /// that hold them with room for a `need`-byte insert, spread evenly
+    /// (SQLite's balance_nonroot). Freed pages go to the freelist; the
+    /// parent's separators are rewritten. False (nothing touched) when no
+    /// page count fits, a boundary entry is overflow-chained, or the parent
+    /// lacks room for the new separators.
+    fn rebalance_group(
+        &mut self,
+        parent_id: PageId,
+        group: &[PageId],
+        last_is_right_most: bool,
+        pt: PageType,
+        need: usize,
+        usable: usize,
+        grow: bool,
+    ) -> Result<bool> {
+        // Every cell of the group in ONE arena (key order): no per-cell
+        // allocation on this hot structural path.
+        let mut arena: Vec<u8> = Vec::with_capacity(group.len() * usable);
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        for &id in group {
+            if !self.leaf_cells_into(id, &mut arena, &mut spans)? {
+                return Ok(false);
+            }
+        }
+        let cells: Vec<&[u8]> = spans.iter().map(|&(o, l)| &arena[o..o + l]).collect();
+        if cells.len() < 2 {
+            return Ok(false);
+        }
+        let sizes: Vec<usize> = cells.iter().map(|c| c.len() + 2).collect();
+        let total: usize = sizes.iter().sum();
+        // Fewest pages: each keeps room for the incoming cell — and, on
+        // the insert path, ~10% slack, or the next insert nearby overflows
+        // the freshly packed group and repacks it again (repeated 3-page
+        // rewrites cost more than the pages they save).
+        let cap = if need > 0 {
+            usable - need - usable / 10
+        } else {
+            usable
+        };
+        // Average fill depends only on the page count: use the FEWEST
+        // pages that hold the cells, one more than the group only when
+        // growing (full neighbours) and nothing smaller fits.
+        let k = total.div_ceil(cap).max(1);
+        if k > group.len() + usize::from(grow) {
+            return Ok(false);
+        }
+        // Page ids per run: the group's own, then (growing) one new page,
+        // allocated at the commit point below.
+        let mut pages: Vec<PageId> = group.to_vec();
+        // Even distribution over k pages by bytes; every run must fit.
+        let mut cuts: Vec<usize> = Vec::with_capacity(k);
+        let mut acc = 0usize;
+        let mut i = 0usize;
+        for p in 1..k {
+            let target = total * p / k;
+            while i < cells.len() && acc + sizes[i] <= target {
+                acc += sizes[i];
+                i += 1;
+            }
+            cuts.push(i);
+        }
+        cuts.push(cells.len());
+        let mut start = 0usize;
+        for &c in &cuts {
+            let bytes: usize = sizes[start..c].iter().sum();
+            if c <= start || bytes > cap {
+                return Ok(false);
+            }
+            start = c;
+        }
+        // No change in shape: nothing to gain.
+        if k == group.len() {
+            let mut start = 0usize;
+            let mut same = true;
+            for (gi, &c) in cuts.iter().enumerate() {
+                let n_now = {
+                    let page = self.pager.get_page(group[gi])?;
+                    let b = page.lock();
+                    b.n_cells() as usize
+                };
+                if c - start != n_now {
+                    same = false;
+                    break;
+                }
+                start = c;
+            }
+            if same {
+                return Ok(false);
+            }
+        }
+        let psz = self.pager.page_size();
+        // Separators for the first k-1 new pages: their max entries.
+        let mut seps: Vec<Cell> = Vec::with_capacity(k);
+        for (gi, &c) in cuts.iter().enumerate().take(k - 1) {
+            let boundary = cells[c - 1];
+            let left_child = group[gi];
+            seps.push(match pt {
+                PageType::LeafTable => match varint::decode_signed(boundary) {
+                    Some((key, _)) => Cell::TableInterior { left_child, key },
+                    None => return Ok(false),
+                },
+                _ => match decode_index_cell(boundary, false, psz) {
+                    Some(v) if v.overflow == 0 => Cell::IndexInterior {
+                        left_child,
+                        key: v.key.to_vec(),
+                        rowid: v.rowid,
+                    },
+                    _ => return Ok(false),
+                },
+            });
+        }
+        // The group's last separator (an upper bound for its whole key
+        // range, which repacking does not change) moves to the new last
+        // page; a right-most group hands that slot over instead.
+        // (Growing, the new page is the last run; its id is assigned once
+        // every check has passed.)
+        let mut new_last = if k <= group.len() { group[k - 1] } else { 0 };
+        let (old_idx, last_sep, dead_chains): (Vec<u16>, Option<Cell>, Vec<PageId>) = {
+            let page = self.pager.get_page(parent_id)?;
+            let b = page.lock();
+            let ppt = b.page_type()?;
+            let mut idx = Vec::new();
+            let mut last = None;
+            let mut dead = Vec::new();
+            for i in 0..b.n_cells() {
+                let p = b.cell_pointer(i) as usize;
+                let c = Cell::decode(b.cell_slice_checked(p)?, ppt, b.page_size())?;
+                if group.contains(&c.left_child()) {
+                    if c.left_child() == group[group.len() - 1] {
+                        if c.index_overflow() != 0 {
+                            return Ok(false);
+                        }
+                        last = Some(c);
+                    } else if c.index_overflow() != 0 {
+                        // A dropped separator's own chain copy dies with it.
+                        dead.push(c.index_overflow());
+                    }
+                    idx.push(i);
+                }
+            }
+            (idx, last, dead)
+        };
+        let last_sep = match last_sep {
+            Some(Cell::TableInterior { key, .. }) => Some(Cell::TableInterior {
+                left_child: new_last,
+                key,
+            }),
+            Some(Cell::IndexInterior { key, rowid, .. }) => Some(Cell::IndexInterior {
+                left_child: new_last,
+                key,
+                rowid,
+            }),
+            Some(_) => return Ok(false),
+            None if last_is_right_most => None,
+            None => return Ok(false),
+        };
+        let expected = group.len() - usize::from(last_is_right_most);
+        if old_idx.len() != expected {
+            return Ok(false);
+        }
+        let room_needed: usize = seps
+            .iter()
+            .chain(last_sep.iter())
+            .map(|c| c.encoded_size() + 2)
+            .sum();
+        // The parent's dead bytes (separators rewritten before) count as
+        // room: compact it in place when the gap alone is too small.
+        let parent_room = {
+            let page = self.pager.get_page(parent_id)?;
+            let free = page.lock().free_space() as usize;
+            free
+        };
+        if parent_room < room_needed && !self.compact_interior(parent_id, room_needed)? {
+            return Ok(false);
+        }
+        // ---- commit point: rewrite leaves, free the extras, fix parent.
+        if k > group.len() {
+            let id = self.pager.allocate_page()?;
+            {
+                let page = self.pager.get_page(id)?;
+                let mut p = page.lock();
+                p.data.fill(0);
+                if pt == PageType::LeafIndex {
+                    p.init_leaf_index();
+                } else {
+                    p.init_leaf_table();
+                }
+            }
+            self.pager.note_dirty(id);
+            pages.push(id);
+            new_last = id;
+        }
+        let last_sep = last_sep.map(|c| match c {
+            Cell::TableInterior { key, .. } => Cell::TableInterior {
+                left_child: new_last,
+                key,
+            },
+            Cell::IndexInterior { key, rowid, .. } => Cell::IndexInterior {
+                left_child: new_last,
+                key,
+                rowid,
+            },
+            other => other,
+        });
+        let mut start = 0usize;
+        for (gi, &c) in cuts.iter().enumerate() {
+            self.write_leaf_slices(pages[gi], &cells[start..c])?;
+            start = c;
+        }
+        {
+            let page = self.pager.get_page(parent_id)?;
+            let mut b = page.lock();
+            let n = b.n_cells() as usize;
+            let st = PAGE_HEADER_SIZE as usize;
+            for &i in old_idx.iter().rev() {
+                let i = i as usize;
+                let cur = b.n_cells() as usize;
+                b.data
+                    .copy_within(st + (i + 1) * 2..st + cur * 2, st + i * 2);
+                b.set_n_cells(cur as u16 - 1);
+            }
+            let _ = n;
+            if last_is_right_most {
+                b.set_right_most_pointer(new_last);
+            }
+            b.touch();
+        }
+        self.pager.note_dirty(parent_id);
+        for sep in seps.iter().chain(last_sep.iter()) {
+            self.insert_cell_into_page(parent_id, sep)?;
+        }
+        for chain in dead_chains {
+            self.free_overflow_chain(chain)?;
+        }
+        for &extra in group.iter().skip(k) {
+            self.pager.free_page(extra)?;
+            self.note_freed(extra);
+        }
+        Ok(true)
+    }
+
+    /// Pack interior page `id`'s cells against the page tail (dead bytes
+    /// of removed separators reclaimed). True when it now has `need` free
+    /// bytes; nothing is written when compaction cannot reach that.
+    fn compact_interior(&mut self, id: PageId, need: usize) -> Result<bool> {
+        if id == 0 {
+            return Ok(false);
+        }
+        let page = self.pager.get_page(id)?;
+        let mut b = page.lock();
+        let pt = b.page_type()?;
+        if !matches!(pt, PageType::InteriorTable | PageType::InteriorIndex) {
+            return Ok(false);
+        }
+        let psz = b.page_size();
+        let n = b.n_cells() as usize;
+        let mut cells: Vec<Vec<u8>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let p = b.cell_pointer(i as u16) as usize;
+            let len = Cell::decode(b.cell_slice_checked(p)?, pt, psz)?.encoded_size();
+            if p + len > b.data.len() {
+                return Ok(false);
+            }
+            cells.push(b.data[p..p + len].to_vec());
+        }
+        let live: usize = cells.iter().map(|c| c.len()).sum();
+        let ptr_end = PAGE_HEADER_SIZE as usize + n * 2;
+        if b.data.len() < ptr_end + live + need {
+            return Ok(false);
+        }
+        let mut write_off = b.data.len();
+        for (i, c) in cells.iter().enumerate() {
+            write_off -= c.len();
+            b.data[write_off..write_off + c.len()].copy_from_slice(c);
+            let dst = PAGE_HEADER_SIZE as usize + i * 2;
+            b.data[dst..dst + 2].copy_from_slice(&(write_off as u16).to_be_bytes());
+        }
+        b.set_cell_content_start(write_off as u32);
+        b.touch();
+        drop(b);
+        self.pager.note_dirty(id);
+        Ok(true)
+    }
+
+    /// Append leaf `id`'s in-page cells (key order) to `arena`, recording
+    /// each as an (offset, length) span. False for a non-leaf or a
+    /// malformed cell (nothing usable recorded for this page).
+    fn leaf_cells_into(
+        &self,
+        id: PageId,
+        arena: &mut Vec<u8>,
+        spans: &mut Vec<(usize, usize)>,
+    ) -> Result<bool> {
+        let page = self.pager.get_page(id)?;
+        let b = page.lock();
+        let pt = b.page_type()?;
+        if !matches!(pt, PageType::LeafTable | PageType::LeafIndex) {
+            return Ok(false);
+        }
+        let psz = b.page_size();
+        for i in 0..b.n_cells() {
+            let p = b.cell_pointer(i) as usize;
+            if p < PAGE_HEADER_SIZE as usize || p >= b.data.len() {
+                return Ok(false);
+            }
+            let size = match pt {
+                PageType::LeafIndex => index_leaf_cell_size(&b.data[p..], psz),
+                _ => table_leaf_cell_size_paged(&b.data[p..], psz),
+            };
+            match size {
+                Some(n) if n > 0 && p + n <= b.data.len() => {
+                    spans.push((arena.len(), n));
+                    arena.extend_from_slice(&b.data[p..p + n]);
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
+    /// [`Self::write_leaf_cells`] over borrowed cell slices.
+    fn write_leaf_slices(&mut self, id: PageId, cells: &[&[u8]]) -> Result<()> {
+        let page = self.pager.get_page(id)?;
+        let mut b = page.lock();
+        let psz = b.data.len();
+        let mut write_off = psz;
+        for (i, c) in cells.iter().enumerate() {
+            write_off -= c.len();
+            b.data[write_off..write_off + c.len()].copy_from_slice(c);
+            let dst = PAGE_HEADER_SIZE as usize + i * 2;
+            b.data[dst..dst + 2].copy_from_slice(&(write_off as u16).to_be_bytes());
+        }
+        b.set_n_cells(cells.len() as u16);
+        b.set_cell_content_start(write_off as u32);
+        b.touch();
+        drop(b);
+        self.pager.note_dirty(id);
+        Ok(())
+    }
+
     /// After a delete from leaf `child_id` (a child of `parent_id`): free
     /// it when empty, else merge it into an adjacent sibling when it is
     /// underfull and the two fit in one page.
     fn rebalance_after_delete(&mut self, parent_id: PageId, child_id: PageId) -> Result<()> {
-        if !self.maybe_recycle_empty_child(parent_id, child_id)? {
+        if self.maybe_recycle_empty_child(parent_id, child_id)? {
+            return Ok(());
+        }
+        let usable = self.pager.page_size() as usize - PAGE_HEADER_SIZE as usize;
+        if parent_id == 0
+            || child_id == self.root
+            || self.pager.concurrent_scope_armed()
+            || !self.leaf_is_underfull(child_id, usable)?
+        {
+            return Ok(());
+        }
+        let pt = self.pager.get_page(child_id)?.lock().page_type()?;
+        // Repack with the neighbours (fewest pages, evenly) — a lone
+        // merge only helped when the whole leaf fit one sibling, so
+        // random deletes left leaves holding a cell or two.
+        if !self.balance_neighbors(parent_id, child_id, pt, 0, 0)? {
             self.maybe_merge_leaf(parent_id, child_id)?;
         }
         Ok(())
@@ -10559,7 +11173,14 @@ impl<'a> Btree<'a> {
                 rowid,
             }
         };
-        match self.insert_into_page(self.root, cell)? {
+        let mut placed = self.insert_into_page(self.root, cell)?;
+        // A leaf rebalance asks for a re-route (consumed by the parent;
+        // the root itself never has one to ask, but stay total).
+        while let InsertResult::Retry(c) = placed {
+            placed = self.insert_into_page(self.root, c)?;
+        }
+        match placed {
+            InsertResult::Retry(_) => unreachable_retry(),
             InsertResult::Done => Ok(()),
             InsertResult::Duplicate => Err(Error::corruption(
                 "index placement reported a duplicate table rowid",

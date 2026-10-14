@@ -36,3 +36,9 @@ SELECT count(*), sum(z1.a) FROM z1, z2, t4 WHERE t4.a > 100 AND z2.a=t4.b AND z1
 /*ordered*/ SELECT t3.c, z2.c FROM t4, t3, z2 WHERE t4.a BETWEEN 43 AND 48 AND t3.a=t4.b AND z2.a=t3.b ORDER BY 1, 2;
 /*ordered*/ SELECT t3.c, z2.c, z1.a FROM t4, t3, z2, z1 WHERE t4.rowid = 43 AND t3.a=t4.b AND z2.a=t3.b AND z1.c=z2.c ORDER BY 3;
 SELECT count(*), sum(z1.a) FROM z1, z2, t4 WHERE t4.a > 100 AND z2.a=t4.b AND z1.c=z2.c;
+-- An IN list on an indexed column drives the chain (IndexIn rows carry
+-- the hidden rowid slot).
+CREATE INDEX t4c ON t4(c);
+/*ordered*/ SELECT t4.a, t3.a, z2.a, z2.c FROM t4, t3, z2 WHERE t4.c IN ('v3', 'v7', 'v11') AND t3.a = t4.b AND z2.a = t3.b ORDER BY 1, 2, 3;
+/*ordered*/ SELECT t4.a, t3.c, z1.a FROM t4, t3, z2, z1 WHERE t4.c IN ('v5', 'v9') AND t3.a = t4.b AND z2.a = t3.b AND z1.c = z2.c ORDER BY 1, 3;
+/*ordered*/ SELECT t4.a, t3.a FROM t4, t3 WHERE t4.rowid IN (3, 8, 40) AND t3.a = t4.b ORDER BY 1;

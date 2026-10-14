@@ -17494,6 +17494,14 @@ pub(crate) fn plan_output_affinities(plan: &Plan) -> Option<Vec<crate::types::Af
             }
             Some(v)
         }
+        Plan::IndexIn { table, .. } => {
+            let mut v: Vec<Affinity> = table.col_affinities.iter().copied().collect();
+            if crate::planner::wants_rowid_slot(table) {
+                v.push(Affinity::Integer);
+            }
+            Some(v)
+        }
+        Plan::RowidIn { table, .. } => Some(table.col_affinities.iter().copied().collect()),
         Plan::Filter { input, .. } => plan_output_affinities(input),
         Plan::Subquery { meta: Some(m), .. } | Plan::CteRows { meta: Some(m), .. } => {
             m.positional_affinities()

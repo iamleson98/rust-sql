@@ -9068,8 +9068,15 @@ pub(crate) fn atom_out_cols(plan: &Plan) -> Option<Vec<String>> {
             }
             v
         }
-        Plan::RowidIn { table, .. } | Plan::IndexIn { table, .. } => {
-            table.col_names.iter().cloned().collect()
+        Plan::RowidIn { table, .. } => table.col_names.iter().cloned().collect(),
+        // exec_index_in emits the hidden slot too (alias-qualified, like
+        // exec_scan) — the width an index join above it offsets by.
+        Plan::IndexIn { table, .. } => {
+            let mut v: Vec<String> = table.col_names.iter().cloned().collect();
+            if wants_rowid_slot(table) {
+                v.push(hidden_rowid_slot(&table.name));
+            }
+            v
         }
         Plan::IndexRange { table, alias, .. } => {
             let mut v = scan_qualified_cols(table, alias);
@@ -11476,6 +11483,12 @@ fn resolve_outer_col_index(
         }
 
         Plan::RowidRange { table, alias, .. } => {
+            resolve_table_col_index(table, alias.as_deref(), table_qualifier, col_name)
+        }
+
+        // IN-list drivers emit table rows in column order too (IndexIn's
+        // trailing hidden slot sits after every real column).
+        Plan::RowidIn { table, alias, .. } | Plan::IndexIn { table, alias, .. } => {
             resolve_table_col_index(table, alias.as_deref(), table_qualifier, col_name)
         }
 
