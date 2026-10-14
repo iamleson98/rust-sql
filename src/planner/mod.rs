@@ -8733,6 +8733,10 @@ fn conjunct_spans_both_sides(
 fn outer_is_selective(plan: &Plan) -> bool {
     match plan {
         Plan::RowidLookup { .. } | Plan::IndexLookup { .. } | Plan::RowidRange { .. } => true,
+        // An index range / IN list reads a bounded slice, like a rowid
+        // range (SQLite drives the speedtest1 four-way join from the
+        // `t4.a BETWEEN` range and probes the rest by index).
+        Plan::IndexRange { .. } | Plan::IndexIn { .. } | Plan::RowidIn { .. } => true,
         Plan::Filter { .. } => true,
         // If the outer is itself an IndexNestedLoopJoin, its outer was
         // already deemed selective (we only pick INLJ when
@@ -9018,16 +9022,49 @@ pub(crate) fn atom_out_cols(plan: &Plan) -> Option<Vec<String>> {
             }
             v
         }
-        Plan::RowidLookup { table, .. }
-        | Plan::RowidIn { table, .. }
-        | Plan::IndexIn { table, .. } => table.col_names.iter().cloned().collect(),
-        Plan::IndexRange { table, alias, .. } => scan_qualified_cols(table, alias),
+        // RowidLookup and IndexRange emit the hidden slot like a scan
+        // (exec_rowid_lookup: alias-qualified; exec_index_range: qualified
+        // by the table name). Leaving it out shifted every column of a
+        // later join in a chain they drive by one — an index join chained
+        // over `t4.a BETWEEN ..` probed `t3.a` for `t3.b`.
+        Plan::RowidLookup { table, alias, .. } => {
+            let mut v = scan_qualified_cols(table, alias);
+            if wants_rowid_slot(table) {
+                v.push(hidden_rowid_slot(alias.as_deref().unwrap_or(&table.name)));
+            }
+            v
+        }
+        Plan::RowidIn { table, .. } | Plan::IndexIn { table, .. } => {
+            table.col_names.iter().cloned().collect()
+        }
+        Plan::IndexRange { table, alias, .. } => {
+            let mut v = scan_qualified_cols(table, alias);
+            if wants_rowid_slot(table) {
+                v.push(hidden_rowid_slot(&table.name));
+            }
+            v
+        }
         Plan::Filter { input, .. } | Plan::Subquery { plan: input, .. } => {
             return atom_out_cols(input)
         }
         Plan::Join { left, right, .. } => {
             let mut v = atom_out_cols(left)?;
             v.extend(atom_out_cols(right)?);
+            v
+        }
+        // Mirrors exec_index_nested_loop_join's (non-fused) schema: the
+        // outer's columns, then the inner table's qualified ones. Without
+        // it a join ABOVE an INLJ chain could not resolve the chain's
+        // inner columns, so a third index probe never chained (the
+        // speedtest1 four-way join hash-joined its fourth table: 1,000x).
+        Plan::IndexNestedLoopJoin {
+            outer,
+            inner_table,
+            inner_alias,
+            ..
+        } => {
+            let mut v = atom_out_cols(outer)?;
+            v.extend(scan_qualified_cols(inner_table, inner_alias));
             v
         }
         Plan::CteRows { columns, .. } => columns.iter().cloned().collect(),
@@ -10011,6 +10048,15 @@ impl<'a> DpCtx<'a> {
                     .first()
                     .is_some_and(|c| c.name.eq_ignore_ascii_case(col))
             {
+                // A one-column UNIQUE key: every value is distinct — an
+                // equality on it matches one row (SQLite's whereLoop
+                // nOut for a unique-index equality), with or without
+                // ANALYZE statistics. Without this every join on a
+                // UNIQUE column took the blind 0.1 guess and the
+                // speedtest1 four-way join kept its syntactic order.
+                if idx.unique && idx.columns.len() == 1 && idx.columns[0].expr.is_none() {
+                    return Some(table_rows_hint(self.catalog, table));
+                }
                 if let Some(s) = self.catalog.index_stats(&idx.name) {
                     // D1 is the average eq-class size; the DISTINCT count
                     // it came from is ~rows/D1 (ceil).
@@ -10385,6 +10431,18 @@ fn try_cost_search_spine(
         })
         .collect();
     let key_resolvable: Vec<bool> = plans.iter().map(atom_exposes_table_cols).collect();
+    if dbg {
+        for i in 0..n {
+            eprintln!(
+                "[dp] atom {i}: rows={} base={} selective={} bare_scan={} key={}",
+                rows[i],
+                base[i],
+                selective[i],
+                bare_scan[i].is_some(),
+                key_resolvable[i]
+            );
+        }
+    }
 
     let ctx = DpCtx {
         catalog,

@@ -1439,7 +1439,9 @@ fn prefetch_search_lines(data: &[u8]) {
 }
 
 struct IndexLeafHint {
-    page: PageRef,
+    /// WEAK: an advisory hint must never pin a page in the cache (see
+    /// `TableHintSlot::page`).
+    page: std::sync::Weak<parking_lot::Mutex<crate::storage::page::Page>>,
     /// First and last cell keys of the leaf (full key bytes).
     lo: Vec<u8>,
     hi: Vec<u8>,
@@ -1511,8 +1513,10 @@ fn table_hint_page(root: PageId, rowid: i64, epoch: u64) -> Option<(PageRef, u32
         for slot in pair {
             if let Some(s) = slots.get(slot).and_then(|x| x.as_ref()) {
                 if s.epoch == epoch && s.root == root && rowid >= s.lo && rowid <= s.hi {
-                    TABLE_HINT_MISS_RUN.with(|c| c.set(0));
-                    return Some((Arc::clone(&s.page), s.last_cell));
+                    if let Some(page) = s.page.upgrade() {
+                        TABLE_HINT_MISS_RUN.with(|c| c.set(0));
+                        return Some((page, s.last_cell));
+                    }
                 }
             }
         }
@@ -1572,7 +1576,7 @@ fn set_table_hint(
         let entry = TableHintSlot {
             epoch,
             root,
-            page: Arc::clone(page),
+            page: Arc::downgrade(page),
             lo,
             hi,
             last_cell: cell,
@@ -1646,7 +1650,14 @@ const TABLE_HINT_BUCKET_SHIFT: i64 = 8;
 struct TableHintSlot {
     epoch: u64,
     root: PageId,
-    page: PageRef,
+    /// WEAK: the 1,024 slots outnumber the default 512-page cache, and a
+    /// strong reference PINS its page (eviction skips pages held outside
+    /// the cache). With strong refs a long session ended with every cached
+    /// page pinned by stale hints — the cache grew past its bound and each
+    /// page fetch rescanned it for an evictable victim (speedtest1's
+    /// REPLACE refill: 9.3 s vs 0.37 s on a fresh handle). An evicted
+    /// page's hint now just misses.
+    page: std::sync::Weak<parking_lot::Mutex<crate::storage::page::Page>>,
     lo: i64,
     hi: i64,
     /// Cell index of the last successful lookup in this leaf — the search
@@ -1658,7 +1669,7 @@ struct TableHintSlot {
 impl TableHintSlot {
     #[inline]
     fn page_ref_eq(&self, other: &PageRef) -> bool {
-        Arc::ptr_eq(&self.page, other)
+        std::ptr::eq(self.page.as_ptr(), Arc::as_ptr(other))
     }
 }
 
@@ -1802,7 +1813,7 @@ fn index_hint_page(root: PageId, key: &[u8], epoch: u64) -> Option<(PageRef, u32
         let c = c.borrow();
         let h = c.indexes.get(&root)?;
         if key >= h.lo.as_slice() && key <= h.hi.as_slice() {
-            Some((Arc::clone(&h.page), h.last_cell))
+            Some((h.page.upgrade()?, h.last_cell))
         } else {
             None
         }
@@ -1839,12 +1850,12 @@ fn set_index_hint(root: PageId, page: &PageRef, lo: &[u8], hi: &[u8], epoch: u64
             c.indexes.clear();
         }
         let h = c.indexes.entry(root).or_insert_with(|| IndexLeafHint {
-            page: Arc::clone(page),
+            page: Arc::downgrade(page),
             lo: Vec::new(),
             hi: Vec::new(),
             last_cell: 0,
         });
-        h.page = Arc::clone(page);
+        h.page = Arc::downgrade(page);
         h.lo.clear();
         h.lo.extend_from_slice(lo);
         h.hi.clear();

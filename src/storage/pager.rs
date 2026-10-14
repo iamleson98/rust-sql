@@ -8016,6 +8016,23 @@ impl Pager {
         self.cache.read().len()
     }
 
+    /// (cached pages, pages pinned by a holder outside the cache, dirty
+    /// pages) — diagnostics for eviction pressure.
+    pub fn cache_pin_stats(&self) -> (usize, usize, usize) {
+        let c = self.cache.read();
+        let mut pinned = 0;
+        let mut dirty = 0;
+        for (_, p) in c.iter() {
+            if Arc::strong_count(p) > 1 {
+                pinned += 1;
+            }
+            if p.lock().dirty {
+                dirty += 1;
+            }
+        }
+        (c.len(), pinned, dirty)
+    }
+
     /// PRAGMA busy_timeout's stored value (ms).
     pub fn busy_timeout_ms(&self) -> i64 {
         self.busy_timeout_ms.load(Ordering::Acquire)

@@ -17441,6 +17441,15 @@ pub(crate) fn plan_output_affinities(plan: &Plan) -> Option<Vec<crate::types::Af
             l.extend(r);
             Some(l)
         }
+        // exec_index_nested_loop_join: the outer's row, then the inner
+        // table's columns (no hidden slot).
+        Plan::IndexNestedLoopJoin {
+            outer, inner_table, ..
+        } => {
+            let mut l = plan_output_affinities(outer)?;
+            l.extend(inner_table.col_affinities.iter().copied());
+            Some(l)
+        }
         _ => None,
     }
 }
