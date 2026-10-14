@@ -180,6 +180,9 @@ pub fn engine_source_id() -> &'static str {
 mod session;
 pub use session::*;
 
+mod slow_stmt;
+pub use slow_stmt::observe as observe_slow_stmt;
+
 pub mod metrics {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -2821,6 +2824,7 @@ fn run_once(stmt: &mut Stmt) -> c_int {
         // Identity arming: same rationale as the tx-control arm above —
         // concurrent owners/joiners and their reads key on it.
         let before = engine.total_changes();
+        let started = std::time::Instant::now();
         let (result, txn_ended, stmt_changes) = {
             let _id = rustqlite::ConnIdentityGuard::arm(conn.id as u64);
             let mut w = engine.db.write();
@@ -2835,6 +2839,9 @@ fn run_once(stmt: &mut Stmt) -> c_int {
             // undid them — read while this statement is the engine's last.
             (r, ended, w.changes())
         };
+        // DML total engine time (the write lock's wait is inside the
+        // w.execute call — BUSY-parked statements surface here too).
+        observe_slow_stmt(started, &sql, "execute", 0);
         if txn_ended && conn.state.in_tx.load(Ordering::Acquire) {
             release_tx_hold(&engine, &conn);
             conn.state.in_tx.store(false, Ordering::Release);
@@ -3054,11 +3061,17 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> c_int {
                 // scope on it) while foreign handles stay on the
                 // committed view.
                 let engine = s.engine.as_ref().unwrap().clone();
+                let started = std::time::Instant::now();
                 let result = {
                     let _id = rustqlite::ConnIdentityGuard::arm(conn.id as u64);
                     let rd = engine.db.read();
                     rd.query_with_columns(sql, [])
                 };
+                // The engine materializes the whole result set above —
+                // this IS the statement's total engine time. One warn per
+                // statement over RUSTQLITE_SLOW_STMT_MS (default 1 s).
+                let n_rows = result.as_ref().map(|(_, r)| r.len()).unwrap_or(0);
+                observe_slow_stmt(started, sql, "select", n_rows);
                 match result {
                     Ok((cols, result_rows)) => {
                         // Replace the placeholder static column set with

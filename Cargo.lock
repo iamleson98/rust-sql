@@ -1217,6 +1217,7 @@ dependencies = [
  "libmimalloc-sys",
  "parking_lot",
  "rustqlite",
+ "tracing",
 ]
 
 [[package]]
