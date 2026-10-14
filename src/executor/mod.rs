@@ -13815,13 +13815,27 @@ fn exec_aggregate_no_group_by(
         // Eligible when every aggregate is COUNT(*) (no arg) or has a
         // resolved bare-column arg. (COUNT(*) pushes None into
         // agg_col_indices — that's fine, not a resolution failure.)
+        // An expression argument (`sum(length(c))`) evaluates against the
+        // FULL row — decoded only for rows the compiled filter passes, so
+        // a selective scan still decodes one or two columns per row.
         let agg_ok = aggregates
             .iter()
             .zip(agg_col_indices.iter())
-            .all(|(agg, idx)| agg.arg.is_none() || idx.is_some());
+            .all(|(agg, idx)| {
+                agg.arg.is_none()
+                    || idx.is_some()
+                    || agg.arg.as_ref().is_some_and(|a| !expr_has_subquery(a))
+            });
+        let full_on_match = aggregates
+            .iter()
+            .zip(agg_col_indices.iter())
+            .any(|(agg, idx)| agg.arg.is_some() && idx.is_none());
         if agg_ok {
-            // Build the wanted-column list: predicate columns + aggregate args.
-            let mut wanted: Vec<usize> = agg_col_indices.iter().filter_map(|x| *x).collect();
+            // TWO decode phases: the predicate's columns for every row,
+            // the aggregates' columns only for rows that pass — a
+            // selective `group_concat(c) … WHERE b BETWEEN …` no longer
+            // decodes (and UTF-8-validates) every row's text.
+            let mut wanted: Vec<usize> = Vec::new();
             crate::executor::predicate::compiled_columns(&pred, &mut wanted);
             wanted.sort_unstable();
             wanted.dedup();
@@ -13830,15 +13844,25 @@ fn exec_aggregate_no_group_by(
             for (pos, &c) in wanted.iter().enumerate() {
                 positions[c] = pos;
             }
-            // Wanted positions for each aggregate arg (usize::MAX when the
-            // arg is COUNT(*) — no column).
+            let mut agg_wanted: Vec<usize> = agg_col_indices.iter().filter_map(|x| *x).collect();
+            agg_wanted.sort_unstable();
+            agg_wanted.dedup();
+            let mut agg_positions = vec![usize::MAX; n_cols];
+            for (pos, &c) in agg_wanted.iter().enumerate() {
+                agg_positions[c] = pos;
+            }
+            // Positions in the aggregate slice for each aggregate arg
+            // (usize::MAX for COUNT(*) / an expression argument).
             let agg_pos: Vec<usize> = agg_col_indices
                 .iter()
-                .map(|a| a.map(|c| positions[c]).unwrap_or(usize::MAX))
+                .map(|a| a.map(|c| agg_positions[c]).unwrap_or(usize::MAX))
                 .collect();
 
             let params = &ctx.params;
+            let named_params = &ctx.named_params;
             let mut sel_buf: Vec<Value> = Vec::with_capacity(wanted.len());
+            let mut agg_buf: Vec<Value> = Vec::with_capacity(agg_wanted.len());
+            let mut full_buf: Vec<Value> = Vec::new();
             let rowid_alias = table.rowid_alias;
             let mut decode_err: Option<Error> = None;
             scan_table_maybe_range(ctx, &table, range, false, |rowid, payload| {
@@ -13852,11 +13876,49 @@ fn exec_aggregate_no_group_by(
                     return true;
                 }
                 saw_any_row = true;
+                if !agg_wanted.is_empty() {
+                    if let Err(e) = decode_row_selective(
+                        payload,
+                        n_cols,
+                        &agg_wanted,
+                        rowid,
+                        rowid_alias,
+                        &mut agg_buf,
+                    ) {
+                        decode_err = Some(e);
+                        return false;
+                    }
+                }
+                if full_on_match {
+                    full_buf.clear();
+                    if let Err(e) =
+                        decode_row_into(payload, n_cols, rowid, rowid_alias, &mut full_buf)
+                    {
+                        decode_err = Some(e);
+                        return false;
+                    }
+                    if append_rowid {
+                        full_buf.push(Value::Integer(rowid));
+                    }
+                }
                 for i in 0..aggregates.len() {
+                    let computed: Value;
                     let arg_val: &Value = if agg_pos[i] == usize::MAX {
-                        &COUNT_STAR_ARG // COUNT(*)
-                    } else if agg_pos[i] < sel_buf.len() {
-                        &sel_buf[agg_pos[i]]
+                        match (&aggregates[i].arg, columns_ref) {
+                            (Some(arg), Some(cols)) => {
+                                match eval_row(arg, &full_buf, cols, params, named_params) {
+                                    Ok(v) => computed = v,
+                                    Err(e) => {
+                                        decode_err = Some(e);
+                                        return false;
+                                    }
+                                }
+                                &computed
+                            }
+                            _ => &COUNT_STAR_ARG, // COUNT(*)
+                        }
+                    } else if agg_pos[i] < agg_buf.len() {
+                        &agg_buf[agg_pos[i]]
                     } else {
                         &Value::Null
                     };
