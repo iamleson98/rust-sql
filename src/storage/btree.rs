@@ -7526,6 +7526,35 @@ impl<'a> Btree<'a> {
         Ok(())
     }
 
+    /// Is leaf `id` under a third full (its cells + pointers)? Sums cell
+    /// sizes in place, stopping as soon as the third is passed.
+    fn leaf_is_underfull(&self, id: PageId, usable: usize) -> Result<bool> {
+        let page = self.pager.get_page(id)?;
+        let b = page.lock();
+        let pt = b.page_type()?;
+        if !matches!(pt, PageType::LeafTable | PageType::LeafIndex) || b.n_cells() == 0 {
+            return Ok(false);
+        }
+        let psz = b.page_size();
+        let limit = usable / 3;
+        let mut used = 0usize;
+        for i in 0..b.n_cells() {
+            let p = b.cell_pointer(i) as usize;
+            if p < PAGE_HEADER_SIZE as usize || p >= b.data.len() {
+                return Ok(false);
+            }
+            let size = match pt {
+                PageType::LeafIndex => index_leaf_cell_size(&b.data[p..], psz),
+                _ => table_leaf_cell_size_paged(&b.data[p..], psz),
+            };
+            used += size.unwrap_or(usable) + 2;
+            if used > limit {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// The in-page cell bytes of leaf `id`, in key order, with the leaf's
     /// type — `None` for a non-leaf or a malformed cell.
     fn leaf_cells(&self, id: PageId) -> Result<Option<(PageType, Vec<Vec<u8>>)>> {
@@ -7576,6 +7605,11 @@ impl<'a> Btree<'a> {
             return Ok(false);
         }
         let usable = self.pager.page_size() as usize - PAGE_HEADER_SIZE as usize;
+        // Cheap gate first (no copies): every delete lands here, and
+        // nearly every leaf is well above a third full.
+        if !self.leaf_is_underfull(child_id, usable)? {
+            return Ok(false);
+        }
         let Some((pt, child_cells)) = self.leaf_cells(child_id)? else {
             return Ok(false);
         };
