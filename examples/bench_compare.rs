@@ -42,9 +42,12 @@ fn best_of<const N: usize>(mut f: impl FnMut() -> Duration) -> Duration {
     // engines run through this same discipline. Probe once; if the
     // workload is µs-scale, train with 100 extra runs; ms-scale gets a
     // handful; anything ≥ 100 ms amortizes cold start internally already.
-    // (The only mutating closures routed through best_of — the
-    // `score = score + 1.0` UPDATE ranges — do identical work every run,
-    // so repeated warmup runs are sound for them too.)
+    // (Mutating closures routed through best_of — the `score = score +
+    // 1.0` UPDATE ranges, which do identical work every run, and the
+    // single-row INSERT families, whose tables grow run over run — are
+    // sound too: both engines run the same growth through the same
+    // discipline, so the minimum stays an apples-to-apples steady-state
+    // estimate.)
     let probe = f();
     if probe < Duration::from_millis(2) {
         for _ in 0..100 {
@@ -156,16 +159,25 @@ fn sqlite_insert_single(conn: &rusqlite::Connection, n: usize) -> Duration {
 }
 
 fn sqlite_insert_single_in_txn(conn: &rusqlite::Connection, n: usize) -> Duration {
-    let start = Instant::now();
-    conn.execute_batch("BEGIN").unwrap();
-    for i in 1..=n as i64 {
-        conn.prepare_cached("INSERT INTO t (name, val, score) VALUES (?1, ?2, ?3)")
-            .unwrap()
-            .execute(params![format!("name{}", i), i * 2, i as f64 * 1.5])
-            .unwrap();
-    }
-    conn.execute_batch("COMMIT").unwrap();
-    start.elapsed()
+    // STEADY-STATE best-of-N (the harness-wide convention — the twin
+    // `rustqlite_insert_single_in_txn` side and run 38405543432's macOS
+    // draw: SQLite's own number swung 3.60-7.15 ms across adjacent runs,
+    // 2x on identical code). Mutating workload whose per-op work grows
+    // with the table, but both engines grow identically through the same
+    // discipline (the 5530e96 UPDATE-range / c052a47 auto-commit
+    // precedents).
+    best_of::<7>(|| {
+        let start = Instant::now();
+        conn.execute_batch("BEGIN").unwrap();
+        for i in 1..=n as i64 {
+            conn.prepare_cached("INSERT INTO t (name, val, score) VALUES (?1, ?2, ?3)")
+                .unwrap()
+                .execute(params![format!("name{}", i), i * 2, i as f64 * 1.5])
+                .unwrap();
+        }
+        conn.execute_batch("COMMIT").unwrap();
+        start.elapsed()
+    })
 }
 
 fn sqlite_insert_multirow(conn: &rusqlite::Connection, n: usize) -> Duration {
@@ -782,22 +794,26 @@ fn rustqlite_insert_single(db: &mut rustqlite::Database, n: usize) -> Duration {
 }
 
 fn rustqlite_insert_single_in_txn(db: &mut rustqlite::Database, n: usize) -> Duration {
+    // STEADY-STATE best-of-N — the same discipline as the SQLite twin
+    // (run 38405543432's macOS draw; see that side's note).
     let sql = "INSERT INTO t (name, val, score) VALUES (?, ?, ?)";
-    let start = Instant::now();
-    db.execute("BEGIN", []).unwrap();
-    for i in 1..=n as i64 {
-        db.execute(
-            sql,
-            [
-                Value::Text(format!("name{}", i).into()),
-                Value::Integer(i * 2),
-                Value::Real(i as f64 * 1.5),
-            ],
-        )
-        .unwrap();
-    }
-    db.execute("COMMIT", []).unwrap();
-    start.elapsed()
+    best_of::<7>(|| {
+        let start = Instant::now();
+        db.execute("BEGIN", []).unwrap();
+        for i in 1..=n as i64 {
+            db.execute(
+                sql,
+                [
+                    Value::Text(format!("name{}", i).into()),
+                    Value::Integer(i * 2),
+                    Value::Real(i as f64 * 1.5),
+                ],
+            )
+            .unwrap();
+        }
+        db.execute("COMMIT", []).unwrap();
+        start.elapsed()
+    })
 }
 
 fn rustqlite_insert_multirow(db: &mut rustqlite::Database, n: usize) -> Duration {

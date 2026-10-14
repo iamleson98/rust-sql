@@ -5030,7 +5030,13 @@ fn blob_read_value(
     column_q: &str,
     rowid: i64,
 ) -> Result<(Vec<u8>, bool), c_int> {
-    let sql = format!("SELECT {column_q} FROM {table_q} WHERE rowid = ?");
+    // QUALIFIED column reference: the engine's (and SQLite's)
+    // double-quoted-string fallback only rewrites an UNQUALIFIED
+    // `"name"` that resolves to no column, so `table."column"` keeps
+    // the honest "no such column" error for a schema mismatch — the
+    // contract sqlite3_blob_open exposes (it resolves the table and
+    // column in the schema, never through a DQS-capable SELECT).
+    let sql = format!("SELECT {table_q}.{column_q} FROM {table_q} WHERE rowid = ?");
     let rows = {
         let _id = rustqlite::ConnIdentityGuard::arm(conn.id as u64);
         let rd = engine.db.read();
