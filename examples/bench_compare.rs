@@ -180,6 +180,18 @@ fn sqlite_insert_single_in_txn(conn: &rusqlite::Connection, n: usize) -> Duratio
     })
 }
 
+fn sqlite_populate_t(conn: &rusqlite::Connection, n: usize) {
+    // FIXTURE twin of `rustqlite_populate_t` — see its comment.
+    conn.execute_batch("BEGIN").unwrap();
+    for i in 1..=n as i64 {
+        conn.prepare_cached("INSERT INTO t (name, val, score) VALUES (?1, ?2, ?3)")
+            .unwrap()
+            .execute(params![format!("name{}", i), i * 2, i as f64 * 1.5])
+            .unwrap();
+    }
+    conn.execute_batch("COMMIT").unwrap();
+}
+
 fn sqlite_insert_multirow(conn: &rusqlite::Connection, n: usize) -> Duration {
     // Matching allocator warmup on the SQLite side (same rationale).
     {
@@ -816,6 +828,35 @@ fn rustqlite_insert_single_in_txn(db: &mut rustqlite::Database, n: usize) -> Dur
     })
 }
 
+fn rustqlite_populate_t(db: &mut rustqlite::Database, n: usize) {
+    // FIXTURE, not a measurement: insert `n` unique rows ONCE. The
+    // best_of-wrapped `rustqlite_insert_single_in_txn` measures steady-
+    // state inserts by REPEATING the whole batch — fine for the insert-
+    // section ratio (both engines grow identically through the same
+    // discipline), but the read/update/mixed-workload fixtures below
+    // must not inherit that repetition: duplicate `val`s made
+    // `WHERE val = ?` decode 7 rows per op on this side while the
+    // SQLite twin's `query_row` reads one and abandons the statement
+    // (run 38541836197's "Point lookup by indexed col 310% slower" was
+    // that fixture artifact, not an engine regression — bisected from
+    // green 3f88fabf1, fast 53a0353, slow f9dbac5 with the only
+    // relevant delta being this duplication).
+    let sql = "INSERT INTO t (name, val, score) VALUES (?, ?, ?)";
+    db.execute("BEGIN", []).unwrap();
+    for i in 1..=n as i64 {
+        db.execute(
+            sql,
+            [
+                Value::Text(format!("name{}", i).into()),
+                Value::Integer(i * 2),
+                Value::Real(i as f64 * 1.5),
+            ],
+        )
+        .unwrap();
+    }
+    db.execute("COMMIT", []).unwrap();
+}
+
 fn rustqlite_insert_multirow(db: &mut rustqlite::Database, n: usize) -> Duration {
     let batch = 500;
     // Allocator steady-state warmup (see the join section): absorb
@@ -1255,10 +1296,10 @@ fn main() {
 
     let mut db_r = rustqlite_open();
     rustqlite_create_table(&mut db_r);
-    rustqlite_insert_single_in_txn(&mut db_r, MEDIUM);
+    rustqlite_populate_t(&mut db_r, MEDIUM);
     let conn_s = sqlite_open();
     sqlite_create_table(&conn_s);
-    sqlite_insert_single_in_txn(&conn_s, MEDIUM);
+    sqlite_populate_t(&conn_s, MEDIUM);
 
     {
         let d_r = rustqlite_point_lookup_rowid(&mut db_r, 1000);
@@ -1490,7 +1531,7 @@ fn main() {
     {
         let mut db = rustqlite::Database::open(&r_path).unwrap();
         rustqlite_create_table(&mut db);
-        rustqlite_insert_single_in_txn(&mut db, MEDIUM);
+        rustqlite_populate_t(&mut db, MEDIUM);
         // Force flush
         db.execute("COMMIT", []).ok();
     }
@@ -1499,7 +1540,7 @@ fn main() {
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = OFF;")
             .ok();
         sqlite_create_table(&conn);
-        sqlite_insert_single_in_txn(&conn, MEDIUM);
+        sqlite_populate_t(&conn, MEDIUM);
     }
 
     let r_size = std::fs::metadata(&r_path).map(|m| m.len()).unwrap_or(0);
