@@ -258,6 +258,42 @@ pub fn encode_record(values: &[Value]) -> Vec<u8> {
     encode_record_enc(values, TextEnc::Utf8)
 }
 
+/// An INDEX record (the `sqlite_stat4.sample` blob): REAL values keep
+/// their 8-byte form — the int-as-real storage optimization applies to
+/// table records only (SQLite's `sample` for `2.0` is serial type 7).
+pub fn encode_index_record(values: &[Value]) -> Vec<u8> {
+    let serial = |v: &Value| match v {
+        Value::Real(_) => (7, 8),
+        other => serial_type_and_size(other, TextEnc::Utf8),
+    };
+    let mut header = Vec::with_capacity(values.len() + 4);
+    for v in values {
+        write_varint(&mut header, serial(v).0 as i64);
+    }
+    let mut size_prefix = 1usize;
+    while varint_len((size_prefix + header.len()) as u64) > size_prefix {
+        size_prefix += 1;
+    }
+    let mut out = Vec::with_capacity(size_prefix + header.len() + values.len() * 8);
+    write_varint(&mut out, (size_prefix + header.len()) as i64);
+    out.extend_from_slice(&header);
+    for v in values {
+        match v {
+            Value::Null => {}
+            Value::Integer(i) => {
+                let n = serial(v).1;
+                if n > 0 {
+                    write_be_int(&mut out, *i, n);
+                }
+            }
+            Value::Real(f) => out.extend_from_slice(&f.to_bits().to_be_bytes()),
+            Value::Text(t) => out.extend_from_slice(t.as_bytes()),
+            Value::Blob(b) => out.extend_from_slice(b),
+        }
+    }
+    out
+}
+
 /// Encoding-aware encode (see [`encode_record`]).
 pub fn encode_record_enc(values: &[Value], enc: TextEnc) -> Vec<u8> {
     // Pass 1: sizes.

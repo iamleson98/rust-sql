@@ -8182,6 +8182,25 @@ impl Pager {
         Ok((next, data.len()))
     }
 
+    /// Is page `id`'s current version the one in the main file? Not
+    /// when it is cached (the cache is authoritative), spilled by an
+    /// open transaction, or committed into the WAL.
+    fn page_is_file_authoritative(&self, id: PageId) -> bool {
+        if self.cache.read().get(id).is_some() {
+            return false;
+        }
+        if let Some(st) = self.wal.read().as_ref() {
+            if st.spilled.contains_key(&id) || st.map.contains_key(&id) {
+                return false;
+            }
+        }
+        !self
+            .delete_spill
+            .lock()
+            .as_ref()
+            .is_some_and(|sp| sp.pages.contains_key(&id))
+    }
+
     pub(crate) fn read_overflow_page_append(
         &self,
         id: PageId,
@@ -8343,7 +8362,8 @@ impl Pager {
             return Ok(0);
         }
         let mut appended = 0usize;
-        let cap = self.page_size() as usize - 16;
+        let psz = self.page_size() as usize;
+        let cap = psz - 16;
         let max_pages = self.n_pages() as usize + 4;
         let mut steps = 0usize;
         let mut cur = first;
@@ -8351,6 +8371,14 @@ impl Pager {
         // Scoped views: page by page through get_page (the resident-run
         // walk below reads the shared cache directly).
         let scoped = self.overflow_reads_scoped();
+        // Read-ahead for cold chains: one read of the next run of file
+        // pages (chains are mostly allocated consecutively) instead of
+        // two syscalls per 4 KB page. A buffered page is used only once
+        // it is checked file-authoritative (not cached, spilled or in the
+        // WAL) at the moment the chain reaches it.
+        let readahead = !scoped && !self.codec.read().is_active();
+        let mut ra: Vec<u8> = Vec::new();
+        let (mut ra_first, mut ra_n): (PageId, usize) = (0, 0);
         'outer: loop {
             // ONE read-guard for a maximal run of resident pages (lock
             // order cache -> page matches get_page/evict, so holding it
@@ -8373,6 +8401,45 @@ impl Pager {
                         // Cold page: release the guard, use the generic
                         // reader, then re-acquire for the next run.
                         drop(cache);
+                        if readahead && self.page_is_file_authoritative(cur) {
+                            let in_buf = |id: PageId, first: PageId, n: usize| {
+                                id >= first && ((id - first) as usize) < n
+                            };
+                            if !in_buf(cur, ra_first, ra_n) {
+                                let want = (end - page_pos).div_ceil(cap).clamp(1, 64);
+                                ra.resize(want * psz, 0);
+                                let n = self.read_file_at(cur as u64 * psz as u64, &mut ra)?;
+                                ra_first = cur;
+                                ra_n = n / psz;
+                            }
+                            if in_buf(cur, ra_first, ra_n) {
+                                let at = (cur - ra_first) as usize * psz;
+                                let pg = &ra[at..at + psz];
+                                if pg[0] != crate::storage::page::PageType::Overflow as u8 {
+                                    return Err(Error::corruption(format!(
+                                        "overflow chain hit non-overflow page {cur}"
+                                    )));
+                                }
+                                let next = u32::from_be_bytes(pg[12..16].try_into().unwrap());
+                                let data = &pg[16..];
+                                let take = data.len().min(cap);
+                                let p_end = page_pos + take;
+                                if p_end > start && page_pos < end {
+                                    let from = start.max(page_pos) - page_pos;
+                                    let to = end.min(p_end) - page_pos;
+                                    if to > from {
+                                        out.extend_from_slice(&data[from..to]);
+                                        appended += to - from;
+                                    }
+                                }
+                                if next == 0 {
+                                    return Ok(appended);
+                                }
+                                page_pos += take;
+                                cur = next;
+                                continue 'outer;
+                            }
+                        }
                         let mut sink = Vec::new();
                         let (next, take) = self.read_overflow_page_append(cur, &mut sink)?;
                         let p_end = page_pos + take;

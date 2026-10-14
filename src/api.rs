@@ -13180,8 +13180,10 @@ impl Database {
                 ));
             }
             for index in indexes {
-                let (n_idx, dvals, samples) =
-                    Self::analyze_index_exact(ctx, catalog, table, &index)?;
+                let (n_idx, dvals, samples) = match Self::analyze_index_walk(ctx, table, &index)? {
+                    Some(r) => r,
+                    None => Self::analyze_index_exact(ctx, catalog, table, &index)?,
+                };
                 // An empty table's FULL index is omitted from stat1 ("an
                 // empty table is omitted from sqlite_stat1"); a PARTIAL
                 // index keeps its zero row.
@@ -13249,6 +13251,195 @@ impl Database {
     /// each entry's prefix changes under the index collations. Returns
     /// the entry count, the stat1 numbers (`D_k`) and the STAT4 samples,
     /// all exactly as the bundled SQLite computes them.
+    /// ANALYZE of one index by walking the INDEX itself — SQLite's
+    /// analyze.c loop: entries arrive in index order, so each one's
+    /// change column comes from comparing its key segments with the
+    /// previous entry's (the order-key encoding is prefix-free, so a
+    /// column's segment is self-delimiting and byte equality is value
+    /// equality under the column's collation). Only the STAT4 samples
+    /// read their rows back. `analyze_index_exact` (a table scan + sort)
+    /// keeps the shapes whose stored order differs from SQLite's index
+    /// order — DESC columns (stored ascending) and WITHOUT ROWID tables
+    /// — and the non-B+tree index kinds. `Ok(None)` = not this shape.
+    #[allow(clippy::type_complexity)]
+    fn analyze_index_walk(
+        ctx: &mut ExecContext,
+        table: &Arc<crate::schema::Table>,
+        index: &Arc<crate::schema::Index>,
+    ) -> Result<Option<(i64, Vec<i64>, Vec<crate::schema::Stat4Sample>)>> {
+        let pk_index = matches!(index.origin, crate::schema::IndexOrigin::WithoutRowidPk);
+        let n_desc = index
+            .columns
+            .iter()
+            .filter(|c| matches!(c.order, crate::sql::ast::Order::Desc))
+            .count();
+        if (table.without_rowid && !pk_index)
+            || table.vtab.is_some()
+            || index.kind != crate::schema::IndexKind::Btree
+            || (n_desc != 0 && n_desc != index.columns.len())
+        {
+            return Ok(None);
+        }
+        let all_desc = n_desc != 0;
+        let n_key = index.columns.len();
+        // A WITHOUT ROWID PRIMARY KEY's entries are the key alone.
+        let n_col = if pk_index { n_key } else { n_key + 1 };
+        let uniq_not_null = pk_index
+            || index.unique
+                && index.columns.iter().all(|c| {
+                    c.expr.is_none()
+                        && table.find_column(&c.name).is_some_and(|p| {
+                            table.rowid_alias == Some(p) || table.columns[p].explicit_not_null
+                        })
+                });
+        let n_col_test = if uniq_not_null { n_key - 1 } else { n_key };
+        // Length of the order-key segment at the start of `b`.
+        fn seg_len(b: &[u8]) -> Option<usize> {
+            match *b.first()? {
+                0x00 => Some(1),
+                0x01 => (b.len() >= 11).then_some(11),
+                0x02 | 0x03 => {
+                    let mut i = 1;
+                    while i + 1 < b.len() {
+                        if b[i] == 0 {
+                            if b[i + 1] == 0 {
+                                return Some(i + 2);
+                            }
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    None
+                }
+                _ => None,
+            }
+        }
+        // Every entry's key bytes (one buffer) and rowid, in stored order.
+        let root = ctx.index_root(index);
+        let mut bt = Btree::new(ctx.pager, root, false);
+        let mut keys: Vec<u8> = Vec::new();
+        let mut spans: Vec<(u32, u32)> = Vec::new();
+        let mut stored_rowids: Vec<i64> = Vec::new();
+        bt.scan_index(|rowid, key| {
+            let at = keys.len() as u32;
+            keys.extend_from_slice(key);
+            spans.push((at, keys.len() as u32));
+            stored_rowids.push(rowid);
+            true
+        })?;
+        drop(bt);
+        // SQLite's order: a DESC index is stored ascending here, so walk
+        // it backwards — but entries with EQUAL keys keep ascending rowid
+        // order (the rowid tie-break is ascending in SQLite's index too).
+        let order: Vec<usize> = if all_desc {
+            let mut out = Vec::with_capacity(spans.len());
+            let mut end = spans.len();
+            while end > 0 {
+                let k = |i: usize| &keys[spans[i].0 as usize..spans[i].1 as usize];
+                let mut start = end - 1;
+                while start > 0 && k(start - 1) == k(end - 1) {
+                    start -= 1;
+                }
+                out.extend(start..end);
+                end = start;
+            }
+            out
+        } else {
+            (0..spans.len()).collect()
+        };
+        let mut changes: Vec<u32> = Vec::with_capacity(order.len());
+        let mut rowids: Vec<i64> = Vec::with_capacity(order.len());
+        let mut prev_ends: Vec<usize> = Vec::with_capacity(n_col_test);
+        let mut ends: Vec<usize> = Vec::with_capacity(n_col_test);
+        let mut prev: &[u8] = &[];
+        for &e in &order {
+            let key = &keys[spans[e].0 as usize..spans[e].1 as usize];
+            ends.clear();
+            let mut at = 0;
+            for _ in 0..n_col_test {
+                match seg_len(&key[at..]) {
+                    Some(n) => at += n,
+                    None => return Ok(None),
+                }
+                ends.push(at);
+            }
+            let i_chng = if rowids.is_empty() {
+                0
+            } else {
+                let mut i = 0;
+                let mut from = 0;
+                while i < n_col_test {
+                    if ends[i] != prev_ends[i] || key[from..ends[i]] != prev[from..prev_ends[i]] {
+                        break;
+                    }
+                    from = ends[i];
+                    i += 1;
+                }
+                i
+            };
+            changes.push(i_chng as u32);
+            rowids.push(stored_rowids[e]);
+            prev = key;
+            std::mem::swap(&mut prev_ends, &mut ends);
+        }
+        let mut acc = Stat4Accum::new(n_col, rowids.len() as u64);
+        for (pos, &c) in changes.iter().enumerate() {
+            acc.push(c as usize, pos);
+        }
+        let n_row = acc.n_row;
+        let dvals: Vec<i64> = (0..n_key)
+            .map(|i| {
+                let n_distinct = acc.cur.dlt[i] + 1;
+                let v = n_row.div_ceil(n_distinct);
+                if v == 2 && n_row * 10 <= n_distinct * 11 {
+                    1
+                } else {
+                    v as i64
+                }
+            })
+            .collect();
+        // STAT4 samples: the raw column values of the sampled entries.
+        let n_cols = table.n_columns();
+        let named: Vec<String> = table
+            .columns
+            .iter()
+            .map(|c| format!("{}.{}", table.name, c.name))
+            .collect();
+        let params: Vec<Value> = Vec::new();
+        let named_params = std::collections::HashMap::new();
+        let mut tbt = Btree::new(ctx.pager, ctx.table_root(table), false);
+        let mut samples = Vec::new();
+        for smp in acc.finish() {
+            let rowid = rowids[smp.pos];
+            let Some(row) = tbt.lookup_table_with(rowid, |payload| {
+                decode_row(payload, n_cols, rowid, table.rowid_alias)
+            })?
+            else {
+                return Ok(None);
+            };
+            let mut keys = Vec::with_capacity(n_key);
+            for c in &index.columns {
+                keys.push(match &c.expr {
+                    Some(e) => Self::analyze_eval_expr(e, &row, &named, &params, &named_params)?,
+                    None => table
+                        .find_column(&c.name)
+                        .and_then(|p| row.get(p))
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                });
+            }
+            samples.push(crate::schema::Stat4Sample {
+                keys,
+                rowid: (!pk_index).then_some(rowid),
+                neq: smp.eq.iter().map(|&v| v as i64).collect(),
+                nlt: smp.lt.iter().map(|&v| v as i64).collect(),
+                ndlt: smp.dlt.iter().map(|&v| v as i64).collect(),
+            });
+        }
+        Ok(Some((n_row as i64, dvals, samples)))
+    }
+
     fn analyze_index_exact(
         ctx: &mut ExecContext,
         catalog: &Catalog,

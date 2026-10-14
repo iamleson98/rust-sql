@@ -608,7 +608,7 @@ impl Stat4Sample {
         if let Some(r) = self.rowid {
             vals.push(Value::Integer(r));
         }
-        crate::storage::sqlitefmt::record::encode_record(&vals)
+        crate::storage::sqlitefmt::record::encode_index_record(&vals)
     }
 
     /// Parse one sqlite_stat4 row's fields (neq/nlt/ndlt space-joined

@@ -538,6 +538,29 @@ impl<'a> EvalContext<'a> {
         self.tables.insert(alias.to_ascii_lowercase(), row);
     }
 
+    /// `lookup` by reference, for the cases that resolve to a column of
+    /// THIS row (the first by-name match `lookup` would take); `None`
+    /// sends every other case (rowid spellings, suffix matches, vtab aux
+    /// slots, outer correlated scopes) to `lookup`. Lets an operator read
+    /// a long TEXT / BLOB operand without copying it.
+    pub fn lookup_ref(&self, table: &Option<String>, name: &str) -> Option<&'a Value> {
+        let i = match table {
+            Some(t) => self
+                .column_names
+                .iter()
+                .position(|n| crate::executor::qualified_name_eq(n, t, name))?,
+            None => {
+                if crate::planner::is_rowid_spelling(name) || name == crate::planner::HIDDEN_ROWID {
+                    return None;
+                }
+                self.column_names
+                    .iter()
+                    .position(|n| n.eq_ignore_ascii_case(name))?
+            }
+        };
+        self.row.get(i)
+    }
+
     /// Look up a column reference. Returns the value or NULL if not found.
     pub fn lookup(&self, table: &Option<String>, name: &str) -> Value {
         if let Some(t) = table {
@@ -1726,6 +1749,16 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
             row_binary(*op, left, right, ctx, false)
         }
         Expr::Binary { op, left, right } => {
+            // `col -> path` / `col ->> path`: read the (often large) JSON
+            // operand in place instead of cloning it per evaluation.
+            if matches!(op, BinaryOp::Arrow | BinaryOp::ArrowText) {
+                if let Expr::Column { table, name } = &**left {
+                    if let Some(l) = ctx.lookup_ref(table, name) {
+                        let r = evaluate(right, ctx)?;
+                        return arrow_eval(*op, l, &r);
+                    }
+                }
+            }
             // exprComputeOperands (comparisons, arithmetic, bitwise, shifts,
             // `||` — every operator that is NULL when an operand is NULL):
             // an operand holding a subquery goes second and is SKIPPED

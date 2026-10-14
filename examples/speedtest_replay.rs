@@ -341,7 +341,14 @@ fn sqlite_value(v: rusqlite::types::ValueRef<'_>) -> String {
 fn run_ours(sections: &[Section], dir: &std::path::Path) -> Vec<Outcome> {
     let mut db = rustqlite::Database::open(dir.join("ours.db")).unwrap();
     let mut out = Vec::with_capacity(sections.len());
-    for s in sections {
+    let n = sections.len();
+    for (si, s) in sections.iter().enumerate() {
+        // `--hold`: announce the last section and pause, so a profiler
+        // can attach for exactly that section.
+        if si + 1 == n && std::env::args().any(|a| a == "--hold") {
+            eprintln!("HOLD {}:{}", s.set, s.number);
+            std::thread::sleep(Duration::from_millis(1500));
+        }
         let mut o = Outcome::default();
         let mut h = std::collections::hash_map::DefaultHasher::new();
         let t0 = Instant::now();

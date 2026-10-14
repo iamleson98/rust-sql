@@ -11,7 +11,7 @@ An embedded SQL database written from scratch in Rust, built to match SQLite's b
 
 ## Still loses to SQLite
 
-- **Memory**: peak memory is 1–4 MB higher on most torture sections, and 15 MB higher on `GROUP BY` over 100k groups (57 vs 42 MB). The binary is about 1.5x larger (mimalloc and extra features).
+- **Memory**: peak memory is 1–4 MB higher on most torture sections, and 15 MB higher on `GROUP BY` over 100k groups (57 vs 42 MB). The default page cache is 8 MB against SQLite's 2 MB (`PRAGMA cache_size` lowers it): file-backed workloads larger than 2 MB can use up to 6 MB more. The binary is about 1.5x larger (mimalloc and extra features).
 - **Speed**:
   - mass `UPDATE` of an indexed column on macOS: about 1.4x slower at 2M rows, up to 1.95x at 100M rows on the CI Mac machines;
   - 4 readers + 1 writer on the CI Mac machines: 0.58–0.67x (it wins on x86);
