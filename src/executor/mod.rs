@@ -21061,7 +21061,19 @@ fn exec_index_in(
 ) -> Result<ExecResult> {
     // Alias-qualified output + residual-eval names — see
     // exec_index_lookup's comment (the leak fix).
-    let out_cols: Arc<[String]> = scan_output_columns(&table, &query_alias, false);
+    //
+    // Hidden rowid slot — the SAME layout rule as `exec_scan`: rows of a
+    // no-alias rowid table carry the trailing rowid so DML consumers
+    // (the UPDATE/DELETE general path addresses source rows by that
+    // slot) work over this access path, not just over Scan. Name-based
+    // projections and star expansions filter hidden slots, so SELECT
+    // output is unchanged. Without the slot, `UPDATE ... WHERE indexed
+    // col IN (...)` on a TEXT-PK table failed with "UPDATE on a table
+    // without INTEGER PRIMARY KEY" (or, through the streaming fast
+    // path's row matcher, silently updated nothing) — pinned by
+    // tests/qualified_in_plan.rs::dml_updates_through_index_in.
+    let append_rowid = crate::planner::wants_rowid_slot(&table);
+    let out_cols: Arc<[String]> = scan_output_columns(&table, &query_alias, append_rowid);
     let empty_row: Vec<Value> = Vec::new();
     let empty_cols: Vec<String> = Vec::new();
     let eval_ctx = EvalContext::new(&empty_row, &empty_cols, &ctx.params, &ctx.named_params);
@@ -21104,7 +21116,7 @@ fn exec_index_in(
     for key_buf in &encoded_keys {
         let rowids = index_bt.lookup_index(key_buf)?;
         for rowid in rowids {
-            if let Some(row) = table_bt
+            if let Some(mut row) = table_bt
                 .lookup_table_with(rowid, |payload| decode_row(payload, n_cols, rowid, alias))?
             {
                 if let Some(pred) = residual {
@@ -21112,6 +21124,9 @@ fn exec_index_in(
                     if !pv {
                         continue;
                     }
+                }
+                if append_rowid {
+                    row.push(Value::Integer(rowid));
                 }
                 rows.push(row);
             }

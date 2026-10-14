@@ -253,3 +253,86 @@ fn qualified_in_matches_sqlite_results() {
         .collect();
     assert_eq!(got, expect);
 }
+
+#[test]
+fn dml_updates_through_index_in() {
+    // UPDATE whose WHERE drives the IndexIn multi-seek on a TEXT-PK
+    // (no rowid-alias) table: the scan must carry the hidden rowid
+    // slot so the UPDATE general path can address rows. Before the
+    // fix this errored with "UPDATE on a table without INTEGER PRIMARY
+    // KEY" — qualified OR unqualified, i.e. a latent engine bug that
+    // the sea-orm shape (always qualified) then hit on every bulk
+    // seat hold/release UPDATE once qualified INs started driving
+    // IndexIn.
+    let mut db = Database::open_in_memory().unwrap();
+    for sql in [
+        "CREATE TABLE seat_inventory (\
+             id TEXT PRIMARY KEY, trip_session_id TEXT NOT NULL, \
+             seat_id TEXT NOT NULL, status TEXT NOT NULL)",
+        "CREATE INDEX seatinv_seatid_idx ON seat_inventory (seat_id)",
+        "CREATE INDEX seatinv_tsid_idx ON seat_inventory (trip_session_id)",
+    ] {
+        db.execute(sql, []).unwrap();
+    }
+    for (id, seat) in [("r1", "s1"), ("r2", "s2"), ("r3", "s3")] {
+        db.execute(
+            &format!("INSERT INTO seat_inventory VALUES ('{id}', 't1', '{seat}', 'available')"),
+            [],
+        )
+        .unwrap();
+    }
+    // The sea-orm shape: every column qualified.
+    db.execute(
+        "UPDATE \"seat_inventory\" SET \"status\" = 'held' \
+         WHERE \"seat_inventory\".\"trip_session_id\" = 't1' \
+         AND \"seat_inventory\".\"seat_id\" IN ('s1', 's3') \
+         AND \"seat_inventory\".\"status\" = 'available'",
+        [],
+    )
+    .unwrap();
+    let statuses: Vec<String> = db
+        .query("SELECT status FROM seat_inventory ORDER BY id", [])
+        .unwrap()
+        .into_iter()
+        .map(|r| r[0].as_text().to_string())
+        .collect();
+    assert_eq!(statuses, vec!["held", "available", "held"], "both IN members must update");
+
+    // DELETE through the same shape.
+    db.execute(
+        "DELETE FROM \"seat_inventory\" WHERE \"seat_inventory\".\"seat_id\" IN ('s2')",
+        [],
+    )
+    .unwrap();
+    let left: Vec<String> = db
+        .query("SELECT id FROM seat_inventory ORDER BY id", [])
+        .unwrap()
+        .into_iter()
+        .map(|r| r[0].as_text().to_string())
+        .collect();
+    assert_eq!(left, vec!["r1", "r3"], "the deleted member must be gone");
+}
+
+#[test]
+fn select_output_over_index_in_has_no_extra_column() {
+    // The hidden rowid slot rides IndexIn rows for DML, but the SELECT
+    // projection must never leak it: explicit column lists bind by
+    // name, and `SELECT *` star expansion filters hidden slots.
+    let db = setup();
+    let rows = db
+        .query(
+            "SELECT \"trip_session\".\"id\" FROM \"trip_session\" \
+             WHERE \"trip_session\".\"schedule_id\" IN ('s1', 's2')",
+            [],
+        )
+        .unwrap();
+    assert!(rows.iter().all(|r| r.len() == 1));
+    let star = db
+        .query(
+            "SELECT * FROM trip_session WHERE schedule_id IN ('s1', 's2') LIMIT 2",
+            [],
+        )
+        .unwrap();
+    // trip_session has 5 columns; the hidden slot never appears.
+    assert!(star.iter().all(|r| r.len() == 5));
+}
