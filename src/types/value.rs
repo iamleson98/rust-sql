@@ -325,6 +325,9 @@ impl Value {
         match self {
             Value::Null => 0,
             Value::Integer(_) | Value::Real(_) => self.as_text().len() as i64,
+            Value::Text(s) if !s.is_raw() => {
+                crate::types::text::utf8_char_count_to_nul(s.as_bytes()) as i64
+            }
             Value::Text(s) => {
                 let b = s.as_bytes();
                 let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());

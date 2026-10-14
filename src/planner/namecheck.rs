@@ -221,6 +221,8 @@ pub(crate) fn tvf_columns(name: &str) -> Option<Vec<&'static str>> {
             "key", "value", "type", "atom", "id", "parent", "fullkey", "path",
         ]),
         "pragma_table_info" => Some(vec!["cid", "name", "type", "notnull", "dflt_value", "pk"]),
+        "pragma_table_xinfo" => Some(crate::executor::tableval::TABLE_XINFO_COLS.to_vec()),
+        "pragma_table_list" => Some(crate::executor::tableval::TABLE_LIST_COLS.to_vec()),
         "pragma_index_list" => Some(vec!["seq", "name", "unique", "origin", "partial"]),
         "pragma_index_info" | "pragma_index_xinfo" => {
             Some(vec!["seqno", "cid", "name", "desc", "coll", "key"])
@@ -286,12 +288,9 @@ fn table_source(ctx: &Ctx<'_>, name: &str, ctes: &CteList) -> Option<(Vec<String
     // EPONYMOUS virtual table: `FROM dbstat` with no argument list —
     // the planner routes it to a zero-argument TableFunction scan (a
     // real table named dbstat shadows it, as it should).
-    if name.eq_ignore_ascii_case("dbstat") {
+    if crate::executor::tableval::is_eponymous(name) {
         return Some((
-            crate::executor::tableval::DBSTAT_COLS
-                .iter()
-                .map(|c| c.to_string())
-                .collect(),
+            tvf_columns(name)?.iter().map(|c| c.to_string()).collect(),
             false,
             false,
         ));

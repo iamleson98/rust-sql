@@ -1428,6 +1428,320 @@ pub fn jb_resolve<'a>(jb: &'a Jb, segs: &[crate::executor::json::PathSeg]) -> Op
     Some(cur)
 }
 
+/// Is the blob `b` a JSONB argument — SQLite's `jsonArgIsJsonb`: a
+/// root header in range whose payload exactly fills the blob (null /
+/// true / false with an empty payload), and, for a payload of at most 7
+/// bytes starting `{`, `[` or a digit (which could equally be JSON
+/// text), a full validity check. Larger payloads are not walked.
+pub fn jsonb_root_fits(b: &[u8]) -> bool {
+    let Some(&c) = b.first() else {
+        return false;
+    };
+    match read_header(b, 0) {
+        Some((typ, len, hdr)) => {
+            typ <= T_OBJECT
+                && hdr.checked_add(len) == Some(b.len())
+                && (typ > T_FALSE || len == 0)
+                && (len > 7
+                    || (c != b'{' && c != b'[' && !c.is_ascii_digit())
+                    || jb_from_bytes(b).is_ok())
+        }
+        None => false,
+    }
+}
+
+/// The byte span `[start, end)` of the element `segs` selects inside the
+/// JSONB blob `b`, found by walking element HEADERS only — siblings are
+/// skipped by their payload size, nothing is decoded or allocated (the
+/// whole-document decode `jb_resolve` needs costs O(document) per call).
+/// `Ok(None)`: the path selects nothing. `Err(())`: a header on the walk
+/// is malformed (callers fall back to the validating decode). Matches
+/// `jb_resolve`: the FIRST equal key wins; `[#-N]` counts from the end.
+#[allow(clippy::result_unit_err)]
+pub fn jsonb_locate(b: &[u8], segs: &[PathSeg]) -> Result<Option<(usize, usize)>, ()> {
+    // Element at `pos` within `[.., lim)`: (type, payload start, end).
+    fn elem(b: &[u8], pos: usize, lim: usize) -> Result<(u8, usize, usize), ()> {
+        let (typ, len, hdr) = read_header(b, pos).ok_or(())?;
+        let ps = pos + hdr;
+        let pe = ps.checked_add(len).ok_or(())?;
+        if pe > lim {
+            return Err(());
+        }
+        Ok((typ, ps, pe))
+    }
+    let (mut start, mut end) = (0usize, b.len());
+    for seg in segs {
+        let (typ, ps, pe) = elem(b, start, end)?;
+        match seg {
+            PathSeg::Key(k) => {
+                if typ != T_OBJECT {
+                    return Ok(None);
+                }
+                let mut p = ps;
+                let mut found = None;
+                while p < pe {
+                    let (kt, kps, kpe) = elem(b, p, pe)?;
+                    if !(T_TEXT..=T_TEXTRAW).contains(&kt) || kpe >= pe {
+                        return Err(());
+                    }
+                    let (_, vps, vpe) = elem(b, kpe, pe)?;
+                    if key_matches(kt, &b[kps..kpe], k) {
+                        found = Some((kpe, vpe));
+                        break;
+                    }
+                    let _ = vps;
+                    p = vpe;
+                }
+                match found {
+                    Some(span) => (start, end) = span,
+                    None => return Ok(None),
+                }
+            }
+            PathSeg::Append => return Ok(None),
+            PathSeg::Index(i) => {
+                if typ != T_ARRAY {
+                    return Ok(None);
+                }
+                let want = if *i < 0 {
+                    let mut n = 0i64;
+                    let mut p = ps;
+                    while p < pe {
+                        p = elem(b, p, pe)?.2;
+                        n += 1;
+                    }
+                    n + *i
+                } else {
+                    *i
+                };
+                if want < 0 {
+                    return Ok(None);
+                }
+                let mut p = ps;
+                let mut k = 0i64;
+                let mut found = None;
+                while p < pe {
+                    let (_, _, epe) = elem(b, p, pe)?;
+                    if k == want {
+                        found = Some((p, epe));
+                        break;
+                    }
+                    k += 1;
+                    p = epe;
+                }
+                match found {
+                    Some(span) => (start, end) = span,
+                    None => return Ok(None),
+                }
+            }
+        }
+    }
+    Ok(Some((start, end)))
+}
+
+/// Does a JSONB object key (type `kt`, payload `raw`) equal `k`? The
+/// same comparison as `jb_resolve` (`Jb::string_value`), without
+/// allocating for the common unescaped valid-UTF-8 key.
+fn key_matches(kt: u8, raw: &[u8], k: &str) -> bool {
+    match kt {
+        T_TEXT | T_TEXTRAW => match std::str::from_utf8(raw) {
+            Ok(s) => s == k,
+            Err(_) => crate::types::Text::from_bytes(raw).as_str() == k,
+        },
+        _ => {
+            let decoded: String = decode_escapes(raw, kt == T_TEXT5)
+                .into_iter()
+                .map(|c| c as char)
+                .collect();
+            decoded == k
+        }
+    }
+}
+
+/// An in-place JSONB edit (`jsonb_edit`).
+pub enum JbEdit<'a> {
+    /// json_set (`create` + overwrite), json_insert (`create`, never
+    /// overwrite), json_replace (overwrite only): `val` is the encoded
+    /// new element, `tree` the same value as a tree (nested creation).
+    Put {
+        val: &'a [u8],
+        tree: &'a Jb,
+        create: bool,
+        overwrite: bool,
+    },
+    Remove,
+}
+
+/// Apply one path edit to the JSONB blob `buf` IN PLACE — SQLite's
+/// jsonBlobEdit: splice the target's bytes, then rewrite the payload
+/// size of every enclosing container (innermost first, minimal header
+/// width). Untouched elements keep their bytes, headers included.
+/// Same outcomes as `jb_set_at` / `jb_remove_at` on the decoded tree.
+/// `Ok(false)`: the root was removed (SQL NULL). `Err(())`: malformed
+/// header on the walk (callers fall back to the tree path).
+#[allow(clippy::result_unit_err)]
+pub fn jsonb_edit(buf: &mut Vec<u8>, segs: &[PathSeg], edit: &JbEdit<'_>) -> Result<bool, ()> {
+    fn elem(b: &[u8], pos: usize, lim: usize) -> Result<(u8, usize, usize), ()> {
+        let (typ, len, hdr) = read_header(b, pos).ok_or(())?;
+        let ps = pos + hdr;
+        let pe = ps.checked_add(len).ok_or(())?;
+        if pe > lim {
+            return Err(());
+        }
+        Ok((typ, ps, pe))
+    }
+    // Header positions of the containers enclosing the current element.
+    let mut parents: Vec<usize> = Vec::with_capacity(segs.len());
+    let (mut start, mut end) = (0usize, buf.len());
+    // The removal span when the target is an object member (its key
+    // goes too).
+    let mut member_start = None;
+    for (depth, seg) in segs.iter().enumerate() {
+        let (typ, ps, pe) = elem(buf, start, end)?;
+        let mut found = None;
+        match seg {
+            PathSeg::Key(k) => {
+                if typ != T_OBJECT {
+                    return Ok(true);
+                }
+                let mut p = ps;
+                while p < pe {
+                    let (kt, kps, kpe) = elem(buf, p, pe)?;
+                    if !(T_TEXT..=T_TEXTRAW).contains(&kt) || kpe >= pe {
+                        return Err(());
+                    }
+                    let (_, _, vpe) = elem(buf, kpe, pe)?;
+                    if key_matches(kt, &buf[kps..kpe], k) {
+                        found = Some((p, kpe, vpe));
+                        break;
+                    }
+                    p = vpe;
+                }
+            }
+            PathSeg::Index(_) | PathSeg::Append => {
+                if typ != T_ARRAY {
+                    return Ok(true);
+                }
+                let mut n = 0i64;
+                let from_end = !matches!(seg, PathSeg::Index(i) if *i >= 0);
+                if from_end {
+                    let mut p = ps;
+                    while p < pe {
+                        p = elem(buf, p, pe)?.2;
+                        n += 1;
+                    }
+                }
+                let want = match seg {
+                    PathSeg::Index(i) if *i < 0 => n + *i,
+                    PathSeg::Index(i) => *i,
+                    _ => n,
+                };
+                let mut p = ps;
+                let mut k = 0i64;
+                while p < pe {
+                    let (_, _, epe) = elem(buf, p, pe)?;
+                    if k == want {
+                        found = Some((p, p, epe));
+                        break;
+                    }
+                    k += 1;
+                    p = epe;
+                }
+                if found.is_none() {
+                    // Missing slot: only `create` at exactly one past the
+                    // end appends (want == count).
+                    if let JbEdit::Put {
+                        tree, create: true, ..
+                    } = edit
+                    {
+                        if want >= 0 && want == k {
+                            if let Some(sub) = create_sub(&segs[depth + 1..], tree) {
+                                parents.push(start);
+                                let mut bytes = Vec::new();
+                                encode_elem(&mut bytes, &sub);
+                                splice_and_resize(buf, pe, pe, &bytes, &parents);
+                            }
+                        }
+                    }
+                    return Ok(true);
+                }
+            }
+        }
+        match found {
+            Some((ms, vs, ve)) => {
+                parents.push(start);
+                member_start = Some(ms);
+                (start, end) = (vs, ve);
+            }
+            None => {
+                // Missing key: `create` appends `key: value` at the end of
+                // the object (a TEXTRAW key, SQLite's path-origin key).
+                if let (
+                    PathSeg::Key(k),
+                    JbEdit::Put {
+                        tree, create: true, ..
+                    },
+                ) = (seg, edit)
+                {
+                    if let Some(sub) = create_sub(&segs[depth + 1..], tree) {
+                        parents.push(start);
+                        let mut bytes = Vec::new();
+                        encode_elem(
+                            &mut bytes,
+                            &Jb::TextRaw(crate::types::Text::from(k.as_str())),
+                        );
+                        encode_elem(&mut bytes, &sub);
+                        splice_and_resize(buf, pe, pe, &bytes, &parents);
+                    }
+                }
+                return Ok(true);
+            }
+        }
+    }
+    // The target exists at [start, end).
+    match edit {
+        JbEdit::Put { val, overwrite, .. } => {
+            if *overwrite {
+                splice_and_resize(buf, start, end, val, &parents);
+            }
+            Ok(true)
+        }
+        JbEdit::Remove => {
+            if segs.is_empty() {
+                return Ok(false);
+            }
+            let from = member_start.unwrap_or(start);
+            splice_and_resize(buf, from, end, &[], &parents);
+            Ok(true)
+        }
+    }
+}
+
+/// Replace `buf[from..to]` with `with`, then fix the payload size of each
+/// container whose header sits at `parents` (outermost first; rewritten
+/// innermost first so outer header positions stay valid).
+fn splice_and_resize(buf: &mut Vec<u8>, from: usize, to: usize, with: &[u8], parents: &[usize]) {
+    buf.splice(from..to, with.iter().copied());
+    let mut delta = with.len() as isize - (to - from) as isize;
+    for &h in parents.iter().rev() {
+        if delta == 0 {
+            break;
+        }
+        let (typ, len, hdr) = read_header(buf, h).expect("walked header");
+        let new_len = (len as isize + delta) as usize;
+        let mut head = Vec::with_capacity(5);
+        push_header(&mut head, typ, new_len);
+        delta += head.len() as isize - hdr as isize;
+        buf.splice(h..h + hdr, head);
+    }
+}
+
+/// Decode the single element at `b[start..end]` (a span from
+/// `jsonb_locate`).
+#[allow(clippy::result_unit_err)]
+pub fn jsonb_decode_span(b: &[u8], start: usize, end: usize) -> Result<Jb, ()> {
+    jb_from_bytes(&b[start..end])
+}
+
 // ---------------------------------------------------------------------------
 // Mutation functions (json_set / json_insert / json_replace / json_remove)
 // operating on the raw tree — untouched subtrees keep their original text.
@@ -1454,39 +1768,29 @@ pub fn jb_set_at(root: Jb, segs: &[PathSeg], new_val: Jb, create: bool, insert_o
                 {
                     let child = std::mem::replace(&mut members[pos].1, Jb::Null);
                     members[pos].1 = walk(child, &segs[1..], new_val, create, insert_only);
-                    Jb::Object(members)
                 } else if create {
-                    let key = Jb::TextRaw(crate::types::Text::from(k.as_str()));
-                    let child = walk(
-                        Jb::Object(Vec::new()),
-                        &segs[1..],
-                        new_val,
-                        create,
-                        insert_only,
-                    );
-                    members.push((key, child));
-                    Jb::Object(members)
-                } else {
-                    Jb::Object(members)
+                    if let Some(child) = create_sub(&segs[1..], new_val) {
+                        members.push((Jb::TextRaw(crate::types::Text::from(k.as_str())), child));
+                    }
                 }
+                Jb::Object(members)
             }
-            (PathSeg::Index(i), Jb::Array(mut items)) => {
-                let idx = if *i < 0 { items.len() as i64 + i } else { *i };
+            (PathSeg::Index(_) | PathSeg::Append, Jb::Array(mut items)) => {
+                let idx = match &segs[0] {
+                    PathSeg::Index(i) if *i < 0 => items.len() as i64 + i,
+                    PathSeg::Index(i) => *i,
+                    _ => items.len() as i64,
+                };
                 if idx >= 0 && (idx as usize) < items.len() {
                     let pos = idx as usize;
                     let child = std::mem::replace(&mut items[pos], Jb::Null);
                     items[pos] = walk(child, &segs[1..], new_val, create, insert_only);
-                } else if create && idx >= 0 && (idx as usize) == items.len() {
+                } else if create && (idx as usize) == items.len() {
                     // Append at the end (SQLite creates only the slot
                     // exactly one past the last element).
-                    let child = walk(
-                        Jb::Object(Vec::new()),
-                        &segs[1..],
-                        new_val,
-                        create,
-                        insert_only,
-                    );
-                    items.push(child);
+                    if let Some(child) = create_sub(&segs[1..], new_val) {
+                        items.push(child);
+                    }
                 }
                 Jb::Array(items)
             }
@@ -1494,6 +1798,24 @@ pub fn jb_set_at(root: Jb, segs: &[PathSeg], new_val: Jb, create: bool, insert_o
         }
     }
     walk(root, segs, &new_val, create, insert_only)
+}
+
+/// The substructure a mutator creates for the path TAIL below a missing
+/// member (SQLite's jsonCreateEditSubstructure): a key builds an object,
+/// `[0]` / `[#]` an array; any other index can't exist in the new empty
+/// array, so nothing is created at all.
+pub(crate) fn create_sub(tail: &[PathSeg], val: &Jb) -> Option<Jb> {
+    match tail.first() {
+        None => Some(val.clone()),
+        Some(PathSeg::Key(k)) => Some(Jb::Object(vec![(
+            Jb::TextRaw(crate::types::Text::from(k.as_str())),
+            create_sub(&tail[1..], val)?,
+        )])),
+        Some(PathSeg::Index(0) | PathSeg::Append) => {
+            Some(Jb::Array(vec![create_sub(&tail[1..], val)?]))
+        }
+        Some(PathSeg::Index(_)) => None,
+    }
 }
 
 /// Remove the value at `segs` — FIRST matching occurrence only

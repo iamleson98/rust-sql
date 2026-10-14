@@ -50,6 +50,29 @@ pub(crate) fn exec_table_function(
         "json_each" => json_each(&vals, false)?,
         "json_tree" => json_each(&vals, true)?,
         "pragma_table_info" => pragma_table_info(ctx, &vals)?,
+        "pragma_table_xinfo" => match vals.first() {
+            Some(Value::Text(t)) => match ctx.catalog().get_table(t) {
+                Some(table) => {
+                    let pr = crate::api::pragma_table_info(&table, true);
+                    (
+                        crate::executor::tableval::TABLE_XINFO_COLS.to_vec(),
+                        pr.rows,
+                    )
+                }
+                None => (TABLE_XINFO_COLS.to_vec(), Vec::new()),
+            },
+            _ => (TABLE_XINFO_COLS.to_vec(), Vec::new()),
+        },
+        "pragma_table_list" => {
+            let filter = match vals.first() {
+                Some(Value::Text(t)) => Some(t.to_string()),
+                _ => None,
+            };
+            (
+                TABLE_LIST_COLS.to_vec(),
+                table_list_rows(ctx.catalog(), filter.as_deref(), None),
+            )
+        }
         "pragma_index_list" => pragma_index_list(ctx, &vals),
         "pragma_index_info" => pragma_index_info(ctx, &vals, false),
         "pragma_index_xinfo" => pragma_index_info(ctx, &vals, true),
@@ -396,6 +419,159 @@ fn pragma_collation_list() -> (Vec<&'static str>, Vec<Vec<Value>>) {
         .map(|(i, n)| vec![Value::Integer(i as i64), Value::Text((*n).into())])
         .collect();
     (COLS.to_vec(), rows)
+}
+
+/// Table-valued functions usable as a bare table name (`FROM dbstat`,
+/// `FROM pragma_table_list`) — SQLite's eponymous virtual tables. A
+/// real table of the same name shadows them.
+pub(crate) fn is_eponymous(name: &str) -> bool {
+    name.eq_ignore_ascii_case("dbstat") || name.eq_ignore_ascii_case("pragma_table_list")
+}
+
+/// `pragma_table_xinfo` columns (`table_info` plus `hidden`).
+pub(crate) const TABLE_XINFO_COLS: [&str; 7] = [
+    "cid",
+    "name",
+    "type",
+    "notnull",
+    "dflt_value",
+    "pk",
+    "hidden",
+];
+
+/// `pragma_table_list` / `PRAGMA table_list` columns.
+pub(crate) const TABLE_LIST_COLS: [&str; 6] = ["schema", "name", "type", "ncol", "wr", "strict"];
+
+/// `PRAGMA table_list` rows: per schema (main, then temp), its tables and
+/// views newest first, then the schema table itself. (SQLite walks its
+/// schema hash, an order it doesn't define; reverse creation is what a
+/// small schema shows.) `filter` keeps one object (case-insensitive); `schema`
+/// keeps one schema.
+pub(crate) fn table_list_rows(
+    catalog: &crate::schema::Catalog,
+    filter: Option<&str>,
+    schema: Option<&str>,
+) -> Vec<Vec<Value>> {
+    use crate::sql::ast::{ResultColumn, SelectBody, TableExpression};
+    // (seq, schema, name, type, ncol, wr, strict)
+    let mut objs: Vec<(u64, &'static str, String, &'static str, i64, bool, bool)> = Vec::new();
+    for (key, t) in catalog.all_tables() {
+        // The schema tables are listed once per schema below.
+        if matches!(
+            key.as_str(),
+            "sqlite_schema" | "sqlite_master" | "sqlite_temp_schema" | "sqlite_temp_master"
+        ) {
+            continue;
+        }
+        let sch = if catalog.is_temp(&t.name) {
+            "temp"
+        } else {
+            "main"
+        };
+        let ty = if t.vtab.is_some() { "virtual" } else { "table" };
+        objs.push((
+            catalog.table_creation_seq(&key),
+            sch,
+            t.name.clone(),
+            ty,
+            t.columns.len() as i64,
+            t.without_rowid,
+            t.strict,
+        ));
+    }
+    for (key, v) in catalog.all_views() {
+        // Output width: the declared column list, else the result
+        // columns with `*` / `t.*` expanded over catalog tables.
+        let ncol = match &v.columns {
+            Some(c) => c.len() as i64,
+            None => {
+                let mut body = &v.select.body;
+                while let SelectBody::Binary { left, .. } = body {
+                    body = left;
+                }
+                let mut n = 0i64;
+                if let SelectBody::Simple(sel) = body {
+                    let mut from_tables: Vec<(String, usize)> = Vec::new();
+                    fn walk(
+                        e: &TableExpression,
+                        cat: &crate::schema::Catalog,
+                        out: &mut Vec<(String, usize)>,
+                    ) {
+                        match e {
+                            TableExpression::Table { name, alias, .. } => {
+                                if let Some(t) = cat.get_table(name) {
+                                    out.push((
+                                        alias.clone().unwrap_or_else(|| name.clone()),
+                                        t.columns.len(),
+                                    ));
+                                }
+                            }
+                            TableExpression::Join { left, right, .. } => {
+                                walk(left, cat, out);
+                                walk(right, cat, out);
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(f) = &sel.from {
+                        walk(f, catalog, &mut from_tables);
+                    }
+                    for c in &sel.columns {
+                        n += match c {
+                            ResultColumn::Expr { .. } => 1,
+                            ResultColumn::Star => from_tables.iter().map(|t| t.1 as i64).sum(),
+                            ResultColumn::TableStar(q) => from_tables
+                                .iter()
+                                .find(|t| t.0.eq_ignore_ascii_case(q))
+                                .map_or(0, |t| t.1 as i64),
+                        };
+                    }
+                }
+                n
+            }
+        };
+        let sch = if catalog.is_temp(&v.name) {
+            "temp"
+        } else {
+            "main"
+        };
+        objs.push((
+            catalog.table_creation_seq(&key),
+            sch,
+            v.name.clone(),
+            "view",
+            ncol,
+            false,
+            false,
+        ));
+    }
+    objs.sort_by_key(|o| std::cmp::Reverse(o.0));
+    let mut rows = Vec::new();
+    for (sch, master) in [("main", "sqlite_schema"), ("temp", "sqlite_temp_schema")] {
+        if schema.is_some_and(|s| !s.eq_ignore_ascii_case(sch)) {
+            continue;
+        }
+        let mut list: Vec<(String, &'static str, i64, bool, bool)> = objs
+            .iter()
+            .filter(|o| o.1 == sch)
+            .map(|o| (o.2.clone(), o.3, o.4, o.5, o.6))
+            .collect();
+        list.push((master.to_string(), "table", 5, false, false));
+        for (name, ty, ncol, wr, strict) in list {
+            if filter.is_some_and(|f| !f.eq_ignore_ascii_case(&name)) {
+                continue;
+            }
+            rows.push(vec![
+                Value::Text(sch.into()),
+                Value::Text(name.as_str().into()),
+                Value::Text(ty.into()),
+                Value::Integer(ncol),
+                Value::Integer(wr as i64),
+                Value::Integer(strict as i64),
+            ]);
+        }
+    }
+    rows
 }
 
 fn pragma_database_list() -> (Vec<&'static str>, Vec<Vec<Value>>) {

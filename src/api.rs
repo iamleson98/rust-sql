@@ -15882,7 +15882,7 @@ fn pragma_arg(v: Option<&crate::sql::ast::PragmaValue>) -> Option<String> {
 /// (cid, name, type, notnull, dflt_value, pk[, hidden]).
 /// `table_info` EXCLUDES generated (hidden) columns; `table_xinfo`
 /// includes them with hidden=2 (VIRTUAL) / 3 (STORED).
-fn pragma_table_info(t: &Arc<crate::schema::Table>, xinfo: bool) -> PragmaRows {
+pub(crate) fn pragma_table_info(t: &Arc<crate::schema::Table>, xinfo: bool) -> PragmaRows {
     let mut columns = vec![
         "cid".to_string(),
         "name".to_string(),
@@ -16482,6 +16482,20 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
             let arg = pragma_arg(p.value.as_ref())?;
             let t = catalog.get_table(&arg)?;
             return Some(pragma_table_info(&t, name == "table_xinfo"));
+        }
+        "table_list" => {
+            let arg = pragma_arg(p.value.as_ref());
+            return Some(PragmaRows {
+                columns: crate::executor::tableval::TABLE_LIST_COLS
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect(),
+                rows: crate::executor::tableval::table_list_rows(
+                    catalog,
+                    arg.as_deref(),
+                    p.schema.as_deref(),
+                ),
+            });
         }
         "index_list" => {
             let arg = pragma_arg(p.value.as_ref())?;

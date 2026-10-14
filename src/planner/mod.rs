@@ -2004,7 +2004,7 @@ impl<'a> Planner<'a> {
                         // argument list) resolves to a zero-argument
                         // TableFunction scan when the catalog misses —
                         // a real table named dbstat shadows it.
-                        if name.eq_ignore_ascii_case("dbstat") && indexed.is_none() {
+                        if crate::executor::tableval::is_eponymous(name) && indexed.is_none() {
                             return Ok(Plan::TableFunction {
                                 name: name.clone(),
                                 args: Vec::new(),

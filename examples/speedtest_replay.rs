@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
+#[derive(Clone)]
 struct Section {
     set: usize,
     number: u32,
@@ -27,6 +28,10 @@ struct Section {
     /// `--params`: the lifted literals of each statement (empty = none).
     params: Vec<Vec<Lit>>,
 }
+
+/// Stands for speedtest1's "Reset the database" step: drop each table
+/// listed by `sqlite_master` (main, then temp) until none is left.
+const RESET: &str = "-- reset";
 
 fn parse_script(text: &str) -> Vec<Section> {
     let mut out: Vec<Section> = Vec::new();
@@ -42,6 +47,12 @@ fn parse_script(text: &str) -> Vec<Section> {
         params: Vec::new(),
     };
     for line in text.lines() {
+        if line.starts_with("-- begin test ") || line.starts_with("-- end test ") {
+            // speedtest1 runs a few statements from C (the reset's table
+            // listing) and logs them without a `;`: never let them run on
+            // into the next section's statements.
+            pending.clear();
+        }
         if let Some(rest) = line.strip_prefix("-- begin test ") {
             let (num, name) = rest.split_once(' ').unwrap_or((rest, ""));
             let number: u32 = num.parse().unwrap_or(0);
@@ -59,7 +70,11 @@ fn parse_script(text: &str) -> Vec<Section> {
             continue;
         }
         if line.starts_with("-- end test ") {
-            if let Some(s) = cur.take() {
+            if let Some(mut s) = cur.take() {
+                if s.name == "Reset the database" {
+                    // speedtest1's reset loop: drop every table (run_* expand it).
+                    s.stmts = vec![RESET.to_string()];
+                }
                 out.push(s);
             }
             continue;
@@ -68,16 +83,31 @@ fn parse_script(text: &str) -> Vec<Section> {
             pending.push('\n');
         }
         pending.push_str(line);
+        // Only a line ending in `;` can complete a statement; checking
+        // every line re-scans a long multi-line statement quadratically.
+        if !line.trim_end().ends_with(';') {
+            continue;
+        }
         let c = std::ffi::CString::new(pending.as_str()).unwrap_or_default();
         // sqlite3_complete: a whole statement (quotes, CREATE TRIGGER
         // bodies) has been read.
         if unsafe { rusqlite::ffi::sqlite3_complete(c.as_ptr()) } != 0 {
-            let stmt = std::mem::take(&mut pending);
-            let t = stmt.trim().trim_end_matches(';').trim();
-            if !t.is_empty() {
-                match cur.as_mut() {
-                    Some(s) => s.stmts.push(t.to_string()),
-                    None => setup.stmts.push(t.to_string()),
+            let chunk = std::mem::take(&mut pending);
+            // A line can hold several statements (sqlite3_exec runs them
+            // in turn): cut at each `;` that completes a statement.
+            let mut start = 0;
+            for (i, _) in chunk.match_indices(';') {
+                let c = std::ffi::CString::new(&chunk[start..=i]).unwrap_or_default();
+                if unsafe { rusqlite::ffi::sqlite3_complete(c.as_ptr()) } == 0 {
+                    continue;
+                }
+                let t = chunk[start..i].trim();
+                start = i + 1;
+                if !t.is_empty() {
+                    match cur.as_mut() {
+                        Some(s) => s.stmts.push(t.to_string()),
+                        None => setup.stmts.push(t.to_string()),
+                    }
                 }
             }
         }
@@ -245,6 +275,16 @@ fn parameterize(sql: &str) -> (String, Vec<Lit>) {
     (out, lits)
 }
 
+fn stmt_times() -> bool {
+    static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *D.get_or_init(|| std::env::args().any(|a| a == "--stmt-times"))
+}
+
+fn diff_mode() -> bool {
+    static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *D.get_or_init(|| std::env::args().any(|a| a == "--diff"))
+}
+
 fn returns_rows(sql: &str) -> bool {
     let head = sql
         .trim_start()
@@ -255,12 +295,18 @@ fn returns_rows(sql: &str) -> bool {
     matches!(
         head.as_str(),
         "SELECT" | "VALUES" | "WITH" | "PRAGMA" | "EXPLAIN"
-    ) || sql.to_ascii_uppercase().contains(" RETURNING ")
+    ) && !(head == "PRAGMA" && sql.contains('='))
+        || sql.to_ascii_uppercase().contains(" RETURNING ")
 }
 
 #[derive(Default, Clone)]
 struct Outcome {
     time: Duration,
+    /// Per row-returning statement: (statement index, first rows) — kept
+    /// for `--diff` only.
+    samples: Vec<(usize, Vec<Vec<String>>)>,
+    /// `--stmt-times`: (elapsed, statement index), ours only.
+    stmt_times: Vec<(Duration, usize)>,
     hash: u64,
     errors: usize,
     first_error: Option<String>,
@@ -300,6 +346,27 @@ fn run_ours(sections: &[Section], dir: &std::path::Path) -> Vec<Outcome> {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         let t0 = Instant::now();
         for (k, sql) in s.stmts.iter().enumerate() {
+            if sql == RESET {
+                for schema in ["main", "temp"] {
+                    let list = format!(
+                        "SELECT name FROM {schema}.sqlite_master WHERE sql LIKE 'CREATE %TABLE%'"
+                    );
+                    while let Ok(rows) = db.query(&list, vec![]) {
+                        let Some(rustqlite::Value::Text(t)) = rows.first().map(|r| r[0].clone())
+                        else {
+                            break;
+                        };
+                        let drop = format!("DROP TABLE {schema}.\"{}\"", t.replace('"', "\"\""));
+                        if let Err(e) = db.execute(&drop, vec![]) {
+                            o.errors += 1;
+                            o.first_error
+                                .get_or_insert_with(|| format!("{e} :: {drop}"));
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
             let p: Vec<rustqlite::Value> = s
                 .params
                 .get(k)
@@ -313,6 +380,7 @@ fn run_ours(sections: &[Section], dir: &std::path::Path) -> Vec<Outcome> {
                         .collect()
                 })
                 .unwrap_or_default();
+            let ts = Instant::now();
             let r = if returns_rows(sql) {
                 db.query(sql, p).map(|rows| {
                     let mut v: Vec<Vec<String>> = rows
@@ -320,10 +388,17 @@ fn run_ours(sections: &[Section], dir: &std::path::Path) -> Vec<Outcome> {
                         .map(|r| r.iter().map(ours_value).collect())
                         .collect();
                     hash_rows(&mut v, &mut h);
+                    if diff_mode() {
+                        v.truncate(4);
+                        o.samples.push((k, v));
+                    }
                 })
             } else {
                 db.execute(sql, p)
             };
+            if stmt_times() {
+                o.stmt_times.push((ts.elapsed(), k));
+            }
             if let Err(e) = r {
                 o.errors += 1;
                 o.first_error
@@ -344,8 +419,26 @@ fn run_sqlite(sections: &[Section], dir: &std::path::Path) -> Vec<Outcome> {
     for s in sections {
         let mut o = Outcome::default();
         let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut samples = Vec::new();
         let t0 = Instant::now();
         for (k, sql) in s.stmts.iter().enumerate() {
+            if sql == RESET {
+                for schema in ["main", "temp"] {
+                    let list = format!(
+                        "SELECT name FROM {schema}.sqlite_master WHERE sql LIKE 'CREATE %TABLE%'"
+                    );
+                    while let Ok(t) = db.query_row(&list, [], |r| r.get::<_, String>(0)) {
+                        let drop = format!("DROP TABLE {schema}.\"{}\"", t.replace('"', "\"\""));
+                        if let Err(e) = db.execute_batch(&drop) {
+                            o.errors += 1;
+                            o.first_error
+                                .get_or_insert_with(|| format!("{e} :: {drop}"));
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
             let r: rusqlite::Result<()> = (|| {
                 let lits = s.params.get(k).filter(|l| !l.is_empty());
                 let mut st = db.prepare_cached(sql)?;
@@ -370,6 +463,10 @@ fn run_sqlite(sections: &[Section], dir: &std::path::Path) -> Vec<Outcome> {
                 }
                 if returns_rows(sql) {
                     hash_rows(&mut v, &mut h);
+                    if diff_mode() {
+                        v.truncate(4);
+                        samples.push((k, v));
+                    }
                 }
                 Ok(())
             })();
@@ -380,6 +477,7 @@ fn run_sqlite(sections: &[Section], dir: &std::path::Path) -> Vec<Outcome> {
             }
         }
         o.time = t0.elapsed();
+        o.samples = samples;
         o.hash = h.finish();
         out.push(o);
     }
@@ -414,6 +512,31 @@ fn main() {
             s.params = params;
         }
     }
+    // `--focus SET:NUM [--reps R]`: run the script up to that section,
+    // then that section R times (for profiling one section in isolation).
+    let arg = |k: &str| {
+        args.iter()
+            .position(|a| a == k)
+            .and_then(|i| args.get(i + 1))
+    };
+    if let Some(f) = arg("--focus") {
+        let (set, num) = f.split_once(':').expect("--focus SET:NUM");
+        let (set, num): (usize, u32) = (set.parse().unwrap(), num.parse().unwrap());
+        let i = sections
+            .iter()
+            .position(|s| s.set == set && s.number == num)
+            .expect("no such section");
+        let reps: usize = arg("--reps").map_or(1, |r| r.parse().unwrap());
+        if args.iter().any(|a| a == "--show") {
+            for (k, q) in sections[i].stmts.iter().enumerate() {
+                eprintln!("[{k}] {}", q[..q.len().min(100)].replace('\n', " "));
+            }
+        }
+        sections.truncate(i + 1);
+        for _ in 1..reps {
+            sections.push(sections[i].clone());
+        }
+    }
     let n_stmts: usize = sections.iter().map(|s| s.stmts.len()).sum();
     eprintln!("{} sections, {} statements", sections.len(), n_stmts);
     let mut results: BTreeMap<&str, Vec<Outcome>> = BTreeMap::new();
@@ -434,7 +557,20 @@ fn main() {
     let (Some(a), Some(b)) = (results.get("ours"), results.get("sqlite")) else {
         for (e, r) in &results {
             let t: Duration = r.iter().map(|o| o.time).sum();
-            println!("{e}: {t:?}");
+            let last = r.last().map(|o| o.time).unwrap_or_default();
+            println!("{e}: {t:?} (last section {last:?})");
+            if let (Some(o), Some(sec)) = (r.last(), sections.last()) {
+                let mut st = o.stmt_times.clone();
+                st.sort_by_key(|t| std::cmp::Reverse(t.0));
+                for (d, k) in st.iter().take(12) {
+                    let q = sec.stmts[*k].replace('\n', " ");
+                    println!(
+                        "  {:>9.3} ms  [{k}] {}",
+                        d.as_secs_f64() * 1e3,
+                        &q[..q.len().min(150)]
+                    );
+                }
+            }
         }
         return;
     };
@@ -450,9 +586,28 @@ fn main() {
         tb += y.time;
         let ratio = y.time.as_secs_f64() / x.time.as_secs_f64().max(1e-9);
         let mut notes = String::new();
-        if x.hash != y.hash {
+        let random = s.stmts.iter().any(|q| q.contains("random("));
+        if x.hash != y.hash && random {
+            notes.push_str("(random data) ");
+        } else if x.hash != y.hash {
             mismatches += 1;
             notes.push_str("RESULT MISMATCH ");
+            if let Some(((k, ra), (_, rb))) = x
+                .samples
+                .iter()
+                .zip(&y.samples)
+                .find(|(a, b)| a.0 != b.0 || a.1 != b.1)
+            {
+                let q = &s.stmts[*k];
+                eprintln!(
+                    "DIFF {}:{} stmt {k}: {}\n  ours:   {:?}\n  sqlite: {:?}",
+                    s.set,
+                    s.number,
+                    &q[..q.len().min(300)],
+                    ra,
+                    rb
+                );
+            }
         }
         if x.errors != y.errors {
             notes.push_str(&format!(

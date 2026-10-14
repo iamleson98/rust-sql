@@ -389,13 +389,19 @@ impl PluginRegistry {
     }
 
     pub fn scalar(&self, name: &str) -> Option<Arc<dyn ScalarFunction>> {
-        self.scalars.get(&name.to_ascii_lowercase()).cloned()
+        self.scalars
+            .get(crate::executor::expr::lower_name(name).as_ref())
+            .cloned()
     }
     pub fn aggregate(&self, name: &str) -> Option<Arc<dyn AggregateFunction>> {
-        self.aggregates.get(&name.to_ascii_lowercase()).cloned()
+        self.aggregates
+            .get(crate::executor::expr::lower_name(name).as_ref())
+            .cloned()
     }
     pub fn collation(&self, name: &str) -> Option<Arc<dyn Collation>> {
-        self.collations.get(&name.to_ascii_lowercase()).cloned()
+        self.collations
+            .get(crate::executor::expr::lower_name(name).as_ref())
+            .cloned()
     }
     /// All registered collation names (PRAGMA collation_list).
     pub fn collation_names(&self) -> Vec<String> {

@@ -72,6 +72,34 @@ pub fn sqlite_char_count(bytes: &[u8]) -> usize {
     n
 }
 
+/// `sqlite_char_count` of the bytes before the first NUL, for VALID
+/// UTF-8 (every non-raw `Text`): there each character is exactly one
+/// non-continuation byte, so the count is a branch-free byte sum that
+/// vectorizes — one pass instead of a NUL search plus a stepping walk.
+pub fn utf8_char_count_to_nul(bytes: &[u8]) -> usize {
+    let mut n = 0;
+    let mut chunks = bytes.chunks_exact(32);
+    for c in &mut chunks {
+        let (mut k, mut nul) = (0usize, false);
+        for &x in c {
+            k += ((x as i8) >= -64) as usize;
+            nul |= x == 0;
+        }
+        if nul {
+            let end = c.iter().position(|&x| x == 0).unwrap_or(c.len());
+            return n + c[..end].iter().filter(|&&x| (x as i8) >= -64).count();
+        }
+        n += k;
+    }
+    for &x in chunks.remainder() {
+        if x == 0 {
+            break;
+        }
+        n += ((x as i8) >= -64) as usize;
+    }
+    n
+}
+
 /// Byte offset of each character start under `sqlite_char_count`'s
 /// stepping, plus the end offset (`len + 1` entries for `len` chars).
 pub fn sqlite_char_offsets(bytes: &[u8]) -> Vec<usize> {
@@ -722,6 +750,25 @@ impl fmt::Debug for Text {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utf8_count_matches_the_stepping_count() {
+        let mut cases: Vec<String> = vec![String::new(), "a".into(), "héllo wörld €".into()];
+        for n in [31usize, 32, 33, 64, 100] {
+            cases.push("é".repeat(n));
+            cases.push("x".repeat(n) + "\0tail");
+            cases.push("€".repeat(n / 3) + "\0" + &"z".repeat(n));
+        }
+        for c in &cases {
+            let b = c.as_bytes();
+            let end = b.iter().position(|&x| x == 0).unwrap_or(b.len());
+            assert_eq!(
+                utf8_char_count_to_nul(b),
+                sqlite_char_count(&b[..end]),
+                "{c:?}"
+            );
+        }
+    }
 
     #[test]
     fn size_is_string_sized() {

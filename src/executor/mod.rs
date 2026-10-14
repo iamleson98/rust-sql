@@ -3020,7 +3020,7 @@ fn fk_parent_exists(
             return Ok(false);
         };
         let mut bt = Btree::new(ctx.pager, root, false);
-        return Ok(matches!(bt.lookup_table(rowid)?, LookupResult::Found(_)));
+        return Ok(bt.lookup_table_with(rowid, |_| Ok(()))?.is_some());
     }
 
     // General path: scan the parent, comparing the key columns.
@@ -3209,7 +3209,7 @@ fn fk_write_child_row(
         {
             let root = ctx.table_root(child);
             let mut bt = Btree::new(ctx.pager, root, false);
-            if let LookupResult::Found(_) = bt.lookup_table(target)? {
+            if bt.lookup_table_with(target, |_| Ok(()))?.is_some() {
                 drop(bt);
                 delete_rows_by_rowid(ctx, child, &[target])?;
             }
@@ -22690,10 +22690,16 @@ fn exec_index_range(
         } else {
             Vec::new()
         };
+        // One handle for the whole batch: its struct-local leaf hint and
+        // root routing resolve neighbouring rowids without a descent, and
+        // the row decodes straight from the page (no payload copy).
+        let mut table_bt = Btree::new(ctx.pager, table_root, false);
+        let n_cols = table.n_columns();
         for rowid in rowids {
-            let mut table_bt = Btree::new(ctx.pager, table_root, false);
-            if let LookupResult::Found(payload) = table_bt.lookup_table(rowid)? {
-                let mut row = decode_row(&payload, table.n_columns(), rowid, table.rowid_alias)?;
+            let found = table_bt.lookup_table_with(rowid, |payload| {
+                decode_row(payload, n_cols, rowid, table.rowid_alias)
+            })?;
+            if let Some(mut row) = found {
                 if let Some(pred) = residual {
                     if append_rowid {
                         row.push(Value::Integer(rowid));
@@ -23071,8 +23077,10 @@ fn exec_index_range_projected(
                     }
                 }
                 (Some(idxs), Some(res)) => {
-                    if let LookupResult::Found(payload) = table_bt.lookup_table(rowid)? {
-                        let mut full = decode_row(&payload, n_cols, rowid, rowid_alias)?;
+                    let found = table_bt.lookup_table_with(rowid, |payload| {
+                        decode_row(payload, n_cols, rowid, rowid_alias)
+                    })?;
+                    if let Some(mut full) = found {
                         full.push(Value::Integer(rowid));
                         let keep = match eval_row_aff_where(
                             res,
@@ -23095,8 +23103,10 @@ fn exec_index_range_projected(
                     }
                 }
                 (None, res) => {
-                    if let LookupResult::Found(payload) = table_bt.lookup_table(rowid)? {
-                        let mut row = decode_row(&payload, n_cols, rowid, rowid_alias)?;
+                    let found = table_bt.lookup_table_with(rowid, |payload| {
+                        decode_row(payload, n_cols, rowid, rowid_alias)
+                    })?;
+                    if let Some(mut row) = found {
                         if let Some(res) = res {
                             row.push(Value::Integer(rowid));
                             let keep = match eval_row_aff_where(
@@ -25286,7 +25296,7 @@ fn exec_insert_one_row(
             match check {
                 Check::Rowid => {
                     let mut bt = Btree::new(ctx.pager, *current_root, false);
-                    if !matches!(bt.lookup_table(rowid)?, LookupResult::Found(_)) {
+                    if bt.lookup_table_with(rowid, |_| Ok(()))?.is_none() {
                         continue;
                     }
                     // UPSERT applies when the target is empty (any
@@ -26674,7 +26684,7 @@ fn apply_rowid_alias_move(
     {
         let root = ctx.table_root(table);
         let mut bt = Btree::new(ctx.pager, root, false);
-        if let LookupResult::Found(_) = bt.lookup_table(target)? {
+        if bt.lookup_table_with(target, |_| Ok(()))?.is_some() {
             match policy {
                 ConflictResolution::Ignore => return Ok(false),
                 ConflictResolution::Replace => {
@@ -27592,7 +27602,7 @@ pub fn next_auto_rowid(pager: &Pager, root: u32, max_rowid: i64, autoinc: bool) 
     let mut bt = Btree::new(pager, root, false);
     for _ in 0..100 {
         let candidate = rng.next_positive();
-        if matches!(bt.lookup_table(candidate)?, LookupResult::NotFound) {
+        if bt.lookup_table_with(candidate, |_| Ok(()))?.is_none() {
             return Ok(candidate);
         }
     }

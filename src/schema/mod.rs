@@ -1253,7 +1253,7 @@ impl Catalog {
         self.schema_cookie = self.schema_cookie.wrapping_add(1);
     }
 
-    /// Creation sequence of a table (0 = unknown). DDL order.
+    /// Creation sequence of a table or view (0 = unknown). DDL order.
     pub fn table_creation_seq(&self, name_lc: &str) -> u64 {
         self.table_seq.get(name_lc).copied().unwrap_or(0)
     }
@@ -1272,6 +1272,8 @@ impl Catalog {
 
     pub fn add_view(&mut self, view: View) {
         let key = view.name.to_ascii_lowercase();
+        self.next_table_seq = self.next_table_seq.wrapping_add(1);
+        self.table_seq.insert(key.clone(), self.next_table_seq);
         self.views.insert(key, Arc::new(view));
         self.schema_cookie = self.schema_cookie.wrapping_add(1);
     }

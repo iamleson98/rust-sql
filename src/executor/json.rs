@@ -25,6 +25,9 @@ use crate::types::Value;
 pub enum PathSeg {
     Key(String),
     Index(i64), // negative = from end
+    /// `[#]`: one past the last element — never selects anything; the
+    /// mutators append there.
+    Append,
 }
 
 #[derive(Clone, Debug)]
@@ -87,9 +90,14 @@ pub fn parse_path(p: &str) -> Option<JsonPath> {
                 let inner = std::str::from_utf8(&b[i + 1..close]).ok()?;
                 if let Some(rest) = inner.strip_prefix("#-") {
                     let n: i64 = rest.parse().ok()?;
-                    segs.push(PathSeg::Index(-n));
+                    // `[#-0]` is `[#]`: the count itself, past the end.
+                    segs.push(if n == 0 {
+                        PathSeg::Append
+                    } else {
+                        PathSeg::Index(-n)
+                    });
                 } else if inner == "#" {
-                    segs.push(PathSeg::Index(-1)); // # alone = last element
+                    segs.push(PathSeg::Append);
                 } else if let Ok(n) = inner.parse::<i64>() {
                     segs.push(PathSeg::Index(n));
                 } else {
@@ -145,6 +153,25 @@ pub(crate) fn load_doc(v: &Value) -> Result<Option<Jb>, Error> {
         Value::Text(t) => parse_lenient_bytes(t.as_bytes())
             .map(Some)
             .map_err(|_| Error::Runtime("malformed JSON".to_string())),
+    }
+}
+
+/// The element `segs` selects in a JSONB BLOB document, decoding only
+/// that element: `Some(None)` = nothing selected, `Some(Some(jb))` = the
+/// element. `None` = not applicable (not a JSONB blob, or a malformed
+/// header on the walk) — callers fall back to `load_doc` + `jb_resolve`,
+/// which validate and raise exactly as before.
+pub(crate) fn jsonb_lookup(doc: &Value, segs: &[PathSeg]) -> Option<Option<Jb>> {
+    let Value::Blob(b) = doc else {
+        return None;
+    };
+    if !jsonb::jsonb_root_fits(b) {
+        return None;
+    }
+    match jsonb::jsonb_locate(b, segs) {
+        Ok(None) => Some(None),
+        Ok(Some((s, e))) => jsonb::jsonb_decode_span(b, s, e).ok().map(Some),
+        Err(()) => None,
     }
 }
 
@@ -212,6 +239,17 @@ pub fn call_json_function(fname: &str, args: &[Value]) -> Result<Option<Value>, 
         },
         "json_valid" => json_valid(args)?,
         "json_type" => {
+            if let (Some(d), Some(p)) = (args.first(), args.get(1)) {
+                if !p.is_null() {
+                    let path = parse_doc_path(p)?;
+                    if let Some(found) = jsonb_lookup(d, path.segs()) {
+                        return Ok(Some(match found {
+                            Some(node) => Value::Text(node.type_name().into()),
+                            None => Value::Null,
+                        }));
+                    }
+                }
+            }
             let Some(doc) = load_doc(args.first().unwrap_or(&Value::Null))? else {
                 return Ok(Some(Value::Null));
             };
@@ -257,7 +295,12 @@ pub fn call_json_function(fname: &str, args: &[Value]) -> Result<Option<Value>, 
         "jsonb_extract" => json_extract(args, Out::Blob)?,
         "json_set" | "json_insert" | "json_replace" => json_mutate(fname, args, Out::Text)?,
         "jsonb_set" | "jsonb_insert" | "jsonb_replace" => {
-            json_mutate(&fname[..fname.len() - 1], args, Out::Blob)?
+            // jsonb_set -> json_set: the mode, minus the `b`.
+            json_mutate(
+                &format!("json_{}", &fname["jsonb_".len()..]),
+                args,
+                Out::Blob,
+            )?
         }
         "json_remove" => json_remove(args, Out::Text)?,
         "jsonb_remove" => json_remove(args, Out::Blob)?,
@@ -394,6 +437,21 @@ fn json_extract(args: &[Value], out: Out) -> Result<Value, Error> {
             "json_extract() requires at least two arguments".to_string(),
         ));
     }
+    if args.len() == 2 && !args[1].is_null() {
+        let path = parse_doc_path(&args[1])?;
+        if let Some(found) = jsonb_lookup(&args[0], path.segs()) {
+            return Ok(match found {
+                Some(node) => match out {
+                    Out::Text => node.to_value(),
+                    Out::Blob => match node {
+                        Jb::Array(_) | Jb::Object(_) => Value::Blob(jsonb::jb_to_bytes(&node)),
+                        scalar => scalar.to_value(),
+                    },
+                },
+                None => Value::Null,
+            });
+        }
+    }
     let Some(doc) = load_doc(&args[0])? else {
         return Ok(Value::Null);
     };
@@ -442,6 +500,34 @@ fn json_mutate(fname: &str, args: &[Value], out: Out) -> Result<Value, Error> {
             fname
         )));
     }
+    // A JSONB blob producing a JSONB blob: edit the bytes in place
+    // (SQLite's jsonBlobEdit) instead of decoding the whole document.
+    if let (Out::Blob, Value::Blob(b)) = (&out, &args[0]) {
+        if jsonb::jsonb_root_fits(b) {
+            let mut buf = b.to_vec();
+            let mut ok = true;
+            let mut i = 1;
+            while i + 1 < args.len() {
+                let path = parse_doc_path(&args[i])?;
+                let tree = sql_value_as_raw(value_to_jb(&args[i + 1]));
+                let val = jsonb::jb_to_bytes(&tree);
+                let edit = jsonb::JbEdit::Put {
+                    val: &val,
+                    tree: &tree,
+                    create: fname != "json_replace",
+                    overwrite: fname != "json_insert",
+                };
+                if jsonb::jsonb_edit(&mut buf, path.segs(), &edit).is_err() {
+                    ok = false;
+                    break;
+                }
+                i += 2;
+            }
+            if ok {
+                return Ok(Value::Blob(buf));
+            }
+        }
+    }
     let Some(mut doc) = load_doc(&args[0])? else {
         return Ok(Value::Null);
     };
@@ -482,6 +568,26 @@ fn sql_value_as_raw(jb: Jb) -> Jb {
 fn json_remove(args: &[Value], out: Out) -> Result<Value, Error> {
     if args.is_empty() {
         return Ok(Value::Null);
+    }
+    if let (Out::Blob, Value::Blob(b)) = (&out, &args[0]) {
+        if jsonb::jsonb_root_fits(b) {
+            let mut buf = b.to_vec();
+            let mut ok = true;
+            for p in &args[1..] {
+                let path = parse_doc_path(p)?;
+                match jsonb::jsonb_edit(&mut buf, path.segs(), &jsonb::JbEdit::Remove) {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(Value::Null),
+                    Err(()) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                return Ok(Value::Blob(buf));
+            }
+        }
     }
     let Some(mut doc) = load_doc(&args[0])? else {
         return Ok(Value::Null);

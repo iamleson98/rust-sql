@@ -22,6 +22,17 @@ fn arrow_eval(op: BinaryOp, l: &Value, r: &Value) -> Result<Value> {
     if l.is_null() || r.is_null() {
         return Ok(Value::Null);
     }
+    if matches!(l, Value::Blob(_)) {
+        if let Ok(Some(segs)) = crate::executor::jsonb::arrow_rhs_segments(r) {
+            if let Some(found) = crate::executor::json::jsonb_lookup(l, &segs) {
+                return Ok(match (op, found) {
+                    (BinaryOp::Arrow, Some(n)) => Value::Text(n.render()),
+                    (BinaryOp::ArrowText, Some(n)) => n.to_value(),
+                    _ => Value::Null,
+                });
+            }
+        }
+    }
     let doc = match crate::executor::json::load_doc(l)? {
         Some(d) => d,
         None => return Ok(Value::Null),
@@ -361,9 +372,8 @@ impl<'a> EvalContext<'a> {
             // "t.c"-qualified column list; the hidden rowid slot carries
             // INTEGER affinity.
             let t = table.as_deref().unwrap();
-            let qual = format!("{}.{}", t.to_ascii_lowercase(), name.to_ascii_lowercase());
             for (i, n) in self.column_names.iter().enumerate() {
-                if n.to_ascii_lowercase() == qual {
+                if crate::executor::qualified_name_eq(n, t, name) {
                     return self.affinity_at(i);
                 }
             }
@@ -532,9 +542,8 @@ impl<'a> EvalContext<'a> {
     pub fn lookup(&self, table: &Option<String>, name: &str) -> Value {
         if let Some(t) = table {
             // Try qualified lookups: "alias.column" or "table.column".
-            let qual_lower = format!("{}.{}", t.to_ascii_lowercase(), name.to_ascii_lowercase());
             for (i, n) in self.column_names.iter().enumerate() {
-                if n.to_ascii_lowercase() == qual_lower {
+                if crate::executor::qualified_name_eq(n, t, name) {
                     return self.row.get(i).cloned().unwrap_or(Value::Null);
                 }
             }
@@ -2405,12 +2414,13 @@ fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext<'_>) -> Result
         }
         return Err(row_value_misused());
     }
-    let fname = name.to_ascii_lowercase();
+    let fname_cow = lower_name(name);
+    let fname: &str = &fname_cow;
     // coalesce / ifnull / iif / if: SQLite codes these INLINE and lazily
     // (iif compiles as CASE) — arguments past the deciding one are never
     // evaluated, so they cannot raise: `iif(0, abs(-9223372036854775808),
     // 1)` is 1, `coalesce(1, abs(-9223372036854775808))` is 1.
-    match fname.as_str() {
+    match fname {
         "coalesce" | "ifnull" if args.len() >= 2 => {
             for a in args {
                 let v = evaluate(a, ctx)?;
@@ -2440,10 +2450,10 @@ fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext<'_>) -> Result
     // the call resolves against the statement's driving vtab scan when
     // one is installed. The first argument is the table reference — it
     // evaluates to the row's rowid through the table-self hidden column.
-    if matches!(fname.as_str(), "bm25" | "highlight" | "snippet") {
+    if matches!(fname, "bm25" | "highlight" | "snippet") {
         if let Some(inst) = crate::executor::vtab_exec::aux_tls_get() {
             let supported = inst
-                .with_table(|vt| Ok(vt.aux_functions().contains(&fname.as_str())))
+                .with_table(|vt| Ok(vt.aux_functions().contains(&fname)))
                 .unwrap_or(false);
             if supported {
                 let argvals: Result<Vec<Value>> = args.iter().map(|e| evaluate(e, ctx)).collect();
@@ -2457,7 +2467,7 @@ fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext<'_>) -> Result
                         )))
                     }
                 };
-                return inst.with_table(|vt| vt.eval_aux(&fname, rowid, &argvals[1..]));
+                return inst.with_table(|vt| vt.eval_aux(fname, rowid, &argvals[1..]));
             }
         }
     }
@@ -2467,7 +2477,7 @@ fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext<'_>) -> Result
         // A json_extract() VALUE argument of a JSON constructor: its JSON
         // subtype depends on the node it selects.
         if crate::executor::json::is_json_extract_call(e)
-            && crate::executor::json::takes_json_value(&fname, i)
+            && crate::executor::json::takes_json_value(fname, i)
         {
             if let Expr::Function { args: inner, .. } = e {
                 let vals: Vec<Value> = inner
@@ -2480,11 +2490,11 @@ fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext<'_>) -> Result
         }
         argvals.push(evaluate(e, ctx)?);
     }
-    crate::executor::json::apply_json_subtypes(&fname, args, &mut argvals);
+    crate::executor::json::apply_json_subtypes(fname, args, &mut argvals);
     // SQLITE_FUNC_NEEDCOLL builtins (scalar min / max, nullif) compare
     // through the collation of their FIRST argument that has one — an
     // explicit COLLATE or a column's declared collation.
-    let needs_coll = match fname.as_str() {
+    let needs_coll = match fname {
         "min" | "max" => argvals.len() > 1,
         "nullif" => argvals.len() == 2,
         _ => false,
@@ -2523,13 +2533,24 @@ fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext<'_>) -> Result
             return Ok(argvals[best].clone());
         }
     }
-    call_scalar(&fname, &argvals)
+    call_scalar(fname, &argvals)
+}
+
+/// `name` ASCII-lowercased, borrowed when it already is (the parser
+/// keeps function names as written; most are lowercase already).
+pub(crate) fn lower_name(name: &str) -> std::borrow::Cow<'_, str> {
+    if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(name.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(name)
+    }
 }
 
 /// Call a scalar SQL function.
 pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
-    let fname = name.to_ascii_lowercase();
-    Ok(match fname.as_str() {
+    let fname_cow = lower_name(name);
+    let fname: &str = &fname_cow;
+    Ok(match fname {
         "abs" => match args.first() {
             Some(Value::Null) | None => Value::Null,
             // SQLite: abs() of the most-negative integer raises
@@ -2635,7 +2656,7 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
         // whole matching characters; a NULL set is NULL. Works on the
         // stored bytes (a raw text or BLOB keeps the rest as is).
         "trim" | "ltrim" | "rtrim" => {
-            let flags: u8 = match fname.as_str() {
+            let flags: u8 = match fname {
                 "ltrim" => 1,
                 "rtrim" => 2,
                 _ => 3,
@@ -2964,10 +2985,10 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
         ),
         "date" | "time" | "datetime" | "strftime" | "julianday" | "unixepoch" | "timediff" => {
             // Full SQLite-compatible date/time engine (see datetime.rs).
-            crate::executor::datetime::call_datetime_function(&fname, args)
+            crate::executor::datetime::call_datetime_function(fname, args)
         }
         "current_date" | "current_time" | "current_timestamp" => {
-            crate::executor::datetime::call_datetime_function(&fname, args)
+            crate::executor::datetime::call_datetime_function(fname, args)
         }
         "last_insert_rowid" => Value::Integer(crate::executor::change_counters::conn_rowid()),
         "changes" => Value::Integer(crate::executor::change_counters::last()),
@@ -3124,7 +3145,7 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
             None => Value::Null,
             Some(v) => {
                 let x = v.as_real();
-                let r = match fname.as_str() {
+                let r = match fname {
                     "sin" => x.sin(),
                     "cos" => x.cos(),
                     "tan" => x.tan(),
@@ -3208,7 +3229,7 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
             Some(Value::Integer(i)) => Value::Integer(i),
             Some(v) => {
                 let x = v.as_real();
-                real_result(match fname.as_str() {
+                real_result(match fname {
                     "floor" => x.floor(),
                     "trunc" => x.trunc(),
                     _ => x.ceil(),
@@ -3458,35 +3479,33 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
         // family) dispatch the same way — after user functions (they can
         // be shadowed by plugins), before the final error.
         _ => {
-            if let Some(r) = crate::plugin::call_user_scalar(&fname, args) {
+            if let Some(r) = crate::plugin::call_user_scalar(fname, args) {
                 return r;
             }
-            match crate::executor::json::call_json_function(&fname, args)? {
+            match crate::executor::json::call_json_function(fname, args)? {
                 Some(v) => v,
-                None => match crate::executor::fts::call_fts_function(&fname, args)? {
+                None => match crate::executor::fts::call_fts_function(fname, args)? {
                     Some(v) => v,
-                    None => match crate::executor::geo::call_geo_function(&fname, args)? {
+                    None => match crate::executor::geo::call_geo_function(fname, args)? {
                         Some(v) => v,
-                        None => match crate::executor::regex::call_regex_function(&fname, args)? {
+                        None => match crate::executor::regex::call_regex_function(fname, args)? {
                             Some(v) => v,
-                            None => {
-                                match crate::executor::trgm::call_trgm_function(&fname, args)? {
-                                    Some(v) => v,
-                                    None => {
-                                        match crate::plugin::geopoly::call_geopoly_function(
-                                            &fname, args,
-                                        )? {
-                                            Some(v) => v,
-                                            None => {
-                                                return Err(Error::NotFound(format!(
-                                                    "no such function: {}",
-                                                    name
-                                                )));
-                                            }
+                            None => match crate::executor::trgm::call_trgm_function(fname, args)? {
+                                Some(v) => v,
+                                None => {
+                                    match crate::plugin::geopoly::call_geopoly_function(
+                                        fname, args,
+                                    )? {
+                                        Some(v) => v,
+                                        None => {
+                                            return Err(Error::NotFound(format!(
+                                                "no such function: {}",
+                                                name
+                                            )));
                                         }
                                     }
                                 }
-                            }
+                            },
                         },
                     },
                 },
