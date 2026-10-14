@@ -5,8 +5,8 @@
 //!
 //! Run: cargo run --release --example dml_scale_probe
 
-use std::time::Instant;
 use rustqlite::{Database, Value};
+use std::time::Instant;
 
 fn main() {
     let mut db = Database::open_in_memory().unwrap();
@@ -61,7 +61,11 @@ fn main() {
     );
     let t0 = Instant::now();
     db.execute(&del_q, chunk.clone()).unwrap();
-    println!("DELETE qualified-IN ({} ids): {:?}", 500 % n_trips, t0.elapsed());
+    println!(
+        "DELETE qualified-IN ({} ids): {:?}",
+        500 % n_trips,
+        t0.elapsed()
+    );
 
     // ── UPDATE: the seat-hold shape ──
     let upd_q = format!(

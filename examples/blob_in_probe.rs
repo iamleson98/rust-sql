@@ -5,8 +5,8 @@
 //!
 //! Run: cargo run --release --example blob_in_probe
 
-use std::time::Instant;
 use rustqlite::{Database, Value};
+use std::time::Instant;
 
 fn mk_blob(i: u32) -> Value {
     // A 16-byte key, UUID-ish.
@@ -41,9 +41,19 @@ fn main() {
     // 8762 schedules × 13 dates ≈ 114k trips (prod scale).
     let n_sched = 8762u32;
     let dates: [&str; 13] = [
-        "2026-10-15", "2026-10-16", "2026-10-17", "2026-10-18", "2026-10-19",
-        "2026-10-20", "2026-10-21", "2026-10-22", "2026-10-23", "2026-10-24",
-        "2026-10-25", "2026-10-26", "2026-10-27",
+        "2026-10-15",
+        "2026-10-16",
+        "2026-10-17",
+        "2026-10-18",
+        "2026-10-19",
+        "2026-10-20",
+        "2026-10-21",
+        "2026-10-22",
+        "2026-10-23",
+        "2026-10-24",
+        "2026-10-25",
+        "2026-10-26",
+        "2026-10-27",
     ];
     db.execute("BEGIN", []).unwrap();
     let ins = "INSERT INTO trip_session VALUES (?, ?, ?, 'scheduled', 40, 40)";
@@ -95,7 +105,7 @@ fn main() {
     }
 
     // Unqualified twin (the shape the previous session's bench used).
-    let keys: Vec<Value> = (0..500u32).map(|i| mk_blob(i)).collect();
+    let keys: Vec<Value> = (0..500u32).map(mk_blob).collect();
     let ph: Vec<String> = (1..=keys.len()).map(|i| format!("?{i}")).collect();
     let sql = format!(
         "SELECT id FROM trip_session WHERE schedule_id IN ({}) AND departure_date = ?501",
@@ -105,5 +115,9 @@ fn main() {
     params.push(Value::Text("2026-10-16".into()));
     let t0 = Instant::now();
     let rows = db.query(&sql, params).unwrap();
-    println!("BLOB unqualified-IN(500)+date twin: {:?} ({} rows)", t0.elapsed(), rows.len());
+    println!(
+        "BLOB unqualified-IN(500)+date twin: {:?} ({} rows)",
+        t0.elapsed(),
+        rows.len()
+    );
 }

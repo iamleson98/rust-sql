@@ -33,7 +33,7 @@ fn arrow_eval(op: BinaryOp, l: &Value, r: &Value) -> Result<Value> {
             }
         }
     }
-    let doc = match crate::executor::json::load_doc(l)? {
+    let doc = match crate::executor::json::load_doc_shared(l)? {
         Some(d) => d,
         None => return Ok(Value::Null),
     };

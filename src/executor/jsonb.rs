@@ -525,46 +525,53 @@ impl<'a> JParser<'a> {
             return Err(self.err());
         }
         self.pos += 1;
-        let mut payload: Vec<u8> = Vec::new();
+        // The payload is the input between the quotes VERBATIM (escapes
+        // stay as written; bytes >= 0x80 are copied raw, valid UTF-8 or
+        // not): scan to the closing quote, validating escapes on the way,
+        // and slice once.
+        let start = self.pos;
+        let mut escaped = false;
         let mut json5 = false;
         loop {
+            let rest = &self.b[self.pos..];
+            let run = rest
+                .iter()
+                .position(|&c| c == b'"' || c == b'\\' || c < 0x20)
+                .unwrap_or(rest.len());
+            self.pos += run;
             let c = self.peek().ok_or(self.pos + 1)?;
             match c {
                 b'"' => {
+                    let payload = &self.b[start..self.pos];
                     self.pos += 1;
-                    let elem = if payload.contains(&b'\\') {
-                        if json5 {
-                            Jb::Text5(crate::types::Text::from_bytes(&payload))
-                        } else {
-                            Jb::TextJ(crate::types::Text::from_bytes(&payload))
-                        }
+                    let text = crate::types::Text::from_bytes(payload);
+                    let elem = if !escaped {
+                        Jb::Text(text)
+                    } else if json5 {
+                        Jb::Text5(text)
                     } else {
-                        Jb::Text(crate::types::Text::from_bytes(&payload))
+                        Jb::TextJ(text)
                     };
                     return Ok((elem, json5));
                 }
                 b'\\' => {
+                    escaped = true;
                     self.pos += 1;
                     let e = self.peek().ok_or(self.pos + 1)?;
                     match e {
                         b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' | b'u' => {
-                            payload.push(b'\\');
-                            payload.push(e);
                             self.pos += 1;
                             if e == b'u' {
                                 if self.peek() == Some(b'{') {
                                     // JSON5 \u{XX...} code point
                                     json5 = true;
-                                    payload.push(b'{');
                                     self.pos += 1;
                                     while self.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
-                                        payload.push(self.peek().unwrap());
                                         self.pos += 1;
                                     }
                                     if self.peek() != Some(b'}') {
                                         return Err(self.pos + 1);
                                     }
-                                    payload.push(b'}');
                                     self.pos += 1;
                                 } else {
                                     for _ in 0..4 {
@@ -572,7 +579,6 @@ impl<'a> JParser<'a> {
                                         if !h.is_ascii_hexdigit() {
                                             return Err(self.pos + 1);
                                         }
-                                        payload.push(h);
                                         self.pos += 1;
                                     }
                                 }
@@ -581,8 +587,6 @@ impl<'a> JParser<'a> {
                         // JSON5 escapes
                         b'x' | b'v' | b'0'..=b'7' | b'\n' | b'\r' => {
                             json5 = true;
-                            payload.push(b'\\');
-                            payload.push(e);
                             self.pos += 1;
                             if e == b'x' {
                                 for _ in 0..2 {
@@ -590,7 +594,6 @@ impl<'a> JParser<'a> {
                                     if !h.is_ascii_hexdigit() {
                                         return Err(self.pos + 1);
                                     }
-                                    payload.push(h);
                                     self.pos += 1;
                                 }
                             }
@@ -598,36 +601,8 @@ impl<'a> JParser<'a> {
                         _ => return Err(self.pos + 1),
                     }
                 }
-                c if c < 0x20 => return Err(self.pos + 1),
-                c if c < 0x80 => {
-                    payload.push(c);
-                    self.pos += 1;
-                }
-                _ => {
-                    // Byte ≥ 0x80: copy a VALID multi-byte sequence whole;
-                    // an invalid one (stray lead / continuation, truncated
-                    // sequence) copies the single byte RAW — SQLite's
-                    // parser treats it as an ordinary string byte.
-                    let rest = &self.b[self.pos..];
-                    let step = match std::str::from_utf8(rest) {
-                        Ok(s) => s.chars().next().map(|ch| ch.len_utf8()).unwrap_or(1),
-                        Err(e) => {
-                            let valid = e.valid_up_to();
-                            if valid > 0 {
-                                std::str::from_utf8(&rest[..valid])
-                                    .unwrap()
-                                    .chars()
-                                    .next()
-                                    .map(|ch| ch.len_utf8())
-                                    .unwrap_or(1)
-                            } else {
-                                1
-                            }
-                        }
-                    };
-                    payload.extend_from_slice(&self.b[self.pos..self.pos + step]);
-                    self.pos += step;
-                }
+                // A control byte (< 0x20).
+                _ => return Err(self.pos + 1),
             }
         }
     }

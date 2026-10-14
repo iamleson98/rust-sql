@@ -120,6 +120,78 @@ pub fn parse_path(p: &str) -> Option<JsonPath> {
 // Document loading (text or JSONB blob, SQLite's dual-parse rules)
 // ---------------------------------------------------------------------------
 
+/// Recently parsed JSON TEXT documents (SQLite's per-statement JsonCache):
+/// one row's document is typically read by several expressions — `x->>'a'`
+/// in each of three expression indexes, old and new keys on UPDATE, the
+/// SET expression itself — and a 100 KB parse dwarfs everything else.
+/// Keyed by CONTENT (length + a sampled fingerprint, then a full byte
+/// compare), so a hit is always the same text; most recent last.
+const DOC_CACHE_SLOTS: usize = 4;
+/// Smaller documents parse faster than the cache can be probed.
+const DOC_CACHE_MIN: usize = 256;
+
+type DocCacheEntry = (u64, crate::types::Text, std::rc::Rc<Jb>);
+
+thread_local! {
+    static DOC_CACHE: std::cell::RefCell<Vec<DocCacheEntry>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Length plus 64 sampled bytes — cheap next to the parse, and the full
+/// compare on a match makes collisions harmless.
+fn doc_fingerprint(b: &[u8]) -> u64 {
+    let mut h: u64 = b.len() as u64;
+    let step = (b.len() / 64).max(1);
+    let mut i = 0;
+    while i < b.len() {
+        h = (h ^ b[i] as u64).wrapping_mul(0x100_0000_01b3);
+        i += step;
+    }
+    h
+}
+
+/// The parsed tree of a JSON TEXT document, through the cache.
+fn cached_text_doc(t: &crate::types::Text) -> Result<std::rc::Rc<Jb>, Error> {
+    let bytes = t.as_bytes();
+    let parse =
+        || parse_lenient_bytes(bytes).map_err(|_| Error::Runtime("malformed JSON".to_string()));
+    if bytes.len() < DOC_CACHE_MIN {
+        return parse().map(std::rc::Rc::new);
+    }
+    let fp = doc_fingerprint(bytes);
+    let hit = DOC_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        let i = c
+            .iter()
+            .position(|(f, k, _)| *f == fp && k.as_bytes() == bytes)?;
+        let e = c.remove(i);
+        let doc = e.2.clone();
+        c.push(e);
+        Some(doc)
+    });
+    if let Some(doc) = hit {
+        return Ok(doc);
+    }
+    let doc = std::rc::Rc::new(parse()?);
+    DOC_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() >= DOC_CACHE_SLOTS {
+            c.remove(0);
+        }
+        c.push((fp, t.clone(), doc.clone()));
+    });
+    Ok(doc)
+}
+
+/// `load_doc` for read-only use: TEXT documents come from the parse
+/// cache without copying the tree.
+pub(crate) fn load_doc_shared(v: &Value) -> Result<Option<std::rc::Rc<Jb>>, Error> {
+    match v {
+        Value::Text(t) => cached_text_doc(t).map(Some),
+        other => Ok(load_doc(other)?.map(std::rc::Rc::new)),
+    }
+}
+
 /// Parse the first argument of a JSON function: TEXT parses as JSON text,
 /// BLOB parses as JSON text first (dual-valid blobs read as text), then
 /// falls back to JSONB. NULL stays NULL; other scalars parse their text
@@ -150,6 +222,12 @@ pub(crate) fn load_doc(v: &Value) -> Result<Option<Jb>, Error> {
         // parser accepts any byte >= 0x20 inside string literals, so
         // `json(CAST(x'22ff22' AS TEXT))` is the JSON string holding
         // the raw 0xff byte (not malformed).
+        Value::Text(t) if t.len() >= DOC_CACHE_MIN => {
+            let doc = cached_text_doc(t)?;
+            Ok(Some(
+                std::rc::Rc::try_unwrap(doc).unwrap_or_else(|rc| (*rc).clone()),
+            ))
+        }
         Value::Text(t) => parse_lenient_bytes(t.as_bytes())
             .map(Some)
             .map_err(|_| Error::Runtime("malformed JSON".to_string())),
@@ -214,7 +292,7 @@ pub fn call_json_function(fname: &str, args: &[Value]) -> Result<Option<Value>, 
         "json_quote" => json_quote(args)?,
         "json_pretty" => match args.first() {
             Some(Value::Null) | None => Value::Null,
-            Some(v) => match load_doc(v)? {
+            Some(v) => match load_doc_shared(v)? {
                 None => Value::Null,
                 Some(jb) => Value::Text(jb.render_pretty()),
             },
@@ -250,7 +328,7 @@ pub fn call_json_function(fname: &str, args: &[Value]) -> Result<Option<Value>, 
                     }
                 }
             }
-            let Some(doc) = load_doc(args.first().unwrap_or(&Value::Null))? else {
+            let Some(doc) = load_doc_shared(args.first().unwrap_or(&Value::Null))? else {
                 return Ok(Some(Value::Null));
             };
             let target = match args.get(1) {
@@ -258,7 +336,7 @@ pub fn call_json_function(fname: &str, args: &[Value]) -> Result<Option<Value>, 
                     let path = parse_doc_path(p)?;
                     jsonb::jb_resolve(&doc, path.segs())
                 }
-                None => Some(&doc),
+                None => Some(&*doc),
             };
             match target {
                 Some(node) => Value::Text(node.type_name().into()),
@@ -266,7 +344,7 @@ pub fn call_json_function(fname: &str, args: &[Value]) -> Result<Option<Value>, 
             }
         }
         "json_array_length" => {
-            let Some(doc) = load_doc(args.first().unwrap_or(&Value::Null))? else {
+            let Some(doc) = load_doc_shared(args.first().unwrap_or(&Value::Null))? else {
                 return Ok(Some(Value::Null));
             };
             let target = match args.get(1) {
@@ -274,7 +352,7 @@ pub fn call_json_function(fname: &str, args: &[Value]) -> Result<Option<Value>, 
                     let path = parse_doc_path(p)?;
                     jsonb::jb_resolve(&doc, path.segs())
                 }
-                None => Some(&doc),
+                None => Some(&*doc),
             };
             Value::Integer(match target {
                 Some(Jb::Array(items)) => items.len() as i64,
@@ -452,7 +530,7 @@ fn json_extract(args: &[Value], out: Out) -> Result<Value, Error> {
             });
         }
     }
-    let Some(doc) = load_doc(&args[0])? else {
+    let Some(doc) = load_doc_shared(&args[0])? else {
         return Ok(Value::Null);
     };
     let mut paths = Vec::with_capacity(args.len() - 1);
@@ -733,7 +811,7 @@ pub(crate) fn json_extract_subtyped(args: &[Value]) -> Result<Value, Error> {
     let subtyped = match args.len() {
         0 | 1 => false,
         2 => {
-            let Some(doc) = load_doc(&args[0])? else {
+            let Some(doc) = load_doc_shared(&args[0])? else {
                 return Ok(v);
             };
             let path = parse_doc_path(&args[1])?;
