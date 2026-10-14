@@ -5046,9 +5046,47 @@ fn exprs_equal_conjunct(a: &Expr, b: &Expr) -> bool {
     expr_eq(a, b)
 }
 
+/// Resolve a column reference against the scanned table for
+/// IN-list access-path selection: an UNQUALIFIED name always resolves
+/// (single-table planning context), and a table-qualified name
+/// (`"t"."c"` / `alias.c`) resolves when the qualifier IS this table's
+/// name (no FROM alias) or its alias (SQLite's own resolution rule —
+/// once aliased, only the alias qualifies).
+///
+/// sea-orm, sqlx's query builder, sequelize and most ORMs emit
+/// TABLE-QUALIFIED columns exclusively (`"trip_session"."schedule_id"`).
+/// Without this resolution the IN-list multi-seek paths
+/// ([`try_index_in`] / [`try_rowid_in`]) never fire for their queries —
+/// `col IN (<2,000 members>)` degenerates to a per-row linear membership
+/// walk over a full scan, which measured 117k rows x 1,871 members
+/// ~30 s and multi-GiB of transient allocations per query on a real
+/// workload (issue iamleson98/rust-be-template#75). Mirrors
+/// `column_name_of`'s qualifier tolerance on the equality-seek path.
+fn column_resolves_to_table(e: &Expr, table: &Table, alias: &Option<String>) -> Option<String> {
+    let inner = match e {
+        Expr::Collate { expr, .. } => expr.as_ref(),
+        other => other,
+    };
+    match inner {
+        Expr::Column { table: None, name } => Some(name.clone()),
+        Expr::Column {
+            table: Some(q),
+            name,
+        } => {
+            let qualifies = match alias {
+                Some(a) => q.eq_ignore_ascii_case(a),
+                None => q.eq_ignore_ascii_case(&table.name),
+            };
+            qualifies.then(|| name.clone())
+        }
+        _ => None,
+    }
+}
+
 /// Detect `first-indexed-col IN (list-of-expressions)` among the
 /// conjuncts. Only single-column-key indexes (the common case) — the
-/// IN-list replaces the equality key. Non-negated only.
+/// IN-list replaces the equality key. Non-negated only. Qualified
+/// references resolve through [`column_resolves_to_table`].
 fn try_index_in(
     catalog: &Catalog,
     conjuncts: &[Expr],
@@ -5062,21 +5100,9 @@ fn try_index_in(
             negated: false,
         } = conjunct
         {
-            // Unqualified column reference, possibly COLLATE-wrapped by
-            // collation resolution (declared column collation / explicit
-            // COLLATE).
-            let unqualified_col = |e: &Expr| -> Option<String> {
-                let inner = match e {
-                    Expr::Collate { expr, .. } => expr.as_ref(),
-                    other => other,
-                };
-                if let Expr::Column { table: None, name } = inner {
-                    Some(name.clone())
-                } else {
-                    None
-                }
-            };
-            if let Some(name) = unqualified_col(expr.as_ref()) {
+            // Column reference (possibly COLLATE-wrapped by collation
+            // resolution) that resolves to THIS table — qualified or not.
+            if let Some(name) = column_resolves_to_table(expr.as_ref(), table, alias) {
                 for index in catalog.indexes_on_table(&table.name) {
                     // Partial gate (same rule as equality seeks).
                     if !index_serves_conjuncts_partial(&index, conjuncts) {
@@ -5344,10 +5370,12 @@ fn try_rowid_in(
             negated: false,
         } = conjunct
         {
-            if let Expr::Column { table: None, name } = expr.as_ref() {
+            // Qualified or unqualified — as long as the reference
+            // resolves to THIS table (see column_resolves_to_table).
+            if let Some(name) = column_resolves_to_table(expr.as_ref(), table, alias) {
                 let is_rowid_alias = table
                     .rowid_alias
-                    .map(|idx| table.columns[idx].name.eq_ignore_ascii_case(name))
+                    .map(|idx| table.columns[idx].name.eq_ignore_ascii_case(&name))
                     .unwrap_or(false);
                 let is_rowid_pseudo = name.eq_ignore_ascii_case("rowid")
                     || name.eq_ignore_ascii_case("_rowid_")

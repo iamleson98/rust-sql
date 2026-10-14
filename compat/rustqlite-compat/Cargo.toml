@@ -20,6 +20,11 @@ path = "src/lib.rs"
 [dependencies]
 rustqlite = { path = "../.." }
 parking_lot = "0.12"
+# Slow-statement warnings (see src/slow_stmt.rs): events flow through
+# the host process's subscriber — the datxevui backend's tracing stack
+# captures them under RUST_LOG=info; no subscriber installed (engine
+# tests, CLI) = no-op. Default features only (no vendor collectors).
+tracing = "0.1"
 
 # This crate ships as `libsqlite3.so` — a library programs (and rustc's
 # proc-macro host, via sqlx-macros) load with dlopen(). mimalloc's C
