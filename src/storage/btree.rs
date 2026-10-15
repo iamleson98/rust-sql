@@ -5270,21 +5270,29 @@ impl<'a> Btree<'a> {
                     );
                 }
                 PageType::InteriorTable => {
+                    // Binary search for the first separator >= rowid (the
+                    // lookup descent's search; this used to decode every
+                    // cell of the page linearly).
                     let borrowed = page.lock();
-                    let n = borrowed.n_cells();
+                    let n = borrowed.n_cells() as usize;
                     let mut next = borrowed.right_most_pointer();
-                    for i in 0..n {
-                        let cell_ptr = borrowed.cell_pointer(i) as usize;
-                        let cell = Cell::decode(
-                            borrowed.cell_slice_checked(cell_ptr)?,
-                            pt,
-                            borrowed.page_size(),
-                        )?;
-                        if let Cell::TableInterior { left_child, key } = cell {
-                            if rowid <= key {
-                                next = left_child;
-                                break;
-                            }
+                    let (mut lo, mut hi) = (0usize, n);
+                    while lo < hi {
+                        let mid = (lo + hi) / 2;
+                        let cell_ptr = borrowed.cell_pointer(mid as u16) as usize;
+                        if cell_ptr + 4 > borrowed.data.len() {
+                            return Err(Error::corruption("truncated interior cell in update"));
+                        }
+                        let left_child = u32::from_be_bytes(
+                            borrowed.data[cell_ptr..cell_ptr + 4].try_into().unwrap(),
+                        );
+                        let (key, _) = varint::decode_signed(&borrowed.data[cell_ptr + 4..])
+                            .ok_or_else(|| Error::corruption("truncated interior key in update"))?;
+                        if rowid <= key {
+                            next = left_child;
+                            hi = mid;
+                        } else {
+                            lo = mid + 1;
                         }
                     }
                     page_id = next;

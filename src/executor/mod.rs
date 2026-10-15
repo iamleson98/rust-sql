@@ -25424,6 +25424,52 @@ fn exec_insert_one_row(
                     }
                     match conflict_policy(stmt_or, st.idx.on_conflict) {
                         ConflictResolution::Ignore => return Ok((InsertOutcome::Skipped, rowid)),
+                        ConflictResolution::Replace
+                            if replaced_holders.is_empty()
+                                && wr_pk_replace_in_place_ok(ctx, table, index_states, i) =>
+                        {
+                            // WITHOUT ROWID REPLACE on its PRIMARY KEY, the
+                            // table's only index: the new row has the same
+                            // key, so delete + insert of the holder (row and
+                            // index entry, each a descent) is an in-place
+                            // payload rewrite — SQLite's single seek.
+                            let mut bt = Btree::new(ctx.pager, *current_root, false);
+                            if let LookupResult::Found(old_payload) =
+                                bt.lookup_table(existing_rowid)?
+                            {
+                                crate::storage::row_codec::encode_row_aliased_into(
+                                    full_row,
+                                    table.rowid_alias,
+                                    payload_buf,
+                                );
+                                journal_row_rewrite_payload_owned(
+                                    ctx,
+                                    table,
+                                    existing_rowid,
+                                    old_payload,
+                                );
+                                if !bt.update_table(existing_rowid, payload_buf)? {
+                                    bt.delete_table(existing_rowid)?;
+                                    bt.insert_table(existing_rowid, payload_buf)?;
+                                }
+                                *current_root = bt.root;
+                                ctx.set_table_root_lc(table_name_lc, *current_root);
+                                ctx.changes += 1;
+                                return Ok((InsertOutcome::Inserted, existing_rowid));
+                            }
+                            replace_delete_holder(
+                                ctx,
+                                table,
+                                table_name_lc,
+                                current_root,
+                                index_states,
+                                max_rowid,
+                                rowid,
+                                existing_rowid,
+                                &mut replaced_holders,
+                            )?;
+                            continue 'checks;
+                        }
                         ConflictResolution::Replace => {
                             replace_delete_holder(
                                 ctx,
@@ -25611,8 +25657,14 @@ fn exec_insert_one_row(
                                 None,
                                 Some(full_row),
                             );
-                            bt.delete_table(rowid)?;
-                            bt.insert_table(rowid, payload)?;
+                            // The replacement lands on the same rowid: an
+                            // in-place rewrite when it fits (one descent),
+                            // else delete + insert. The journal entries
+                            // below (Deleted, Inserted) replay either way.
+                            if !bt.update_table(rowid, payload)? {
+                                bt.delete_table(rowid)?;
+                                bt.insert_table(rowid, payload)?;
+                            }
                         }
                         ConflictResolution::Ignore => return Ok((InsertOutcome::Skipped, rowid)),
                         p => {
@@ -25791,10 +25843,14 @@ fn exec_insert_one_row(
             }
         }
     }
-    ctx.last_insert_rowid = rowid;
-    // The SQL function sees it at once (OP_Insert sets db->lastRowid):
-    // a later row of this statement, or a trigger body, reads it.
-    crate::executor::change_counters::note_conn_rowid(rowid);
+    // A WITHOUT ROWID table's hidden rowid is internal: SQLite's
+    // last_insert_rowid() never moves for such inserts.
+    if !table.without_rowid {
+        ctx.last_insert_rowid = rowid;
+        // The SQL function sees it at once (OP_Insert sets db->lastRowid):
+        // a later row of this statement, or a trigger body, reads it.
+        crate::executor::change_counters::note_conn_rowid(rowid);
+    }
     ctx.changes += 1;
     // Cache maintenance: populate a MISSING entry only when `rowid` is
     // PROVEN to be the table's true max — auto-allocated (true_max + 1 at
@@ -25900,6 +25956,28 @@ fn rowid_conflict_message(table: &Table) -> String {
 /// its delete removed nothing (an index entry naming a missing row):
 /// corruption — error instead of probing forever.
 #[allow(clippy::too_many_arguments)]
+/// May a REPLACE conflict on index `i` rewrite the holder in place? Only
+/// for a WITHOUT ROWID table whose PRIMARY KEY (index `i`) is its only
+/// index — the new row then has the holder's key, hidden rowid and index
+/// entry — and when nothing observes the delete + insert pair: no
+/// triggers, no foreign-key enforcement, no preupdate / session sink.
+fn wr_pk_replace_in_place_ok(
+    ctx: &ExecContext<'_>,
+    table: &Table,
+    index_states: &[IndexMaintState],
+    i: usize,
+) -> bool {
+    table.without_rowid
+        && index_states.len() == 1
+        && matches!(
+            index_states[i].idx.origin,
+            crate::schema::IndexOrigin::WithoutRowidPk
+        )
+        && !ctx.pager.foreign_keys_enabled()
+        && !crate::preupdate::armed()
+        && ctx.catalog().trigger_list(&table.name).is_empty()
+}
+
 fn replace_delete_holder(
     ctx: &mut ExecContext<'_>,
     table: &Arc<Table>,
