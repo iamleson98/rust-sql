@@ -7786,6 +7786,15 @@ impl<'a> Btree<'a> {
         if grow && min_room == 0 {
             return Ok(false);
         }
+        // A right=0 parent's LAST cell is the de-facto right edge: its key
+        // is not an upper bound of its child (the child holds larger keys),
+        // so it cannot be re-inserted as the group's bounding separator —
+        // sorted by that key it landed BEFORE the new separators and put
+        // the right edge first (index entries out of order). Leave that
+        // shape to the split path, which handles it.
+        if right_most == 0 && hi == all.len() - 1 {
+            return Ok(false);
+        }
         let group: Vec<PageId> = all[lo..=hi].to_vec();
         let last_is_right_most = right_most != 0 && hi == all.len() - 1;
         self.rebalance_group(
@@ -7978,6 +7987,11 @@ impl<'a> Btree<'a> {
             return Ok(false);
         }
         // ---- commit point: rewrite leaves, free the extras, fix parent.
+        // Entries MOVE between existing pages here: every key-range hint
+        // (the thread-local leaf maps, keyed by the write epoch) must
+        // re-derive — a stale one would place a later entry in the leaf
+        // that USED to own its range.
+        self.pager.note_write();
         if k > group.len() {
             let id = self.pager.allocate_page()?;
             {

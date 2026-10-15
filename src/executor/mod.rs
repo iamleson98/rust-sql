@@ -175,61 +175,68 @@ mod corr {
     /// be bare (the UPDATE/DELETE paths push unqualified names), and a
     /// `users.id` reference must resolve there, not to an inner table's
     /// same-named column.
+    /// Where an outer reference binds: (frame index, column index) in the
+    /// innermost-first walk below.
+    fn locate_outer(c: &CorrState, table: Option<&str>, name: &str) -> Option<(usize, usize)> {
+        if c.outer.is_empty() {
+            return None;
+        }
+        if let Some(t) = table {
+            // Pass 1: exact "qual.name" in each frame, innermost first
+            // (compared in place — the old per-name lowercase copies
+            // allocated on every correlated reference, every row).
+            for (f, frame) in c.outer.iter().enumerate().rev() {
+                if let Some(i) = frame
+                    .names()
+                    .iter()
+                    .position(|n| super::qualified_name_eq(n, t, name))
+                {
+                    return Some((f, i));
+                }
+            }
+            // Pass 2: bare-name match (frame stores unqualified names —
+            // UPDATE/DELETE source rows). DELIBERATELY NO
+            // suffix-matching on QUALIFIED frame names: a ref
+            // `lba.audio_url` (qualifier = an inner source alias)
+            // must NEVER bind to an outer frame's
+            // `layout_blocks.audio_url` — the qualifiers differ, so
+            // the ref is not about that table at all. The old suffix
+            // pass silently leaked OUTER values into qualified inner
+            // refs whenever the local layout missed them (found via
+            // pdf-tts's mirror-sync: `lba.audio_url` read the OUTER
+            // `layout_blocks.audio_url` and wrote NULLs into the
+            // mirror column). Exact "qual.name" matches are Pass 1's
+            // job; bare frames are this pass's job; nothing else is
+            // a legal bind for a QUALIFIED reference.
+            for (f, frame) in c.outer.iter().enumerate().rev() {
+                if let Some(i) = frame
+                    .names()
+                    .iter()
+                    .position(|n| n.eq_ignore_ascii_case(name))
+                {
+                    return Some((f, i));
+                }
+            }
+        } else {
+            // Unqualified: exact, then suffix — same as local.
+            for (f, frame) in c.outer.iter().enumerate().rev() {
+                let names = frame.names();
+                if let Some(i) = names.iter().position(|n| n.eq_ignore_ascii_case(name)) {
+                    return Some((f, i));
+                }
+                if let Some(i) = crate::executor::expr::suffix_column_index(names, name) {
+                    return Some((f, i));
+                }
+            }
+        }
+        None
+    }
+
     pub(crate) fn lookup_outer(table: Option<&str>, name: &str) -> Option<Value> {
         CORR.with(|c| {
             let c = c.borrow();
-            if c.outer.is_empty() {
-                return None;
-            }
-            if let Some(t) = table {
-                // Pass 1: exact "qual.name" in each frame, innermost first
-                // (compared in place — the old per-name lowercase copies
-                // allocated on every correlated reference, every row).
-                for frame in c.outer.iter().rev() {
-                    let names = frame.names();
-                    for (i, n) in names.iter().enumerate() {
-                        if super::qualified_name_eq(n, t, name) {
-                            return frame.row().get(i).cloned();
-                        }
-                    }
-                }
-                // Pass 2: bare-name match (frame stores unqualified names —
-                // UPDATE/DELETE source rows). DELIBERATELY NO
-                // suffix-matching on QUALIFIED frame names: a ref
-                // `lba.audio_url` (qualifier = an inner source alias)
-                // must NEVER bind to an outer frame's
-                // `layout_blocks.audio_url` — the qualifiers differ, so
-                // the ref is not about that table at all. The old suffix
-                // pass silently leaked OUTER values into qualified inner
-                // refs whenever the local layout missed them (found via
-                // pdf-tts's mirror-sync: `lba.audio_url` read the OUTER
-                // `layout_blocks.audio_url` and wrote NULLs into the
-                // mirror column). Exact "qual.name" matches are Pass 1's
-                // job; bare frames are this pass's job; nothing else is
-                // a legal bind for a QUALIFIED reference.
-                for frame in c.outer.iter().rev() {
-                    let names = frame.names();
-                    for (i, n) in names.iter().enumerate() {
-                        if n.eq_ignore_ascii_case(name) {
-                            return frame.row().get(i).cloned();
-                        }
-                    }
-                }
-            } else {
-                // Unqualified: exact, then suffix — same as local.
-                for frame in c.outer.iter().rev() {
-                    let names = frame.names();
-                    for (i, n) in names.iter().enumerate() {
-                        if n.eq_ignore_ascii_case(name) {
-                            return frame.row().get(i).cloned();
-                        }
-                    }
-                    if let Some(i) = crate::executor::expr::suffix_column_index(names, name) {
-                        return frame.row().get(i).cloned();
-                    }
-                }
-            }
-            None
+            let (f, i) = locate_outer(&c, table, name)?;
+            c.outer[f].row().get(i).cloned()
         })
     }
 
@@ -6540,6 +6547,7 @@ fn exec_filter(ctx: &mut ExecContext<'_>, input: &Plan, predicate: &Expr) -> Res
         _ => None,
     };
     let _subq_scope = crate::executor::expr::SubqueryScope::for_exprs([predicate]);
+    let _slots = crate::executor::expr::SlotScope::for_exprs([predicate], &inner.columns);
     for row in inner.rows {
         let v = match scan_affinities {
             Some(aff) => eval_row_aff_where(

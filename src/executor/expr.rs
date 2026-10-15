@@ -564,36 +564,8 @@ impl<'a> EvalContext<'a> {
     /// Look up a column reference. Returns the value or NULL if not found.
     pub fn lookup(&self, table: &Option<String>, name: &str) -> Value {
         if let Some(t) = table {
-            // Try qualified lookups: "alias.column" or "table.column".
-            for (i, n) in self.column_names.iter().enumerate() {
-                if crate::executor::qualified_name_eq(n, t, name) {
-                    return self.row.get(i).cloned().unwrap_or(Value::Null);
-                }
-            }
-            // Qualified rowid spelling that matched no real column: the
-            // side's hidden rowid slot, named "<prefix>.\0rowid". This
-            // is what makes `a.rowid` / `b.rowid` bind to the CORRECT
-            // side in a join's combined column list (both sides carry a
-            // trailing slot; a bare-name fallback would always bind the
-            // first one).
-            if crate::planner::is_rowid_spelling(name) {
-                for (i, n) in self.column_names.iter().enumerate() {
-                    if crate::planner::is_hidden_rowid(n) {
-                        if let Some(pos) = n.rfind('.') {
-                            if n[..pos].eq_ignore_ascii_case(t) {
-                                return self.row.get(i).cloned().unwrap_or(Value::Null);
-                            }
-                        }
-                    }
-                }
-            }
-            // Hidden vtab aux slot (FTS5's `rank` / table-self column):
-            // the marked name `t.\u{1}rank` answers `t.rank` after every
-            // real column failed.
-            for (i, n) in self.column_names.iter().enumerate() {
-                if crate::executor::vtab_exec::aux_slot_matches(n, Some(t), name) {
-                    return self.row.get(i).cloned().unwrap_or(Value::Null);
-                }
+            if let Some(i) = self.resolve_qualified_local(t, name) {
+                return self.row.get(i).cloned().unwrap_or(Value::Null);
             }
             // Qualified ref that doesn't match a local qualified name: if an
             // outer scope knows "qual.column", it is a correlated reference
@@ -610,7 +582,47 @@ impl<'a> EvalContext<'a> {
         self.lookup_in_main(name)
     }
 
-    fn lookup_in_main(&self, name: &str) -> Value {
+    /// The LOCAL column a qualified reference `t.name` binds to, before
+    /// any outer scope is consulted: the qualified name itself, then the
+    /// side's hidden rowid slot for a rowid spelling, then a vtab aux
+    /// slot. Depends on the column names alone.
+    pub(crate) fn resolve_qualified_local(&self, t: &str, name: &str) -> Option<usize> {
+        // Try qualified lookups: "alias.column" or "table.column".
+        if let Some(i) = self
+            .column_names
+            .iter()
+            .position(|n| crate::executor::qualified_name_eq(n, t, name))
+        {
+            return Some(i);
+        }
+        // Qualified rowid spelling that matched no real column: the
+        // side's hidden rowid slot, named "<prefix>.\0rowid". This
+        // is what makes `a.rowid` / `b.rowid` bind to the CORRECT
+        // side in a join's combined column list (both sides carry a
+        // trailing slot; a bare-name fallback would always bind the
+        // first one).
+        if crate::planner::is_rowid_spelling(name) {
+            for (i, n) in self.column_names.iter().enumerate() {
+                if crate::planner::is_hidden_rowid(n) {
+                    if let Some(pos) = n.rfind('.') {
+                        if n[..pos].eq_ignore_ascii_case(t) {
+                            return Some(i);
+                        }
+                    }
+                }
+            }
+        }
+        // Hidden vtab aux slot (FTS5's `rank` / table-self column):
+        // the marked name `t.\u{1}rank` answers `t.rank` after every
+        // real column failed.
+        self.column_names
+            .iter()
+            .position(|n| crate::executor::vtab_exec::aux_slot_matches(n, Some(t), name))
+    }
+
+    /// The LOCAL column a bare reference binds to (see `lookup_in_main`),
+    /// before the correlated outer scopes. Depends on the names alone.
+    pub(crate) fn resolve_main_local(&self, name: &str) -> Option<usize> {
         // Special column: rowid / _rowid_ / oid — and the planner's
         // rewritten hidden name (no-alias tables; see
         // planner::HIDDEN_ROWID). The trailing pseudo-rowid slot may be
@@ -629,26 +641,37 @@ impl<'a> EvalContext<'a> {
                 .iter()
                 .position(|c| c.eq_ignore_ascii_case("rowid") || crate::planner::is_hidden_rowid(c))
             {
-                return self.row.get(idx).cloned().unwrap_or(Value::Null);
+                return Some(idx);
             }
         }
         // Try exact match first.
-        for (i, n) in self.column_names.iter().enumerate() {
-            if n.eq_ignore_ascii_case(name) {
-                return self.row.get(i).cloned().unwrap_or(Value::Null);
-            }
+        if let Some(i) = self
+            .column_names
+            .iter()
+            .position(|n| n.eq_ignore_ascii_case(name))
+        {
+            return Some(i);
         }
         // Try qualified match by suffix (e.g. "u.id" matches "id").
         if let Some(i) = suffix_column_index(self.column_names, name) {
-            return self.row.get(i).cloned().unwrap_or(Value::Null);
+            return Some(i);
         }
         // Hidden vtab aux slot (FTS5's `rank` / table-self column): the
         // marked name answers the bare reference after every real column
         // failed.
-        for (i, n) in self.column_names.iter().enumerate() {
-            if crate::executor::vtab_exec::aux_slot_matches(n, None, name) {
-                return self.row.get(i).cloned().unwrap_or(Value::Null);
-            }
+        self.column_names
+            .iter()
+            .position(|n| crate::executor::vtab_exec::aux_slot_matches(n, None, name))
+    }
+
+    /// `lookup_in_main` for the evaluator's slot path.
+    pub(crate) fn lookup_in_main_pub(&self, name: &str) -> Value {
+        self.lookup_in_main(name)
+    }
+
+    fn lookup_in_main(&self, name: &str) -> Value {
+        if let Some(i) = self.resolve_main_local(name) {
+            return self.row.get(i).cloned().unwrap_or(Value::Null);
         }
         // Not found locally — correlated-subquery outer scope (innermost
         // frame first). No-op when no correlated subquery is executing.
@@ -1168,6 +1191,153 @@ pub(crate) fn contains_collate(e: &Expr) -> bool {
         Expr::Row(items) => any(items),
         Expr::Raise { message, .. } => opt(message),
     }
+}
+
+/// Column SLOTS an operator resolved for its expressions against its
+/// row layout (`SlotScope::for_exprs`): Column node address -> row index.
+/// Valid only for an EvalContext over the SAME column-name slice (checked
+/// per use), so a nested evaluation over another layout never sees it.
+#[derive(Default)]
+struct SlotTable {
+    names: (usize, usize),
+    entries: Vec<(usize, u32)>,
+}
+
+thread_local! {
+    static SLOTS: std::cell::RefCell<SlotTable> = std::cell::RefCell::new(SlotTable::default());
+}
+
+/// Visit every Column node of `e` outside its subqueries.
+fn for_each_column<'e>(e: &'e Expr, f: &mut dyn FnMut(&'e Expr)) {
+    let each = |xs: &'e [Expr], f: &mut dyn FnMut(&'e Expr)| {
+        for x in xs {
+            for_each_column(x, f);
+        }
+    };
+    match e {
+        Expr::Column { .. } => f(e),
+        Expr::Literal(_) | Expr::Parameter(_) | Expr::Subquery(_) | Expr::Exists(_) => {}
+        Expr::Binary { left, right, .. } | Expr::Is { left, right, .. } => {
+            for_each_column(left, f);
+            for_each_column(right, f);
+        }
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. } => for_each_column(expr, f),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            for_each_column(expr, f);
+            for_each_column(low, f);
+            for_each_column(high, f);
+        }
+        Expr::In { expr, source, .. } => {
+            for_each_column(expr, f);
+            if let InSource::List(l) = source {
+                each(l, f);
+            }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            for_each_column(expr, f);
+            for_each_column(pattern, f);
+            if let Some(x) = escape {
+                for_each_column(x, f);
+            }
+        }
+        Expr::Function { args, filter, .. } => {
+            each(args, f);
+            if let Some(x) = filter {
+                for_each_column(x, f);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(x) = operand {
+                for_each_column(x, f);
+            }
+            for (w, t) in whens {
+                for_each_column(w, f);
+                for_each_column(t, f);
+            }
+            if let Some(x) = else_ {
+                for_each_column(x, f);
+            }
+        }
+        Expr::Row(items) => each(items, f),
+        Expr::Raise { message, .. } => {
+            if let Some(x) = message {
+                for_each_column(x, f);
+            }
+        }
+    }
+}
+
+/// Installs an operator's column slots for the duration of its row loop
+/// (restores the previous table on drop).
+pub(crate) struct SlotScope(Option<SlotTable>);
+
+impl SlotScope {
+    /// Resolve every column reference of `exprs` against `columns` with
+    /// the evaluator's own LOCAL rules (`resolve_qualified_local` /
+    /// `resolve_main_local`); references that resolve nowhere locally
+    /// (correlated outer refs, misses) keep the per-row lookup.
+    pub(crate) fn for_exprs<'e>(
+        exprs: impl IntoIterator<Item = &'e Expr>,
+        columns: &[String],
+    ) -> Self {
+        let empty_params: HashMap<String, Value> = HashMap::new();
+        let probe = EvalContext::new(&[], columns, &[], &empty_params);
+        let mut entries: Vec<(usize, u32)> = Vec::new();
+        for e in exprs {
+            for_each_column(e, &mut |c| {
+                if let Expr::Column { table, name } = c {
+                    let i = match table {
+                        Some(t) => probe.resolve_qualified_local(t, name),
+                        None => probe.resolve_main_local(name),
+                    };
+                    // u32::MAX: resolves nowhere locally (an outer ref).
+                    entries.push((c as *const Expr as usize, i.map_or(u32::MAX, |i| i as u32)));
+                }
+            });
+        }
+        let table = SlotTable {
+            names: (columns.as_ptr() as usize, columns.len()),
+            entries,
+        };
+        SlotScope(Some(
+            SLOTS.with(|s| std::mem::replace(&mut *s.borrow_mut(), table)),
+        ))
+    }
+}
+
+impl Drop for SlotScope {
+    fn drop(&mut self) {
+        if let Some(t) = self.0.take() {
+            SLOTS.with(|s| *s.borrow_mut() = t);
+        }
+    }
+}
+
+/// The resolved slot of Column node `e` for a context over `columns`.
+#[inline]
+fn column_slot(e: &Expr, columns: &[String]) -> Option<usize> {
+    SLOTS.with(|s| {
+        let s = s.borrow();
+        if s.entries.is_empty() || s.names != (columns.as_ptr() as usize, columns.len()) {
+            return None;
+        }
+        let key = e as *const Expr as usize;
+        s.entries.iter().find(|x| x.0 == key).map(|x| x.1 as usize)
+    })
 }
 
 /// Restores the previous `SUBQUERY_FREE` / `COLLATE_FREE` on drop.
@@ -1834,7 +2004,26 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
                 Ok(ctx.named_params.get(p).cloned().unwrap_or(Value::Null))
             }
         }
-        Expr::Column { table, name } => Ok(ctx.lookup(table, name)),
+        Expr::Column { table, name } => {
+            match column_slot(expr, ctx.column_names) {
+                Some(i) if i != u32::MAX as usize => {
+                    Ok(ctx.row.get(i).cloned().unwrap_or(Value::Null))
+                }
+                // Proven non-local for this layout: straight to the outer
+                // scopes (the binding cached per node), then — for a
+                // qualified ref — `lookup`'s unqualified local fallback.
+                Some(_) => {
+                    if let Some(v) = crate::executor::corr_outer_lookup(table.as_deref(), name) {
+                        return Ok(v);
+                    }
+                    Ok(match table {
+                        Some(_) => ctx.lookup_in_main_pub(name),
+                        None => Value::Null,
+                    })
+                }
+                None => Ok(ctx.lookup(table, name)),
+            }
+        }
         // A VALUE-context AND / OR (a result column, an operand, an
         // argument, a SET value) follows exprCodeTargetAndOr: BOTH
         // operands are computed — `SELECT x > 0 OR abs(y)` raises on an
