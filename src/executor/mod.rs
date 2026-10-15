@@ -690,9 +690,73 @@ pub(crate) struct SubqPlanEntry {
 ///
 /// Nested subquery bodies are NOT descended into: their refs resolve
 /// through the runtime outer-scope stack, which sees every level.
+/// The bare column names a reference in `sel`'s own expressions can bind
+/// to INSIDE the subquery — its FROM sources' columns (catalog tables,
+/// CTEs) and its result aliases — when every source's columns are known;
+/// `None` (unknown: a derived table, a table function, a compound body)
+/// keeps every bare reference on the runtime inner-first resolution.
+fn inner_bare_names(
+    sel: &SelectStatement,
+    catalog: &crate::schema::Catalog,
+    ctes: Option<&HashMap<String, crate::types::CteMaterialization>>,
+) -> Option<std::collections::HashSet<String>> {
+    fn from_cols(
+        te: &TableExpression,
+        catalog: &crate::schema::Catalog,
+        ctes: Option<&HashMap<String, crate::types::CteMaterialization>>,
+        out: &mut std::collections::HashSet<String>,
+    ) -> Option<()> {
+        match te {
+            TableExpression::Table {
+                name, schema: None, ..
+            } => {
+                let lc = name.to_ascii_lowercase();
+                if let Some((_, cols, _)) = ctes.and_then(|m| m.get(&lc)) {
+                    for c in cols.iter() {
+                        let bare = c.rsplit('.').next().unwrap_or(c);
+                        out.insert(bare.to_ascii_lowercase());
+                    }
+                    return Some(());
+                }
+                let t = catalog.get_table(name)?;
+                if t.vtab.is_some() {
+                    return None;
+                }
+                for c in &t.columns {
+                    out.insert(c.name.to_ascii_lowercase());
+                }
+                Some(())
+            }
+            TableExpression::Join { left, right, .. } => {
+                from_cols(left, catalog, ctes, out)?;
+                from_cols(right, catalog, ctes, out)
+            }
+            _ => None,
+        }
+    }
+    let SelectBody::Simple(s) = &sel.body else {
+        return None;
+    };
+    let mut out = std::collections::HashSet::new();
+    if let Some(from) = &s.from {
+        from_cols(from, catalog, ctes, &mut out)?;
+    }
+    for c in &s.columns {
+        match c {
+            ResultColumn::Expr { alias: Some(a), .. } => {
+                out.insert(a.to_ascii_lowercase());
+            }
+            ResultColumn::Expr { .. } => {}
+            _ => {}
+        }
+    }
+    Some(out)
+}
+
 fn rewrite_outer_refs(
     sel: &SelectStatement,
     catalog: &crate::schema::Catalog,
+    ctes: Option<&HashMap<String, crate::types::CteMaterialization>>,
     outer_names: &[String],
     base: usize,
 ) -> (SelectStatement, Vec<(Option<String>, String)>) {
@@ -720,6 +784,8 @@ fn rewrite_outer_refs(
     };
     let mut bindings: Vec<(Option<String>, String)> = Vec::new();
     let mut cloned = sel.clone();
+    let inner = inner_bare_names(sel, catalog, ctes);
+    BARE_INNER.with(|b| *b.borrow_mut() = inner);
     rewrite_outer_refs_in_select(
         &mut cloned,
         &sources,
@@ -727,7 +793,15 @@ fn rewrite_outer_refs(
         &mut bindings,
         &resolves_in_frame,
     );
+    BARE_INNER.with(|b| *b.borrow_mut() = None);
     (cloned, bindings)
+}
+
+thread_local! {
+    /// `inner_bare_names` of the subquery being rewritten (None = bare
+    /// references stay on the runtime resolution).
+    static BARE_INNER: std::cell::RefCell<Option<std::collections::HashSet<String>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// One SELECT's expression sites (WHERE, HAVING, columns, GROUP BY,
@@ -837,7 +911,17 @@ fn rewrite_outer_refs_in_expr(
         Expr::Column { table, name } => {
             let is_outer = match table {
                 Some(q) => !sources.contains(&q.to_ascii_lowercase()),
-                None => false, // bare refs: runtime inner-first resolution
+                // A bare ref binds inner-first: outer only when it names
+                // none of the subquery's own columns (known exactly — see
+                // inner_bare_names) and is no rowid spelling.
+                None => {
+                    !crate::planner::is_rowid_spelling(name)
+                        && BARE_INNER.with(|b| {
+                            b.borrow()
+                                .as_ref()
+                                .is_some_and(|inner| !inner.contains(&name.to_ascii_lowercase()))
+                        })
+                }
             };
             if is_outer && resolves_in_frame(table, name) {
                 // A POSITIONAL parameter (numeric name): both the
@@ -5238,7 +5322,8 @@ fn exec_select_statement(
             // AST node is static, so this base recurs identically on
             // every re-evaluation of the cached plan.
             let base = ctx.params.len();
-            let (mut cloned, bindings) = rewrite_outer_refs(sel, catalog, outer_names, base);
+            let (mut cloned, bindings) =
+                rewrite_outer_refs(sel, catalog, ctx.ctes.as_ref(), outer_names, base);
             if limit_one {
                 clamp_select_limit_to_one(&mut cloned);
             }
@@ -5379,7 +5464,8 @@ fn exec_select_statement_with_ctes(
             let outer_names: &[String] = unsafe { &*outer_names_ptr };
             let row: &[Value] = unsafe { &*outer_row_ptr };
             let base = ctx.params.len();
-            let (cloned, bindings) = rewrite_outer_refs(sel, catalog, outer_names, base);
+            let (cloned, bindings) =
+                rewrite_outer_refs(sel, catalog, ctx.ctes.as_ref(), outer_names, base);
             let params = if bindings.is_empty() {
                 None
             } else {
@@ -6548,6 +6634,11 @@ fn exec_filter(ctx: &mut ExecContext<'_>, input: &Plan, predicate: &Expr) -> Res
     };
     let _subq_scope = crate::executor::expr::SubqueryScope::for_exprs([predicate]);
     let _slots = crate::executor::expr::SlotScope::for_exprs([predicate], &inner.columns);
+    // The predicate's leaves compiled against this layout (the per-row
+    // contexts below are built the same way: same names, same affinities).
+    let compile_ctx = EvalContext::new(&[], &inner.columns, &ctx.params, &ctx.named_params)
+        .with_affinities(scan_affinities);
+    let _compiled = crate::executor::expr::CompiledScope::for_condition(predicate, &compile_ctx);
     for row in inner.rows {
         let v = match scan_affinities {
             Some(aff) => eval_row_aff_where(
@@ -7095,6 +7186,20 @@ fn apply_projection(
             out_rows.push(out);
         }
     } else {
+        // The computed columns compiled once against this layout (the
+        // per-row eval_row contexts: same names, no affinity map).
+        let computed = columns
+            .iter()
+            .enumerate()
+            .filter(|(i, c)| {
+                !matches!(resolved.get(*i), Some(Some(_)))
+                    && qualified_stars[*i].is_none()
+                    && !matches!(&c.expr, Expr::Column { name, .. } if name == "*")
+            })
+            .map(|(_, c)| &c.expr);
+        let _subq_scope = crate::executor::expr::SubqueryScope::for_exprs(computed.clone());
+        let compile_ctx = EvalContext::new(&[], &inner.columns, &ctx.params, &ctx.named_params);
+        let _compiled = crate::executor::expr::CompiledScope::for_values(computed, &compile_ctx);
         for row in &inner.rows {
             let mut out = Vec::with_capacity(out_columns.len());
             for (i, c) in columns.iter().enumerate() {

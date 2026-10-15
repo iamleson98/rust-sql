@@ -1340,6 +1340,492 @@ fn column_slot(e: &Expr, columns: &[String]) -> Option<usize> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Compiled expressions (per operator)
+// ---------------------------------------------------------------------------
+//
+// An operator compiles the expressions it evaluates per row ONCE against
+// its row layout (`CompiledScope::for_condition` / `for_values`): column
+// references become slots, the comparison affinity and collation of every
+// comparison are decided up front, builtin scalar calls skip the dispatch
+// preamble. Anything else stays a `Fallback` to the tree walker, which is
+// also what every compiled node reproduces exactly: same operand order,
+// same helpers (`apply_binary`, `apply_comparison_affinity`,
+// `call_scalar`). `evaluate` consults the scope at entry, so the
+// condition machinery (AND / OR / NOT / BETWEEN jumps) is unchanged and
+// only its leaves run compiled.
+
+/// A comparison's collation, resolved once.
+enum CColl {
+    /// No collation applies (`binary_comparison_collation` was None).
+    Default,
+    /// An explicit or declared BINARY.
+    Binary,
+    Custom(std::sync::Arc<dyn crate::plugin::Collation>),
+    /// Named but unregistered: raises on evaluation, as the walker does.
+    Missing(String),
+}
+
+enum CExpr {
+    Slot(u32),
+    Lit(Value),
+    Param(usize),
+    /// Evaluated by the tree walker (pointer into the scope's borrowed
+    /// expressions — valid while the scope lives).
+    Fallback(*const Expr),
+    Unary(UnaryOp, Box<CExpr>),
+    Bin {
+        op: BinaryOp,
+        l: Box<CExpr>,
+        r: Box<CExpr>,
+        /// Comparison affinity (comparisons only).
+        aff: Option<CmpAffinity>,
+        coll: CColl,
+    },
+    Func {
+        name: String,
+        args: Vec<CExpr>,
+    },
+}
+
+/// Function names whose evaluation is more than "evaluate the arguments
+/// left to right, then call_scalar": lazy / short-circuit forms, the
+/// collation-aware ones, JSON subtype handling, vtab aux functions and
+/// the planner's internal markers.
+fn func_needs_walker(name: &str) -> bool {
+    matches!(
+        name,
+        "coalesce"
+            | "ifnull"
+            | "iif"
+            | "if"
+            | "min"
+            | "max"
+            | "nullif"
+            | "bm25"
+            | "highlight"
+            | "snippet"
+    ) || name.starts_with("json")
+        || name.starts_with("__")
+        || name == crate::planner::CONST_WHERE_FN
+        || name == crate::sql::parser::ROW_COL_FN
+}
+
+impl CExpr {
+    fn compile(e: &Expr, ctx: &EvalContext<'_>) -> CExpr {
+        let fallback = || CExpr::Fallback(e as *const Expr);
+        match e {
+            Expr::Literal(v) => CExpr::Lit(v.clone()),
+            Expr::Parameter(p) => match p.parse::<usize>() {
+                Ok(i) => CExpr::Param(i),
+                Err(_) => fallback(),
+            },
+            Expr::Column { table, name } => {
+                let i = match table {
+                    Some(t) => ctx.resolve_qualified_local(t, name),
+                    None => ctx.resolve_main_local(name),
+                };
+                match i {
+                    Some(i) => CExpr::Slot(i as u32),
+                    None => fallback(),
+                }
+            }
+            Expr::Collate { expr, .. } => CExpr::compile(expr, ctx),
+            Expr::Unary { op, expr } if !matches!(op, UnaryOp::Not | UnaryOp::Truth { .. }) => {
+                CExpr::Unary(*op, Box::new(CExpr::compile(expr, ctx)))
+            }
+            Expr::Binary { op, left, right }
+                if !matches!(
+                    op,
+                    BinaryOp::And
+                        | BinaryOp::Or
+                        | BinaryOp::Arrow
+                        | BinaryOp::ArrowText
+                        | BinaryOp::FtsMatch
+                        | BinaryOp::Distance
+                ) && !is_row(left)
+                    && !is_row(right) =>
+            {
+                let is_cmp = matches!(
+                    op,
+                    BinaryOp::Eq
+                        | BinaryOp::NotEq
+                        | BinaryOp::Lt
+                        | BinaryOp::LtEq
+                        | BinaryOp::Gt
+                        | BinaryOp::GtEq
+                );
+                let aff = is_cmp.then(|| {
+                    let col = |x: &Expr| ctx.comparison_column_affinity(x);
+                    comparison_affinity(
+                        expr_affinity_with(left, &col),
+                        expr_affinity_with(right, &col),
+                    )
+                });
+                let coll = match ctx.binary_comparison_collation(left, right) {
+                    None => CColl::Default,
+                    Some(n) if n.eq_ignore_ascii_case("binary") => CColl::Binary,
+                    Some(n) => match crate::plugin::lookup_collation(&n) {
+                        Some(c) => CColl::Custom(c),
+                        None => CColl::Missing(n),
+                    },
+                };
+                CExpr::Bin {
+                    op: *op,
+                    l: Box::new(CExpr::compile(left, ctx)),
+                    r: Box::new(CExpr::compile(right, ctx)),
+                    aff,
+                    coll,
+                }
+            }
+            Expr::Function {
+                name,
+                args,
+                filter: None,
+                over: None,
+                ..
+            } => {
+                let lname = lower_name(name).into_owned();
+                if func_needs_walker(&lname) || args.len() > 64 {
+                    return fallback();
+                }
+                CExpr::Func {
+                    name: lname,
+                    args: args.iter().map(|a| CExpr::compile(a, ctx)).collect(),
+                }
+            }
+            _ => fallback(),
+        }
+    }
+
+    fn is_fallback(&self) -> bool {
+        matches!(self, CExpr::Fallback(_))
+    }
+
+    /// The value of a leaf that lives in the context (a slot, a
+    /// parameter, a literal): borrowed, no clone.
+    #[inline]
+    fn leaf_ref<'c>(&'c self, ctx: &'c EvalContext<'_>) -> Option<&'c Value> {
+        const NULL: Value = Value::Null;
+        match self {
+            CExpr::Slot(i) => Some(ctx.row.get(*i as usize).unwrap_or(&NULL)),
+            CExpr::Param(i) => Some(ctx.params.get(*i).unwrap_or(&NULL)),
+            CExpr::Lit(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    fn eval(&self, ctx: &EvalContext<'_>) -> Result<Value> {
+        match self {
+            CExpr::Slot(i) => Ok(ctx.row.get(*i as usize).cloned().unwrap_or(Value::Null)),
+            CExpr::Lit(v) => Ok(v.clone()),
+            CExpr::Param(i) => Ok(ctx.params.get(*i).cloned().unwrap_or(Value::Null)),
+            // SAFETY: the scope that owns this node borrows the expression
+            // tree for its whole lifetime.
+            CExpr::Fallback(p) => evaluate_uncompiled(unsafe { &**p }, ctx),
+            CExpr::Unary(op, x) => Ok(apply_unary(*op, &x.eval(ctx)?)),
+            CExpr::Bin {
+                op,
+                l,
+                r,
+                aff,
+                coll,
+            } => {
+                // Operands that live in the context are BORROWED (a long
+                // TEXT column used to be cloned per comparison); the
+                // affinity conversion, which consumes its operands, runs
+                // only when a TEXT operand makes it matter.
+                let (lo, ro);
+                let lv: &Value = match l.leaf_ref(ctx) {
+                    Some(v) => v,
+                    None => {
+                        lo = l.eval(ctx)?;
+                        &lo
+                    }
+                };
+                let rv: &Value = match r.leaf_ref(ctx) {
+                    Some(v) => v,
+                    None => {
+                        ro = r.eval(ctx)?;
+                        &ro
+                    }
+                };
+                let converted;
+                let (lv, rv) = match aff {
+                    Some(a) if matches!(lv, Value::Text(_)) || matches!(rv, Value::Text(_)) => {
+                        converted = apply_comparison_affinity(*a, lv.clone(), rv.clone());
+                        (&converted.0, &converted.1)
+                    }
+                    _ => (lv, rv),
+                };
+                // INTEGER x INTEGER: SQLite's integer arithmetic and
+                // comparison inline (overflow and the remaining cases take
+                // the general path). Collations order TEXT only.
+                if let (Value::Integer(a), Value::Integer(b)) = (lv, rv) {
+                    if !matches!(coll, CColl::Missing(_)) {
+                        let (a, b) = (*a, *b);
+                        let int = |x: bool| Value::Integer(x as i64);
+                        let fast = match op {
+                            BinaryOp::Add => a.checked_add(b).map(Value::Integer),
+                            BinaryOp::Sub => a.checked_sub(b).map(Value::Integer),
+                            BinaryOp::Mul => a.checked_mul(b).map(Value::Integer),
+                            BinaryOp::Div if b == 0 => Some(Value::Null),
+                            BinaryOp::Div if !(b == -1 && a == i64::MIN) => {
+                                Some(Value::Integer(a / b))
+                            }
+                            BinaryOp::Mod if b == 0 => Some(Value::Null),
+                            BinaryOp::Mod => Some(Value::Integer(if b == -1 { 0 } else { a % b })),
+                            BinaryOp::Eq => Some(int(a == b)),
+                            BinaryOp::NotEq => Some(int(a != b)),
+                            BinaryOp::Lt => Some(int(a < b)),
+                            BinaryOp::LtEq => Some(int(a <= b)),
+                            BinaryOp::Gt => Some(int(a > b)),
+                            BinaryOp::GtEq => Some(int(a >= b)),
+                            _ => None,
+                        };
+                        if let Some(v) = fast {
+                            return Ok(v);
+                        }
+                    }
+                }
+                match coll {
+                    CColl::Default | CColl::Binary => Ok(apply_binary(*op, lv, rv)),
+                    CColl::Custom(c) => Ok(apply_binary_collated(*op, lv, rv, c.as_ref())),
+                    CColl::Missing(n) => Err(crate::error::Error::semantic(format!(
+                        "no such collation sequence: {}",
+                        n
+                    ))),
+                }
+            }
+            CExpr::Func { name, args } => {
+                // Context-resident arguments are passed as SHALLOW copies
+                // that are never dropped (`call_scalar` only reads its
+                // arguments; anything it returns is a fresh value): no
+                // clone of a long TEXT argument per call. Computed
+                // arguments are owned and dropped normally.
+                let mut vals: Vec<std::mem::ManuallyDrop<Value>> = Vec::with_capacity(args.len());
+                let mut owned: u64 = 0;
+                let res = (|| {
+                    for (k, a) in args.iter().enumerate() {
+                        match a.leaf_ref(ctx) {
+                            // SAFETY: a bitwise copy of a value the context
+                            // keeps alive for this call; never dropped.
+                            Some(v) => {
+                                vals.push(std::mem::ManuallyDrop::new(unsafe { std::ptr::read(v) }))
+                            }
+                            None => {
+                                vals.push(std::mem::ManuallyDrop::new(a.eval(ctx)?));
+                                if k < 64 {
+                                    owned |= 1 << k;
+                                } else {
+                                    return Err(crate::error::Error::Unsupported("arity"));
+                                }
+                            }
+                        }
+                    }
+                    // SAFETY: ManuallyDrop<Value> is repr(transparent).
+                    let as_values: &[Value] = unsafe {
+                        std::slice::from_raw_parts(vals.as_ptr() as *const Value, vals.len())
+                    };
+                    call_scalar(name, as_values)
+                })();
+                for (k, v) in vals.iter_mut().enumerate() {
+                    if k < 64 && owned & (1 << k) != 0 {
+                        // SAFETY: owned values are dropped exactly once.
+                        unsafe { std::mem::ManuallyDrop::drop(v) };
+                    }
+                }
+                res
+            }
+        }
+    }
+}
+
+/// The compiled forms of an operator's per-row expressions: node address
+/// -> compiled tree, valid for contexts over the same column-name slice.
+#[derive(Default)]
+struct CompiledTable {
+    names: (usize, usize),
+    entries: Vec<(usize, CExpr)>,
+}
+
+thread_local! {
+    static COMPILED: std::cell::RefCell<CompiledTable> =
+        std::cell::RefCell::new(CompiledTable::default());
+    static COMPILED_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Installs an operator's compiled expressions (restores on drop).
+pub(crate) struct CompiledScope(Option<(CompiledTable, bool)>);
+
+impl CompiledScope {
+    /// Compile a CONDITION: its jump structure (AND / OR / NOT / truth
+    /// tests / BETWEEN) stays with the condition evaluator; every leaf it
+    /// evaluates is compiled. `ctx` must be built like the per-row
+    /// contexts (same column names, same affinities). Subquery-holding
+    /// expressions are not compiled (their evaluation order is subtle).
+    pub(crate) fn for_condition(e: &Expr, ctx: &EvalContext<'_>) -> Self {
+        let mut entries = Vec::new();
+        // The enclosing SubqueryScope already proved it subquery-free
+        // (one walk per execution, not two).
+        let free = SUBQUERY_FREE.with(|c| c.get()) || !contains_subquery(e);
+        if free {
+            register_condition(e, ctx, &mut entries);
+        }
+        Self::install(ctx, entries)
+    }
+
+    /// Compile VALUE expressions (projection columns).
+    pub(crate) fn for_values<'e>(
+        exprs: impl IntoIterator<Item = &'e Expr>,
+        ctx: &EvalContext<'_>,
+    ) -> Self {
+        let mut entries = Vec::new();
+        let free = SUBQUERY_FREE.with(|c| c.get());
+        for e in exprs {
+            if free || !contains_subquery(e) {
+                register_value(e, ctx, &mut entries);
+            }
+        }
+        Self::install(ctx, entries)
+    }
+
+    fn install(ctx: &EvalContext<'_>, entries: Vec<(usize, CExpr)>) -> Self {
+        let active = !entries.is_empty();
+        let table = CompiledTable {
+            names: (ctx.column_names.as_ptr() as usize, ctx.column_names.len()),
+            entries,
+        };
+        let prev = COMPILED.with(|c| std::mem::replace(&mut *c.borrow_mut(), table));
+        let prev_active = COMPILED_ACTIVE.with(|c| c.replace(active));
+        CompiledScope(Some((prev, prev_active)))
+    }
+}
+
+impl Drop for CompiledScope {
+    fn drop(&mut self) {
+        if let Some((t, a)) = self.0.take() {
+            COMPILED.with(|c| *c.borrow_mut() = t);
+            COMPILED_ACTIVE.with(|c| c.set(a));
+        }
+    }
+}
+
+/// Register the compiled leaves of a condition (mirrors cond_if_false /
+/// cond_if_true's structural recursion).
+fn register_condition(e: &Expr, ctx: &EvalContext<'_>, out: &mut Vec<(usize, CExpr)>) {
+    match e {
+        Expr::Binary {
+            op: BinaryOp::And | BinaryOp::Or,
+            left,
+            right,
+        } => {
+            register_condition(left, ctx, out);
+            register_condition(right, ctx, out);
+        }
+        Expr::Unary {
+            op: UnaryOp::Not | UnaryOp::Truth { .. },
+            expr,
+        } => register_condition(expr, ctx, out),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            register_value(expr, ctx, out);
+            register_value(low, ctx, out);
+            register_value(high, ctx, out);
+        }
+        _ => register_value(e, ctx, out),
+    }
+}
+
+/// Register `e` compiled — or, when its root cannot compile, its
+/// children's maximal compilable subtrees (the walker evaluates them
+/// through `evaluate`, which finds them).
+fn register_value(e: &Expr, ctx: &EvalContext<'_>, out: &mut Vec<(usize, CExpr)>) {
+    let c = CExpr::compile(e, ctx);
+    if !c.is_fallback() {
+        // Bare slots and literals gain nothing over the walker's own arms.
+        if !matches!(c, CExpr::Lit(_)) {
+            out.push((e as *const Expr as usize, c));
+        }
+        return;
+    }
+    let mut kids: Vec<&Expr> = Vec::new();
+    match e {
+        Expr::Binary { left, right, .. } | Expr::Is { left, right, .. } => {
+            kids.push(left);
+            kids.push(right);
+        }
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } | Expr::Cast { expr, .. } => {
+            kids.push(expr)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => kids.extend([&**expr, &**low, &**high]),
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            kids.push(expr);
+            kids.push(pattern);
+            if let Some(x) = escape {
+                kids.push(x);
+            }
+        }
+        Expr::In { expr, source, .. } => {
+            kids.push(expr);
+            if let InSource::List(l) = source {
+                kids.extend(l.iter());
+            }
+        }
+        Expr::Function { args, .. } => kids.extend(args.iter()),
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(x) = operand {
+                kids.push(x);
+            }
+            for (w, t) in whens {
+                kids.push(w);
+                kids.push(t);
+            }
+            if let Some(x) = else_ {
+                kids.push(x);
+            }
+        }
+        _ => {}
+    }
+    for k in kids {
+        register_value(k, ctx, out);
+    }
+}
+
+/// The compiled form of `e` for a context over `columns`, if any.
+#[inline]
+fn compiled_eval(e: &Expr, ctx: &EvalContext<'_>) -> Option<Result<Value>> {
+    if !COMPILED_ACTIVE.with(|c| c.get()) {
+        return None;
+    }
+    COMPILED.with(|c| {
+        let t = c.borrow();
+        if t.names != (ctx.column_names.as_ptr() as usize, ctx.column_names.len()) {
+            return None;
+        }
+        let key = e as *const Expr as usize;
+        let ce = t.entries.iter().find(|x| x.0 == key)?;
+        // SAFETY: entries live until the scope drops, and `t` (the borrow)
+        // is only needed to find the node; evaluation may install nested
+        // scopes, so release the borrow first.
+        let ptr: *const CExpr = &ce.1;
+        drop(t);
+        Some(unsafe { &*ptr }.eval(ctx))
+    })
+}
+
 /// Restores the previous `SUBQUERY_FREE` / `COLLATE_FREE` on drop.
 pub(crate) struct SubqueryScope(bool, bool);
 
@@ -1991,6 +2477,14 @@ fn evaluate_in_row(
 }
 
 pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
+    if let Some(r) = compiled_eval(expr, ctx) {
+        return r;
+    }
+    evaluate_uncompiled(expr, ctx)
+}
+
+/// The tree walker proper (`evaluate` minus the compiled-scope probe).
+fn evaluate_uncompiled(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
     match expr {
         Expr::Literal(v) => Ok(v.clone()),
         Expr::Parameter(p) => {
@@ -3135,6 +3629,31 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
                         return Ok(Value::Text(crate::types::text::Text::from_bytes(
                             &b[offs[begin as usize]..offs[end as usize]],
                         )));
+                    }
+                }
+                // A forward slice (start >= 1, length >= 0) of TEXT needs
+                // only the bytes up to its end: when that prefix is ASCII
+                // and NUL-free, the byte offsets ARE the character offsets
+                // (a far-right start just yields '').
+                if let (Value::Text(t), Value::Integer(p1)) = (&args[0], &args[1]) {
+                    let z = if args.len() == 3 {
+                        match &args[2] {
+                            Value::Integer(z) => Some(*z),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(z) = z.filter(|z| *z >= 0) {
+                        if *p1 >= 1 {
+                            let b = t.as_bytes();
+                            let begin = ((*p1 - 1) as u64).min(b.len() as u64) as usize;
+                            let end = (begin as u64 + z as u64).min(b.len() as u64) as usize;
+                            let pre = &b[..end];
+                            if pre.iter().all(|&c| c != 0 && c < 0x80) {
+                                return Ok(Value::Text(t.as_str()[begin..end].into()));
+                            }
+                        }
                     }
                 }
                 let s = args[0].as_text();

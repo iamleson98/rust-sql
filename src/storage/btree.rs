@@ -7726,25 +7726,10 @@ impl<'a> Btree<'a> {
         // reclaimed only by a compaction): the rebalance rewrites both
         // pages packed, so live bytes are what matter.
         let free_of = |this: &Self, id: PageId| -> Result<Option<usize>> {
-            let page = this.pager.get_page(id)?;
-            let b = page.lock();
-            if b.page_type()? != pt {
-                return Ok(None);
-            }
-            let psz = b.page_size();
-            let mut live = 0usize;
-            for i in 0..b.n_cells() {
-                let p = b.cell_pointer(i) as usize;
-                if p < PAGE_HEADER_SIZE as usize || p >= b.data.len() {
-                    return Ok(None);
-                }
-                let size = match pt {
-                    PageType::LeafIndex => index_leaf_cell_size(&b.data[p..], psz),
-                    _ => table_leaf_cell_size_paged(&b.data[p..], psz),
-                };
-                live += size.unwrap_or(usable) + 2;
-            }
-            Ok(Some(usable.saturating_sub(live)))
+            Ok(match this.leaf_live_cached(id, usable)? {
+                Some((spt, live)) if spt == pt => Some(usable.saturating_sub(live)),
+                _ => None,
+            })
         };
         // The sibling group: the child with its roomier leaf neighbour
         // (SQLite's balance_nonroot takes up to three; with the third page
@@ -8183,6 +8168,30 @@ impl<'a> Btree<'a> {
 
     /// Is leaf `id` under a third full (its cells + pointers)? Sums cell
     /// sizes in place, stopping as soon as the third is passed.
+    /// A leaf's live bytes (cells + pointers) through the page's
+    /// live-byte cache (see `Page::live_cache`), with its type. `None`
+    /// for a non-leaf or a malformed cell.
+    fn leaf_live_cached(&self, id: PageId, usable: usize) -> Result<Option<(PageType, usize)>> {
+        let page = self.pager.get_page(id)?;
+        let b = page.lock();
+        let pt = b.page_type()?;
+        if !matches!(pt, PageType::LeafTable | PageType::LeafIndex) {
+            return Ok(None);
+        }
+        let key = (b.epoch, b.n_cells(), b.cell_content_start());
+        if let Some((e, n, cs, live)) = b.live_cache {
+            if (e, n, cs) == key {
+                return Ok(Some((pt, live as usize)));
+            }
+        }
+        let Some(used) = leaf_live_bytes(&b, pt, usable) else {
+            return Ok(None);
+        };
+        drop(b);
+        page.lock().live_cache = Some((key.0, key.1, key.2, used as u32));
+        Ok(Some((pt, used)))
+    }
+
     fn leaf_is_underfull(&self, id: PageId, usable: usize) -> Result<bool> {
         let page = self.pager.get_page(id)?;
         let b = page.lock();
@@ -8260,12 +8269,11 @@ impl<'a> Btree<'a> {
         if !self.leaf_is_underfull(child_id, usable)? {
             return Ok(false);
         }
-        let Some((pt, child_cells)) = self.leaf_cells(child_id)? else {
+        let Some((pt, child_bytes)) = self.leaf_live_cached(child_id, usable)? else {
             return Ok(false);
         };
         let footprint = |cells: &[Vec<u8>]| cells.iter().map(|c| c.len() + 2).sum::<usize>();
-        let child_bytes = footprint(&child_cells);
-        if child_cells.is_empty() || child_bytes * 3 > usable {
+        if child_bytes == 0 || child_bytes * 3 > usable {
             return Ok(false);
         }
         // The child's slot in the parent: a separator cell, or rightmost.
@@ -8300,10 +8308,21 @@ impl<'a> Btree<'a> {
         if sibling == 0 || sibling == child_id || sibling == self.root {
             return Ok(false);
         }
+        // O(1) fit test before copying either page's cells: a full
+        // sibling (the common decline) used to cost two page copies on
+        // every delete into the underfull leaf.
+        match self.leaf_live_cached(sibling, usable)? {
+            Some((spt, live)) if spt == pt && child_bytes + live <= usable => {}
+            _ => return Ok(false),
+        }
+        let Some((_, child_cells)) = self.leaf_cells(child_id)? else {
+            return Ok(false);
+        };
         let Some((spt, sib_cells)) = self.leaf_cells(sibling)? else {
             return Ok(false);
         };
-        if spt != pt || child_bytes + footprint(&sib_cells) > usable {
+        let child_bytes = footprint(&child_cells);
+        if child_cells.is_empty() || spt != pt || child_bytes + footprint(&sib_cells) > usable {
             return Ok(false);
         }
         // Key order: the child precedes a right sibling, follows a left one.
