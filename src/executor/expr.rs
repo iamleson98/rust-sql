@@ -464,7 +464,7 @@ impl<'a> EvalContext<'a> {
     /// collation ("BINARY" when it declares none). `None`: no collation
     /// (the comparison's other operand may supply one).
     pub(crate) fn expr_collation(&self, e: &Expr) -> Option<String> {
-        if let Some(c) = explicit_collation(e) {
+        if let Some(c) = eval_explicit_collation(e) {
             return Some(c);
         }
         // No collated column anywhere in scope: a column operand is BINARY,
@@ -496,7 +496,7 @@ impl<'a> EvalContext<'a> {
     /// stops the search — `nullif(j, upper(j COLLATE NOCASE))` compares
     /// BINARY. The rowid defines none.
     pub(crate) fn needcoll_arg_collation(&self, e: &Expr) -> Option<String> {
-        if let Some(c) = explicit_collation(e) {
+        if let Some(c) = eval_explicit_collation(e) {
             return Some(c);
         }
         let mut p = e;
@@ -528,8 +528,8 @@ impl<'a> EvalContext<'a> {
     /// declared collation applied (`SELECT b = 'X'` over a NOCASE column
     /// compared BINARY).
     pub(crate) fn binary_comparison_collation(&self, left: &Expr, right: &Expr) -> Option<String> {
-        explicit_collation(left)
-            .or_else(|| explicit_collation(right))
+        eval_explicit_collation(left)
+            .or_else(|| eval_explicit_collation(right))
             .or_else(|| self.expr_collation(left))
             .or_else(|| self.expr_collation(right))
     }
@@ -829,6 +829,16 @@ pub(crate) fn explicit_collation(e: &Expr) -> Option<String> {
     explicit_collation_walk(e)
 }
 
+/// `explicit_collation` for the EVALUATOR's comparisons: None at once
+/// inside an operator's COLLATE-free scope (planning code keeps the
+/// ungated form — it may run inside such a scope for a subquery).
+fn eval_explicit_collation(e: &Expr) -> Option<String> {
+    if COLLATE_FREE.with(|c| c.get()) {
+        return None;
+    }
+    explicit_collation(e)
+}
+
 fn explicit_collation_walk(e: &Expr) -> Option<String> {
     let explicit_collation = explicit_collation_walk;
     match e {
@@ -1085,6 +1095,121 @@ pub(crate) fn contains_subquery(e: &Expr) -> bool {
     subquery_in(e, true)
 }
 
+thread_local! {
+    /// Set while an operator evaluates expressions it proved free of
+    /// subqueries (`SubqueryScope::for_exprs`): the evaluator's operand
+    /// ORDER rules (exprEvalRhsFirst / exprComputeOperands) then need no
+    /// per-node `contains_subquery` walk — a walk at every binary node is
+    /// quadratic in the tree depth. Every `execute()` resets it, so a
+    /// nested statement never inherits it.
+    static SUBQUERY_FREE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
+    /// Set while an operator evaluates expressions holding no COLLATE
+    /// node (outside subqueries, their own scope): `explicit_collation`
+    /// is then None for every operand without walking it — the global
+    /// `COLLATE_SEEN` gate opens for the whole process the first time any
+    /// statement says COLLATE, and every comparison walked both operand
+    /// subtrees per row after that.
+    static COLLATE_FREE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Does `e` hold a COLLATE node anywhere outside its subqueries? (A
+/// window spec counts as possibly holding one.)
+pub(crate) fn contains_collate(e: &Expr) -> bool {
+    let any = |xs: &[Expr]| xs.iter().any(contains_collate);
+    let opt = |x: &Option<Box<Expr>>| x.as_deref().is_some_and(contains_collate);
+    match e {
+        Expr::Collate { .. } => true,
+        Expr::Literal(_) | Expr::Parameter(_) | Expr::Column { .. } => false,
+        Expr::Subquery(_) | Expr::Exists(_) => false,
+        Expr::Binary { left, right, .. } | Expr::Is { left, right, .. } => {
+            contains_collate(left) || contains_collate(right)
+        }
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } | Expr::Cast { expr, .. } => {
+            contains_collate(expr)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => contains_collate(expr) || contains_collate(low) || contains_collate(high),
+        Expr::In { expr, source, .. } => {
+            contains_collate(expr) || matches!(source, InSource::List(l) if any(l))
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => contains_collate(expr) || contains_collate(pattern) || opt(escape),
+        Expr::Function {
+            args,
+            filter,
+            over,
+            order_by,
+            ..
+        } => {
+            over.is_some()
+                || any(args)
+                || opt(filter)
+                || order_by.iter().any(|t| contains_collate(&t.expr))
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            opt(operand)
+                || opt(else_)
+                || whens
+                    .iter()
+                    .any(|(w, t)| contains_collate(w) || contains_collate(t))
+        }
+        Expr::Row(items) => any(items),
+        Expr::Raise { message, .. } => opt(message),
+    }
+}
+
+/// Restores the previous `SUBQUERY_FREE` / `COLLATE_FREE` on drop.
+pub(crate) struct SubqueryScope(bool, bool);
+
+impl SubqueryScope {
+    /// Mark the evaluation of `exprs` subquery-free / COLLATE-free when
+    /// none of them holds one.
+    pub(crate) fn for_exprs<'e>(exprs: impl IntoIterator<Item = &'e Expr>) -> Self {
+        let (mut subq_free, mut coll_free) = (true, true);
+        for e in exprs {
+            subq_free &= !contains_subquery(e);
+            coll_free &= !contains_collate(e);
+        }
+        SubqueryScope(
+            SUBQUERY_FREE.with(|c| c.replace(subq_free)),
+            COLLATE_FREE.with(|c| c.replace(coll_free)),
+        )
+    }
+    /// A plan subtree starts here: anything possible.
+    pub(crate) fn reset() -> Self {
+        SubqueryScope(
+            SUBQUERY_FREE.with(|c| c.replace(false)),
+            COLLATE_FREE.with(|c| c.replace(false)),
+        )
+    }
+}
+
+impl Drop for SubqueryScope {
+    fn drop(&mut self) {
+        SUBQUERY_FREE.with(|c| c.set(self.0));
+        COLLATE_FREE.with(|c| c.set(self.1));
+    }
+}
+
+/// `contains_subquery` inside the evaluator: false at once in a
+/// subquery-free scope.
+#[inline]
+fn eval_has_subquery(e: &Expr) -> bool {
+    !SUBQUERY_FREE.with(|c| c.get()) && contains_subquery(e)
+}
+
 /// A subquery still to run per row (a correlated one): the materialized
 /// carriers of uncorrelated subqueries do not count.
 pub(crate) fn contains_live_subquery(e: &Expr) -> bool {
@@ -1157,7 +1282,7 @@ fn can_be_null(e: &Expr) -> bool {
 /// SQLite's exprEvalRhsFirst: with a subquery only on the LEFT, the
 /// right operand of an AND / OR goes first.
 fn and_or_order<'a>(left: &'a Expr, right: &'a Expr) -> (&'a Expr, &'a Expr) {
-    if contains_subquery(left) && !contains_subquery(right) {
+    if eval_has_subquery(left) && !eval_has_subquery(right) {
         (right, left)
     } else {
         (left, right)
@@ -1733,7 +1858,7 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
             }
             let (first, second) = and_or_order(left, right);
             let a = evaluate(first, ctx)?;
-            if !a.is_null() && contains_subquery(second) {
+            if !a.is_null() && eval_has_subquery(second) {
                 let t = a.is_truthy();
                 if *op == BinaryOp::And && !t {
                     return Ok(Value::Integer(0));
@@ -1787,8 +1912,8 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
             );
             let (l, r) = if null_skips
                 && can_be_null(right)
-                && contains_subquery(left)
-                && !contains_subquery(right)
+                && eval_has_subquery(left)
+                && !eval_has_subquery(right)
             {
                 let r = evaluate(right, ctx)?;
                 if r.is_null() {
@@ -1797,7 +1922,7 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
                 (evaluate(left, ctx)?, r)
             } else {
                 let l = evaluate(left, ctx)?;
-                if null_skips && l.is_null() && contains_subquery(right) {
+                if null_skips && l.is_null() && eval_has_subquery(right) {
                     return Ok(Value::Null);
                 }
                 (l, evaluate(right, ctx)?)

@@ -33,8 +33,25 @@ pub(crate) fn aux_slot_name(prefix: &str, aux: &str) -> String {
 /// reference `(table?, col)`? `table == None` accepts any qualifier
 /// (bare-name resolution).
 pub(crate) fn aux_slot_matches(slot: &str, table: Option<&str>, col: &str) -> bool {
-    let Some(pos) = slot.rfind(AUX_MARK) else {
-        return false;
+    // A marker-free `col` can only be the text after the LAST marker when
+    // the slot ENDS with marker + col: an O(1) test instead of a reverse
+    // search through every column name of every failed lookup.
+    let pos = if col.contains(AUX_MARK) {
+        match slot.rfind(AUX_MARK) {
+            Some(p) => p,
+            None => return false,
+        }
+    } else {
+        let mark = AUX_MARK.len_utf8();
+        let (b, k) = (slot.as_bytes(), col.len());
+        if b.len() < k + mark || !slot.is_char_boundary(b.len() - k - mark) {
+            return false;
+        }
+        let p = b.len() - k - mark;
+        if !slot[p..].starts_with(AUX_MARK) {
+            return false;
+        }
+        p
     };
     let base = &slot[pos + AUX_MARK.len_utf8()..];
     if !base.eq_ignore_ascii_case(col) {

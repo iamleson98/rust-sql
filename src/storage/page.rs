@@ -185,6 +185,12 @@ pub struct Page {
     pub serial: u64,
     /// Mutation counter for this object — bumped by `touch()`.
     pub epoch: u32,
+    /// Leaf live-byte count (cells + pointers) as of (epoch, n_cells,
+    /// content start) — the delete path keeps it current so the
+    /// underfull test after every delete is O(1). Never persisted; a
+    /// stale value only mis-times a rebalance (which measures the real
+    /// cells itself).
+    pub live_cache: Option<(u32, u16, u32, u32)>,
 }
 
 /// Source of Page `serial`s — uniqueness is the only property needed
@@ -203,6 +209,7 @@ impl Page {
             dirty: false,
             serial: PAGE_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             epoch: 0,
+            live_cache: None,
         }
     }
 
@@ -232,6 +239,7 @@ impl Page {
             dirty: false,
             serial: PAGE_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             epoch: 0,
+            live_cache: None,
         }
     }
 
@@ -620,6 +628,7 @@ mod tests {
             dirty: false,
             serial: p.serial,
             epoch: p.epoch,
+            live_cache: None,
         };
         assert_eq!(p2.page_type().unwrap(), PageType::InteriorTable);
         assert_eq!(p2.n_cells(), 3);

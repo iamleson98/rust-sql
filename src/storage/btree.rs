@@ -878,6 +878,25 @@ pub(crate) fn table_leaf_cell_size_paged(buf: &[u8], page_size: u32) -> Option<u
     }
 }
 
+/// A leaf's live bytes: its cells' in-page sizes plus their pointers.
+/// `None` for a malformed cell pointer.
+fn leaf_live_bytes(b: &crate::storage::page::Page, pt: PageType, usable: usize) -> Option<usize> {
+    let psz = b.page_size();
+    let mut used = 0usize;
+    for i in 0..b.n_cells() {
+        let p = b.cell_pointer(i) as usize;
+        if p < PAGE_HEADER_SIZE as usize || p >= b.data.len() {
+            return None;
+        }
+        let size = match pt {
+            PageType::LeafIndex => index_leaf_cell_size(&b.data[p..], psz),
+            _ => table_leaf_cell_size_paged(&b.data[p..], psz),
+        };
+        used += size.unwrap_or(usable) + 2;
+    }
+    Some(used)
+}
+
 fn decode_index_cell(buf: &[u8], interior: bool, page_size: u32) -> Option<IndexCellView<'_>> {
     let (left_child, after_child) = if interior {
         if buf.len() < 4 {
@@ -8157,24 +8176,19 @@ impl<'a> Btree<'a> {
         if !matches!(pt, PageType::LeafTable | PageType::LeafIndex) || b.n_cells() == 0 {
             return Ok(false);
         }
-        let psz = b.page_size();
         let limit = usable / 3;
-        let mut used = 0usize;
-        for i in 0..b.n_cells() {
-            let p = b.cell_pointer(i) as usize;
-            if p < PAGE_HEADER_SIZE as usize || p >= b.data.len() {
-                return Ok(false);
-            }
-            let size = match pt {
-                PageType::LeafIndex => index_leaf_cell_size(&b.data[p..], psz),
-                _ => table_leaf_cell_size_paged(&b.data[p..], psz),
-            };
-            used += size.unwrap_or(usable) + 2;
-            if used > limit {
-                return Ok(false);
+        let key = (b.epoch, b.n_cells(), b.cell_content_start());
+        if let Some((e, n, cs, live)) = b.live_cache {
+            if (e, n, cs) == key {
+                return Ok(live as usize <= limit);
             }
         }
-        Ok(true)
+        let Some(used) = leaf_live_bytes(&b, pt, usable) else {
+            return Ok(false);
+        };
+        drop(b);
+        page.lock().live_cache = Some((key.0, key.1, key.2, used as u32));
+        Ok(used <= limit)
     }
 
     /// The in-page cell bytes of leaf `id`, in key order, with the leaf's
@@ -8994,20 +9008,29 @@ impl<'a> Btree<'a> {
                 }
                 // Spilled row: free its overflow chain BEFORE removing the
                 // cell (the chain pages are otherwise unreachable garbage).
+                // (Header-only probe: the old full Cell::decode copied the
+                // payload of every deleted row.)
                 if pt == PageType::LeafTable {
-                    let cell_ptr = {
+                    let overflow = {
                         let borrowed = page.lock();
-                        borrowed.cell_pointer(pos) as usize
+                        let cell_ptr = borrowed.cell_pointer(pos) as usize;
+                        let rest = borrowed.cell_slice_checked(cell_ptr)?;
+                        let (_, rn) = decode_rowid_only(rest)
+                            .ok_or_else(|| Error::corruption("truncated rowid"))?;
+                        let (plen, pn) = varint::decode(&rest[rn..])
+                            .ok_or_else(|| Error::corruption("truncated payload length"))?;
+                        let local = overflow_local_len_for(plen as usize, borrowed.data.len());
+                        if local != plen as usize {
+                            let at = rn + pn + local;
+                            let head = rest
+                                .get(at..at + 4)
+                                .ok_or_else(|| Error::corruption("truncated overflow head"))?;
+                            u32::from_be_bytes(head.try_into().unwrap())
+                        } else {
+                            0
+                        }
                     };
-                    let cell = {
-                        let borrowed = page.lock();
-                        Cell::decode(
-                            borrowed.cell_slice_checked(cell_ptr)?,
-                            pt,
-                            borrowed.page_size(),
-                        )?
-                    };
-                    if let Cell::TableLeafOverflow { overflow, .. } = cell {
+                    if overflow != 0 {
                         self.free_overflow_chain(overflow)?;
                     }
                 }
@@ -9021,6 +9044,22 @@ impl<'a> Btree<'a> {
                 let ptr_array_start = header_offset + PAGE_HEADER_SIZE as usize;
                 {
                     let mut borrowed = page.lock();
+                    // Keep the live-byte cache current (see Page::live_cache).
+                    let before = (borrowed.epoch, n, borrowed.cell_content_start());
+                    let live_after = match borrowed.live_cache {
+                        Some((e, cn, cs, live)) if (e, cn, cs) == before => {
+                            let p = borrowed.cell_pointer(pos) as usize;
+                            let psz = borrowed.page_size();
+                            let size = match pt {
+                                PageType::LeafIndex => {
+                                    index_leaf_cell_size(&borrowed.data[p..], psz)
+                                }
+                                _ => table_leaf_cell_size_paged(&borrowed.data[p..], psz),
+                            };
+                            size.map(|sz| live.saturating_sub(sz as u32 + 2))
+                        }
+                        _ => None,
+                    };
                     let pos_usize = pos as usize;
                     let n_usize = n as usize;
                     borrowed.data.copy_within(
@@ -9029,6 +9068,8 @@ impl<'a> Btree<'a> {
                     );
                     borrowed.set_n_cells(n - 1);
                     borrowed.touch();
+                    borrowed.live_cache = live_after
+                        .map(|l| (borrowed.epoch, n - 1, borrowed.cell_content_start(), l));
                 }
                 self.pager.note_dirty(page_id);
                 Ok(true)

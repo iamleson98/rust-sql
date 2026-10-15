@@ -2077,6 +2077,7 @@ pub fn execute(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
         collect_affinity_sources(plan, &mut sources);
     }
     let _aff_scope = crate::executor::expr::AffinityScope::push(sources);
+    let _subq_scope = crate::executor::expr::SubqueryScope::reset();
     if ctx.explain_stats.is_some() {
         let depth = ctx.explain_depth;
         ctx.explain_depth = depth + 1;
@@ -6538,6 +6539,7 @@ fn exec_filter(ctx: &mut ExecContext<'_>, input: &Plan, predicate: &Expr) -> Res
         Plan::Scan { table, .. } => Some(&table.col_affinities),
         _ => None,
     };
+    let _subq_scope = crate::executor::expr::SubqueryScope::for_exprs([predicate]);
     for row in inner.rows {
         let v = match scan_affinities {
             Some(aff) => eval_row_aff_where(
