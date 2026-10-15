@@ -1158,7 +1158,72 @@ pub fn jb_from_bytes(b: &[u8]) -> Result<Jb, ()> {
 
 /// Is this blob a valid JSONB value?
 pub fn is_valid_jsonb(b: &[u8]) -> bool {
-    jb_from_bytes(b).is_ok()
+    jsonb_check(b).is_some()
+}
+
+/// Validate a JSONB blob WITHOUT building the tree — `decode_elem`'s
+/// acceptance rules exactly. `Some(canonical)`: valid, and `canonical`
+/// tells whether every header has the shortest form (`jb_to_bytes` of
+/// the decoded tree would then reproduce the blob byte for byte, since
+/// decoding keeps every scalar payload as-is). `None`: not valid JSONB.
+pub fn jsonb_check(b: &[u8]) -> Option<bool> {
+    fn min_hdr(len: usize) -> usize {
+        match len {
+            0..=11 => 1,
+            12..=0xff => 2,
+            0x100..=0xffff => 3,
+            0x1_0000..=0xffff_ffff => 5,
+            _ => 9,
+        }
+    }
+    // Returns (end, is_string_type) of the element at `pos`.
+    fn elem(b: &[u8], pos: usize, canon: &mut bool, depth: u32) -> Option<(usize, bool)> {
+        if depth > 2000 {
+            return None;
+        }
+        let (typ, len, hdr) = read_header(b, pos)?;
+        if hdr != min_hdr(len) {
+            *canon = false;
+        }
+        let ps = pos + hdr;
+        let pe = ps.checked_add(len)?;
+        if pe > b.len() {
+            return None;
+        }
+        match typ {
+            T_NULL | T_TRUE | T_FALSE => (len == 0).then_some((pe, false)),
+            T_INT | T_INT5 | T_FLOAT | T_FLOAT5 => {
+                std::str::from_utf8(&b[ps..pe]).ok()?;
+                Some((pe, false))
+            }
+            T_TEXT | T_TEXTJ | T_TEXT5 | T_TEXTRAW => Some((pe, true)),
+            T_ARRAY => {
+                let mut p = ps;
+                while p < pe {
+                    p = elem(b, p, canon, depth + 1)?.0;
+                }
+                (p == pe).then_some((pe, false))
+            }
+            T_OBJECT => {
+                let mut p = ps;
+                while p < pe {
+                    let (kp, is_str) = elem(b, p, canon, depth + 1)?;
+                    if !is_str || kp >= pe {
+                        return None;
+                    }
+                    p = elem(b, kp, canon, depth + 1)?.0;
+                }
+                (p == pe).then_some((pe, false))
+            }
+            _ => None,
+        }
+    }
+    if b.is_empty() {
+        return None;
+    }
+    let mut canon = true;
+    let (end, _) = elem(b, 0, &mut canon, 0)?;
+    (end == b.len()).then_some(canon)
 }
 
 // ---------------------------------------------------------------------------

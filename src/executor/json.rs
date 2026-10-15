@@ -421,6 +421,10 @@ fn json_fn(args: &[Value], out: Out) -> Result<Value, Error> {
             // JSONB-first; a valid JSONB blob round-trips VERBATIM
             // through jsonb() (SQLite's identity, even for non-shortest
             // headers), and renders as text through json().
+            if matches!(out, Out::Blob) && jsonb::jsonb_check(b).is_some() {
+                // Validation only — no tree for the verbatim copy.
+                return Ok(Value::Blob(b.clone()));
+            }
             match jsonb::jb_from_bytes(b) {
                 Ok(jb) => match out {
                     Out::Blob => Ok(Value::Blob(b.clone())),
@@ -484,6 +488,9 @@ fn json_object(args: &[Value], out: Out) -> Result<Value, Error> {
             "json_object() requires an even number of arguments".to_string(),
         ));
     }
+    if matches!(out, Out::Blob) {
+        return jsonb_object_spliced(args);
+    }
     let mut pairs = Vec::with_capacity(args.len() / 2);
     let mut i = 0;
     while i + 1 < args.len() {
@@ -504,6 +511,42 @@ fn json_object(args: &[Value], out: Out) -> Result<Value, Error> {
         i += 2;
     }
     Ok(out.emit(&Jb::Object(pairs)))
+}
+
+/// `jsonb_object(...)`: encode straight into the output payload. A
+/// canonical JSONB blob argument is copied verbatim — byte-identical to
+/// decoding and re-encoding it, without the tree (speedtest1 3:100 nests
+/// two ~45 KB JSONB values into each of 500 rows). A non-canonical one
+/// still re-encodes (SQLite shortens every header).
+fn jsonb_object_spliced(args: &[Value]) -> Result<Value, Error> {
+    let mut payload: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i + 1 < args.len() {
+        let key = match &args[i] {
+            Value::Null => {
+                return Err(Error::Runtime(
+                    "json_object() labels must be TEXT".to_string(),
+                ))
+            }
+            v => value_to_jb(v),
+        };
+        if !key.is_string() {
+            return Err(Error::Runtime(
+                "json_object() labels must be TEXT".to_string(),
+            ));
+        }
+        jsonb::encode_elem_pub(&mut payload, &key);
+        match &args[i + 1] {
+            Value::Blob(b) if jsonb::jsonb_check(b) == Some(true) => {
+                payload.extend_from_slice(b);
+            }
+            v => jsonb::encode_elem_pub(&mut payload, &value_to_jb(v)),
+        }
+        i += 2;
+    }
+    let mut out = Vec::with_capacity(payload.len() + 9);
+    jsonb::push_container(&mut out, jsonb::T_OBJECT, &payload);
+    Ok(Value::Blob(out))
 }
 
 /// `json_extract(X, P...)` / `jsonb_extract(...)`: single path → the value

@@ -1205,7 +1205,7 @@ pub(crate) fn journal_row_rewrite(
     rowid: i64,
     old_row: &Row,
 ) {
-    if let Some(t) = ctx.catalog().get_table(&table.name.to_ascii_lowercase()) {
+    if let Some(t) = ctx.catalog().get_table_fast(&table.name) {
         ctx.stmt_undo.push(StmtUndoEntry::Updated {
             table: t,
             rowid,
@@ -1226,7 +1226,7 @@ pub(crate) fn journal_row_rewrite_payload_owned(
     rowid: i64,
     old_payload: Vec<u8>,
 ) {
-    if let Some(t) = ctx.catalog().get_table(&table.name.to_ascii_lowercase()) {
+    if let Some(t) = ctx.catalog().get_table_fast(&table.name) {
         ctx.stmt_undo.push(StmtUndoEntry::Updated {
             table: t,
             rowid,
@@ -1241,7 +1241,7 @@ pub(crate) fn journal_row_rewrite_payload(
     rowid: i64,
     old_payload: &[u8],
 ) {
-    if let Some(t) = ctx.catalog().get_table(&table.name.to_ascii_lowercase()) {
+    if let Some(t) = ctx.catalog().get_table_fast(&table.name) {
         ctx.stmt_undo.push(StmtUndoEntry::Updated {
             table: t,
             rowid,

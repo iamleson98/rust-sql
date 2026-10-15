@@ -4349,6 +4349,7 @@ fn rewrite_rowid_single_member_in(e: &Expr, table: &Table) -> Expr {
                                 .rowid_alias
                                 .and_then(|idx| table.columns.get(idx))
                                 .map(|c| c.name.clone()),
+                            table,
                         )
                 }
                 _ => false,
@@ -4503,6 +4504,7 @@ fn rewrite_or_branches(e: &Expr, table: &Table) -> Expr {
                                 .rowid_alias
                                 .and_then(|idx| table.columns.get(idx))
                                 .map(|c| c.name.clone()),
+                            table,
                         )
                 }
                 _ => false,
@@ -4739,7 +4741,7 @@ fn apply_where_for_scan_inner(
             .and_then(|idx| table.columns.get(idx))
             .map(|c| c.name.clone());
         let rowid_eq = conjuncts.iter().any(|c| {
-            extract_eq_predicate(c).is_some_and(|(col, _)| is_rowid_col(&col, &alias_name))
+            extract_eq_predicate(c).is_some_and(|(col, _)| is_rowid_col(&col, &alias_name, table))
         });
         // Rowid IN-list: `WHERE id IN (v1, v2, ...)` — a batched
         // multi-seek instead of a full scan + per-row IN evaluation (which
@@ -5526,7 +5528,7 @@ fn try_rowid_range(
     for conjunct in conjuncts {
         // Try `col BETWEEN ? AND ?`
         if let Some((col, lo, hi)) = extract_between(conjunct) {
-            if is_rowid_col(&col, &rowid_col_name) {
+            if is_rowid_col(&col, &rowid_col_name, table) {
                 saw_rowid_ref = true;
                 if start.is_none() && end.is_none() {
                     start = Some(lo);
@@ -5539,7 +5541,7 @@ fn try_rowid_range(
         }
         // Try `col OP value` or `value OP col` for <, <=, >, >=
         if let Some((col, op, val)) = extract_range(conjunct) {
-            if is_rowid_col(&col, &rowid_col_name) {
+            if is_rowid_col(&col, &rowid_col_name, table) {
                 saw_rowid_ref = true;
                 match op.as_str() {
                     // `col > v` / `col < v`: the inclusive bound is a hint
@@ -5574,7 +5576,7 @@ fn try_rowid_range(
         // RowidLookup, but if there are other conjuncts we still want the
         // residual to capture them.
         if let Some((col, val)) = extract_eq_predicate(conjunct) {
-            if is_rowid_col(&col, &rowid_col_name) {
+            if is_rowid_col(&col, &rowid_col_name, table) {
                 saw_rowid_ref = true;
                 if start.is_none() && end.is_none() {
                     start = Some(val.clone());
@@ -5602,7 +5604,7 @@ fn try_rowid_range(
 
 /// Check if a column name (possibly with table qualifier) refers to the
 /// rowid-alias column or to the magic `rowid`/`_rowid_`/`oid` names.
-fn is_rowid_col(col_name: &str, rowid_alias_name: &Option<String>) -> bool {
+fn is_rowid_col(col_name: &str, rowid_alias_name: &Option<String>, table: &Table) -> bool {
     // Strip any table qualifier: "u.id" → "id".
     let bare = col_name.rsplit('.').next().unwrap_or(col_name);
     if let Some(alias) = rowid_alias_name {
@@ -5610,9 +5612,17 @@ fn is_rowid_col(col_name: &str, rowid_alias_name: &Option<String>) -> bool {
             return true;
         }
     }
-    bare.eq_ignore_ascii_case("rowid")
+    // `rowid` / `_rowid_` / `oid` name the rowid only when no declared
+    // column takes the name (SQLite: a real column shadows it — `CREATE
+    // TABLE r(rowid TEXT, v)` makes `r.rowid = '2'` a column compare, not
+    // a rowid seek).
+    (bare.eq_ignore_ascii_case("rowid")
         || bare.eq_ignore_ascii_case("_rowid_")
-        || bare.eq_ignore_ascii_case("oid")
+        || bare.eq_ignore_ascii_case("oid"))
+        && !table
+            .columns
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(bare))
 }
 
 /// Try to build an IndexRange plan from range predicates on the first
@@ -7061,11 +7071,24 @@ pub fn plan_column_refs(plan: &Plan) -> Vec<(Option<String>, String)> {
     match plan {
         Plan::Scan { table, alias, .. } => {
             let prefix = alias.clone().unwrap_or_else(|| table.name.clone());
-            table
+            let mut v: Vec<(Option<String>, String)> = table
                 .columns
                 .iter()
                 .map(|c| (Some(prefix.clone()), c.name.clone()))
-                .collect()
+                .collect();
+            // A rowid table also binds its rowid names: `j1.rowid = 1` in a
+            // join pushes into j1's side (a rowid seek) instead of staying
+            // a filter over the whole join (speedtest1 3:141 scanned j1
+            // once per CTE row). An unqualified `rowid` against two rowid
+            // tables binds both sides and stays at the top.
+            if !table.without_rowid {
+                for n in ["rowid", "_rowid_", "oid"] {
+                    if !table.columns.iter().any(|c| c.name.eq_ignore_ascii_case(n)) {
+                        v.push((Some(prefix.clone()), n.to_string()));
+                    }
+                }
+            }
+            v
         }
         Plan::Filter { input, .. } | Plan::Subquery { plan: input, .. } => plan_column_refs(input),
         Plan::Join { left, right, .. } => {
