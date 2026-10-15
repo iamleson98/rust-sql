@@ -183,6 +183,44 @@ fn cached_text_doc(t: &crate::types::Text) -> Result<std::rc::Rc<Jb>, Error> {
     Ok(doc)
 }
 
+/// `load_doc` for an editing caller: a TEXT document comes from the parse
+/// cache (a copy of the cached tree, or the tree itself when the cache
+/// does not hold it) — the UPDATE that edits a row has usually just read
+/// it (`SET x = json_set(x, '$.e', (x->>'f') - 1)`).
+fn load_doc_owned_cached(v: &Value) -> Result<Option<Jb>, Error> {
+    match v {
+        Value::Text(t) => {
+            let rc = cached_text_doc(t)?;
+            Ok(Some(
+                std::rc::Rc::try_unwrap(rc).unwrap_or_else(|rc| (*rc).clone()),
+            ))
+        }
+        other => load_doc(other),
+    }
+}
+
+/// `out.emit(&doc)`, and a TEXT result enters the parse cache with the
+/// tree already in hand: the edited row's expression-index keys and the
+/// next statement's reads of it then skip the re-parse.
+fn emit_cached(doc: Jb, out: Out) -> Value {
+    let v = out.emit(&doc);
+    if let Value::Text(t) = &v {
+        let bytes = t.as_bytes();
+        if bytes.len() >= DOC_CACHE_MIN {
+            let fp = doc_fingerprint(bytes);
+            let doc = std::rc::Rc::new(doc);
+            DOC_CACHE.with(|c| {
+                let mut c = c.borrow_mut();
+                if c.len() >= DOC_CACHE_SLOTS {
+                    c.remove(0);
+                }
+                c.push((fp, t.clone(), doc));
+            });
+        }
+    }
+    v
+}
+
 /// `load_doc` for read-only use: TEXT documents come from the parse
 /// cache without copying the tree.
 pub(crate) fn load_doc_shared(v: &Value) -> Result<Option<std::rc::Rc<Jb>>, Error> {
@@ -649,7 +687,7 @@ fn json_mutate(fname: &str, args: &[Value], out: Out) -> Result<Value, Error> {
             }
         }
     }
-    let Some(mut doc) = load_doc(&args[0])? else {
+    let Some(mut doc) = load_doc_owned_cached(&args[0])? else {
         return Ok(Value::Null);
     };
     let mut i = 1;
@@ -667,7 +705,7 @@ fn json_mutate(fname: &str, args: &[Value], out: Out) -> Result<Value, Error> {
         }
         i += 2;
     }
-    Ok(out.emit(&doc))
+    Ok(emit_cached(doc, out))
 }
 
 /// SQLite's mutation functions (json_set/insert/replace) insert SQL TEXT
@@ -710,7 +748,7 @@ fn json_remove(args: &[Value], out: Out) -> Result<Value, Error> {
             }
         }
     }
-    let Some(mut doc) = load_doc(&args[0])? else {
+    let Some(mut doc) = load_doc_owned_cached(&args[0])? else {
         return Ok(Value::Null);
     };
     for p in &args[1..] {
@@ -720,7 +758,7 @@ fn json_remove(args: &[Value], out: Out) -> Result<Value, Error> {
             None => return Ok(Value::Null), // path '$' removes the document
         }
     }
-    Ok(out.emit(&doc))
+    Ok(emit_cached(doc, out))
 }
 
 /// `json_valid(X)` (strict JSON) / `json_valid(X, flags)` — bit 1 = strict

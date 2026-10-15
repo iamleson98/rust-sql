@@ -4,7 +4,7 @@ An embedded SQL database written from scratch in Rust, built to match SQLite's b
 
 ## Beats SQLite
 
-- **Speed**: wins every time column of the 18-section torture matrix and all 18 rows of `bench_full_vs_sqlite`. Examples: full-scan aggregates 10x, top-N `ORDER BY` 9x, `GROUP BY` 4.6x, `LIKE '%…%'` scans 3x, large `IN` lists 3x, point lookups 1.2x, bulk load 1.4x, joins on computed keys (`b.y = a.x + 1`) 1.1–1.7x, cold open of a 1M-row file 2x.
+- **Speed**: wins all 18 rows of `bench_full_vs_sqlite`, every row of the other three CI benchmark gates (`bench_compare`, the criterion comparison, `bench_sqlx_native`), and 13 of the 15 timed sections of the 18-section torture matrix (random-key inserts are at parity; the five-index load is listed below). Examples: full-scan aggregates 10x, top-N `ORDER BY` 9x, `GROUP BY` 4.6x, `LIKE '%…%'` scans 3x, large `IN` lists 3x, point lookups 1.2x, bulk load 1.4x, joins on computed keys (`b.y = a.x + 1`) 1.1–1.7x, cold open of a 1M-row file 2x.
 - **Concurrency**: parallel readers 4–18x, parallel writers (`BEGIN CONCURRENT`) 3.2x, 8 readers + 2 writers 2.0x, 8-connection mixed read/write via sqlx 7–8x, single-query parallel aggregates 5.8–8.8x.
 - **Scale**: a 100M-row run against SQLite every night on Linux, Windows and macOS; the 100M-row file ends up 5% smaller than SQLite's.
 - **Correctness**: about 1,800 tests, including crash recovery, out-of-memory and I/O fault injection, corruption fuzzing, and differential fuzzing against real SQLite (over a million queries, compared value-for-value by storage class).
@@ -15,7 +15,8 @@ An embedded SQL database written from scratch in Rust, built to match SQLite's b
 - **Speed**:
   - mass `UPDATE` of an indexed column on macOS: about 1.4x slower at 2M rows, up to 1.95x at 100M rows on the CI Mac machines;
   - 4 readers + 1 writer on the CI Mac machines: 0.58–0.67x (it wins on x86);
-  - `GROUP BY` over 100k groups at the nightly scale-matrix size on Windows: 213 vs 140 ms.
+  - `GROUP BY` over 100k groups at the nightly scale-matrix size on Windows: 213 vs 140 ms;
+  - loading a table with five secondary indexes one row per statement (torture S12): about 0.8x on macOS (300 vs 240 ms for 100k rows). Integer index keys take 11 bytes against SQLite's 1–4, so the indexes split and rebalance more often.
 
 ## Remaining gaps
 

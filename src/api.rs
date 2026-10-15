@@ -5597,6 +5597,23 @@ impl Database {
                     columns.len()
                 )));
             }
+            // The previous statement's mapping when the same table object
+            // gets the exact same column list (a wide INSERT used to pay
+            // n linear name searches + an O(n^2) duplicate check per
+            // statement — speedtest1 1:100 names 120 columns in each of
+            // 6250 INSERTs). The cache holds the table Arc, so a pointer
+            // match is the same immutable schema object.
+            let reused = LAST_INSERT_COLS.with(|c| {
+                let c = c.borrow();
+                let (t, names, idx) = c.as_ref()?;
+                (Arc::ptr_eq(t, &table)
+                    && names.len() == columns.len()
+                    && names.iter().zip(columns.iter()).all(|(a, b)| a == b))
+                .then(|| idx.clone())
+            });
+            if let Some(idx) = reused {
+                return Ok(Some((table, idx)));
+            }
             let mut seen: Vec<usize> = Vec::with_capacity(columns.len());
             for name in columns.iter() {
                 match resolve_insert_column(&table, name) {
@@ -5615,6 +5632,13 @@ impl Database {
                     }
                 }
             }
+            LAST_INSERT_COLS.with(|c| {
+                *c.borrow_mut() = Some((
+                    Arc::clone(&table),
+                    columns.iter().map(|n| n.to_string()).collect(),
+                    seen.clone(),
+                ))
+            });
             seen
         };
         Ok(Some((table, col_indices)))
@@ -20108,6 +20132,13 @@ fn ddl_source_sql(sql: &str, index_like: bool) -> &str {
     } else {
         stripped
     }
+}
+
+thread_local! {
+    /// `fast_insert_target`'s last (table, exact column names, indices).
+    #[allow(clippy::type_complexity)]
+    static LAST_INSERT_COLS: std::cell::RefCell<Option<(Arc<crate::schema::Table>, Vec<String>, Vec<usize>)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Resolve one name from an INSERT column list to a column index.
