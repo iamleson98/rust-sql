@@ -18998,6 +18998,19 @@ impl Database {
         let result = (|| -> Result<()> {
             let root = ctx.table_root(table);
             let mut bt = Btree::new(ctx.pager, root, false);
+            if !crate::preupdate::armed() {
+                // No preupdate / session sink: an existence probe (no
+                // payload copy, no row decode), then the delete.
+                if bt.lookup_table_with(rowid, |_| Ok(()))?.is_none() {
+                    return Ok(()); // WHERE matched nothing: a no-op DELETE.
+                }
+                bt.delete_table(rowid)?;
+                if bt.root != root {
+                    ctx.set_table_root_lc(&table.name.to_ascii_lowercase(), bt.root);
+                }
+                changed = 1;
+                return Ok(());
+            }
             let old_payload = match bt.lookup_table(rowid)? {
                 crate::storage::btree::LookupResult::Found(p) => p,
                 crate::storage::btree::LookupResult::NotFound => {
