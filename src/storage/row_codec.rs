@@ -1068,6 +1068,28 @@ pub fn probe_int_column(
     }
 }
 
+/// The stored TEXT bytes of column `col` of a row payload, without
+/// building a Value (or UTF-8-validating them): `Some(bytes)` for a TEXT
+/// value (valid or raw-bytes form), `None` for every other storage class,
+/// a missing column (ALTER ADD COLUMN defaults live in the schema), the
+/// rowid alias, or a corrupt walk — callers then take the decoding path.
+pub fn probe_text_column(payload: &[u8], col: usize, rowid_alias: Option<usize>) -> Option<&[u8]> {
+    if rowid_alias == Some(col) {
+        return None;
+    }
+    let mut off = 0usize;
+    for _ in 0..col {
+        off += encoded_span(payload.get(off..)?)?;
+    }
+    let tag = *payload.get(off)?;
+    if tag != 0x07 && tag != 0x0B {
+        return None;
+    }
+    let (len, n) = crate::types::value::decode_uvarint(payload.get(off + 1..)?).ok()?;
+    let start = off + 1 + n;
+    payload.get(start..start.checked_add(len as usize)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

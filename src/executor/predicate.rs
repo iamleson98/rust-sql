@@ -305,6 +305,18 @@ fn pred_int(pv: &PredValue, row: &[Value], positions: &[usize], params: &[Value]
             Some(Value::Integer(n)) => Some(*n),
             _ => None,
         },
+        // NUMERIC comparison affinity leaves an INTEGER unchanged, so a
+        // bound parameter under an INTEGER/REAL/NUMERIC column (the
+        // shape of every `col BETWEEN ? AND ?`) still takes the fast
+        // path; TEXT/BLOB affinity declines.
+        PredValue::Coerce { inner, affinity } => {
+            use crate::types::Affinity as A;
+            if matches!(affinity, A::Integer | A::Real | A::Numeric) {
+                pred_int(inner, row, positions, params)
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -695,6 +707,36 @@ impl CompiledPredicate {
                 let b = &b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())];
                 crate::executor::expr::like_contains_bytes(b, needle)
             }
+        }
+    }
+}
+
+impl CompiledPredicate {
+    /// Decide the predicate from the raw row payload when that needs no
+    /// decoding: `Some(result)` when every deciding leaf could be read
+    /// straight from the stored bytes, `None` to decode and `eval`. Only
+    /// `col LIKE '%needle%'` over a stored TEXT value reads raw today —
+    /// the LIKE scans' rejected rows then cost one substring search, no
+    /// Value construction or UTF-8 validation.
+    #[inline]
+    pub(crate) fn raw_eval(&self, payload: &[u8], rowid_alias: Option<usize>) -> Option<bool> {
+        match self {
+            CompiledPredicate::LikeSubstr { col, needle } => {
+                let b = crate::storage::row_codec::probe_text_column(payload, *col, rowid_alias)?;
+                // C-string subject: LIKE stops at the first NUL byte.
+                let b = &b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())];
+                Some(crate::executor::expr::like_contains_bytes(b, needle))
+            }
+            // FALSE dominates an AND, so one raw FALSE decides it.
+            CompiledPredicate::And(a, b) => match a.raw_eval(payload, rowid_alias) {
+                Some(false) => Some(false),
+                ra => match (ra, b.raw_eval(payload, rowid_alias)) {
+                    (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                },
+            },
+            _ => None,
         }
     }
 }
@@ -1160,6 +1202,45 @@ pub(crate) fn compile_predicate(
     prefix: &str,
 ) -> Option<CompiledPredicate> {
     compile_predicate_at(e, table, prefix, true, false)
+}
+
+/// `compile_predicate`, then specialised to this execution's bound
+/// parameters: `col LIKE ?` bound to a `%needle%` pattern takes the same
+/// pre-classified substring search as the literal pattern (speedtest1's
+/// LIKE scans bind every pattern) instead of re-classifying the pattern
+/// on every row.
+pub(crate) fn compile_predicate_bound(
+    e: &Expr,
+    table: &crate::schema::Table,
+    prefix: &str,
+    params: &[Value],
+) -> Option<CompiledPredicate> {
+    let mut p = compile_predicate(e, table, prefix)?;
+    bind_params(&mut p, params);
+    Some(p)
+}
+
+fn bind_params(p: &mut CompiledPredicate, params: &[Value]) {
+    match p {
+        CompiledPredicate::And(a, b) | CompiledPredicate::Or(a, b) => {
+            bind_params(a, params);
+            bind_params(b, params);
+        }
+        CompiledPredicate::Not(a) => bind_params(a, params),
+        CompiledPredicate::Like {
+            col,
+            pattern: PredValue::Param(i),
+            negated: false,
+            glob: false,
+        } => {
+            if let Some(Value::Text(t)) = params.get(*i) {
+                if let Some(needle) = classify_contains(t.as_bytes()) {
+                    *p = CompiledPredicate::LikeSubstr { col: *col, needle };
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// `seekable`: `e` sits where SQLite could drive an IN-loop with it — an

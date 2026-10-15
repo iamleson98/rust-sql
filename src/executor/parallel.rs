@@ -515,8 +515,9 @@ pub(crate) fn try_parallel_distinct_aggregate(
 
     // Filter: must compile positionally (the serial compiled path's own
     // gate); an uncompilable predicate declines.
-    let compiled = filter_predicate
-        .and_then(|p| crate::executor::predicate::compile_predicate(p, table, prefix));
+    let compiled = filter_predicate.and_then(|p| {
+        crate::executor::predicate::compile_predicate_bound(p, table, prefix, &ctx.params)
+    });
 
     let root = ctx.table_root(table);
     let split = match plan_range_split(ctx, root)? {

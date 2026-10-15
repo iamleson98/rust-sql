@@ -6608,8 +6608,12 @@ fn exec_filter(ctx: &mut ExecContext<'_>, input: &Plan, predicate: &Expr) -> Res
     // name lookups of eval_row when the predicate shape is supported.
     if let Plan::Scan { table, alias, .. } = input {
         let prefix = alias.as_deref().unwrap_or(&table.name);
-        if let Some(pred) = crate::executor::predicate::compile_predicate(predicate, table, prefix)
-        {
+        if let Some(pred) = crate::executor::predicate::compile_predicate_bound(
+            predicate,
+            table,
+            prefix,
+            &ctx.params,
+        ) {
             let n_cols = table.n_columns();
             let positions: Vec<usize> = (0..n_cols).collect();
             let params: &[Value] = &ctx.params;
@@ -6776,21 +6780,24 @@ fn scan_filter_limit(
     }
     let prefix = alias.as_deref().unwrap_or(&table.name);
     let pred = match predicate {
-        Some(p) => match crate::executor::predicate::compile_predicate(p, table, prefix) {
-            Some(c) => Some(c),
-            None => {
-                // A LIMIT still stops the scan for a predicate that does
-                // not compile (function calls, CASE, …): rows past the
-                // k-th match are never read — nor evaluated, so they
-                // cannot raise (SQLite's loop ends at the LIMIT).
-                return match stop_after {
-                    Some(stop) if !expr_has_subquery(p) => {
-                        scan_eval_filter_limit(ctx, table, alias, p, stop).map(Some)
-                    }
-                    _ => Ok(None),
-                };
+        Some(p) => {
+            match crate::executor::predicate::compile_predicate_bound(p, table, prefix, &ctx.params)
+            {
+                Some(c) => Some(c),
+                None => {
+                    // A LIMIT still stops the scan for a predicate that does
+                    // not compile (function calls, CASE, …): rows past the
+                    // k-th match are never read — nor evaluated, so they
+                    // cannot raise (SQLite's loop ends at the LIMIT).
+                    return match stop_after {
+                        Some(stop) if !expr_has_subquery(p) => {
+                            scan_eval_filter_limit(ctx, table, alias, p, stop).map(Some)
+                        }
+                        _ => Ok(None),
+                    };
+                }
             }
-        },
+        }
         None => None, // accept every row
     };
     let n_cols = table.n_columns();
@@ -6832,19 +6839,25 @@ fn scan_filter_limit(
             let mut sel_buf: Vec<Value> = Vec::with_capacity(wanted.len());
             let stop = stop_after;
             scan_table_rows(ctx, table, false, |rowid, payload| {
-                if let Err(e) = crate::storage::row_codec::decode_row_selective(
-                    payload,
-                    n_cols,
-                    &wanted,
-                    rowid,
-                    rowid_alias,
-                    &mut sel_buf,
-                ) {
-                    decode_err = Some(e);
-                    return false;
-                }
-                if !pred.eval(&sel_buf, &positions, params) {
-                    return true; // non-matching row: cost = selective decode only
+                match pred.raw_eval(payload, rowid_alias) {
+                    Some(false) => return true, // decided on the stored bytes
+                    Some(true) => {}
+                    None => {
+                        if let Err(e) = crate::storage::row_codec::decode_row_selective(
+                            payload,
+                            n_cols,
+                            &wanted,
+                            rowid,
+                            rowid_alias,
+                            &mut sel_buf,
+                        ) {
+                            decode_err = Some(e);
+                            return false;
+                        }
+                        if !pred.eval(&sel_buf, &positions, params) {
+                            return true; // non-matching row: cost = selective decode only
+                        }
+                    }
                 }
                 // Matching row: materialize the full row for output.
                 match decode_row(payload, n_cols, rowid, rowid_alias) {
@@ -12061,8 +12074,9 @@ pub(crate) fn scan_groupby_grouper(
         // The filter, however, may still COMPILE: evaluate it positionally
         // against the full row (identity positions) instead of walking the
         // AST with per-row name lookups.
-        let compiled_filter = filter_predicate
-            .and_then(|p| crate::executor::predicate::compile_predicate(p, &table, prefix));
+        let compiled_filter = filter_predicate.and_then(|p| {
+            crate::executor::predicate::compile_predicate_bound(p, &table, prefix, &ctx.params)
+        });
         let identity: Vec<usize> = (0..n_cols).collect();
 
         // ---- Compiled-expression fast path ------------------------------
@@ -13923,8 +13937,9 @@ fn exec_aggregate_no_group_by(
     let compiled = if has_agg_filter {
         None
     } else {
-        filter_predicate
-            .and_then(|p| crate::executor::predicate::compile_predicate(p, &table, prefix))
+        filter_predicate.and_then(|p| {
+            crate::executor::predicate::compile_predicate_bound(p, &table, prefix, &ctx.params)
+        })
     };
     if let Some(pred) = compiled {
         // Eligible when every aggregate is COUNT(*) (no arg) or has a
@@ -13941,10 +13956,51 @@ fn exec_aggregate_no_group_by(
                     || idx.is_some()
                     || agg.arg.as_ref().is_some_and(|a| !expr_has_subquery(a))
             });
+        // `length(col)` arguments (speedtest1's `sum(length(c))`) read
+        // their column from the selective aggregate decode instead of
+        // decoding the whole row for an AST walk per matching row.
+        let agg_len_col: Vec<Option<usize>> = aggregates
+            .iter()
+            .map(|agg| match &agg.arg {
+                Some(Expr::Function {
+                    name,
+                    args,
+                    distinct: false,
+                    filter: None,
+                    over: None,
+                    order_by,
+                }) if args.len() == 1
+                    && order_by.is_empty()
+                    && name.eq_ignore_ascii_case("length") =>
+                {
+                    match &args[0] {
+                        Expr::Column { table: ref_t, name } => {
+                            let matches = ref_t
+                                .as_ref()
+                                .map(|t| {
+                                    if prefix == table.name {
+                                        t == &table.name || t == prefix
+                                    } else {
+                                        t == prefix
+                                    }
+                                })
+                                .unwrap_or(true);
+                            if matches {
+                                table.find_column(name)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect();
         let full_on_match = aggregates
             .iter()
-            .zip(agg_col_indices.iter())
-            .any(|(agg, idx)| agg.arg.is_some() && idx.is_none());
+            .zip(agg_col_indices.iter().zip(agg_len_col.iter()))
+            .any(|(agg, (idx, len))| agg.arg.is_some() && idx.is_none() && len.is_none());
         if agg_ok {
             // TWO decode phases: the predicate's columns for every row,
             // the aggregates' columns only for rows that pass — a
@@ -13959,7 +14015,11 @@ fn exec_aggregate_no_group_by(
             for (pos, &c) in wanted.iter().enumerate() {
                 positions[c] = pos;
             }
-            let mut agg_wanted: Vec<usize> = agg_col_indices.iter().filter_map(|x| *x).collect();
+            let mut agg_wanted: Vec<usize> = agg_col_indices
+                .iter()
+                .chain(agg_len_col.iter())
+                .filter_map(|x| *x)
+                .collect();
             agg_wanted.sort_unstable();
             agg_wanted.dedup();
             let mut agg_positions = vec![usize::MAX; n_cols];
@@ -13972,6 +14032,10 @@ fn exec_aggregate_no_group_by(
                 .iter()
                 .map(|a| a.map(|c| agg_positions[c]).unwrap_or(usize::MAX))
                 .collect();
+            let agg_len_pos: Vec<usize> = agg_len_col
+                .iter()
+                .map(|a| a.map(|c| agg_positions[c]).unwrap_or(usize::MAX))
+                .collect();
 
             let params = &ctx.params;
             let named_params = &ctx.named_params;
@@ -13981,14 +14045,25 @@ fn exec_aggregate_no_group_by(
             let rowid_alias = table.rowid_alias;
             let mut decode_err: Option<Error> = None;
             scan_table_maybe_range(ctx, &table, range, false, |rowid, payload| {
-                if let Err(e) =
-                    decode_row_selective(payload, n_cols, &wanted, rowid, rowid_alias, &mut sel_buf)
-                {
-                    decode_err = Some(e);
-                    return false;
-                }
-                if !pred.eval(&sel_buf, &positions, params) {
-                    return true;
+                match pred.raw_eval(payload, rowid_alias) {
+                    Some(false) => return true,
+                    Some(true) => {}
+                    None => {
+                        if let Err(e) = decode_row_selective(
+                            payload,
+                            n_cols,
+                            &wanted,
+                            rowid,
+                            rowid_alias,
+                            &mut sel_buf,
+                        ) {
+                            decode_err = Some(e);
+                            return false;
+                        }
+                        if !pred.eval(&sel_buf, &positions, params) {
+                            return true;
+                        }
+                    }
                 }
                 saw_any_row = true;
                 if !agg_wanted.is_empty() {
@@ -14018,7 +14093,13 @@ fn exec_aggregate_no_group_by(
                 }
                 for i in 0..aggregates.len() {
                     let computed: Value;
-                    let arg_val: &Value = if agg_pos[i] == usize::MAX {
+                    let arg_val: &Value = if agg_len_pos[i] != usize::MAX {
+                        computed = match agg_buf.get(agg_len_pos[i]) {
+                            Some(Value::Null) | None => Value::Null,
+                            Some(v) => Value::Integer(v.length()),
+                        };
+                        &computed
+                    } else if agg_pos[i] == usize::MAX {
                         match (&aggregates[i].arg, columns_ref) {
                             (Some(arg), Some(cols)) => {
                                 match eval_row(arg, &full_buf, cols, params, named_params) {
