@@ -6632,13 +6632,12 @@ fn exec_filter(ctx: &mut ExecContext<'_>, input: &Plan, predicate: &Expr) -> Res
         Plan::Scan { table, .. } => Some(&table.col_affinities),
         _ => None,
     };
-    let _subq_scope = crate::executor::expr::SubqueryScope::for_exprs([predicate]);
-    let _slots = crate::executor::expr::SlotScope::for_exprs([predicate], &inner.columns);
-    // The predicate's leaves compiled against this layout (the per-row
-    // contexts below are built the same way: same names, same affinities).
+    // The predicate's flags, slots and compiled leaves for this layout
+    // (the per-row contexts below are built the same way: same names,
+    // same affinities) — cached across runs of the same plan.
     let compile_ctx = EvalContext::new(&[], &inner.columns, &ctx.params, &ctx.named_params)
         .with_affinities(scan_affinities);
-    let _compiled = crate::executor::expr::CompiledScope::for_condition(predicate, &compile_ctx);
+    let _scope = crate::executor::expr::OperatorScope::condition(predicate, &compile_ctx);
     for row in inner.rows {
         let v = match scan_affinities {
             Some(aff) => eval_row_aff_where(
@@ -7197,9 +7196,9 @@ fn apply_projection(
                     && !matches!(&c.expr, Expr::Column { name, .. } if name == "*")
             })
             .map(|(_, c)| &c.expr);
-        let _subq_scope = crate::executor::expr::SubqueryScope::for_exprs(computed.clone());
+        let computed: Vec<&Expr> = computed.collect();
         let compile_ctx = EvalContext::new(&[], &inner.columns, &ctx.params, &ctx.named_params);
-        let _compiled = crate::executor::expr::CompiledScope::for_values(computed, &compile_ctx);
+        let _scope = crate::executor::expr::OperatorScope::values(&computed, &compile_ctx);
         for row in &inner.rows {
             let mut out = Vec::with_capacity(out_columns.len());
             for (i, c) in columns.iter().enumerate() {

@@ -1286,29 +1286,7 @@ fn for_each_column<'e>(e: &'e Expr, f: &mut dyn FnMut(&'e Expr)) {
 pub(crate) struct SlotScope(Option<SlotTable>);
 
 impl SlotScope {
-    /// Resolve every column reference of `exprs` against `columns` with
-    /// the evaluator's own LOCAL rules (`resolve_qualified_local` /
-    /// `resolve_main_local`); references that resolve nowhere locally
-    /// (correlated outer refs, misses) keep the per-row lookup.
-    pub(crate) fn for_exprs<'e>(
-        exprs: impl IntoIterator<Item = &'e Expr>,
-        columns: &[String],
-    ) -> Self {
-        let empty_params: HashMap<String, Value> = HashMap::new();
-        let probe = EvalContext::new(&[], columns, &[], &empty_params);
-        let mut entries: Vec<(usize, u32)> = Vec::new();
-        for e in exprs {
-            for_each_column(e, &mut |c| {
-                if let Expr::Column { table, name } = c {
-                    let i = match table {
-                        Some(t) => probe.resolve_qualified_local(t, name),
-                        None => probe.resolve_main_local(name),
-                    };
-                    // u32::MAX: resolves nowhere locally (an outer ref).
-                    entries.push((c as *const Expr as usize, i.map_or(u32::MAX, |i| i as u32)));
-                }
-            });
-        }
+    fn install(entries: Vec<(usize, u32)>, columns: &[String]) -> Self {
         let table = SlotTable {
             names: (columns.as_ptr() as usize, columns.len()),
             entries,
@@ -1317,6 +1295,26 @@ impl SlotScope {
             SLOTS.with(|s| std::mem::replace(&mut *s.borrow_mut(), table)),
         ))
     }
+}
+
+/// Column slots of `exprs` against `columns` (see `SlotScope::for_exprs`);
+/// u32::MAX marks a reference that resolves nowhere locally (an outer ref).
+fn slot_entries(exprs: &[&Expr], columns: &[String]) -> Vec<(usize, u32)> {
+    let empty_params: HashMap<String, Value> = HashMap::new();
+    let probe = EvalContext::new(&[], columns, &[], &empty_params);
+    let mut entries: Vec<(usize, u32)> = Vec::new();
+    for e in exprs.iter().copied() {
+        for_each_column(e, &mut |c| {
+            if let Expr::Column { table, name } = c {
+                let i = match table {
+                    Some(t) => probe.resolve_qualified_local(t, name),
+                    None => probe.resolve_main_local(name),
+                };
+                entries.push((c as *const Expr as usize, i.map_or(u32::MAX, |i| i as u32)));
+            }
+        });
+    }
+    entries
 }
 
 impl Drop for SlotScope {
@@ -1385,7 +1383,24 @@ enum CExpr {
     Func {
         name: String,
         args: Vec<CExpr>,
+        /// The builtin resolved at compile time (the name match in
+        /// `call_scalar` runs per call otherwise; builtins win over user
+        /// functions there too, so the binding is the same).
+        direct: Option<BuiltinFn>,
     },
+}
+
+/// A builtin scalar's implementation.
+type BuiltinFn = fn(&[Value]) -> Result<Value>;
+
+fn direct_builtin(name: &str) -> Option<BuiltinFn> {
+    Some(match name {
+        "substr" | "substring" => scalar_substr,
+        "instr" => scalar_instr,
+        "length" => scalar_length,
+        "abs" => scalar_abs,
+        _ => return None,
+    })
 }
 
 /// Function names whose evaluation is more than "evaluate the arguments
@@ -1490,6 +1505,7 @@ impl CExpr {
                     return fallback();
                 }
                 CExpr::Func {
+                    direct: direct_builtin(&lname),
                     name: lname,
                     args: args.iter().map(|a| CExpr::compile(a, ctx)).collect(),
                 }
@@ -1597,13 +1613,14 @@ impl CExpr {
                     ))),
                 }
             }
-            CExpr::Func { name, args } => {
+            CExpr::Func { name, args, direct } => {
                 // Context-resident arguments are passed as SHALLOW copies
                 // that are never dropped (`call_scalar` only reads its
                 // arguments; anything it returns is a fresh value): no
                 // clone of a long TEXT argument per call. Computed
-                // arguments are owned and dropped normally.
-                let mut vals: Vec<std::mem::ManuallyDrop<Value>> = Vec::with_capacity(args.len());
+                // arguments are owned and dropped normally. Up to four
+                // arguments live on the stack.
+                let mut vals: smallvec_args::Args = smallvec_args::Args::new();
                 let mut owned: u64 = 0;
                 let res = (|| {
                     for (k, a) in args.iter().enumerate() {
@@ -1623,19 +1640,76 @@ impl CExpr {
                             }
                         }
                     }
-                    // SAFETY: ManuallyDrop<Value> is repr(transparent).
-                    let as_values: &[Value] = unsafe {
-                        std::slice::from_raw_parts(vals.as_ptr() as *const Value, vals.len())
-                    };
-                    call_scalar(name, as_values)
-                })();
-                for (k, v) in vals.iter_mut().enumerate() {
-                    if k < 64 && owned & (1 << k) != 0 {
-                        // SAFETY: owned values are dropped exactly once.
-                        unsafe { std::mem::ManuallyDrop::drop(v) };
+                    let as_values: &[Value] = vals.as_values();
+                    match direct {
+                        Some(f) => f(as_values),
+                        None => call_scalar(name, as_values),
                     }
-                }
+                })();
+                vals.drop_owned(owned);
                 res
+            }
+        }
+    }
+}
+
+/// The compiled evaluator's argument buffer: ManuallyDrop values (shallow
+/// copies of context-resident operands are never dropped), inline for up
+/// to four arguments.
+mod smallvec_args {
+    use crate::types::Value;
+    use std::mem::ManuallyDrop;
+
+    pub(super) enum Args {
+        Inline(usize, [ManuallyDrop<Value>; 4]),
+        Heap(Vec<ManuallyDrop<Value>>),
+    }
+
+    impl Args {
+        pub(super) fn new() -> Self {
+            const N: ManuallyDrop<Value> = ManuallyDrop::new(Value::Null);
+            Args::Inline(0, [N; 4])
+        }
+        pub(super) fn push(&mut self, v: ManuallyDrop<Value>) {
+            match self {
+                Args::Inline(n, a) if *n < 4 => {
+                    a[*n] = v;
+                    *n += 1;
+                }
+                Args::Inline(n, a) => {
+                    let mut h: Vec<ManuallyDrop<Value>> = Vec::with_capacity(8);
+                    for x in a.iter_mut().take(*n) {
+                        // SAFETY: moved out once; the inline slot is
+                        // forgotten (Args is replaced below).
+                        h.push(ManuallyDrop::new(unsafe { ManuallyDrop::take(x) }));
+                    }
+                    h.push(v);
+                    *self = Args::Heap(h);
+                }
+                Args::Heap(h) => h.push(v),
+            }
+        }
+        fn slots(&mut self) -> &mut [ManuallyDrop<Value>] {
+            match self {
+                Args::Inline(n, a) => &mut a[..*n],
+                Args::Heap(h) => h,
+            }
+        }
+        pub(super) fn as_values(&self) -> &[Value] {
+            let s: &[ManuallyDrop<Value>] = match self {
+                Args::Inline(n, a) => &a[..*n],
+                Args::Heap(h) => h,
+            };
+            // SAFETY: ManuallyDrop<Value> is repr(transparent).
+            unsafe { std::slice::from_raw_parts(s.as_ptr() as *const Value, s.len()) }
+        }
+        /// Drop the arguments the bitmask marks as owned (once).
+        pub(super) fn drop_owned(&mut self, owned: u64) {
+            for (k, v) in self.slots().iter_mut().enumerate() {
+                if k < 64 && owned & (1 << k) != 0 {
+                    // SAFETY: owned values are dropped exactly once.
+                    unsafe { ManuallyDrop::drop(v) };
+                }
             }
         }
     }
@@ -1659,37 +1733,6 @@ thread_local! {
 pub(crate) struct CompiledScope(Option<(CompiledTable, bool)>);
 
 impl CompiledScope {
-    /// Compile a CONDITION: its jump structure (AND / OR / NOT / truth
-    /// tests / BETWEEN) stays with the condition evaluator; every leaf it
-    /// evaluates is compiled. `ctx` must be built like the per-row
-    /// contexts (same column names, same affinities). Subquery-holding
-    /// expressions are not compiled (their evaluation order is subtle).
-    pub(crate) fn for_condition(e: &Expr, ctx: &EvalContext<'_>) -> Self {
-        let mut entries = Vec::new();
-        // The enclosing SubqueryScope already proved it subquery-free
-        // (one walk per execution, not two).
-        let free = SUBQUERY_FREE.with(|c| c.get()) || !contains_subquery(e);
-        if free {
-            register_condition(e, ctx, &mut entries);
-        }
-        Self::install(ctx, entries)
-    }
-
-    /// Compile VALUE expressions (projection columns).
-    pub(crate) fn for_values<'e>(
-        exprs: impl IntoIterator<Item = &'e Expr>,
-        ctx: &EvalContext<'_>,
-    ) -> Self {
-        let mut entries = Vec::new();
-        let free = SUBQUERY_FREE.with(|c| c.get());
-        for e in exprs {
-            if free || !contains_subquery(e) {
-                register_value(e, ctx, &mut entries);
-            }
-        }
-        Self::install(ctx, entries)
-    }
-
     fn install(ctx: &EvalContext<'_>, entries: Vec<(usize, CExpr)>) -> Self {
         let active = !entries.is_empty();
         let table = CompiledTable {
@@ -1707,6 +1750,358 @@ impl Drop for CompiledScope {
         if let Some((t, a)) = self.0.take() {
             COMPILED.with(|c| *c.borrow_mut() = t);
             COMPILED_ACTIVE.with(|c| c.set(a));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Operator scopes, cached across executions
+// ---------------------------------------------------------------------------
+//
+// A correlated subquery's cached plan runs once per OUTER row (SQLite
+// compiles it into the outer statement once): rebuilding an operator's
+// subquery / COLLATE flags, column slots and compiled expressions on every
+// run cost about as much as evaluating them. The cache keys them by the
+// expression tree's identity — the roots' addresses plus a SIGNATURE that
+// hashes every node's address AND content — and by everything the
+// construction read (column names, affinities, the collation registry's
+// state). A hit therefore means the very same live tree, so the compiled
+// form's internal pointers are valid.
+
+/// A fast (FxHash-style) hasher for the scope signature: it is computed
+/// on every operator run, where SipHash cost as much as recompiling.
+#[derive(Default)]
+struct SigHasher(u64);
+
+impl std::hash::Hasher for SigHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            self.write_u64(u64::from_le_bytes(c.try_into().unwrap()));
+        }
+        let mut tail = [0u8; 8];
+        let r = chunks.remainder();
+        tail[..r.len()].copy_from_slice(r);
+        self.write_u64(u64::from_le_bytes(tail) ^ ((r.len() as u64) << 56));
+    }
+    #[inline]
+    fn write_u64(&mut self, v: u64) {
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+    #[inline]
+    fn write_usize(&mut self, v: usize) {
+        self.write_u64(v as u64);
+    }
+    #[inline]
+    fn write_u8(&mut self, v: u8) {
+        self.write_u64(v as u64);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+fn sig_node(e: &Expr, h: &mut SigHasher) {
+    use std::hash::Hash;
+    (e as *const Expr as usize).hash(h);
+    std::mem::discriminant(e).hash(h);
+    match e {
+        Expr::Literal(v) => value_sig(v, h),
+        Expr::Parameter(p) => p.hash(h),
+        Expr::Column { table, name } => {
+            table.hash(h);
+            name.hash(h);
+        }
+        Expr::Binary { op, .. } => std::mem::discriminant(op).hash(h),
+        Expr::Unary { op, .. } => {
+            std::mem::discriminant(op).hash(h);
+            if let UnaryOp::Truth { truth, negated } = op {
+                truth.hash(h);
+                negated.hash(h);
+            }
+        }
+        Expr::Between { negated, .. }
+        | Expr::IsNull { negated, .. }
+        | Expr::Is { negated, .. }
+        | Expr::In { negated, .. } => negated.hash(h),
+        Expr::Like { op, negated, .. } => {
+            std::mem::discriminant(op).hash(h);
+            negated.hash(h);
+        }
+        Expr::Function {
+            name,
+            distinct,
+            over,
+            order_by,
+            ..
+        } => {
+            name.hash(h);
+            distinct.hash(h);
+            over.is_some().hash(h);
+            order_by.len().hash(h);
+        }
+        Expr::Cast { type_name, .. } => type_name.hash(h),
+        Expr::Collate { collation, .. } => collation.hash(h),
+        Expr::Subquery(s) | Expr::Exists(s) => (&**s as *const SelectStatement as usize).hash(h),
+        Expr::Case { .. } | Expr::Row(_) | Expr::Raise { .. } => {}
+    }
+}
+
+fn value_sig(v: &Value, h: &mut SigHasher) {
+    use std::hash::Hash;
+    match v {
+        Value::Null => 0u8.hash(h),
+        Value::Integer(i) => (1u8, i).hash(h),
+        Value::Real(f) => (2u8, f.to_bits()).hash(h),
+        Value::Text(t) => (3u8, t.as_bytes()).hash(h),
+        Value::Blob(b) => (4u8, b.as_slice()).hash(h),
+    }
+}
+
+/// Every node of `e` (subqueries are leaves), parent first.
+fn sig_walk(e: &Expr, h: &mut SigHasher) {
+    sig_node(e, h);
+    match e {
+        Expr::Binary { left, right, .. } | Expr::Is { left, right, .. } => {
+            sig_walk(left, h);
+            sig_walk(right, h);
+        }
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. } => sig_walk(expr, h),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            sig_walk(expr, h);
+            sig_walk(low, h);
+            sig_walk(high, h);
+        }
+        Expr::In { expr, source, .. } => {
+            sig_walk(expr, h);
+            // Table / subquery sources: their identity is enough.
+            if let InSource::List(l) = source {
+                for x in l.iter() {
+                    sig_walk(x, h);
+                }
+            }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            sig_walk(expr, h);
+            sig_walk(pattern, h);
+            if let Some(x) = escape {
+                sig_walk(x, h);
+            }
+        }
+        Expr::Function {
+            args,
+            filter,
+            order_by,
+            ..
+        } => {
+            for x in args {
+                sig_walk(x, h);
+            }
+            if let Some(x) = filter {
+                sig_walk(x, h);
+            }
+            for t in order_by {
+                sig_walk(&t.expr, h);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(x) = operand {
+                sig_walk(x, h);
+            }
+            for (w, t) in whens {
+                sig_walk(w, h);
+                sig_walk(t, h);
+            }
+            if let Some(x) = else_ {
+                sig_walk(x, h);
+            }
+        }
+        Expr::Row(items) => {
+            for x in items {
+                sig_walk(x, h);
+            }
+        }
+        Expr::Raise { message, .. } => {
+            if let Some(x) = message {
+                sig_walk(x, h);
+            }
+        }
+        Expr::Literal(_)
+        | Expr::Parameter(_)
+        | Expr::Column { .. }
+        | Expr::Subquery(_)
+        | Expr::Exists(_) => {}
+    }
+}
+
+/// Everything an operator scope's construction read, besides the tree.
+#[derive(PartialEq)]
+struct ScopeInputs {
+    names: Vec<String>,
+    affinities: Option<Vec<crate::types::Affinity>>,
+    collated_frames: u32,
+    collate_seen: bool,
+    condition: bool,
+}
+
+struct CachedScope {
+    roots: Vec<usize>,
+    sig: u64,
+    inputs: ScopeInputs,
+    subq_free: bool,
+    coll_free: bool,
+    slots: Vec<(usize, u32)>,
+    compiled: Vec<(usize, CExpr)>,
+}
+
+thread_local! {
+    static SCOPE_CACHE: std::cell::RefCell<Vec<CachedScope>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Cap on cached operator scopes per thread (oldest evicted first).
+const SCOPE_CACHE_CAP: usize = 64;
+
+/// One operator's evaluation scopes (subquery / COLLATE flags, column
+/// slots, compiled expressions) for its row loop — built once, or taken
+/// from the cache when the same live expression tree runs again under
+/// the same inputs; returned to the cache on drop.
+pub(crate) struct OperatorScope {
+    key: Option<(Vec<usize>, u64, ScopeInputs)>,
+    compiled: Option<CompiledScope>,
+    slots: Option<SlotScope>,
+    flags: Option<SubqueryScope>,
+}
+
+impl OperatorScope {
+    /// Scopes for a CONDITION evaluated per row over `ctx`'s layout.
+    pub(crate) fn condition(e: &Expr, ctx: &EvalContext<'_>) -> Self {
+        Self::build(&[e], ctx, true)
+    }
+
+    /// Scopes for VALUE expressions evaluated per row.
+    pub(crate) fn values(exprs: &[&Expr], ctx: &EvalContext<'_>) -> Self {
+        Self::build(exprs, ctx, false)
+    }
+
+    fn build(exprs: &[&Expr], ctx: &EvalContext<'_>, condition: bool) -> Self {
+        let mut h = SigHasher::default();
+        for e in exprs {
+            sig_walk(e, &mut h);
+        }
+        let sig = std::hash::Hasher::finish(&h);
+        let collated_frames = COLLATED_FRAMES.with(|c| c.get());
+        let collate_seen =
+            crate::sql::lexer::COLLATE_SEEN.load(std::sync::atomic::Ordering::Relaxed);
+        // Compared borrowed (no per-run clone of the names); owned copies
+        // are made only for a new entry.
+        let same = |x: &CachedScope| {
+            x.sig == sig
+                && x.roots.len() == exprs.len()
+                && x.roots
+                    .iter()
+                    .zip(exprs)
+                    .all(|(r, e)| *r == *e as *const Expr as usize)
+                && x.inputs.names.as_slice() == ctx.column_names
+                && x.inputs.affinities.as_deref() == ctx.column_affinities
+                && x.inputs.collated_frames == collated_frames
+                && x.inputs.collate_seen == collate_seen
+                && x.inputs.condition == condition
+        };
+        let hit = SCOPE_CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            let i = c.iter().position(same)?;
+            Some(c.remove(i))
+        });
+        let (roots, inputs, subq_free, coll_free, slots, compiled) = match hit {
+            Some(h) => (
+                h.roots,
+                h.inputs,
+                h.subq_free,
+                h.coll_free,
+                h.slots,
+                h.compiled,
+            ),
+            None => {
+                let roots: Vec<usize> = exprs.iter().map(|e| *e as *const Expr as usize).collect();
+                let inputs = ScopeInputs {
+                    names: ctx.column_names.to_vec(),
+                    affinities: ctx.column_affinities.map(|a| a.to_vec()),
+                    collated_frames,
+                    collate_seen,
+                    condition,
+                };
+                let subq_free = !exprs.iter().any(|e| contains_subquery(e));
+                let coll_free = !exprs.iter().any(|e| contains_collate(e));
+                let slots = slot_entries(exprs, ctx.column_names);
+                let mut compiled = Vec::new();
+                if subq_free {
+                    for e in exprs {
+                        if condition {
+                            register_condition(e, ctx, &mut compiled);
+                        } else {
+                            register_value(e, ctx, &mut compiled);
+                        }
+                    }
+                }
+                (roots, inputs, subq_free, coll_free, slots, compiled)
+            }
+        };
+        let flags = SubqueryScope::from_flags(subq_free, coll_free);
+        let slots = SlotScope::install(slots, ctx.column_names);
+        let compiled = CompiledScope::install(ctx, compiled);
+        OperatorScope {
+            key: Some((roots, sig, inputs)),
+            compiled: Some(compiled),
+            slots: Some(slots),
+            flags: Some(flags),
+        }
+    }
+}
+
+impl Drop for OperatorScope {
+    fn drop(&mut self) {
+        // Take this operator's tables back out of the thread-locals, then
+        // let the scopes restore what they replaced (reverse order).
+        let compiled = COMPILED.with(|c| std::mem::take(&mut c.borrow_mut().entries));
+        let slots = SLOTS.with(|s| std::mem::take(&mut s.borrow_mut().entries));
+        let subq_free = SUBQUERY_FREE.with(|c| c.get());
+        let coll_free = COLLATE_FREE.with(|c| c.get());
+        self.compiled.take();
+        self.slots.take();
+        self.flags.take();
+        if let Some((roots, sig, inputs)) = self.key.take() {
+            SCOPE_CACHE.with(|c| {
+                let mut c = c.borrow_mut();
+                if c.len() >= SCOPE_CACHE_CAP {
+                    c.remove(0);
+                }
+                c.push(CachedScope {
+                    roots,
+                    sig,
+                    inputs,
+                    subq_free,
+                    coll_free,
+                    slots,
+                    compiled,
+                });
+            });
         }
     }
 }
@@ -1830,14 +2225,8 @@ fn compiled_eval(e: &Expr, ctx: &EvalContext<'_>) -> Option<Result<Value>> {
 pub(crate) struct SubqueryScope(bool, bool);
 
 impl SubqueryScope {
-    /// Mark the evaluation of `exprs` subquery-free / COLLATE-free when
-    /// none of them holds one.
-    pub(crate) fn for_exprs<'e>(exprs: impl IntoIterator<Item = &'e Expr>) -> Self {
-        let (mut subq_free, mut coll_free) = (true, true);
-        for e in exprs {
-            subq_free &= !contains_subquery(e);
-            coll_free &= !contains_collate(e);
-        }
+    /// Install known flags (an OperatorScope's cached answers).
+    fn from_flags(subq_free: bool, coll_free: bool) -> Self {
         SubqueryScope(
             SUBQUERY_FREE.with(|c| c.replace(subq_free)),
             COLLATE_FREE.with(|c| c.replace(coll_free)),
@@ -3377,6 +3766,182 @@ fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext<'_>) -> Result
     call_scalar(fname, &argvals)
 }
 
+/// `scalar_substr`'s builtin (shared by `call_scalar` and the compiled
+/// evaluator's direct dispatch).
+fn scalar_substr(args: &[Value]) -> Result<Value> {
+    Ok({
+        if args.len() >= 2
+            && args.iter().take(2).all(|v| !v.is_null())
+            && (args.len() < 3 || !args[2].is_null())
+        {
+            // Blob operands are byte-indexed and yield a blob
+            // (mirrors SQLite: substr(x'00ff', 2, 1) = x'ff').
+            if let Some(Value::Blob(b)) = args.first() {
+                // func.c substrFunc: sqlite3_value_blob() of a
+                // zero-length BLOB is a NULL pointer, and the function
+                // returns early — substr(x'', ...) is NULL (an empty
+                // TEXT still yields '').
+                if b.is_empty() {
+                    return Ok(Value::Null);
+                }
+                let (begin, end) = substr_range(
+                    b.len() as i64,
+                    args[1].as_integer(),
+                    if args.len() == 3 {
+                        args[2].as_integer()
+                    } else {
+                        1_000_000_000 /* SQLITE_LIMIT_LENGTH: func.c substrFunc's default length (a far-negative start drives it below zero: empty result) */
+                    },
+                );
+                return Ok(Value::Blob(b[begin as usize..end as usize].to_vec()));
+            }
+            // A TEXT holding invalid UTF-8: substrFunc's byte walk
+            // (SQLITE_SKIP_UTF8 steps), whose cut can split or keep
+            // stray bytes exactly as SQLite does.
+            if let Value::Text(t) = &args[0] {
+                if t.is_raw() {
+                    let b = t.as_bytes();
+                    let b = &b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())];
+                    let offs = crate::types::text::sqlite_char_offsets(b);
+                    let z = if args.len() == 3 {
+                        args[2].as_integer()
+                    } else {
+                        1_000_000_000
+                    };
+                    let (begin, end) =
+                        substr_range((offs.len() - 1) as i64, args[1].as_integer(), z);
+                    return Ok(Value::Text(crate::types::text::Text::from_bytes(
+                        &b[offs[begin as usize]..offs[end as usize]],
+                    )));
+                }
+            }
+            // A forward slice (start >= 1, length >= 0) of TEXT needs
+            // only the bytes up to its end: when that prefix is ASCII
+            // and NUL-free, the byte offsets ARE the character offsets
+            // (a far-right start just yields '').
+            if let (Value::Text(t), Value::Integer(p1)) = (&args[0], &args[1]) {
+                let z = if args.len() == 3 {
+                    match &args[2] {
+                        Value::Integer(z) => Some(*z),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some(z) = z.filter(|z| *z >= 0) {
+                    if *p1 >= 1 {
+                        let b = t.as_bytes();
+                        let begin = ((*p1 - 1) as u64).min(b.len() as u64) as usize;
+                        let end = (begin as u64 + z as u64).min(b.len() as u64) as usize;
+                        let pre = &b[..end];
+                        if pre.iter().all(|&c| c != 0 && c < 0x80) {
+                            return Ok(Value::Text(t.as_str()[begin..end].into()));
+                        }
+                    }
+                }
+            }
+            let s = args[0].as_text();
+            // func.c substrFunc walks sqlite3_value_text() as a C
+            // string: TEXT ends at its first NUL byte.
+            let s = match s.find('\0') {
+                Some(nul) => &s[..nul],
+                None => &s[..],
+            };
+            let z = if args.len() == 3 {
+                args[2].as_integer()
+            } else {
+                1_000_000_000 /* SQLITE_LIMIT_LENGTH: func.c substrFunc's default length (a far-negative start drives it below zero: empty result) */
+            };
+            if s.is_ascii() {
+                // Fast path: byte index == char index for ASCII.
+                let (begin, end) = substr_range(s.len() as i64, args[1].as_integer(), z);
+                Value::Text(s[begin as usize..end as usize].into())
+            } else {
+                // Count UTF-8 characters, never slice mid-codepoint.
+                let n = s.chars().count() as i64;
+                let (begin, end) = substr_range(n, args[1].as_integer(), z);
+                let out: String = s
+                    .chars()
+                    .skip(begin as usize)
+                    .take((end - begin) as usize)
+                    .collect();
+                Value::Text(out.into())
+            }
+        } else {
+            Value::Null
+        }
+    })
+}
+
+/// `scalar_instr`'s builtin (shared by `call_scalar` and the compiled
+/// evaluator's direct dispatch).
+fn scalar_instr(args: &[Value]) -> Result<Value> {
+    Ok({
+        if args.len() != 2 || args[0].is_null() || args[1].is_null() {
+            return Ok(Value::Null);
+        }
+        // func.c instrFunc: BLOB×BLOB searches bytes and counts
+        // bytes; every other pairing searches the TEXT forms and
+        // counts CHARACTERS (`instr('héllo','l')` is 3). An empty
+        // needle is found at 1.
+        if let (Value::Blob(h), Value::Blob(n)) = (&args[0], &args[1]) {
+            if n.is_empty() {
+                return Ok(Value::Integer(1));
+            }
+            return Ok(Value::Integer(
+                h.windows(n.len())
+                    .position(|w| w == n.as_slice())
+                    .map_or(0, |p| p as i64 + 1),
+            ));
+        }
+        let hay: Vec<u8> = args[0].text_bytes().into_owned();
+        let needle: Vec<u8> = args[1].text_bytes().into_owned();
+        if needle.is_empty() {
+            return Ok(Value::Integer(1));
+        }
+        match hay
+            .windows(needle.len())
+            .position(|w| w == needle.as_slice())
+        {
+            Some(pos) => {
+                Value::Integer(hay[..pos].iter().filter(|&&b| b & 0xc0 != 0x80).count() as i64 + 1)
+            }
+            None => Value::Integer(0),
+        }
+    })
+}
+
+/// `scalar_length`'s builtin (shared by `call_scalar` and the compiled
+/// evaluator's direct dispatch).
+fn scalar_length(args: &[Value]) -> Result<Value> {
+    Ok(match args.first() {
+        Some(Value::Null) | None => Value::Null,
+        Some(v) => Value::Integer(v.length()),
+    })
+}
+
+/// `scalar_abs`'s builtin (shared by `call_scalar` and the compiled
+/// evaluator's direct dispatch).
+fn scalar_abs(args: &[Value]) -> Result<Value> {
+    Ok(match args.first() {
+        Some(Value::Null) | None => Value::Null,
+        // SQLite: abs() of the most-negative integer raises
+        // "integer overflow" (the value has no positive i64).
+        Some(Value::Integer(i)) if *i == i64::MIN => {
+            return Err(Error::runtime("integer overflow"));
+        }
+        Some(Value::Integer(i)) => Value::Integer(i.abs()),
+        // func.c absFunc's default arm: REAL, TEXT and BLOB all go
+        // through sqlite3_value_double and yield a REAL (`abs('-5')`
+        // is 5.0, `abs('abc')` is 0.0); `abs(-0.0)` keeps -0.0
+        // (`rVal<0` is false for negative zero).
+        Some(other) => {
+            let r = other.as_real();
+            Value::Real(if r < 0.0 { -r } else { r })
+        }
+    })
+}
+
 /// `name` ASCII-lowercased, borrowed when it already is (the parser
 /// keeps function names as written; most are lowercase already).
 pub(crate) fn lower_name(name: &str) -> std::borrow::Cow<'_, str> {
@@ -3392,27 +3957,8 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
     let fname_cow = lower_name(name);
     let fname: &str = &fname_cow;
     Ok(match fname {
-        "abs" => match args.first() {
-            Some(Value::Null) | None => Value::Null,
-            // SQLite: abs() of the most-negative integer raises
-            // "integer overflow" (the value has no positive i64).
-            Some(Value::Integer(i)) if *i == i64::MIN => {
-                return Err(Error::runtime("integer overflow"));
-            }
-            Some(Value::Integer(i)) => Value::Integer(i.abs()),
-            // func.c absFunc's default arm: REAL, TEXT and BLOB all go
-            // through sqlite3_value_double and yield a REAL (`abs('-5')`
-            // is 5.0, `abs('abc')` is 0.0); `abs(-0.0)` keeps -0.0
-            // (`rVal<0` is false for negative zero).
-            Some(other) => {
-                let r = other.as_real();
-                Value::Real(if r < 0.0 { -r } else { r })
-            }
-        },
-        "length" => match args.first() {
-            Some(Value::Null) | None => Value::Null,
-            Some(v) => Value::Integer(v.length()),
-        },
+        "abs" => return scalar_abs(args),
+        "length" => return scalar_length(args),
         // octet_length(X) — SQLite 3.46+ / SQL standard: the number of
         // bytes in X's encoding. TEXT/BLOB are their byte lengths;
         // numerics use the byte length of their text representation;
@@ -3585,108 +4131,7 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
                 }
             }
         }
-        "substr" | "substring" => {
-            if args.len() >= 2
-                && args.iter().take(2).all(|v| !v.is_null())
-                && (args.len() < 3 || !args[2].is_null())
-            {
-                // Blob operands are byte-indexed and yield a blob
-                // (mirrors SQLite: substr(x'00ff', 2, 1) = x'ff').
-                if let Some(Value::Blob(b)) = args.first() {
-                    // func.c substrFunc: sqlite3_value_blob() of a
-                    // zero-length BLOB is a NULL pointer, and the function
-                    // returns early — substr(x'', ...) is NULL (an empty
-                    // TEXT still yields '').
-                    if b.is_empty() {
-                        return Ok(Value::Null);
-                    }
-                    let (begin, end) = substr_range(
-                        b.len() as i64,
-                        args[1].as_integer(),
-                        if args.len() == 3 {
-                            args[2].as_integer()
-                        } else {
-                            1_000_000_000 /* SQLITE_LIMIT_LENGTH: func.c substrFunc's default length (a far-negative start drives it below zero: empty result) */
-                        },
-                    );
-                    return Ok(Value::Blob(b[begin as usize..end as usize].to_vec()));
-                }
-                // A TEXT holding invalid UTF-8: substrFunc's byte walk
-                // (SQLITE_SKIP_UTF8 steps), whose cut can split or keep
-                // stray bytes exactly as SQLite does.
-                if let Value::Text(t) = &args[0] {
-                    if t.is_raw() {
-                        let b = t.as_bytes();
-                        let b = &b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())];
-                        let offs = crate::types::text::sqlite_char_offsets(b);
-                        let z = if args.len() == 3 {
-                            args[2].as_integer()
-                        } else {
-                            1_000_000_000
-                        };
-                        let (begin, end) =
-                            substr_range((offs.len() - 1) as i64, args[1].as_integer(), z);
-                        return Ok(Value::Text(crate::types::text::Text::from_bytes(
-                            &b[offs[begin as usize]..offs[end as usize]],
-                        )));
-                    }
-                }
-                // A forward slice (start >= 1, length >= 0) of TEXT needs
-                // only the bytes up to its end: when that prefix is ASCII
-                // and NUL-free, the byte offsets ARE the character offsets
-                // (a far-right start just yields '').
-                if let (Value::Text(t), Value::Integer(p1)) = (&args[0], &args[1]) {
-                    let z = if args.len() == 3 {
-                        match &args[2] {
-                            Value::Integer(z) => Some(*z),
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    };
-                    if let Some(z) = z.filter(|z| *z >= 0) {
-                        if *p1 >= 1 {
-                            let b = t.as_bytes();
-                            let begin = ((*p1 - 1) as u64).min(b.len() as u64) as usize;
-                            let end = (begin as u64 + z as u64).min(b.len() as u64) as usize;
-                            let pre = &b[..end];
-                            if pre.iter().all(|&c| c != 0 && c < 0x80) {
-                                return Ok(Value::Text(t.as_str()[begin..end].into()));
-                            }
-                        }
-                    }
-                }
-                let s = args[0].as_text();
-                // func.c substrFunc walks sqlite3_value_text() as a C
-                // string: TEXT ends at its first NUL byte.
-                let s = match s.find('\0') {
-                    Some(nul) => &s[..nul],
-                    None => &s[..],
-                };
-                let z = if args.len() == 3 {
-                    args[2].as_integer()
-                } else {
-                    1_000_000_000 /* SQLITE_LIMIT_LENGTH: func.c substrFunc's default length (a far-negative start drives it below zero: empty result) */
-                };
-                if s.is_ascii() {
-                    // Fast path: byte index == char index for ASCII.
-                    let (begin, end) = substr_range(s.len() as i64, args[1].as_integer(), z);
-                    Value::Text(s[begin as usize..end as usize].into())
-                } else {
-                    // Count UTF-8 characters, never slice mid-codepoint.
-                    let n = s.chars().count() as i64;
-                    let (begin, end) = substr_range(n, args[1].as_integer(), z);
-                    let out: String = s
-                        .chars()
-                        .skip(begin as usize)
-                        .take((end - begin) as usize)
-                        .collect();
-                    Value::Text(out.into())
-                }
-            } else {
-                Value::Null
-            }
-        }
+        "substr" | "substring" => return scalar_substr(args),
         "coalesce" | "ifnull" => {
             for v in args {
                 if !v.is_null() {
@@ -3883,39 +4328,7 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
         }
         // INSTR(s, sub) — returns the 1-indexed position of `sub` in `s`,
         // or 0 if not found. NULL inputs return NULL.
-        "instr" => {
-            if args.len() != 2 || args[0].is_null() || args[1].is_null() {
-                return Ok(Value::Null);
-            }
-            // func.c instrFunc: BLOB×BLOB searches bytes and counts
-            // bytes; every other pairing searches the TEXT forms and
-            // counts CHARACTERS (`instr('héllo','l')` is 3). An empty
-            // needle is found at 1.
-            if let (Value::Blob(h), Value::Blob(n)) = (&args[0], &args[1]) {
-                if n.is_empty() {
-                    return Ok(Value::Integer(1));
-                }
-                return Ok(Value::Integer(
-                    h.windows(n.len())
-                        .position(|w| w == n.as_slice())
-                        .map_or(0, |p| p as i64 + 1),
-                ));
-            }
-            let hay: Vec<u8> = args[0].text_bytes().into_owned();
-            let needle: Vec<u8> = args[1].text_bytes().into_owned();
-            if needle.is_empty() {
-                return Ok(Value::Integer(1));
-            }
-            match hay
-                .windows(needle.len())
-                .position(|w| w == needle.as_slice())
-            {
-                Some(pos) => Value::Integer(
-                    hay[..pos].iter().filter(|&&b| b & 0xc0 != 0x80).count() as i64 + 1,
-                ),
-                None => Value::Integer(0),
-            }
-        }
+        "instr" => return scalar_instr(args),
         // PRINTF — minimal SQLite printf implementation. Supports %d, %s,
         // %f, %x, %c, %% substitutions. NULL format returns NULL.
         // printf.c sqlite3_str_vappendf in SQL-function mode — see
