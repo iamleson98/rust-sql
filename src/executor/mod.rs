@@ -8132,12 +8132,47 @@ fn expr_sort_terms(
 
 /// The scan operators' output column names, shared by `exec_scan` and
 /// the parallel sort driver (hidden-rowid slot appended last).
+type ScanColsEntry = (Arc<Table>, Option<String>, bool, Arc<[String]>);
+
+thread_local! {
+    /// Aliased scans' output column lists: `FROM users u` re-formatted
+    /// `u.<col>` for every column on every execution (5% of a cached
+    /// two-table join). Holding the table Arc keeps the pointer key
+    /// unambiguous; a schema change makes a new table object.
+    static SCAN_COLS: std::cell::RefCell<Vec<ScanColsEntry>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn scan_output_columns(
     table: &Arc<Table>,
     alias: &Option<String>,
     append_rowid: bool,
 ) -> Arc<[String]> {
     let prefix = alias.as_deref().unwrap_or(&table.name);
+    if !append_rowid && prefix == table.name {
+        return table.qualified_col_names.clone();
+    }
+    let hit = SCAN_COLS.with(|c| {
+        c.borrow()
+            .iter()
+            .find(|(t, a, r, _)| Arc::ptr_eq(t, table) && a == alias && *r == append_rowid)
+            .map(|e| e.3.clone())
+    });
+    if let Some(cols) = hit {
+        return cols;
+    }
+    let cols = scan_output_columns_build(table, prefix, append_rowid);
+    SCAN_COLS.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() >= 16 {
+            c.remove(0);
+        }
+        c.push((Arc::clone(table), alias.clone(), append_rowid, cols.clone()));
+    });
+    cols
+}
+
+fn scan_output_columns_build(table: &Table, prefix: &str, append_rowid: bool) -> Arc<[String]> {
     if append_rowid {
         let base: Vec<String> = if prefix == table.name {
             table.qualified_col_names.iter().cloned().collect()
@@ -20522,7 +20557,7 @@ fn exec_index_nested_loop_join(
     });
     // Reused rowid batch + decode buffer across outer rows (one malloc per
     // STATEMENT instead of one per outer row / per matched row).
-    let mut rowids: Vec<i64> = Vec::new();
+    let mut rowids: Vec<i64> = Vec::with_capacity(16);
     let mut inner_vals: Row = Vec::new();
     // ONE index + ONE table B+tree handle for the whole join: the pinned
     // root pages and thread-local leaf hints survive across every probe

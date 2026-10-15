@@ -1040,6 +1040,13 @@ fn cmp_key_bytes(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     a.len().cmp(&b.len())
 }
 
+/// `a.starts_with(b)` with the inline comparison (no `memcmp` call for
+/// the short order keys index probes compare).
+#[inline]
+fn key_starts_with(a: &[u8], b: &[u8]) -> bool {
+    a.len() >= b.len() && cmp_key_bytes(&a[..b.len()], b).is_eq()
+}
+
 /// Read the separator key of a table-interior cell without allocating.
 /// Layout: [be_u32: left_child][varint: key].
 fn decode_table_interior_key(buf: &[u8]) -> Option<i64> {
@@ -12415,7 +12422,7 @@ impl<'a> Btree<'a> {
             while l < h {
                 let mid = (l + h) / 2;
                 let k = self.leaf_key_cow(&borrowed, mid)?;
-                if k.as_ref() < key {
+                if cmp_key_bytes(k.as_ref(), key).is_lt() {
                     l = mid + 1;
                 } else {
                     h = mid;
@@ -12431,7 +12438,7 @@ impl<'a> Btree<'a> {
             let mut hi_b = n;
             if lo_b < hi_b {
                 let k = self.leaf_key_cow(&borrowed, lo_b)?;
-                if k.as_ref() < key {
+                if cmp_key_bytes(k.as_ref(), key).is_lt() {
                     lo_b += 1;
                 } else {
                     hi_b = lo_b;
@@ -12444,7 +12451,7 @@ impl<'a> Btree<'a> {
             while l < h {
                 let mid = (l + h) / 2;
                 let k = self.leaf_key_cow(&borrowed, mid)?;
-                if k.as_ref() < key {
+                if cmp_key_bytes(k.as_ref(), key).is_lt() {
                     l = mid + 1;
                 } else {
                     h = mid;
@@ -12478,11 +12485,11 @@ impl<'a> Btree<'a> {
                 scratch.clear();
                 match self.assemble_overflow_payload_into(v.key, v.total, v.overflow, &mut scratch)
                 {
-                    Ok(()) => scratch.starts_with(key),
+                    Ok(()) => key_starts_with(&scratch, key),
                     Err(_) => false,
                 }
             } else {
-                v.key.starts_with(key)
+                key_starts_with(v.key, key)
             };
             if matched {
                 out.push(v.rowid);
