@@ -897,6 +897,37 @@ fn leaf_live_bytes(b: &crate::storage::page::Page, pt: PageType, usable: usize) 
     Some(used)
 }
 
+/// The live-byte cache's value for a leaf after one cell at `ptr` is
+/// added (`grow`) or removed: `Some(live')` when the cache was current
+/// under `before` (epoch, n_cells, content start) — the caller then
+/// re-keys it — else `None` (recomputed on the next read).
+fn live_cache_adjust(
+    b: &crate::storage::page::Page,
+    pt: PageType,
+    before: (u32, u16, u32),
+    ptr: usize,
+    grow: bool,
+) -> Option<u32> {
+    if !matches!(pt, PageType::LeafTable | PageType::LeafIndex) {
+        return None;
+    }
+    let (e, n, cs, live) = b.live_cache?;
+    if (e, n, cs) != before || ptr >= b.data.len() {
+        return None;
+    }
+    let psz = b.page_size();
+    let size = match pt {
+        PageType::LeafIndex => index_leaf_cell_size(&b.data[ptr..], psz),
+        _ => table_leaf_cell_size_paged(&b.data[ptr..], psz),
+    }? as u32
+        + 2;
+    Some(if grow {
+        live + size
+    } else {
+        live.saturating_sub(size)
+    })
+}
+
 fn decode_index_cell(buf: &[u8], interior: bool, page_size: u32) -> Option<IndexCellView<'_>> {
     let (left_child, after_child) = if interior {
         if buf.len() < 4 {
@@ -964,16 +995,49 @@ fn index_cell_lt(
     }
     let rest = &rb[rlen..];
     let (raw_len, m) = varint::decode(rest)?;
-    let (key_len, local_len, _) = index_cell_split(raw_len, page_size as usize);
-    if local_len != key_len {
-        return Some(None);
-    }
+    // A key of at most 64 bytes is always in-page (both cell formats'
+    // max-local exceed it at every legal page size, 512 and up) — skip
+    // the split arithmetic for the common short keys.
+    let total = (raw_len & !INDEX_V6_MARK) as usize;
+    let key_len = if total <= 64 {
+        total
+    } else {
+        let (key_len, local_len, _) = index_cell_split(raw_len, page_size as usize);
+        if local_len != key_len {
+            return Some(None);
+        }
+        key_len
+    };
     let ck = rest.get(m..m + key_len)?;
-    Some(Some(match ck.cmp(key) {
+    Some(Some(match cmp_key_bytes(ck, key) {
         std::cmp::Ordering::Less => true,
         std::cmp::Ordering::Greater => false,
         std::cmp::Ordering::Equal => varint::decode_signed(rb)?.0 < rowid,
     }))
+}
+
+/// Lexicographic byte comparison, inline for short keys: index probes
+/// compare ~11-byte order keys, where the `memcmp` call (through the
+/// dynamic-library stub on macOS) cost more than the compare itself.
+#[inline]
+fn cmp_key_bytes(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    let n = a.len().min(b.len());
+    let mut i = 0;
+    while i + 8 <= n {
+        let x = u64::from_be_bytes(a[i..i + 8].try_into().unwrap());
+        let y = u64::from_be_bytes(b[i..i + 8].try_into().unwrap());
+        if x != y {
+            return x.cmp(&y);
+        }
+        i += 8;
+    }
+    while i < n {
+        if a[i] != b[i] {
+            return a[i].cmp(&b[i]);
+        }
+        i += 1;
+    }
+    a.len().cmp(&b.len())
 }
 
 /// Read the separator key of a table-interior cell without allocating.
@@ -6352,7 +6416,10 @@ impl<'a> Btree<'a> {
                     page_id
                 )));
             }
+            let before = (borrowed.epoch, n, borrowed.cell_content_start());
             cell.encode_into(&mut borrowed.data[off..off + cell_size]);
+            // Keep the live-byte cache current (see Page::live_cache).
+            let live_after = live_cache_adjust(borrowed, pt, before, off, true);
             borrowed.set_cell_content_start(new_content_start);
 
             // Shift cell pointers to make room at position `pos` — one
@@ -6375,6 +6442,8 @@ impl<'a> Btree<'a> {
             borrowed.data[dst..dst + 2].copy_from_slice(&(new_content_start as u16).to_be_bytes());
             borrowed.set_n_cells(n + 1);
             borrowed.touch();
+            borrowed.live_cache =
+                live_after.map(|l| (borrowed.epoch, n + 1, borrowed.cell_content_start(), l));
             if pt == PageType::LeafIndex {
                 self.last_index_leaf =
                     Some(AppendHint::fresh(page_id, borrowed.serial, borrowed.epoch));
@@ -6806,7 +6875,17 @@ impl<'a> Btree<'a> {
                 self.pager.note_dirty(page_id);
                 return Ok(fits);
             }
-            // Exact in-page byte sum, overflow-aware.
+            // Exact in-page byte sum, overflow-aware — or the live-byte
+            // cache's (cells + pointers) when it is current: every insert
+            // into a full leaf asks this before rebalancing / splitting.
+            let key = (b.epoch, n as u16, content_start as u32);
+            if let Some((e, cn, cs, live)) = b.live_cache {
+                if (e, cn, cs) == key
+                    && (live as usize).saturating_sub(2 * n) + content_start == psz
+                {
+                    return Ok(false); // packed: no dead space to reclaim
+                }
+            }
             let mut total = 0usize;
             let mut packed_ok = true;
             for i in 0..n as u16 {
@@ -11474,6 +11553,20 @@ impl<'a> Btree<'a> {
         {
             let page = self.pager.get_page(page_id)?;
             let mut borrowed = page.lock();
+            // Keep the live-byte cache current (see Page::live_cache):
+            // REPLACE / UPDATE alternate index deletes and inserts on the
+            // same leaves, and each delete's underfull check used to
+            // re-sum the whole leaf.
+            let live_after = match borrowed.page_type() {
+                Ok(pt) => live_cache_adjust(
+                    &borrowed,
+                    pt,
+                    (borrowed.epoch, n, borrowed.cell_content_start()),
+                    borrowed.cell_pointer(pos) as usize,
+                    false,
+                ),
+                Err(_) => None,
+            };
             let pos_usize = pos as usize;
             let n_usize = n as usize;
             // One memmove instead of a per-element byte-swap loop.
@@ -11483,6 +11576,8 @@ impl<'a> Btree<'a> {
             );
             borrowed.set_n_cells(n - 1);
             borrowed.touch();
+            borrowed.live_cache =
+                live_after.map(|l| (borrowed.epoch, n - 1, borrowed.cell_content_start(), l));
         }
         self.pager.note_dirty(page_id);
         Ok(true)
@@ -12110,6 +12205,95 @@ impl<'a> Btree<'a> {
     /// followed by a forward scan over the matching prefix (which may span
     /// multiple leaves). Previously this was a full O(N) scan of every
     /// index page — the main reason indexed point lookups lagged SQLite.
+    /// The rowid of the FIRST entry whose key starts with `key`, or None —
+    /// the uniqueness probe (SQLite's OP_NoConflict seek). One descent with
+    /// the allocation-free `index_cell_lt` comparisons and no leaf-hint
+    /// bookkeeping; the shapes it cannot decide on the descended leaf
+    /// alone (overflow cells, a right=0 interior edge, a probe past the
+    /// leaf's last cell, where the run may start in the right sibling)
+    /// take `lookup_index_into`.
+    ///
+    /// Also returns the leaf the descent decided on, pinned: with no
+    /// match, an entry `(key, rowid)` belongs exactly there (no stored key
+    /// equals `key`, so its descent takes the same path) — the caller
+    /// hands it to the insert as its placement (SQLite's USESEEKRESULT).
+    pub fn index_first_with_prefix(
+        &mut self,
+        key: &[u8],
+    ) -> Result<(Option<i64>, Option<AppendHint>)> {
+        if let Some(r) = self.index_first_with_prefix_fast(key)? {
+            return Ok(r);
+        }
+        let mut out = Vec::new();
+        self.lookup_index_into(key, &mut out)?;
+        Ok((out.first().copied(), None))
+    }
+
+    /// `Some(answer)`, or `None` when the descent cannot decide.
+    #[allow(clippy::type_complexity)]
+    fn index_first_with_prefix_fast(
+        &mut self,
+        key: &[u8],
+    ) -> Result<Option<(Option<i64>, Option<AppendHint>)>> {
+        let _probe = self.pager.key_probe_scope(self.root, key);
+        let _undo_scan = crate::storage::pager::suspend_undo_capture();
+        let mut page_id = self.root;
+        for _ in 0..64 {
+            let page = self.pager.get_page(page_id)?;
+            let b = page.lock();
+            let psz = b.page_size();
+            let pt = b.page_type()?;
+            let interior = match pt {
+                PageType::LeafIndex => false,
+                PageType::InteriorIndex => true,
+                _ => return Ok(None),
+            };
+            let n = b.n_cells();
+            // First cell whose key is >= `key` ((key, MIN) ordering: a cell
+            // is "less" iff its key bytes are strictly less).
+            let (mut lo, mut hi) = (0u16, n);
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                let cell = b.cell_slice_checked(b.cell_pointer(mid) as usize)?;
+                match index_cell_lt(cell, interior, psz, key, i64::MIN) {
+                    Some(Some(true)) => lo = mid + 1,
+                    Some(Some(false)) => hi = mid,
+                    _ => return Ok(None), // overflow / malformed: general path
+                }
+            }
+            if !interior {
+                if lo >= n {
+                    return Ok(None);
+                }
+                let cell = b.cell_slice_checked(b.cell_pointer(lo) as usize)?;
+                let Some(v) = decode_index_cell(cell, false, psz) else {
+                    return Ok(None);
+                };
+                if v.overflow != 0 {
+                    return Ok(None);
+                }
+                // Entries with the prefix are contiguous and sort first
+                // among those >= `key`.
+                let pin = AppendHint::fresh(page_id, b.serial, b.epoch);
+                return Ok(Some((v.key.starts_with(key).then_some(v.rowid), Some(pin))));
+            }
+            let child = if lo < n {
+                let cell = b.cell_slice_checked(b.cell_pointer(lo) as usize)?;
+                match decode_index_cell(cell, true, psz) {
+                    Some(v) => v.left_child,
+                    None => return Ok(None),
+                }
+            } else {
+                b.right_most_pointer()
+            };
+            if child == 0 {
+                return Ok(None);
+            }
+            page_id = child;
+        }
+        Ok(None)
+    }
+
     pub fn lookup_index(&mut self, key: &[u8]) -> Result<Vec<i64>> {
         let mut out = Vec::new();
         self.lookup_index_into(key, &mut out)?;

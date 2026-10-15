@@ -23452,6 +23452,24 @@ pub(crate) struct IndexMaintState {
     /// buffers (`delete_index` on an absent pair is a clean no-op;
     /// `insert_index_entry_if_absent` heals re-inserts).
     pub op_buf: Option<IndexOpBuf>,
+    /// A buffered UNIQUE index's keys claimed by this statement's rows
+    /// whose entries are still in `op_buf` (key -> rowid): the per-row
+    /// uniqueness probe consults it after the tree. Cleared at every
+    /// flush (the entries are then in the tree, and a REPLACE delete may
+    /// follow).
+    pub pending: Option<std::collections::HashMap<Vec<u8>, i64>>,
+    /// On the FIRST buffered state only: the rowids whose entries sit in
+    /// the buffers (every buffered index holds an entry per row). A
+    /// REPLACE delete of such a row flushes first; a pre-existing
+    /// holder's entries are already in the trees. Cleared at each flush.
+    pub stmt_rows: Option<std::collections::HashSet<i64>>,
+}
+
+/// Does `rowid` have index entries still in a sorted-batch buffer?
+fn rowid_buffered(index_states: &[IndexMaintState], rowid: i64) -> bool {
+    index_states
+        .iter()
+        .any(|st| st.stmt_rows.as_ref().is_some_and(|r| r.contains(&rowid)))
 }
 
 impl IndexMaintState {
@@ -23841,6 +23859,8 @@ pub(crate) fn make_index_states(
                 place: None,
                 key_buf: Vec::with_capacity(16),
                 op_buf: None,
+                pending: None,
+                stmt_rows: None,
             }
         })
         .collect()
@@ -24184,10 +24204,17 @@ fn exec_insert_inner(
             &table,
             &crate::sql::ast::TriggerEvent::Insert,
         );
+        let has_delete_triggers = crate::executor::triggers::has_triggers_for(
+            ctx,
+            &table,
+            &crate::sql::ast::TriggerEvent::Delete,
+        );
         arm_insert_index_bufs(
             &mut index_states,
+            &table,
             expr_rows.len(),
             has_insert_triggers,
+            has_delete_triggers,
             stmt_or.or_else(|| table_conflict_clauses(&table).then_some(ConflictResolution::Fail)),
             upsert.is_some(),
         );
@@ -24486,10 +24513,17 @@ fn exec_insert_inner(
         &table,
         &crate::sql::ast::TriggerEvent::Insert,
     );
+    let has_delete_triggers = crate::executor::triggers::has_triggers_for(
+        ctx,
+        &table,
+        &crate::sql::ast::TriggerEvent::Delete,
+    );
     arm_insert_index_bufs(
         &mut index_states,
+        &table,
         source_res.rows.len(),
         has_insert_triggers,
+        has_delete_triggers,
         stmt_or.or_else(|| table_conflict_clauses(&table).then_some(ConflictResolution::Fail)),
         upsert.is_some(),
     );
@@ -24828,8 +24862,10 @@ pub fn fast_insert_literal_rows(
     // the per-row root-to-leaf descent + in-leaf search per entry.
     arm_insert_index_bufs(
         &mut index_states,
+        table,
         rows.len(),
         has_insert_triggers,
+        false, // ABORT: no REPLACE deletes
         Some(crate::sql::ast::ConflictResolution::Abort),
         false,
     );
@@ -25048,6 +25084,8 @@ fn take_fast_index_states(
             for st in states.iter_mut() {
                 st.root = ctx.index_root(&st.idx);
                 st.op_buf = None;
+                st.pending = None;
+                st.stmt_rows = None;
             }
             return states;
         }
@@ -25590,15 +25628,25 @@ fn exec_insert_one_row(
                     if index_key_has_null(&st.idx, table, full_row) {
                         continue;
                     }
-                    // Any REPLACE/UPSERT path below mutates the index trees,
-                    // so the append hint may go stale — drop it.
-                    st.clear_hints();
                     let key_bytes = st.encode_key(full_row)?.to_vec();
                     let mut ibt = Btree::new(ctx.pager, st.root, true);
-                    let matches = ibt.lookup_index(&key_bytes)?;
-                    let Some(&existing_rowid) = matches.first() else {
+                    let (hit, leaf) = ibt.index_first_with_prefix(&key_bytes)?;
+                    // A buffered unique index: this statement's earlier
+                    // rows hold keys the tree does not show yet.
+                    let hit = hit.or_else(|| st.pending.as_ref()?.get(&key_bytes).copied());
+                    let Some(existing_rowid) = hit else {
+                        // No conflict: the entry's insert lands in the leaf
+                        // this probe just descended to.
+                        if leaf.is_some() {
+                            st.place = leaf;
+                        }
                         continue;
                     };
+                    // Any REPLACE/UPSERT path below mutates the index trees,
+                    // so the append hint may go stale — drop it. (Only on a
+                    // conflict: clearing it before every probe sent each
+                    // unique-index insert down the full descent.)
+                    st.clear_hints();
                     // UPSERT: conflicts on the targeted index (or on any
                     // constraint, for an empty target) take the upsert
                     // action; other constraints resolve as usual.
@@ -25839,6 +25887,12 @@ fn exec_insert_one_row(
                     }
                     match rowid_policy {
                         ConflictResolution::Replace => {
+                            // The old row's index entries are deleted below
+                            // from the trees: land any buffered ones first
+                            // (it may be one of this statement's rows).
+                            if rowid_buffered(index_states, rowid) {
+                                flush_insert_index_bufs(ctx, index_states)?;
+                            }
                             old_payload_opt = Some(existing_payload);
                             crate::preupdate::fire_delete_payload(
                                 table,
@@ -26000,6 +26054,12 @@ fn exec_insert_one_row(
         if st.op_buf.is_some() {
             let key_bytes = st.encode_key(full_row)?;
             let key = key_bytes.to_vec();
+            if let Some(p) = st.pending.as_mut() {
+                p.insert(key.clone(), rowid);
+            }
+            if let Some(r) = st.stmt_rows.as_mut() {
+                r.insert(rowid);
+            }
             if let Some(buf) = st.op_buf.as_mut() {
                 buf.1.push((key, rowid));
             }
@@ -26028,15 +26088,13 @@ fn exec_insert_one_row(
     // statement scale — a 100M-row single-statement load carries at
     // most INDEX_BATCH_CHUNK_OPS pairs per index). No-op for the
     // all-None statement shapes (the common OLTP case).
-    for st in index_states.iter_mut() {
-        if let Some(buf) = st.op_buf.as_mut() {
-            if buf.0.len() + buf.1.len() >= INDEX_BATCH_CHUNK_OPS {
-                let idx = std::sync::Arc::clone(&st.idx);
-                let mut root = st.root;
-                flush_index_op_buf(ctx, &idx, &mut root, buf)?;
-                st.root = root;
-            }
-        }
+    // All buffers flush together, keeping `stmt_rows` exact.
+    if index_states.iter().any(|st| {
+        st.op_buf
+            .as_ref()
+            .is_some_and(|buf| buf.0.len() + buf.1.len() >= INDEX_BATCH_CHUNK_OPS)
+    }) {
+        flush_insert_index_bufs(ctx, index_states)?;
     }
     // A WITHOUT ROWID table's hidden rowid is internal: SQLite's
     // last_insert_rowid() never moves for such inserts.
@@ -26191,6 +26249,13 @@ fn replace_delete_holder(
         )));
     }
     replaced_holders.push(existing_rowid);
+    // A holder that is one of this statement's own rows may still have
+    // its index entries in the sorted-batch buffers: land them first, so
+    // the delete below finds them in the trees. (A pre-existing holder's
+    // entries are all in the trees already.)
+    if rowid_buffered(index_states, existing_rowid) {
+        flush_insert_index_bufs(ctx, index_states)?;
+    }
     let mut bt = Btree::new(ctx.pager, *current_root, false);
     let old_payload_opt = match bt.lookup_table(existing_rowid)? {
         LookupResult::Found(p) => Some(p),
@@ -27343,10 +27408,13 @@ pub(crate) fn flush_index_op_buf(
 /// shapes whose per-row maintenance has no user-visible ordering. The
 /// buffered multiset is applied as pinned-leaf sorted sweeps; it is
 /// identical to per-row maintenance because rowids are unique per row.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn arm_insert_index_bufs(
     index_states: &mut [IndexMaintState],
+    table: &Table,
     n_rows: usize,
     has_insert_triggers: bool,
+    has_delete_triggers: bool,
     stmt_or: Option<ConflictResolution>,
     has_upsert: bool,
 ) {
@@ -27357,11 +27425,26 @@ pub(crate) fn arm_insert_index_bufs(
         Some(o) => o == ConflictResolution::Abort,
         None => !index_states.iter().any(|st| st.idx.on_conflict.is_some()),
     };
-    let batch_worthy =
-        n_rows >= INDEX_BATCH_MIN_ROWS && !has_insert_triggers && !has_upsert && plain_abort;
+    // A statement-level OR REPLACE (it overrides every constraint's own
+    // clause): each conflict deletes its holder, and the buffers are
+    // flushed before every such delete (`replace_delete_holder`), so the
+    // delete sees this statement's own rows' entries. No DELETE triggers
+    // (recursive_triggers would run them mid-statement).
+    let replace_all = stmt_or == Some(ConflictResolution::Replace) && !has_delete_triggers;
+    let batch_worthy = n_rows >= INDEX_BATCH_MIN_ROWS
+        && !has_insert_triggers
+        && !has_upsert
+        && (plain_abort || replace_all);
+    // UNIQUE indexes buffer too, their uniqueness probe consulting the
+    // statement's pending keys after the tree — unless a foreign key
+    // could probe this table's indexes mid-statement (self-reference),
+    // or the table is WITHOUT ROWID (its PRIMARY KEY index is the row
+    // lookup path).
+    let unique_ok = table.foreign_keys.is_empty() && !table.without_rowid;
+    let mut first = true;
     for st in index_states.iter_mut() {
         let eligible = batch_worthy
-            && !st.idx.unique
+            && (!st.idx.unique || unique_ok)
             && st.idx.partial_expr.is_none()
             && matches!(st.idx.kind, crate::schema::IndexKind::Btree);
         if eligible {
@@ -27374,12 +27457,18 @@ pub(crate) fn arm_insert_index_bufs(
                 }
                 None => st.op_buf = Some((Vec::new(), Vec::new())),
             }
+            st.pending = st.idx.unique.then(std::collections::HashMap::new);
+            // Only REPLACE deletes ask which rows are buffered.
+            st.stmt_rows = (first && replace_all).then(std::collections::HashSet::new);
+            first = false;
             // A buffered statement never consumes the per-row append
             // hint; drop any carried pin so the flush's sweep starts
             // from a clean descent.
             st.clear_hints();
         } else {
             st.op_buf = None;
+            st.pending = None;
+            st.stmt_rows = None;
         }
     }
 }
@@ -27403,6 +27492,12 @@ pub(crate) fn flush_insert_index_bufs(
                 flush_index_op_buf(ctx, &idx, &mut root, buf)?;
             }
             st.root = root;
+            if let Some(p) = st.pending.as_mut() {
+                p.clear();
+            }
+            if let Some(r) = st.stmt_rows.as_mut() {
+                r.clear();
+            }
         }
     }
     Ok(())
