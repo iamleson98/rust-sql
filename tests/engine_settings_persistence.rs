@@ -47,7 +47,7 @@ fn engine_wide_pragmas_survive_engine_recreation() {
     // pool whose connections have all been reaped.
 
     // Generation 2: a brand-new engine for the same file must inherit
-    // the settings instead of resetting to the defaults (512 pages /
+    // the settings instead of resetting to the defaults (2048 pages /
     // -2000 KiB / FULL sync / FILE temp store).
     {
         let db = Database::open(&path).expect("open generation 2");
@@ -127,7 +127,7 @@ fn in_memory_databases_never_record_settings() {
         let db = Database::open(&path).expect("open fresh file");
         assert_eq!(
             db.pager().cache_capacity(),
-            512,
+            2048,
             "a fresh file must keep the engine default, not inherit a \
              memory pager's settings"
         );

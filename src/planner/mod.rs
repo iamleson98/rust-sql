@@ -10788,19 +10788,29 @@ fn collect_col_refs(expr: &Expr, needed: &mut NeededCols) {
 
 /// Whether every inner-table column referenced above the join is
 /// servable from the index entries alone: the rowid alias (the index
-/// entry's rowid) or the literal `rowid`. An empty reference set
-/// (`SELECT COUNT(*) ...`) is covering by definition.
+/// entry's rowid), the literal `rowid`, or the probed key column (the
+/// index's first column — every matched entry carries the probe key;
+/// the executor decodes it, fetching the row when the encoding is
+/// ambiguous for the column). An empty reference set (`SELECT COUNT(*)
+/// ...`) is covering by definition.
 fn inner_covering(
     needed: &NeededCols,
     inner_table: &Arc<Table>,
     inner_alias: &Option<String>,
+    inner_index: &Index,
 ) -> bool {
     if needed.star {
         return false;
     }
+    let key_col = inner_index
+        .columns
+        .first()
+        .filter(|c| c.expr.is_none())
+        .map(|c| c.name.to_ascii_lowercase());
     let alias_ok = |name: &str| {
         let n = name.to_ascii_lowercase();
         n == "rowid"
+            || key_col.as_deref() == Some(n.as_str())
             || inner_table
                 .rowid_alias
                 .is_some_and(|a| n == inner_table.columns[a].name.to_ascii_lowercase())
@@ -11185,10 +11195,13 @@ fn inlj_walk(catalog: &Catalog, plan: Plan, needed: &NeededCols) -> Plan {
                                 // residual included — reads an inner column
                                 // beyond the rowid alias.
                                 let covering = match &residual {
-                                    Some(r) => {
-                                        inner_covering(&with_exprs(&[r], needed), r_table, r_alias)
-                                    }
-                                    None => inner_covering(needed, r_table, r_alias),
+                                    Some(r) => inner_covering(
+                                        &with_exprs(&[r], needed),
+                                        r_table,
+                                        r_alias,
+                                        &idx,
+                                    ),
+                                    None => inner_covering(needed, r_table, r_alias, &idx),
                                 };
                                 let inlj = Plan::IndexNestedLoopJoin {
                                     outer: left.clone(),
@@ -11246,10 +11259,13 @@ fn inlj_walk(catalog: &Catalog, plan: Plan, needed: &NeededCols) -> Plan {
                                     (r_qual.as_deref(), r_col),
                                 );
                                 let covering = match &residual {
-                                    Some(r) => {
-                                        inner_covering(&with_exprs(&[r], needed), l_table, l_alias)
-                                    }
-                                    None => inner_covering(needed, l_table, l_alias),
+                                    Some(r) => inner_covering(
+                                        &with_exprs(&[r], needed),
+                                        l_table,
+                                        l_alias,
+                                        &idx,
+                                    ),
+                                    None => inner_covering(needed, l_table, l_alias, &idx),
                                 };
                                 let inlj = Plan::IndexNestedLoopJoin {
                                     outer: right.clone(),

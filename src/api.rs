@@ -90,13 +90,13 @@ fn set_read_view_pref(v: ReadView) {
 }
 
 /// The maximum number of pages cached in memory for FILE-backed databases
-/// (512 pages x 4 KiB = 2 MiB — SQLite's own default cache_size of
-/// -2000 KiB). In-memory databases never evict (the cache IS the store),
-/// so this only bounds file-pager RSS: a full-file scan through a 2 MiB
-/// window instead of caching the whole file (S17: 13 MB -> ~6 MB peak on
-/// a 7 MB file), matching SQLite's memory profile on the same workload.
-/// `PRAGMA cache_size` can raise it for hot working sets.
-const DEFAULT_CACHE_PAGES: usize = 512;
+/// (2048 pages x 4 KiB = 8 MiB; SQLite's default is -2000 KiB). In-memory
+/// databases never evict (the cache IS the store), so this only bounds
+/// file-pager RSS. Four times SQLite's window: our index pages hold fewer
+/// entries (wider integer keys), and at 2 MiB speedtest1's indexed DML
+/// spilled and re-read dirty pages (50000 single-row UPDATEs 162 ->
+/// 107 ms at 8 MiB). `PRAGMA cache_size` lowers or raises it.
+const DEFAULT_CACHE_PAGES: usize = 2048;
 
 /// Allocator-wake drain state: the delayed-free sweep happens once per
 /// process (verified by examples/probe_rounds.rs), so a global flag
@@ -4648,7 +4648,9 @@ impl Database {
             }
             tmp.execute(table.create_sql.as_str(), ())?;
             let t_t = std::time::Instant::now();
-            self.vacuum_copy_table(tmp, &table)?;
+            if !self.vacuum_copy_table_cells(tmp, &table)? {
+                self.vacuum_copy_table(tmp, &table)?;
+            }
             if std::env::var_os("RSQL_VAC_TIMING").is_some() {
                 eprintln!("[vac] table {name} copy: {:?}", t_t.elapsed());
             }
@@ -4706,6 +4708,106 @@ impl Database {
             }
         }
         Ok(())
+    }
+
+    /// Copy a rowid table into the compact target as raw CELLS: its rows
+    /// in rowid order through the append path (dense leaves, one descent
+    /// per leaf), then each implicit UNIQUE / PRIMARY KEY index entry by
+    /// entry in index order — no SQL, no per-row unique probes, no
+    /// random-order index inserts (which left those indexes ~70% full).
+    /// The record bytes are the engine's own on both sides. `Ok(false)`:
+    /// a shape the SQL-level copy keeps (WITHOUT ROWID, virtual,
+    /// AUTOINCREMENT — its sqlite_sequence bump rides the INSERTs —, temp).
+    fn vacuum_copy_table_cells(&self, tmp: &mut Database, table: &Arc<Table>) -> Result<bool> {
+        if table.without_rowid
+            || table.vtab.is_some()
+            || table.columns.iter().any(|c| c.autoincrement)
+            || tmp.catalog.is_temp(&table.name)
+        {
+            return Ok(false);
+        }
+        let (Some(src_root), Some(dst_root)) = (
+            object_root_from_schema(self, &table.name)?,
+            object_root_from_schema(tmp, &table.name)?,
+        ) else {
+            return Ok(false);
+        };
+        // Copy one tree's entries; returns the target's final root.
+        let mut copy_err: Option<Error> = None;
+        let mut target = Btree::new(&tmp.pager, dst_root, true);
+        {
+            let mut hint = None;
+            let mut source = Btree::new(&self.pager, src_root, true);
+            source.scan_table(|rowid, payload| {
+                match target.insert_table_append_hinted(rowid, payload, hint.take()) {
+                    Ok(h) => {
+                        hint = h;
+                        true
+                    }
+                    Err(e) => {
+                        copy_err = Some(e);
+                        false
+                    }
+                }
+            })?;
+        }
+        if let Some(e) = copy_err {
+            return Err(e);
+        }
+        if target.root != dst_root {
+            tmp.rewrite_schema_row_root("table", &table.name, target.root)?;
+            if let Some(t) = tmp.catalog.get_table(&table.name) {
+                let mut t = t.as_ref().clone();
+                t.root_page = target.root;
+                tmp.catalog.replace_table(&table.name, t);
+            }
+        }
+        for ix in self.catalog.indexes_on_table(&table.name) {
+            if !ix.name.starts_with("sqlite_autoindex_")
+                || !matches!(ix.kind, crate::schema::IndexKind::Btree)
+            {
+                continue;
+            }
+            let (Some(src_ix), Some(dst_ix)) = (
+                object_root_from_schema(self, &ix.name)?,
+                object_root_from_schema(tmp, &ix.name)?,
+            ) else {
+                continue;
+            };
+            let mut target = Btree::new(&tmp.pager, dst_ix, true);
+            {
+                let mut hint = None;
+                let mut source = Btree::new(&self.pager, src_ix, true);
+                source.scan_index(|rowid, key| {
+                    match target.insert_index_append_hinted(key, rowid, hint.take()) {
+                        Ok(h) => {
+                            hint = h;
+                            true
+                        }
+                        Err(e) => {
+                            copy_err = Some(e);
+                            false
+                        }
+                    }
+                })?;
+            }
+            if let Some(e) = copy_err.take() {
+                return Err(e);
+            }
+            if target.root != dst_ix {
+                tmp.rewrite_schema_row_root("index", &ix.name, target.root)?;
+                if let Some(i) = tmp.catalog.get_index(&ix.name) {
+                    tmp.catalog.replace_index(
+                        &ix.name,
+                        crate::schema::Index {
+                            root_page: target.root,
+                            ..i.as_ref().clone()
+                        },
+                    );
+                }
+            }
+        }
+        Ok(true)
     }
 
     /// Copy one table's rows into the compact target, preserving

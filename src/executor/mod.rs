@@ -20244,24 +20244,50 @@ fn exec_index_nested_loop_join(
     // alias fills it from the entry's rowid. Any wider want means the
     // planner's covering gate was not met (belt-and-braces: drop back
     // to the fetching path rather than emit NULLs someone reads).
+    //
+    // The probed KEY column (the index's first column, a plain column) is
+    // servable too: every matched entry's first key segment IS the probe
+    // encoding, decoded once per outer row (`decode_order_key_value`);
+    // when the encoding is ambiguous for the column (a numeric key under
+    // BLOB affinity, a collation-folded text key) that outer row fetches
+    // its rows instead.
+    let key_col: Option<usize> = inner_index
+        .columns
+        .first()
+        .filter(|c| c.expr.is_none())
+        .and_then(|c| inner_table.find_column(&c.name))
+        .filter(|&k| inner_table.rowid_alias != Some(k));
+    let key_binary = inner_index
+        .columns
+        .first()
+        .is_some_and(|c| c.collation.is_empty() || c.collation.eq_ignore_ascii_case("BINARY"));
+    let key_aff = key_col.map(|k| inner_table.columns[k].affinity);
     let covering = if covering {
         let alias_pos = inner_table.rowid_alias;
         match &fused_inner_cols {
             None => true,
-            Some(w) => w.len() == 1 && alias_pos.is_some_and(|a| w[0] == a),
+            Some(w) => w
+                .iter()
+                .all(|&c| alias_pos == Some(c) || key_col == Some(c)),
         }
     } else {
         false
     };
-    // The alias's slot inside the fused wanted list (covering allows at
-    // most a one-element wanted list, so the slot is 0) — `None` when
-    // the fused projection selects no inner column at all.
-    let covering_alias_slot: Option<usize> =
-        if covering && fused_inner_cols.as_ref().is_some_and(|w| w.len() == 1) {
-            Some(0)
-        } else {
-            None
-        };
+    // Whether a covering emission reads the key column at all.
+    let covering_needs_key = covering
+        && key_col.is_some_and(|k| match &fused_inner_cols {
+            None => true,
+            Some(w) => w.contains(&k),
+        });
+    // What each fused wanted slot holds in covering mode: the rowid alias
+    // (true) or the key column (false).
+    let covering_slot_is_alias: Vec<bool> = match &fused_inner_cols {
+        Some(w) if covering => w
+            .iter()
+            .map(|&c| inner_table.rowid_alias == Some(c))
+            .collect(),
+        _ => Vec::new(),
+    };
     let mut key_buf: Vec<u8> = Vec::with_capacity(16);
     // Output-slot plan for the fused selective path, PRECOMPUTED once:
     // for each output position either an outer column index, or the
@@ -20385,8 +20411,18 @@ fn exec_index_nested_loop_join(
         // most once. (A corrupted index producing duplicates is
         // `PRAGMA integrity_check`'s to report, not the join's to paper
         // over — and it saves a HashSet allocation per multi-row key.)
+        // The covering key value for this probe (None = fetch the rows).
+        let key_val: Option<Value> = if covering_needs_key {
+            match (key_binary || key_buf.first() != Some(&0x02), key_aff) {
+                (true, Some(aff)) => crate::types::value::decode_order_key_value(&key_buf, aff),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let covering_now = covering && (!covering_needs_key || key_val.is_some());
         for &rowid in &rowids {
-            if covering {
+            if covering_now {
                 // Index-only emission: no table descent, no decode. The
                 // fused slots (when present) reference outer columns and
                 // at most the alias slot; the combined path fills the
@@ -20399,10 +20435,12 @@ fn exec_index_nested_loop_join(
                         for &(is_outer, idx, _) in slots {
                             if is_outer {
                                 out.push(outer_row[idx].clone());
-                            } else if Some(idx) == covering_alias_slot {
-                                out.push(Value::Integer(rowid));
                             } else {
-                                out.push(Value::Null);
+                                match covering_slot_is_alias.get(idx) {
+                                    Some(true) => out.push(Value::Integer(rowid)),
+                                    Some(false) => out.push(key_val.clone().unwrap_or(Value::Null)),
+                                    None => out.push(Value::Null),
+                                }
                             }
                         }
                         out_rows.push(out);
@@ -20413,6 +20451,9 @@ fn exec_index_nested_loop_join(
                         combined.extend(std::iter::repeat(Value::Null).take(n_inner_cols));
                         if let Some(a) = inner_table.rowid_alias {
                             combined[outer_width + a] = Value::Integer(rowid);
+                        }
+                        if let (Some(k), Some(v)) = (key_col, &key_val) {
+                            combined[outer_width + k] = v.clone();
                         }
                         out_rows.push(combined);
                     }

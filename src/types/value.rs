@@ -572,7 +572,9 @@ impl Value {
                 // it equals encode IDENTICALLY (SQLite indexes 2 and 2.0
                 // as one key), and no real key prefixes another.
                 out.push(0x01);
-                out.extend_from_slice(&double_order_key(*f).to_be_bytes());
+                // -0.0 == 0.0 (SQL equality): one key for both, or a
+                // -0.0 probe misses the zero entries.
+                out.extend_from_slice(&double_order_key(*f + 0.0).to_be_bytes());
                 out.extend_from_slice(&0u16.to_be_bytes());
             }
             Value::Text(s) => {
@@ -647,7 +649,7 @@ impl Value {
             }
             Value::Real(f) => {
                 o[0] = 0x01;
-                o[1..9].copy_from_slice(&double_order_key(*f).to_be_bytes());
+                o[1..9].copy_from_slice(&double_order_key(*f + 0.0).to_be_bytes());
                 o[9..11].copy_from_slice(&0u16.to_be_bytes());
             }
             Value::Text(s) => {
@@ -1020,6 +1022,75 @@ pub(crate) fn double_order_key(f: f64) -> u64 {
     }
 }
 
+/// Decode one ORDER-KEY segment (exactly one value's bytes) back to the
+/// value a column of affinity `aff` stored — `None` when the encoding is
+/// ambiguous for that column: the numeric family blurs INTEGER and REAL
+/// (`2` and `2.0` encode alike), so a numeric segment decodes only under
+/// INTEGER / NUMERIC affinity (an integral in-range value was stored as
+/// INTEGER, anything else as REAL) or REAL affinity (always REAL; a zero
+/// declines — its sign is not worth the risk). TEXT / BLOB segments
+/// decode exactly; callers ensure the index column's collation is
+/// BINARY (a folded key loses the original text).
+pub(crate) fn decode_order_key_value(seg: &[u8], aff: Affinity) -> Option<Value> {
+    let unescape = |body: &[u8]| -> Option<Vec<u8>> {
+        // body = escaped payload + [00 00]
+        let n = body.len().checked_sub(2)?;
+        if body[n..] != [0, 0] {
+            return None;
+        }
+        let mut out = Vec::with_capacity(n);
+        let mut i = 0;
+        while i < n {
+            if body[i] == 0 {
+                if body.get(i + 1) != Some(&1) {
+                    return None;
+                }
+                out.push(0);
+                i += 2;
+            } else {
+                out.push(body[i]);
+                i += 1;
+            }
+        }
+        Some(out)
+    };
+    match *seg.first()? {
+        0x00 if seg.len() == 1 => Some(Value::Null),
+        0x02 => Some(Value::Text(crate::types::Text::from_bytes(&unescape(
+            &seg[1..],
+        )?))),
+        0x03 => Some(Value::Blob(unescape(&seg[1..])?)),
+        0x01 if seg.len() == 11 => {
+            let k = u64::from_be_bytes(seg[1..9].try_into().ok()?);
+            let bits = if k >> 63 == 1 {
+                k & !0x8000_0000_0000_0000
+            } else {
+                !k
+            };
+            let lo = f64::from_bits(bits);
+            let delta = u16::from_be_bytes(seg[9..11].try_into().ok()?);
+            match aff {
+                Affinity::Integer | Affinity::Numeric => {
+                    if delta != 0 {
+                        let v = lo as i128 + delta as i128;
+                        return i64::try_from(v).ok().map(Value::Integer);
+                    }
+                    if lo.fract() == 0.0
+                        && (-9.223_372_036_854_776e18..9.223_372_036_854_776e18).contains(&lo)
+                    {
+                        Some(Value::Integer(lo as i64))
+                    } else {
+                        Some(Value::Real(lo))
+                    }
+                }
+                Affinity::Real if delta == 0 && lo != 0.0 && !lo.is_nan() => Some(Value::Real(lo)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Escape payload bytes for the Text/Blob ORDER-KEY encoding: every 0x00
 /// becomes the pair (00 01). Together with the [00 00] terminator this
 /// makes the encoded key PREFIX-FREE (no key is a strict prefix of
@@ -1233,6 +1304,37 @@ pub(crate) fn parse_real_prefix(s: &str) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn order_key_values_decode_back() {
+        use crate::types::Affinity as A;
+        let cases: Vec<(Value, A)> = vec![
+            (Value::Integer(0), A::Integer),
+            (Value::Integer(-7), A::Numeric),
+            (Value::Integer(i64::MAX), A::Integer),
+            (Value::Integer(i64::MIN), A::Integer),
+            (Value::Integer((1 << 53) + 3), A::Integer),
+            (Value::Real(2.5), A::Integer),
+            (Value::Real(-1e300), A::Numeric),
+            (Value::Real(3.0), A::Real),
+            (Value::Real(-0.25), A::Real),
+            (Value::Text("a\0b".into()), A::Text),
+            (Value::Text("".into()), A::Text),
+            (Value::Blob(vec![0, 0, 1, 255]), A::Blob),
+        ];
+        for (v, aff) in cases {
+            let k = v.encode_order_key();
+            assert_eq!(decode_order_key_value(&k, aff).as_ref(), Some(&v), "{v:?}");
+        }
+        assert_eq!(
+            decode_order_key_value(&Value::Integer(2).encode_order_key(), A::Blob),
+            None
+        );
+        assert_eq!(
+            decode_order_key_value(&Value::Real(0.0).encode_order_key(), A::Real),
+            None
+        );
+    }
 
     #[test]
     fn value_ordering() {

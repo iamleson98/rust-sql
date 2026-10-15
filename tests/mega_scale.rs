@@ -143,7 +143,7 @@ fn ops_count(rows: u64) -> u64 {
 }
 
 /// Peak-RSS budget for the WHOLE marathon (MB). The page cache is
-/// capacity-bounded (512 pages), so nothing may scale with row count
+/// capacity-bounded (2048 pages), so nothing may scale with row count
 /// beyond the per-batch statement payloads; the per-row allowance is a
 /// deliberately tight 2.5 bytes/row — an 8-bytes-per-row leak (the
 /// documented failure class) adds 80 MB per 10M rows and trips every

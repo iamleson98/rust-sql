@@ -82,7 +82,7 @@ fn batch_size() -> u64 {
 }
 
 /// Peak-RSS bound for a section (MB). Auto: a fixed base plus a small
-/// per-row allowance — the page cache is capacity-bounded (512 pages),
+/// per-row allowance — the page cache is capacity-bounded (2048 pages),
 /// so NOTHING in the engine may scale with row count; the allowance
 /// only covers per-batch statement payloads. `LIMIT_PEAK_MB` overrides
 /// for hosts with unusual baselines.
