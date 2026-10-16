@@ -587,13 +587,36 @@ fn main() {
     );
     let (mut ta, mut tb) = (Duration::ZERO, Duration::ZERO);
     let (mut wins, mut losses, mut mismatches) = (0, 0, 0);
+    // A section's rows are only comparable when the DATA it reads was
+    // built deterministically. speedtest1 builds whole sets with
+    // random()/randomblob() in an EARLIER section of the same set (the
+    // JSON J1/J2 tables, the facttab star schema): each engine rolls its
+    // own data, so later queries read different rows BY DESIGN. The
+    // per-section check flagged only text containing "random(" itself —
+    // sections 3:140/3:141/7:130/7:140 (queries over randomized data,
+    // no random in their own text) came out as false mismatches. Data
+    // lineage turns over at set boundaries (the section-999 reset), so
+    // the flag is a prefix-OR within each set.
+    let mut data_random = Vec::with_capacity(sections.len());
+    {
+        let mut cur_set = usize::MAX;
+        let mut rand = false;
+        for s in sections.iter() {
+            if s.set != cur_set {
+                cur_set = s.set;
+                rand = false;
+            }
+            rand |= s.stmts.iter().any(|q| q.contains("random("));
+            data_random.push(rand);
+        }
+    }
     for (i, s) in sections.iter().enumerate() {
         let (x, y) = (&a[i], &b[i]);
         ta += x.time;
         tb += y.time;
         let ratio = y.time.as_secs_f64() / x.time.as_secs_f64().max(1e-9);
         let mut notes = String::new();
-        let random = s.stmts.iter().any(|q| q.contains("random("));
+        let random = data_random[i];
         if x.hash != y.hash && random {
             notes.push_str("(random data) ");
         } else if x.hash != y.hash {
@@ -656,4 +679,20 @@ fn main() {
         losses,
         mismatches
     );
+    // Correctness gate for CI: a non-random section whose rows differ, or
+    // a section where one engine errored and the other did not, is a
+    // wrong answer. Speed is reported, never gated (shared runners).
+    let error_splits = sections
+        .iter()
+        .zip(a.iter().zip(b.iter()))
+        .filter(|(_, (x, y))| x.errors != y.errors)
+        .count();
+    if mismatches > 0 || error_splits > 0 {
+        eprintln!(
+            "GATE FAIL: {} result mismatches, {} error-count splits",
+            mismatches, error_splits
+        );
+        std::process::exit(1);
+    }
+    println!("GATE OK: both engines agree on every non-random section");
 }

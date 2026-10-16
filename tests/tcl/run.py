@@ -109,6 +109,14 @@ def main():
         sq, _, _, sq_to = run_one(a.testdir, f, "sqlite", tmo)
         ours, out, unk, to = run_one(a.testdir, f, "ours", tmo)
         diverge = [n for n, r in sq.items() if r == "PASS" and ours.get(n) != "PASS"]
+        # The honest split of that list: a test our side RAN and got a
+        # different answer on is a real divergence; a test our side never
+        # reached is almost always the file's timeout cutting the run
+        # short (the fault-sim files die mid-loop), which is a failure to
+        # FINISH, not a semantic difference. Both are reported; they are
+        # just not the same number.
+        ran = [n for n in diverge if ours.get(n) == "FAIL"]
+        unreached = [n for n in diverge if n not in ours]
         # The failing tests' output blocks on `ours` (first 50 only — the
         # fault-injection files diverge by the thousand).
         starts = {}
@@ -122,6 +130,8 @@ def main():
             "sqlite_pass": sum(1 for r in sq.values() if r == "PASS"),
             "ours_pass": sum(1 for r in ours.values() if r == "PASS"),
             "diverge": diverge,
+            "diverge_ran": ran,
+            "diverge_unreached": unreached,
             "details": details,
             "timeout": to,
             "sqlite_timeout": sq_to,
@@ -137,8 +147,11 @@ def main():
                   + (" TIMEOUT" if r["timeout"] else ""), flush=True)
     tot_sq = sum(r["sqlite_pass"] for r in results.values())
     tot_div = sum(len(r["diverge"]) for r in results.values())
+    tot_ran = sum(len(r.get("diverge_ran", r["diverge"])) for r in results.values())
+    tot_unre = sum(len(r.get("diverge_unreached", [])) for r in results.values())
     print(f"TOTAL: {len(results)} files, {tot_sq} tests pass on sqlite, "
           f"{tot_div} of them diverge on ours "
+          f"({tot_ran} ran-and-failed, {tot_unre} never reached) "
           f"({sum(1 for r in results.values() if r['diverge'])} files)")
     if a.o:
         with open(a.o, "w") as fh:

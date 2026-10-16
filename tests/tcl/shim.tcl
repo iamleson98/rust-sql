@@ -182,6 +182,13 @@ proc shim_db {h method args} {
 }
 
 # Every compile-time capability on except the testfixture internals.
+# NOTE: nothing but plain capability names may live inside these braced
+# lists — a `#` line inside braces is NOT a comment in Tcl but literal
+# list ELEMENTS, each of which gets `set ::sqlite_options($word) 0`.
+# run 38855855625's hardening comment did exactly that and its prose
+# word "pragma" clobbered the real `pragma=1` flag above (ctime.test's
+# `ifcapable !pragma||!compileoption_diags` then finished the file
+# early, and 18 more corpus files gated on `pragma` misrouted).
 foreach o {
   8_3_names allow_rowid_in_view altertable analyze api_armor atomicwrite attach
   auth autoinc autoindex autoreset autovacuum bloblit builtin_test cast check
@@ -193,6 +200,11 @@ foreach o {
   update_delete_limit vacuum view vtab wal windowfunc normalize offset_sql_func
   null_trim stmtvtab carray stat4 utf16 trace preupdate session
 } { set ::sqlite_options($o) 1 }
+# Small knobs the corpus probes that were missing: mutex_noop (the
+# shim presents a real-mutex build - run_thread_tests, called from
+# EVERY finish_test, errors out without it), memdebug (no
+# SQLITE_MEMDEBUG), casesensitivelike (default off; the pragma
+# toggles it at runtime), configslower, yytrackmaxstackdepth.
 foreach o {
   crashtest debug default_autovacuum default_ckptfullfsync direct_read dirsync
   fast_secure_delete fts3 fts3_unicode fts4_deferred has_codec icu icu_collations
@@ -202,14 +214,15 @@ foreach o {
   shared_cache shared_chache snapshot sqllog tclvar thread_misuse_warnings
   threadsafe threadsafe1 threadsafe2 unlock_notify uri_00_error win32malloc wsd
   cursorhints break
-  # Small knobs the corpus probes that were missing: mutex_noop (the
-  # shim presents a real-mutex build - run_thread_tests, called from
-  # EVERY finish_test, errors out without it), memdebug (no
-  # SQLITE_MEMDEBUG), casesensitivelike (default off; the pragma
-  # toggles it at runtime), configslower, yytrackmaxstackdepth.
   mutex_noop memdebug casesensitivelike configslower yytrackmaxstackdepth
 } { set ::sqlite_options($o) 0 }
 set ::sqlite_options(default_autovacuum) 0
+# tester.tcl's finalize_testing (reached from EVERY finish_test, early
+# ones included: `ifcapable !xyz { finish_test ; return }`) reads this
+# global with no unset guard — an early finish on a file whose flags
+# route it out crashed the whole file on "can't read
+# sqlite_open_file_count" with every remaining test lost.
+set ::sqlite_open_file_count 0
 
 # test1.c's fpnum_compare: token-wise equality, floating-point tokens
 # compared to 14 significant digits.
