@@ -33,6 +33,19 @@ fn arrow_eval(op: BinaryOp, l: &Value, r: &Value) -> Result<Value> {
             }
         }
     }
+    if let Value::Text(t) = l {
+        // TEXT documents resolve on their cached JSONB bytes (no tree).
+        if let Ok(Some(segs)) = crate::executor::jsonb::arrow_rhs_segments(r) {
+            let blob = crate::executor::json::cached_text_jsonb(t)?;
+            if let Some(found) = crate::executor::json::jsonb_lookup_bytes(&blob, &segs) {
+                return Ok(match (op, found) {
+                    (BinaryOp::Arrow, Some(n)) => Value::Text(n.render()),
+                    (BinaryOp::ArrowText, Some(n)) => n.to_value(),
+                    _ => Value::Null,
+                });
+            }
+        }
+    }
     let doc = match crate::executor::json::load_doc_shared(l)? {
         Some(d) => d,
         None => return Ok(Value::Null),

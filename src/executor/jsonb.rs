@@ -165,8 +165,7 @@ impl Jb {
             }
             Jb::Text5(s) => {
                 out.push(b'"');
-                let t = translate_json5_escapes(s.as_bytes());
-                write_escaped_string(&t, out);
+                write_json5_as_json(s.as_bytes(), out);
                 out.push(b'"');
             }
             Jb::TextRaw(s) => {
@@ -320,6 +319,129 @@ pub fn parse_lenient_bytes(b: &[u8]) -> Result<Jb, usize> {
     Ok(v)
 }
 
+/// [`parse_lenient_bytes`] straight to JSONB bytes — byte-identical to
+/// `jb_to_bytes(&parse_lenient_bytes(b)?)`, the same errors at the same
+/// positions, but no tree: SQLite's parser also writes JSONB directly
+/// (jsonTranslateTextToBlob). A 90 KB document used to cost one String
+/// allocation per number and per key plus the tree's teardown.
+pub fn parse_lenient_to_jsonb(b: &[u8]) -> Result<Vec<u8>, usize> {
+    let mut p = JParser {
+        b,
+        pos: 0,
+        strict: false,
+    };
+    let mut out = Vec::with_capacity(b.len());
+    p.emit_value(&mut out)?;
+    p.skip_ws();
+    if p.pos != p.b.len() {
+        return Err(p.pos + 1);
+    }
+    Ok(out)
+}
+
+/// Minified JSON text of a JSONB blob — `jb_from_bytes(b)?.render()`
+/// without the tree. `None` when the blob is not valid JSONB.
+pub fn render_jsonb(b: &[u8]) -> Option<crate::types::Text> {
+    fn elem(b: &[u8], pos: usize, out: &mut Vec<u8>, depth: u32) -> Option<usize> {
+        if depth > 2000 {
+            return None;
+        }
+        let (typ, len, hdr) = read_header(b, pos)?;
+        let ps = pos + hdr;
+        let pe = ps.checked_add(len)?;
+        if pe > b.len() {
+            return None;
+        }
+        let raw = &b[ps..pe];
+        match typ {
+            T_NULL | T_TRUE | T_FALSE => {
+                if len != 0 {
+                    return None;
+                }
+                out.extend_from_slice(match typ {
+                    T_NULL => b"null".as_slice(),
+                    T_TRUE => b"true",
+                    _ => b"false",
+                });
+            }
+            T_INT | T_FLOAT => {
+                std::str::from_utf8(raw).ok()?;
+                out.extend_from_slice(raw);
+            }
+            T_INT5 => {
+                out.extend_from_slice(canonical_int5(std::str::from_utf8(raw).ok()?).as_bytes())
+            }
+            T_FLOAT5 => {
+                out.extend_from_slice(canonical_float5(std::str::from_utf8(raw).ok()?).as_bytes())
+            }
+            T_TEXT | T_TEXTJ => {
+                out.push(b'"');
+                out.extend_from_slice(raw);
+                out.push(b'"');
+            }
+            T_TEXT5 => {
+                out.push(b'"');
+                write_json5_as_json(raw, out);
+                out.push(b'"');
+            }
+            T_TEXTRAW => {
+                out.push(b'"');
+                write_escaped_string(raw, out);
+                out.push(b'"');
+            }
+            T_ARRAY => {
+                out.push(b'[');
+                let mut p = ps;
+                let mut first = true;
+                while p < pe {
+                    if !first {
+                        out.push(b',');
+                    }
+                    first = false;
+                    p = elem(b, p, out, depth + 1)?;
+                }
+                if p != pe {
+                    return None;
+                }
+                out.push(b']');
+            }
+            T_OBJECT => {
+                out.push(b'{');
+                let mut p = ps;
+                let mut first = true;
+                while p < pe {
+                    if !first {
+                        out.push(b',');
+                    }
+                    first = false;
+                    let (kt, _, _) = read_header(b, p)?;
+                    if !matches!(kt, T_TEXT | T_TEXTJ | T_TEXT5 | T_TEXTRAW) {
+                        return None;
+                    }
+                    p = elem(b, p, out, depth + 1)?;
+                    if p >= pe {
+                        return None;
+                    }
+                    out.push(b':');
+                    p = elem(b, p, out, depth + 1)?;
+                }
+                if p != pe {
+                    return None;
+                }
+                out.push(b'}');
+            }
+            _ => return None,
+        }
+        Some(pe)
+    }
+    if b.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(b.len() + b.len() / 8);
+    let end = elem(b, 0, &mut out, 0)?;
+    (end == b.len()).then(|| crate::types::Text::from_bytes(&out))
+}
+
 /// Parse under strict RFC 8259 rules (json_valid bit 1): no trailing
 /// commas, no `+`/`.5`/`1.`/hex/Infinity/NaN, no unquoted keys.
 pub fn parse_strict(s: &str) -> Result<Jb, usize> {
@@ -346,6 +468,23 @@ pub fn parse_strict_bytes(b: &[u8]) -> Result<Jb, usize> {
 /// (the lenient parser already accepts the JSON5 superset SQLite does).
 pub fn parse_json5(s: &str) -> Result<Jb, usize> {
     parse_lenient(s)
+}
+
+/// A scanned number: SQL NULL (lenient `NaN`), a fixed payload, or a
+/// span of the input.
+enum NumTok {
+    Null,
+    Static(u8, &'static str),
+    Span(u8, usize, usize),
+}
+
+fn num_jb(typ: u8, t: String) -> Jb {
+    match typ {
+        T_INT => Jb::Int(t),
+        T_INT5 => Jb::Int5(t),
+        T_FLOAT => Jb::Float(t),
+        _ => Jb::Float5(t),
+    }
 }
 
 struct JParser<'a> {
@@ -375,6 +514,7 @@ impl<'a> JParser<'a> {
             Some(b'{') => self.parse_object(),
             Some(b'[') => self.parse_array(),
             Some(b'"') => self.parse_string().map(|(v, _)| v),
+            Some(b'\'') if !self.strict => self.parse_string_q(b'\'').map(|(v, _)| v),
             Some(b't') => self.parse_lit("true", Jb::True),
             Some(b'f') => self.parse_lit("false", Jb::False),
             Some(b'n') => self.parse_lit("null", Jb::Null),
@@ -395,6 +535,19 @@ impl<'a> JParser<'a> {
     }
 
     fn parse_number(&mut self) -> Result<Jb, usize> {
+        Ok(match self.scan_number()? {
+            NumTok::Null => Jb::Null,
+            NumTok::Static(typ, t) => num_jb(typ, t.to_string()),
+            NumTok::Span(typ, s, e) => {
+                num_jb(typ, std::str::from_utf8(&self.b[s..e]).unwrap().to_string())
+            }
+        })
+    }
+
+    /// Scan one number: its JSONB type and payload (a span of the input,
+    /// or a fixed text for the JSON5 infinities). The single definition of
+    /// number syntax for the tree parser and the JSONB emitter.
+    fn scan_number(&mut self) -> Result<NumTok, usize> {
         let start = self.pos;
         // Optional sign. `-Infinity` / `-NaN` are accepted in lenient mode.
         match self.peek() {
@@ -402,11 +555,11 @@ impl<'a> JParser<'a> {
                 self.pos += 1;
                 if !self.strict && self.b[self.pos..].starts_with(b"Infinity") {
                     self.pos += 8;
-                    return Ok(Jb::Float("-9e999".into()));
+                    return Ok(NumTok::Static(T_FLOAT, "-9e999"));
                 }
                 if !self.strict && self.b[self.pos..].starts_with(b"NaN") {
                     self.pos += 3;
-                    return Ok(Jb::Null);
+                    return Ok(NumTok::Null);
                 }
             }
             Some(b'+') => {
@@ -416,7 +569,7 @@ impl<'a> JParser<'a> {
                 self.pos += 1;
                 if self.b[self.pos..].starts_with(b"Infinity") {
                     self.pos += 8;
-                    return Ok(Jb::Float("9e999".into()));
+                    return Ok(NumTok::Static(T_FLOAT, "9e999"));
                 }
             }
             _ => {}
@@ -440,10 +593,7 @@ impl<'a> JParser<'a> {
             if self.pos == hs {
                 return Err(self.pos + 1);
             }
-            let text = std::str::from_utf8(&self.b[start..self.pos])
-                .unwrap()
-                .to_string();
-            return Ok(Jb::Int5(text));
+            return Ok(NumTok::Span(T_INT5, start, self.pos));
         }
         // Integer part (may be empty for `.5` in lenient mode).
         let int_start = self.pos;
@@ -483,35 +633,32 @@ impl<'a> JParser<'a> {
         if int_digits == 0 && frac_digits == 0 {
             return Err(start + 1);
         }
-        let text = std::str::from_utf8(&self.b[start..self.pos]).unwrap();
         // Leading zeros: RFC 8259 forbids `01`, `00` — SQLite rejects even
         // leniently (`json('[00]')` errors).
         if int_digits > 1 && self.b[int_start] == b'0' {
             return Err(int_start + 1);
         }
+        let plus = self.b[start] == b'+';
+        // A leading '+' is stripped from the payload (SQLite
+        // canonicalizes "+.5" to ".5", "+5" to "5").
+        let body = if plus { start + 1 } else { start };
         if frac_start.is_some() || has_exp {
             // Real number: FLOAT when canonical RFC 8259, else FLOAT5.
             // Canonical: no '+', nonempty int part, frac (when present)
             // has digits, exp (when present) has digits (checked above).
-            let canonical = !text.starts_with('+')
-                && int_digits > 0
-                && (frac_start.is_none() || frac_digits > 0);
+            let canonical = !plus && int_digits > 0 && (frac_start.is_none() || frac_digits > 0);
             if self.strict && !canonical {
                 return Err(start + 1);
             }
             if canonical {
-                Ok(Jb::Float(text.to_string()))
+                Ok(NumTok::Span(T_FLOAT, start, self.pos))
             } else {
-                // Strip a leading '+' (SQLite canonicalizes "+.5" to ".5").
-                let t = text.strip_prefix('+').unwrap_or(text);
-                Ok(Jb::Float5(t.to_string()))
+                Ok(NumTok::Span(T_FLOAT5, body, self.pos))
             }
         } else {
-            // Pure integer: canonical INT (a leading '+' is stripped;
-            // magnitude does not matter — JSONB INT holds arbitrary
-            // precision text).
-            let t = text.strip_prefix('+').unwrap_or(text);
-            Ok(Jb::Int(t.to_string()))
+            // Pure integer: canonical INT (magnitude does not matter —
+            // JSONB INT holds arbitrary precision text).
+            Ok(NumTok::Span(T_INT, body, self.pos))
         }
     }
 
@@ -521,7 +668,32 @@ impl<'a> JParser<'a> {
     /// sequence (or a stray lead/continuation byte) copies through as
     /// its own bytes, exactly as the input holds them.
     fn parse_string(&mut self) -> Result<(Jb, bool), usize> {
-        if self.peek() != Some(b'"') {
+        self.parse_string_q(b'"')
+    }
+
+    fn parse_string_q(&mut self, q: u8) -> Result<(Jb, bool), usize> {
+        let (typ, s, e, json5) = self.scan_string_q(q)?;
+        let text = crate::types::Text::from_bytes(&self.b[s..e]);
+        let elem = match typ {
+            T_TEXT => Jb::Text(text),
+            T_TEXT5 => Jb::Text5(text),
+            _ => Jb::TextJ(text),
+        };
+        Ok((elem, json5))
+    }
+
+    /// Scan a double-quoted string: (JSONB type, payload span, saw JSON5
+    /// escapes). The payload is the bytes between the quotes verbatim.
+    fn scan_string(&mut self) -> Result<(u8, usize, usize, bool), usize> {
+        self.scan_string_q(b'"')
+    }
+
+    /// `scan_string` for either quote: JSON5 single-quoted strings follow
+    /// SQLite's typing — TEXT, TEXTJ with RFC 8259 escapes, TEXT5 with
+    /// JSON5-only escapes or a `"` inside the quotes (it needs escaping
+    /// when rendered).
+    fn scan_string_q(&mut self, q: u8) -> Result<(u8, usize, usize, bool), usize> {
+        if self.peek() != Some(q) {
             return Err(self.err());
         }
         self.pos += 1;
@@ -536,23 +708,27 @@ impl<'a> JParser<'a> {
             let rest = &self.b[self.pos..];
             let run = rest
                 .iter()
-                .position(|&c| c == b'"' || c == b'\\' || c < 0x20)
+                .position(|&c| c == q || c == b'"' || c == b'\\' || c < 0x20)
                 .unwrap_or(rest.len());
             self.pos += run;
             let c = self.peek().ok_or(self.pos + 1)?;
             match c {
-                b'"' => {
-                    let payload = &self.b[start..self.pos];
+                // A `"` inside a single-quoted string.
+                b'"' if q != b'"' => {
+                    json5 = true;
                     self.pos += 1;
-                    let text = crate::types::Text::from_bytes(payload);
-                    let elem = if !escaped {
-                        Jb::Text(text)
-                    } else if json5 {
-                        Jb::Text5(text)
+                }
+                c if c == q => {
+                    let end = self.pos;
+                    self.pos += 1;
+                    let typ = if json5 {
+                        T_TEXT5
+                    } else if escaped {
+                        T_TEXTJ
                     } else {
-                        Jb::TextJ(text)
+                        T_TEXT
                     };
-                    return Ok((elem, json5));
+                    return Ok((typ, start, end, json5));
                 }
                 b'\\' => {
                     escaped = true;
@@ -562,32 +738,33 @@ impl<'a> JParser<'a> {
                         b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' | b'u' => {
                             self.pos += 1;
                             if e == b'u' {
-                                if self.peek() == Some(b'{') {
-                                    // JSON5 \u{XX...} code point
-                                    json5 = true;
-                                    self.pos += 1;
-                                    while self.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
-                                        self.pos += 1;
-                                    }
-                                    if self.peek() != Some(b'}') {
+                                // `\u` takes exactly four hex digits (SQLite
+                                // has no JSON5 `\u{...}` form).
+                                for _ in 0..4 {
+                                    let h = self.peek().ok_or(self.pos + 1)?;
+                                    if !h.is_ascii_hexdigit() {
                                         return Err(self.pos + 1);
                                     }
                                     self.pos += 1;
-                                } else {
-                                    for _ in 0..4 {
-                                        let h = self.peek().ok_or(self.pos + 1)?;
-                                        if !h.is_ascii_hexdigit() {
-                                            return Err(self.pos + 1);
-                                        }
-                                        self.pos += 1;
-                                    }
                                 }
                             }
                         }
-                        // JSON5 escapes
-                        b'x' | b'v' | b'0'..=b'7' | b'\n' | b'\r' => {
+                        // JSON5-only escapes (SQLite's set): `\x`HH, `\v`, `\'`,
+                        // `\0` not followed by a digit, and line
+                        // continuations; none of them under strict rules.
+                        b'x' | b'v' | b'0' | b'\n' | b'\r' | b'\'' => {
+                            if self.strict
+                                || (e == b'0'
+                                    && self.b.get(self.pos + 1).is_some_and(|c| c.is_ascii_digit()))
+                            {
+                                return Err(self.pos + 1);
+                            }
                             json5 = true;
                             self.pos += 1;
+                            // `\` CR LF is one line continuation.
+                            if e == b'\r' && self.peek() == Some(b'\n') {
+                                self.pos += 1;
+                            }
                             if e == b'x' {
                                 for _ in 0..2 {
                                     let h = self.peek().ok_or(self.pos + 1)?;
@@ -671,21 +848,7 @@ impl<'a> JParser<'a> {
             } else if !self.strict {
                 // Unquoted key or single-quoted key (JSON5)
                 if self.peek() == Some(b'\'') {
-                    // JSON5 single-quoted strings: treat as Text5-ish; rare.
-                    self.pos += 1;
-                    let mut s: Vec<u8> = Vec::new();
-                    while let Some(c) = self.peek() {
-                        if c == b'\'' {
-                            break;
-                        }
-                        s.push(c);
-                        self.pos += 1;
-                    }
-                    if self.peek() != Some(b'\'') {
-                        return Err(self.pos + 1);
-                    }
-                    self.pos += 1;
-                    Jb::Text5(crate::types::Text::from_bytes(&s))
+                    self.parse_string_q(b'\'')?.0
                 } else {
                     let kb = self.parse_ident_key_bytes()?;
                     Jb::Text(crate::types::Text::from_utf8(&kb).map_err(|_| self.err())?)
@@ -713,6 +876,176 @@ impl<'a> JParser<'a> {
                 Some(b'}') => {
                     self.pos += 1;
                     return Ok(Jb::Object(pairs));
+                }
+                _ => return Err(self.pos + 1),
+            }
+        }
+    }
+}
+
+impl JParser<'_> {
+    /// `parse_value`, written as JSONB into `out` (see
+    /// [`parse_lenient_to_jsonb`]). Mirrors the tree parser branch for
+    /// branch; scalars go through the shared scanners.
+    fn emit_value(&mut self, out: &mut Vec<u8>) -> Result<(), usize> {
+        self.skip_ws();
+        match self.peek() {
+            Some(b'{') => self.emit_object(out),
+            Some(b'[') => self.emit_array(out),
+            Some(b'"') => {
+                let (typ, s, e, _) = self.scan_string()?;
+                push_header(out, typ, e - s);
+                out.extend_from_slice(&self.b[s..e]);
+                Ok(())
+            }
+            Some(b'\'') if !self.strict => {
+                let (typ, s, e, _) = self.scan_string_q(b'\'')?;
+                push_header(out, typ, e - s);
+                out.extend_from_slice(&self.b[s..e]);
+                Ok(())
+            }
+            Some(b't') => self.emit_lit("true", T_TRUE, out),
+            Some(b'f') => self.emit_lit("false", T_FALSE, out),
+            Some(b'n') => self.emit_lit("null", T_NULL, out),
+            Some(b'N') if !self.strict => self.emit_lit("NaN", T_NULL, out),
+            Some(b'I') if !self.strict => {
+                if self.b[self.pos..].starts_with(b"Infinity") {
+                    self.pos += 8;
+                    push_header(out, T_FLOAT, 5);
+                    out.extend_from_slice(b"9e999");
+                    Ok(())
+                } else {
+                    Err(self.err())
+                }
+            }
+            Some(b'-') | Some(b'+') | Some(b'0'..=b'9') | Some(b'.') => {
+                match self.scan_number()? {
+                    NumTok::Null => out.push(T_NULL),
+                    NumTok::Static(typ, t) => {
+                        push_header(out, typ, t.len());
+                        out.extend_from_slice(t.as_bytes());
+                    }
+                    NumTok::Span(typ, s, e) => {
+                        push_header(out, typ, e - s);
+                        out.extend_from_slice(&self.b[s..e]);
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(self.err()),
+        }
+    }
+
+    fn emit_lit(&mut self, lit: &str, typ: u8, out: &mut Vec<u8>) -> Result<(), usize> {
+        if self.b[self.pos..].starts_with(lit.as_bytes()) {
+            self.pos += lit.len();
+            out.push(typ);
+            Ok(())
+        } else {
+            Err(self.err())
+        }
+    }
+
+    /// Open a container: a one-byte header placeholder, widened by
+    /// `close_container` once the payload size is known (the shortest
+    /// header, as `encode_elem` writes it).
+    fn open_container(out: &mut Vec<u8>) -> usize {
+        out.push(0);
+        out.len()
+    }
+
+    fn close_container(out: &mut Vec<u8>, start: usize, typ: u8) {
+        let len = out.len() - start;
+        let mut hdr = Vec::with_capacity(9);
+        push_header(&mut hdr, typ, len);
+        out[start - 1] = hdr[0];
+        if hdr.len() > 1 {
+            out.splice(start..start, hdr[1..].iter().copied());
+        }
+    }
+
+    fn emit_array(&mut self, out: &mut Vec<u8>) -> Result<(), usize> {
+        self.pos += 1; // [
+        let start = Self::open_container(out);
+        self.skip_ws();
+        if self.peek() == Some(b']') {
+            self.pos += 1;
+            Self::close_container(out, start, T_ARRAY);
+            return Ok(());
+        }
+        loop {
+            self.emit_value(out)?;
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                    self.skip_ws();
+                    // Trailing comma (lenient only)
+                    if self.peek() == Some(b']') && !self.strict {
+                        self.pos += 1;
+                        Self::close_container(out, start, T_ARRAY);
+                        return Ok(());
+                    }
+                }
+                Some(b']') => {
+                    self.pos += 1;
+                    Self::close_container(out, start, T_ARRAY);
+                    return Ok(());
+                }
+                _ => return Err(self.pos + 1),
+            }
+        }
+    }
+
+    fn emit_object(&mut self, out: &mut Vec<u8>) -> Result<(), usize> {
+        self.pos += 1; // {
+        let start = Self::open_container(out);
+        self.skip_ws();
+        if self.peek() == Some(b'}') {
+            self.pos += 1;
+            Self::close_container(out, start, T_OBJECT);
+            return Ok(());
+        }
+        loop {
+            self.skip_ws();
+            if self.peek() == Some(b'"') {
+                let (typ, s, e, _) = self.scan_string()?;
+                push_header(out, typ, e - s);
+                out.extend_from_slice(&self.b[s..e]);
+            } else if !self.strict {
+                if self.peek() == Some(b'\'') {
+                    let (typ, s, e, _) = self.scan_string_q(b'\'')?;
+                    push_header(out, typ, e - s);
+                    out.extend_from_slice(&self.b[s..e]);
+                } else {
+                    let kb = self.parse_ident_key_bytes()?;
+                    push_header(out, T_TEXT, kb.len());
+                    out.extend_from_slice(&kb);
+                }
+            } else {
+                return Err(self.err());
+            }
+            self.skip_ws();
+            if self.peek() != Some(b':') {
+                return Err(self.pos + 1);
+            }
+            self.pos += 1;
+            self.emit_value(out)?;
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                    self.skip_ws();
+                    if self.peek() == Some(b'}') && !self.strict {
+                        self.pos += 1;
+                        Self::close_container(out, start, T_OBJECT);
+                        return Ok(());
+                    }
+                }
+                Some(b'}') => {
+                    self.pos += 1;
+                    Self::close_container(out, start, T_OBJECT);
+                    return Ok(());
                 }
                 _ => return Err(self.pos + 1),
             }
@@ -796,6 +1129,7 @@ pub fn decode_escapes(b: &[u8], json5: bool) -> Vec<u8> {
                             }
                         }
                     }
+                    b'\'' if json5 => out.push(b'\''),
                     b'x' if json5 => {
                         let cp = std::str::from_utf8(&b[i + 1..(i + 3).min(b.len())])
                             .ok()
@@ -825,10 +1159,50 @@ pub fn decode_escapes(b: &[u8], json5: bool) -> Vec<u8> {
     out
 }
 
-/// Translate JSON5 escapes to RFC 8259 escapes (rendering a TEXT5
-/// payload): decode to the value, re-escape minimally at render time.
-fn translate_json5_escapes(b: &[u8]) -> Vec<u8> {
-    decode_escapes(b, true)
+/// Render a TEXT5 payload as JSON text the way SQLite does
+/// (jsonAppendNormalizedString): RFC 8259 escapes copy through verbatim,
+/// `\xHH` becomes `\u00HH` (digits as written), `\0` `\u0000`, `\'` a
+/// plain `'`, `\v` `\u000b`, and line continuations vanish (SQLite
+/// 3.53; 3.51 still wrote `\v` as `\u0009`). A raw `"` (from a
+/// single-quoted string) is escaped.
+fn write_json5_as_json(b: &[u8], out: &mut Vec<u8>) {
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\\' && i + 1 < b.len() {
+            let e = b[i + 1];
+            i += 2;
+            match e {
+                b'x' if i + 2 <= b.len() => {
+                    out.extend_from_slice(b"\\u00");
+                    out.extend_from_slice(&b[i..i + 2]);
+                    i += 2;
+                }
+                b'0' => out.extend_from_slice(b"\\u0000"),
+                b'v' => out.extend_from_slice(b"\\u000b"),
+                b'\'' => out.push(b'\''),
+                b'\n' => {}
+                b'\r' => {
+                    if b.get(i) == Some(&b'\n') {
+                        i += 1;
+                    }
+                }
+                _ => {
+                    out.push(b'\\');
+                    out.push(e);
+                }
+            }
+        } else if c == b'"' {
+            out.extend_from_slice(b"\\\"");
+            i += 1;
+        } else if c < 0x20 {
+            write_escaped_string(&[c], out);
+            i += 1;
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
 }
 
 /// Write raw bytes into JSON text, inserting RFC 8259 escapes
@@ -2263,6 +2637,207 @@ pub fn arrow_rhs_segments(v: &Value) -> Result<Option<Vec<PathSeg>>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The direct text -> JSONB parser and the bytes renderer must agree
+    /// with the tree path on every input: same bytes, same error offset,
+    /// same rendering.
+    fn same_as_tree(input: &[u8]) {
+        let tree = parse_lenient_bytes(input);
+        let direct = parse_lenient_to_jsonb(input);
+        match (&tree, &direct) {
+            (Ok(t), Ok(d)) => {
+                assert_eq!(
+                    &jb_to_bytes(t),
+                    d,
+                    "bytes differ for {:?}",
+                    String::from_utf8_lossy(input)
+                );
+                assert_eq!(
+                    render_jsonb(d).map(|x| x.as_bytes().to_vec()),
+                    Some(t.render().as_bytes().to_vec()),
+                    "render differs for {:?}",
+                    String::from_utf8_lossy(input)
+                );
+                assert_eq!(jsonb_check(d), Some(true));
+            }
+            (Err(a), Err(b)) => assert_eq!(
+                a,
+                b,
+                "error offset for {:?}",
+                String::from_utf8_lossy(input)
+            ),
+            _ => panic!(
+                "tree {:?} vs direct {:?} for {:?}",
+                tree.is_ok(),
+                direct.is_ok(),
+                String::from_utf8_lossy(input)
+            ),
+        }
+    }
+
+    #[test]
+    fn direct_jsonb_parse_matches_tree_edge_cases() {
+        let cases: &[&[u8]] = &[
+            b"{}",
+            b"[]",
+            b"null",
+            b"true",
+            b"false",
+            b"0",
+            b"-0",
+            b"+5",
+            b"-12",
+            b"1.5",
+            b"1e5",
+            b"1E+5",
+            b"-1.25e-3",
+            b".5",
+            b"5.",
+            b"+.5",
+            b"0x1F",
+            b"-0xff",
+            b"+0X1",
+            b"Infinity",
+            b"-Infinity",
+            b"+Infinity",
+            b"NaN",
+            b"-NaN",
+            b"00",
+            b"01",
+            b"1e",
+            b"1.e5",
+            b"-",
+            b"+",
+            b".",
+            b"\"\"",
+            b"\"abc\"",
+            b"\"a\\\"b\"",
+            b"\"\\u00e9\"",
+            b"\"\\u{1F600}\"",
+            b"\"\\x41\"",
+            b"\"\\v\\0\"",
+            b"\"a\\\nb\"",
+            b"\"\xff\xfe\"",
+            b"\"\x01\"",
+            b"\"unterminated",
+            b"[1,2,3]",
+            b"[1,2,]",
+            b"[,]",
+            b"[1 2]",
+            b"{\"a\":1}",
+            b"{a:1,b:[2,{c:3}]}",
+            b"{'q':1}",
+            b"{'unterminated:1}",
+            b"{\"a\":1,}",
+            b"{\"a\" 1}",
+            b"{1:2}",
+            b"  [ 1 , { \"k\" : [ ] } ]  ",
+            b"[1] x",
+            b"",
+            b"   ",
+            b"[\"x\",\"\\n\\t\"]",
+            b"{\"\":\"\"}",
+            b"[[[[[[[[[[1]]]]]]]]]]",
+        ];
+        for c in cases {
+            same_as_tree(c);
+        }
+        // Containers whose payloads cross every header width.
+        for n in [10usize, 11, 12, 255, 256, 65535, 65536, 70000] {
+            let s = format!("[\"{}\"]", "x".repeat(n));
+            same_as_tree(s.as_bytes());
+            let s = format!("{{\"k\":[{}]}}", vec!["1"; n / 2 + 1].join(","));
+            same_as_tree(s.as_bytes());
+        }
+    }
+
+    #[test]
+    fn direct_jsonb_parse_matches_tree_random() {
+        let mut seed: u64 = 0x5EED_1234;
+        let mut rnd = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        fn gen(r: &mut dyn FnMut(u64) -> u64, depth: u32, out: &mut String) {
+            let pick = if depth > 4 { r(6) } else { r(9) };
+            match pick {
+                0 => out.push_str(["null", "true", "false", "NaN", "Infinity"][r(5) as usize]),
+                1 => out.push_str(&format!("{}", r(100000) as i64 - 50000)),
+                2 => out.push_str(
+                    [
+                        "1.5",
+                        "-0.25e3",
+                        ".5",
+                        "5.",
+                        "+7",
+                        "0x2A",
+                        "1e-7",
+                        "-Infinity",
+                    ][r(8) as usize],
+                ),
+                3 | 4 => {
+                    let words = ["a", "\\n", "\\\"", "\\u00e9", "é→", "\\x41", "", "sp ace"];
+                    out.push('"');
+                    for _ in 0..r(4) {
+                        out.push_str(words[r(words.len() as u64) as usize]);
+                    }
+                    out.push('"');
+                }
+                5 => out.push_str(&"z".repeat(r(300) as usize + 1).replace('z', "9")),
+                6 => {
+                    out.push('[');
+                    let n = r(5);
+                    for i in 0..n {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        out.push_str([" ", "", "\n"][r(3) as usize]);
+                        gen(r, depth + 1, out);
+                    }
+                    if n > 0 && r(4) == 0 {
+                        out.push(',');
+                    }
+                    out.push(']');
+                }
+                _ => {
+                    out.push('{');
+                    let n = r(5);
+                    for i in 0..n {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        match r(3) {
+                            0 => out.push_str(&format!("k{}", r(9))),
+                            1 => out.push_str(&format!("'q{}'", r(9))),
+                            _ => out.push_str(&format!("\"s{}\"", r(9))),
+                        }
+                        out.push(':');
+                        gen(r, depth + 1, out);
+                    }
+                    out.push('}');
+                }
+            }
+        }
+        for _ in 0..4000 {
+            let mut s = String::new();
+            gen(&mut rnd, 0, &mut s);
+            same_as_tree(s.as_bytes());
+            // Byte-level mutations: truncation, deletion, insertion.
+            let b = s.as_bytes();
+            if !b.is_empty() {
+                let cut = rnd(b.len() as u64) as usize;
+                same_as_tree(&b[..cut]);
+                let mut d = b.to_vec();
+                d.remove(cut);
+                same_as_tree(&d);
+                let mut ins = b.to_vec();
+                ins.insert(cut, b"\",:[]{}x\\ 0"[rnd(11) as usize]);
+                same_as_tree(&ins);
+            }
+        }
+    }
 
     #[test]
     fn real_render_matches_sqlite() {

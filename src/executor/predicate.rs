@@ -868,7 +868,11 @@ fn compile_pred_expr(e: &Expr, table: &crate::schema::Table, prefix: &str) -> Op
             Some(PredExpr::Unary(*op, Box::new(inner)))
         }
         Expr::Binary { op, left, right } => {
-            if matches!(op, BinaryOp::And | BinaryOp::Or) {
+            // `apply_binary` evaluates neither the JSON arrows nor MATCH /
+            // distance (it returns NULL for them): those stay on the
+            // general evaluator. Compiling `x ->> 'f' > 50` made every
+            // row's filter NULL — the WHERE matched nothing.
+            if !eager_binary_op(*op) {
                 return None;
             }
             let l = compile_pred_expr(left, table, prefix)?;
@@ -883,6 +887,20 @@ fn compile_pred_expr(e: &Expr, table: &crate::schema::Table, prefix: &str) -> Op
         }
         _ => None,
     }
+}
+
+/// Binary operators `apply_binary` evaluates eagerly — the compiled
+/// operand trees may hold only these.
+fn eager_binary_op(op: BinaryOp) -> bool {
+    !matches!(
+        op,
+        BinaryOp::And
+            | BinaryOp::Or
+            | BinaryOp::Arrow
+            | BinaryOp::ArrowText
+            | BinaryOp::FtsMatch
+            | BinaryOp::Distance
+    )
 }
 
 /// True when a compiled nested comparison needs no affinity conversion:
@@ -1890,8 +1908,9 @@ pub(crate) fn compile_expr(
         }
         Expr::Binary { op, left, right } => {
             // Arithmetic/comparison only; AND/OR short-circuit semantics
-            // differ from eager evaluation — keep those on the general path.
-            if matches!(op, BinaryOp::And | BinaryOp::Or) {
+            // differ from eager evaluation, and `apply_binary` returns NULL
+            // for the JSON arrows / MATCH / distance — general path.
+            if !eager_binary_op(*op) {
                 return None;
             }
             let l = compile_expr(left, col_names, params_len)?;

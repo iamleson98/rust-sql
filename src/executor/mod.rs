@@ -27346,15 +27346,20 @@ fn buffer_index_ops_pre_pass(
             if !handled {
                 // Expression / partial index, or a structural fallback:
                 // the decode path (identical to the per-row loop's).
-                decode_row_into(old_payload, n_cols, *rowid, alias, &mut old_row_buf)?;
-                decode_row_into(new_payload, n_cols, *rowid, alias, &mut new_row_buf)?;
-                let old_keys =
-                    crate::executor::index_am::index_entry_keys(idx, table, &old_row_buf)?;
-                let new_keys =
-                    crate::executor::index_am::index_entry_keys(idx, table, &new_row_buf)?;
-                let (old_in, new_in) = partial_membership_pair(
+                let staged = index_needs_eval(idx)
+                    && UPD_KEY_STAGE.with(|s| {
+                        s.borrow().as_ref().is_some_and(|st| {
+                            st.keys.contains_key(&(*rowid, Arc::as_ptr(idx) as usize))
+                        })
+                    });
+                if !staged {
+                    decode_row_into(old_payload, n_cols, *rowid, alias, &mut old_row_buf)?;
+                    decode_row_into(new_payload, n_cols, *rowid, alias, &mut new_row_buf)?;
+                }
+                let (old_keys, new_keys, old_in, new_in) = row_index_keys(
                     idx,
                     table,
+                    *rowid,
                     &old_row_buf,
                     &new_row_buf,
                     params,
@@ -27384,6 +27389,138 @@ fn buffer_index_ops_pre_pass(
 
 /// The streaming UPDATE's collected write set: (rowid, arena range, stashed old payload).
 type UpdateRec = (i64, std::ops::Range<usize>, Option<Vec<u8>>);
+
+/// One row's maintenance keys for one index: (old keys, new keys, old
+/// row in the index, new row in the index).
+type RowIndexKeys = (Vec<Vec<u8>>, Vec<Vec<u8>>, bool, bool);
+
+/// EXPRESSION / PARTIAL index keys staged while each row is collected
+/// (`process_update_row`), when the row's documents are hot: the index
+/// pass that runs after the whole collection used to re-evaluate
+/// `x->>'a'` on every row's old and new values — a fresh parse of each
+/// (the JSON cache holds a few documents, not a statement's worth).
+/// Keyed by (rowid, index object); consumers fall back to computing.
+struct UpdKeyStage {
+    table: Arc<Table>,
+    indexes: Vec<Arc<crate::schema::Index>>,
+    keys: HashMap<(i64, usize), RowIndexKeys>,
+}
+
+thread_local! {
+    static UPD_KEY_STAGE: std::cell::RefCell<Option<UpdKeyStage>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Clears the stage when the UPDATE that armed it ends (any exit path).
+struct UpdKeyStageGuard;
+
+impl Drop for UpdKeyStageGuard {
+    fn drop(&mut self) {
+        UPD_KEY_STAGE.with(|s| *s.borrow_mut() = None);
+    }
+}
+
+fn index_needs_eval(idx: &crate::schema::Index) -> bool {
+    idx.partial_expr.is_some() || idx.columns.iter().any(|c| c.expr.is_some())
+}
+
+/// Arm the stage for an UPDATE of `table` touching `indexes` (only the
+/// expression / partial ones are staged; nothing is armed without them).
+fn arm_upd_key_stage(
+    table: &Arc<Table>,
+    indexes: &[&Arc<crate::schema::Index>],
+) -> Option<UpdKeyStageGuard> {
+    let staged: Vec<Arc<crate::schema::Index>> = indexes
+        .iter()
+        .filter(|ix| index_needs_eval(ix) && matches!(ix.kind, crate::schema::IndexKind::Btree))
+        .map(|ix| Arc::clone(ix))
+        .collect();
+    if staged.is_empty() {
+        return None;
+    }
+    UPD_KEY_STAGE.with(|s| {
+        *s.borrow_mut() = Some(UpdKeyStage {
+            table: Arc::clone(table),
+            indexes: staged,
+            keys: HashMap::new(),
+        })
+    });
+    Some(UpdKeyStageGuard)
+}
+
+/// `process_update_row`'s hook: stage this row's keys for the armed
+/// indexes, from the same old / new payload bytes the index pass decodes.
+#[allow(clippy::too_many_arguments)]
+fn stage_row_index_keys(
+    table: &Arc<Table>,
+    rowid: i64,
+    n_cols: usize,
+    old_payload: &[u8],
+    new_payload: &[u8],
+    params: &[Value],
+    named_params: &HashMap<String, Value>,
+) -> Result<()> {
+    let indexes = UPD_KEY_STAGE.with(|s| {
+        let s = s.borrow();
+        let st = s.as_ref()?;
+        Arc::ptr_eq(&st.table, table).then(|| st.indexes.clone())
+    });
+    let Some(indexes) = indexes else {
+        return Ok(());
+    };
+    let mut old_row = Vec::with_capacity(n_cols);
+    let mut new_row = Vec::with_capacity(n_cols);
+    decode_row_into(old_payload, n_cols, rowid, table.rowid_alias, &mut old_row)?;
+    decode_row_into(new_payload, n_cols, rowid, table.rowid_alias, &mut new_row)?;
+    let mut staged = Vec::with_capacity(indexes.len());
+    for idx in &indexes {
+        let old_keys = crate::executor::index_am::index_entry_keys(idx, table, &old_row)?;
+        let new_keys = crate::executor::index_am::index_entry_keys(idx, table, &new_row)?;
+        let (old_in, new_in) =
+            partial_membership_pair(idx, table, &old_row, &new_row, params, named_params)?;
+        staged.push((
+            Arc::as_ptr(idx) as usize,
+            (old_keys, new_keys, old_in, new_in),
+        ));
+    }
+    UPD_KEY_STAGE.with(|s| {
+        if let Some(st) = s.borrow_mut().as_mut() {
+            for (ix, k) in staged {
+                st.keys.insert((rowid, ix), k);
+            }
+        }
+    });
+    Ok(())
+}
+
+/// One row's keys for `idx`: the staged ones when present, else computed
+/// from the decoded rows (the same computation).
+#[allow(clippy::too_many_arguments)]
+fn row_index_keys(
+    idx: &Arc<crate::schema::Index>,
+    table: &Table,
+    rowid: i64,
+    old_row: &[Value],
+    new_row: &[Value],
+    params: &[Value],
+    named_params: &HashMap<String, Value>,
+) -> Result<RowIndexKeys> {
+    if index_needs_eval(idx) {
+        let hit = UPD_KEY_STAGE.with(|s| {
+            s.borrow_mut()
+                .as_mut()
+                .and_then(|st| st.keys.remove(&(rowid, Arc::as_ptr(idx) as usize)))
+        });
+        if let Some(k) = hit {
+            return Ok(k);
+        }
+    }
+    let old_keys = crate::executor::index_am::index_entry_keys(idx, table, old_row)?;
+    let new_keys = crate::executor::index_am::index_entry_keys(idx, table, new_row)?;
+    let (old_in, new_in) =
+        partial_membership_pair(idx, table, old_row, new_row, params, named_params)?;
+    Ok((old_keys, new_keys, old_in, new_in))
+}
 
 /// One index's buffered maintenance ops: (key, rowid) pairs, deletes
 /// and inserts in separate lists (each sorted independently at flush).
@@ -29329,6 +29466,14 @@ fn try_streaming_update(
         table,
         &crate::sql::ast::TriggerEvent::Update(vec![]),
     );
+    // Expression / partial index keys are staged as each row is collected
+    // (see `UpdKeyStage`); a trigger body could update this table with a
+    // statement of its own, so triggers keep the compute-later path.
+    let _key_stage = if has_update_triggers {
+        None
+    } else {
+        arm_upd_key_stage(table, &touched_indexes)
+    };
     // RE-ENTRANCY: the per-row callback evaluates SET / WHERE / RETURNING
     // expressions and fires triggers — any subquery or trigger body may
     // read the very table being scanned. A borrowed scan holds the leaf
@@ -30512,13 +30657,10 @@ fn try_streaming_update(
                 }
                 for (ti, idx) in touched_indexes.iter().enumerate() {
                     // Multi-entry keys (gin/gist): diff the whole key SETS.
-                    let old_keys =
-                        crate::executor::index_am::index_entry_keys(idx, table, &old_row_buf)?;
-                    let new_keys =
-                        crate::executor::index_am::index_entry_keys(idx, table, &new_row)?;
-                    let (old_in, new_in) = partial_membership_pair(
+                    let (old_keys, new_keys, old_in, new_in) = row_index_keys(
                         idx,
                         table,
+                        *rowid,
                         &old_row_buf,
                         &new_row,
                         &params,
@@ -30991,6 +31133,17 @@ fn process_update_row(
                             Some(&new_row),
                         );
                     }
+                    if old_payload_stash.is_some() {
+                        stage_row_index_keys(
+                            table,
+                            rowid,
+                            n_cols,
+                            payload,
+                            &update_arena[start..],
+                            params,
+                            named_params,
+                        )?;
+                    }
                     updates.push((rowid, start..update_arena.len(), old_payload_stash));
                     return Ok(());
                 }
@@ -31078,6 +31231,17 @@ fn process_update_row(
     );
     let start = update_arena.len();
     update_arena.extend_from_slice(payload_buf);
+    if old_payload_stash.is_some() {
+        stage_row_index_keys(
+            table,
+            rowid,
+            n_cols,
+            payload,
+            payload_buf,
+            params,
+            named_params,
+        )?;
+    }
     updates.push((rowid, start..update_arena.len(), old_payload_stash));
     Ok(())
 }

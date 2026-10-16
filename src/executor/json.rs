@@ -137,6 +137,104 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+type BlobCacheEntry = (u64, crate::types::Text, std::rc::Rc<Vec<u8>>);
+
+thread_local! {
+    /// TEXT documents parsed straight to JSONB (`parse_lenient_to_jsonb`)
+    /// for the byte-level consumers — `->` / `->>` path lookups and the
+    /// in-place edits of json_set & co. Same keying as `DOC_CACHE`.
+    static BLOB_CACHE: std::cell::RefCell<Vec<BlobCacheEntry>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The JSONB bytes of a JSON TEXT document, through the cache.
+pub(crate) fn cached_text_jsonb(t: &crate::types::Text) -> Result<std::rc::Rc<Vec<u8>>, Error> {
+    let bytes = t.as_bytes();
+    let parse = || {
+        jsonb::parse_lenient_to_jsonb(bytes)
+            .map_err(|_| Error::Runtime("malformed JSON".to_string()))
+    };
+    if bytes.len() < DOC_CACHE_MIN {
+        return parse().map(std::rc::Rc::new);
+    }
+    let fp = doc_fingerprint(bytes);
+    let hit = BLOB_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        let i = c
+            .iter()
+            .position(|(f, k, _)| *f == fp && k.as_bytes() == bytes)?;
+        let e = c.remove(i);
+        let blob = e.2.clone();
+        c.push(e);
+        Some(blob)
+    });
+    if let Some(blob) = hit {
+        return Ok(blob);
+    }
+    let blob = std::rc::Rc::new(parse()?);
+    blob_cache_put(fp, t.clone(), blob.clone());
+    Ok(blob)
+}
+
+fn blob_cache_put(fp: u64, t: crate::types::Text, blob: std::rc::Rc<Vec<u8>>) {
+    BLOB_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() >= DOC_CACHE_SLOTS {
+            c.remove(0);
+        }
+        c.push((fp, t, blob));
+    });
+}
+
+/// Path lookup on JSONB bytes: `Some(found)` (`None` inside = no such
+/// path), or `None` when the bytes cannot be walked (callers fall back).
+pub(crate) fn jsonb_lookup_bytes(b: &[u8], segs: &[PathSeg]) -> Option<Option<Jb>> {
+    if !jsonb::jsonb_root_fits(b) {
+        return None;
+    }
+    match jsonb::jsonb_locate(b, segs) {
+        Ok(None) => Some(None),
+        Ok(Some((s, e))) => jsonb::jsonb_decode_span(b, s, e).ok().map(Some),
+        Err(()) => None,
+    }
+}
+
+/// An edit pass over a JSONB buffer: `Ok(Some(true))` edited,
+/// `Ok(Some(false))` the root was removed, `Ok(None)` declined.
+type BlobEdits<'a> = dyn FnMut(&mut Vec<u8>) -> Result<Option<bool>, Error> + 'a;
+
+/// json_set/insert/replace/remove over a JSON TEXT document, edited as
+/// JSONB bytes in place (SQLite parses to JSONB and edits the blob too).
+/// `Ok(None)`: an edit the byte walker declines — the caller takes the
+/// tree path. A TEXT result enters the bytes cache with its blob.
+fn text_doc_edit(
+    t: &crate::types::Text,
+    out: &Out,
+    edits: &mut BlobEdits<'_>,
+) -> Result<Option<Value>, Error> {
+    let mut buf = (*cached_text_jsonb(t)?).clone();
+    match edits(&mut buf)? {
+        None => Ok(None),
+        Some(false) => Ok(Some(Value::Null)), // the root was removed
+        Some(true) => Ok(Some(match out {
+            Out::Blob => Value::Blob(buf),
+            Out::Text => {
+                let Some(text) = jsonb::render_jsonb(&buf) else {
+                    return Ok(None);
+                };
+                if text.as_bytes().len() >= DOC_CACHE_MIN {
+                    blob_cache_put(
+                        doc_fingerprint(text.as_bytes()),
+                        text.clone(),
+                        std::rc::Rc::new(buf),
+                    );
+                }
+                Value::Text(text)
+            }
+        })),
+    }
+}
+
 /// Length plus 64 sampled bytes — cheap next to the parse, and the full
 /// compare on a match makes collisions harmless.
 fn doc_fingerprint(b: &[u8]) -> u64 {
@@ -687,6 +785,30 @@ fn json_mutate(fname: &str, args: &[Value], out: Out) -> Result<Value, Error> {
             }
         }
     }
+    if let Value::Text(t) = &args[0] {
+        let r = text_doc_edit(t, &out, &mut |buf| {
+            let mut i = 1;
+            while i + 1 < args.len() {
+                let path = parse_doc_path(&args[i])?;
+                let tree = sql_value_as_raw(value_to_jb(&args[i + 1]));
+                let val = jsonb::jb_to_bytes(&tree);
+                let edit = jsonb::JbEdit::Put {
+                    val: &val,
+                    tree: &tree,
+                    create: fname != "json_replace",
+                    overwrite: fname != "json_insert",
+                };
+                if jsonb::jsonb_edit(buf, path.segs(), &edit).is_err() {
+                    return Ok(None);
+                }
+                i += 2;
+            }
+            Ok(Some(true))
+        })?;
+        if let Some(v) = r {
+            return Ok(v);
+        }
+    }
     let Some(mut doc) = load_doc_owned_cached(&args[0])? else {
         return Ok(Value::Null);
     };
@@ -746,6 +868,22 @@ fn json_remove(args: &[Value], out: Out) -> Result<Value, Error> {
             if ok {
                 return Ok(Value::Blob(buf));
             }
+        }
+    }
+    if let Value::Text(t) = &args[0] {
+        let r = text_doc_edit(t, &out, &mut |buf| {
+            for p in &args[1..] {
+                let path = parse_doc_path(p)?;
+                match jsonb::jsonb_edit(buf, path.segs(), &jsonb::JbEdit::Remove) {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(Some(false)),
+                    Err(()) => return Ok(None),
+                }
+            }
+            Ok(Some(true))
+        })?;
+        if let Some(v) = r {
+            return Ok(v);
         }
     }
     let Some(mut doc) = load_doc_owned_cached(&args[0])? else {
