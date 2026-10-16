@@ -14,3 +14,6 @@ __pycache__/
 target-nodflt/
 probe-tmp/
 .cargo/config.toml
+
+# scratch dirs the local harness runs leave behind
+testdir/

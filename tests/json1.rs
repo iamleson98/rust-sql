@@ -196,3 +196,46 @@ fn json_unicode_and_escapes() {
         vec![vec![Value::Text("{\"k\":\"a\\\"b\"}".into())]]
     );
 }
+
+#[test]
+fn json_type_false_is_false() {
+    // Found by speedtest1's J1 set: `json_type()` reported "true" for a
+    // JSON `false` in every form — scalar text, JSONB blob, and as a
+    // path target inside a JSONB document — so a GROUP BY over
+    // json_type(x,'$.c[#-N].y') lost the whole `false` group.
+    let mut db = Database::open_in_memory().unwrap();
+    assert_eq!(
+        q(&db, "SELECT json_type('false'), json_type('true')"),
+        vec![vec![
+            Value::Text("false".into()),
+            Value::Text("true".into())
+        ]]
+    );
+    assert_eq!(
+        q(
+            &db,
+            "SELECT json_type(jsonb('false')), json_type(jsonb('true'))"
+        ),
+        vec![vec![
+            Value::Text("false".into()),
+            Value::Text("true".into())
+        ]]
+    );
+    db.execute("CREATE TABLE t(x JSONB)", ()).unwrap();
+    db.execute(
+        "INSERT INTO t VALUES(jsonb('{\"y\": false, \"z\": true, \"n\": null}'))",
+        (),
+    )
+    .unwrap();
+    assert_eq!(
+        q(
+            &db,
+            "SELECT json_type(x,'$.y'), json_type(x,'$.z'), json_type(x,'$.n') FROM t"
+        ),
+        vec![vec![
+            Value::Text("false".into()),
+            Value::Text("true".into()),
+            Value::Text("null".into()),
+        ]]
+    );
+}

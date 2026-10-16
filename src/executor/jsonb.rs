@@ -85,7 +85,11 @@ impl Jb {
     pub fn type_name(&self) -> &'static str {
         match self {
             Jb::Null => "null",
-            Jb::True | Jb::False => "true",
+            // JSON `false` is its own type string (found by speedtest1's
+            // J1 set: json_type over `[#-N].y` paths lost the whole
+            // `false` group; pinned in tests/json1.rs).
+            Jb::True => "true",
+            Jb::False => "false",
             Jb::Int(_) | Jb::Int5(_) => "integer",
             Jb::Float(_) | Jb::Float5(_) => "real",
             Jb::Text(_) | Jb::TextJ(_) | Jb::Text5(_) | Jb::TextRaw(_) => "text",
