@@ -202,6 +202,12 @@ foreach o {
   shared_cache shared_chache snapshot sqllog tclvar thread_misuse_warnings
   threadsafe threadsafe1 threadsafe2 unlock_notify uri_00_error win32malloc wsd
   cursorhints break
+  # Small knobs the corpus probes that were missing: mutex_noop (the
+  # shim presents a real-mutex build - run_thread_tests, called from
+  # EVERY finish_test, errors out without it), memdebug (no
+  # SQLITE_MEMDEBUG), casesensitivelike (default off; the pragma
+  # toggles it at runtime), configslower, yytrackmaxstackdepth.
+  mutex_noop memdebug casesensitivelike configslower yytrackmaxstackdepth
 } { set ::sqlite_options($o) 0 }
 set ::sqlite_options(default_autovacuum) 0
 

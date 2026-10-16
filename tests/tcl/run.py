@@ -8,7 +8,7 @@ are ignored.
     python3 tests/tcl/run.py SQLITE_TEST_DIR [FILE_GLOB...] [-j N] [-o OUT.json]
                              [--shard I/N]
 """
-import argparse, glob, json, os, re, resource, signal, subprocess, sys, tempfile
+import argparse, glob, json, os, re, resource, shutil, signal, subprocess, sys, tempfile, time
 from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -17,8 +17,38 @@ SERVER = os.environ.get("TCL_DB_SERVER") or os.path.join(ROOT, "target", "releas
 SHIM = os.path.join(HERE, "shim.tcl")
 
 
+# SQLite's mega faultsim files: the per-file timeout applies to EACH
+# backend, and these legitimately run for many minutes even on the
+# reference SQLite (hundreds of thousands of faultsim iterations). With
+# the default budget BOTH backends get cut off mid-file and the
+# iteration count at the cutoff becomes "divergence" - noise, not
+# signal. These files get a bigger, still-identical budget per backend.
+PER_FILE_TIMEOUT = {
+    "quota.test": 1500,
+    "tkt-313723c356.test": 1500,
+    "corruptC.test": 1500,
+    "wal4.test": 1500,
+    "withM.test": 1500,
+    "bitvec.test": 600,
+    "speed1p.test": 900,
+    "incrvacuum.test": 900,
+    "incrvacuum2.test": 900,
+    "multiplex3.test": 900,
+}
+
+
+def timeout_for(path, default):
+    return PER_FILE_TIMEOUT.get(os.path.basename(path), default)
+
+
 def run_one(testdir, path, backend, timeout):
-    with tempfile.TemporaryDirectory(prefix="tcl-") as cwd:
+    # Not TemporaryDirectory: its cleanup RAISES on a race (a killed
+    # process group can leave a late unlink behind - Errno 39 once
+    # killed a whole CI shard). mkdtemp + ignore_errors rmtree absorbs
+    # it; the retry loop closes the tiny window where the killed
+    # process still held the directory open.
+    cwd = tempfile.mkdtemp(prefix="tcl-")
+    try:
         # Own process group: on timeout the database server child dies
         # too (an orphaned server would hold the output pipes open).
         p = subprocess.Popen(
@@ -37,6 +67,12 @@ def run_one(testdir, path, backend, timeout):
             timed_out = True
         out = o.decode("utf-8", "replace")
         err = e.decode("utf-8", "replace")
+    finally:
+        for _ in range(4):
+            if not os.path.isdir(cwd):
+                break
+            shutil.rmtree(cwd, ignore_errors=True)
+            time.sleep(0.05)
     res = {}
     for line in out.splitlines():
         m = re.match(r"@@(PASS|FAIL) (.*)", line)
@@ -69,8 +105,9 @@ def main():
         files = files[i::n]
 
     def work(f):
-        sq, _, _, sq_to = run_one(a.testdir, f, "sqlite", a.timeout)
-        ours, out, unk, to = run_one(a.testdir, f, "ours", a.timeout)
+        tmo = timeout_for(f, a.timeout)
+        sq, _, _, sq_to = run_one(a.testdir, f, "sqlite", tmo)
+        ours, out, unk, to = run_one(a.testdir, f, "ours", tmo)
         diverge = [n for n, r in sq.items() if r == "PASS" and ours.get(n) != "PASS"]
         # The failing tests' output blocks on `ours` (first 50 only — the
         # fault-injection files diverge by the thousand).
