@@ -2585,6 +2585,28 @@ impl Pager {
         if file_size == 0 {
             pager.is_new.store(true, Ordering::Release);
             pager.initialize_new_db()?;
+            // STALE SIDECAR ON AN EMPTY DATABASE (SQLite's
+            // pagerOpenWalIfPresent): a -wal file next to a 0-page main
+            // file is meaningless — there is nothing to recover (the
+            // db never had a page 1) — and SQLite DELETES it on open.
+            // Keeping it breaks the close/reopen choreography the Tcl
+            // suite relies on (wal4-2: the -test block asserts the wal
+            // is gone after the first read) and lets a foreign crash
+            // artifact shadow later generations. Guarded by the
+            // lifecycle lock: enable_wal holds the same lock across
+            // "create sidecar" AND "materialize header", so this can
+            // never interleave with a WAL switch on a fresh file.
+            if !pager.store.read().is_memory() {
+                let wal_file = crate::storage::wal::wal_path_for(&pager.path);
+                if wal_file.exists() {
+                    let _guard = crate::storage::wal::lifecycle_guard().lock();
+                    // Re-check under the lock (enable_wal may have run
+                    // between the exists() probe and here).
+                    if wal_file.exists() && pager.store.read().len()? == 0 {
+                        let _ = std::fs::remove_file(&wal_file);
+                    }
+                }
+            }
         } else {
             pager.read_header()?;
             // v3 files: the legacy linked-list freelist becomes trunk
@@ -2794,9 +2816,11 @@ impl Pager {
         Ok(())
     }
 
-    /// Create a fresh database: write page 0 with the file header and an
-    /// empty leaf page (the schema table root).
-    fn initialize_new_db(&self) -> Result<()> {
+    /// The fresh empty-database page 0 (header + empty schema-table leaf).
+    /// Shared by the two materialization points: `initialize_new_db`
+    /// (open of a 0-byte file) and `get_page`'s miss path (a deferred
+    /// header re-synthesized after cache eviction — see `is_new`).
+    fn build_init_page0(&self) -> Page {
         let page_size = self.page_size.load(Ordering::Acquire);
         let mut page0 = Page::new(0, page_size);
         FileHeader::write(
@@ -2814,23 +2838,40 @@ impl Pager {
             .copy_from_slice(&0u16.to_be_bytes()); // cell_content_start = 0 (= page_size)
         page0.data[DB_HEADER_SIZE as usize + 8..DB_HEADER_SIZE as usize + 12]
             .copy_from_slice(&0u32.to_be_bytes()); // right_pointer = 0
-        page0.touch();
+        page0
+    }
 
-        self.write_file_at(0, &page0.data)?;
-        // Sync only for durable opens. `:memory:` databases (skip_fsync)
-        // are backed by a throwaway temp file that is deleted on drop —
-        // an fsync here costs ~0.4 ms on CI Linux, ~1.5 ms on macOS and
-        // ~10 ms on Windows per open, and buys nothing.
-        if !self.skip_fsync.load(Ordering::Acquire) {
-            self.store.read().sync_all(self.fullfsync())?;
+    fn initialize_new_db(&self) -> Result<()> {
+        let page0 = self.build_init_page0();
+        // DEFERRED MATERIALIZATION (SQLite parity): a file-backed open of
+        // a 0-byte database writes NOTHING — SQLite keeps the synthesized
+        // page 1 in its page cache and the file stays 0 bytes until the
+        // first COMMIT (an open+SELECT+close leaves an empty file behind;
+        // the eager 4096-byte header write + fsync here cost one fsync
+        // per open — the wal4-2 faultsim loop alone did 557k of them).
+        // `is_new` stays TRUE: it now means "the header exists only in
+        // the cache" — get_page(0) re-synthesizes after an eviction, the
+        // first flush (or a journal-mode switch, which SQLite also makes
+        // durable immediately) writes the page and clears the flag.
+        // In-memory stores keep the direct write: their backing Vec IS
+        // the committed image, and `is_new` semantics don't apply (no
+        // reopen, no file).
+        if self.store.read().is_memory() {
+            self.write_file_at(0, &page0.data)?;
+            self.is_new.store(false, Ordering::Release);
+        } else {
+            let page_ref: PageRef = std::sync::Arc::new(parking_lot::Mutex::new(page0));
+            {
+                let mut cache = self.cache.write();
+                self.maybe_evict_locked(&mut cache);
+                cache.insert(0, page_ref);
+            }
+            self.lru.lock().push_back(0);
         }
         self.n_pages.store(1, Ordering::Release);
         self.committed_n_pages.store(1, Ordering::Release);
-        self.page_size.store(page_size, Ordering::Release);
         self.schema_cookie.store(0, Ordering::Release);
-        self.is_new.store(false, Ordering::Release);
-        // page0 was written directly to disk (not through the cache), so
-        // no in-memory page is dirty. Keep the counter accurate.
+        // page0 entered the cache CLEAN (not dirty): nothing is pending.
         self.dirty_count_approx.store(0, Ordering::Release);
         Ok(())
     }
@@ -3563,6 +3604,21 @@ impl Pager {
             let mut cache = self.cache.write();
             // Double-check: another thread may have inserted while we waited.
             if let Some(page_ref) = cache.get(id).cloned() {
+                return Ok(page_ref);
+            }
+            // DEFERRED INIT: page 0 of a 0-byte-open database lives only
+            // in the cache (initialize_new_db wrote nothing). An eviction
+            // dropped it — re-synthesize it CLEAN (is_new is still set:
+            // no flush ever wrote a header). Identical bytes every time;
+            // the first real write dirties it through note_dirty(0) and
+            // the commit's flush clears is_new for good.
+            if id == 0 && self.is_new.load(Ordering::Acquire) {
+                let page = self.build_init_page0();
+                let page_ref: PageRef = std::sync::Arc::new(parking_lot::Mutex::new(page));
+                self.maybe_evict_locked(&mut cache);
+                cache.insert(0, page_ref.clone());
+                drop(cache);
+                self.lru.lock().push_back(0);
                 return Ok(page_ref);
             }
             let psz = self.page_size();
@@ -5628,6 +5684,39 @@ impl Pager {
             p.touch();
         }
         self.note_dirty(0);
+        // DEFERRED INIT (0-byte open, header only in cache): there are no
+        // durable header bytes to patch — the raw 4-byte write at offset
+        // 72 would extend a 0-byte file into a 76-byte fragment. Instead
+        // materialize the WHOLE page 0 into the MAIN FILE now, exactly
+        // like SQLite (its journal_mode=WAL on an empty database writes
+        // page 1, 4096 bytes, synchronously at the pragma). This MUST be
+        // a direct write, not flush(): by the time enable_wal calls here
+        // the sidecar is attached and flush() would route the page into
+        // WAL FRAMES — the main file would stay 0 bytes, and a crash
+        // would leave a recoverable-only-through-the-wal database that
+        // the stale-sidecar delete on the next open would destroy.
+        if self.is_new.load(Ordering::Acquire) {
+            let data = {
+                let mut p = page0.lock();
+                FileHeader::write(
+                    &mut p.data,
+                    self.page_size.load(Ordering::Acquire),
+                    self.n_pages.load(Ordering::Acquire),
+                    self.schema_cookie.load(Ordering::Acquire),
+                );
+                p.data[20..24]
+                    .copy_from_slice(&self.freelist_head.load(Ordering::Acquire).to_le_bytes());
+                p.data[24..28]
+                    .copy_from_slice(&self.freelist_count.load(Ordering::Acquire).to_le_bytes());
+                p.data.clone()
+            };
+            self.write_file_at(0, &data)?;
+            if !self.skip_fsync.load(Ordering::Acquire) {
+                self.store.read().sync_all(self.fullfsync())?;
+            }
+            self.is_new.store(false, Ordering::Release);
+            return Ok(());
+        }
         let mut raw = [0u8; 4];
         raw.copy_from_slice(&mode.to_le_bytes());
         self.write_file_at(72, &raw)?;
@@ -7150,9 +7239,16 @@ impl Pager {
                 self.dirty_pages.lock().insert(0);
             }
         } else {
-            // Page 0 not in cache — read + modify now, WRITE last.
+            // Page 0 not in cache — read + modify now, WRITE last. For a
+            // DEFERRED-INIT database (is_new: the header exists only in
+            // the cache) synthesize instead of reading the 0-byte file —
+            // the read would return a zeroed page missing the schema
+            // leaf's b-tree bytes.
             let mut header = vec![0u8; psz as usize];
-            if self.codec.read().is_active() {
+            if self.is_new.load(Ordering::Acquire) {
+                let init = self.build_init_page0();
+                header.copy_from_slice(&init.data);
+            } else if self.codec.read().is_active() {
                 let mut raw = vec![0u8; psz as usize];
                 self.read_file_at(0, &mut raw)?;
                 let decoded = {
@@ -7579,6 +7675,11 @@ impl Pager {
         if !self.skip_fsync.load(Ordering::Acquire) {
             self.store.read().sync_all(self.fullfsync())?;
         }
+        // The header (page 0) is now durable: a deferred-init database
+        // (0-byte open, header only in cache) has MATERIALIZED. From
+        // here on, get_page(0)'s miss path must read the file, not
+        // re-synthesize.
+        self.is_new.store(false, Ordering::Release);
         // Mass-delete tail truncation: shrink the file with the commit.
         self.apply_pending_truncate()?;
         self.dirty_count_approx.store(0, Ordering::Release);

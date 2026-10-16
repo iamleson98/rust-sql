@@ -14304,7 +14304,18 @@ impl Database {
                     };
                     execute(&ins_plan, ctx)?;
                 }
-                ctx.pager.flush()?;
+                // DURABILITY BOUNDARY (SQLite parity): in AUTOCOMMIT the
+                // schema change is durable at statement end (flush now —
+                // the DML epilogue's flush does not cover this path).
+                // Inside an explicit transaction NOTHING is written to
+                // the main file until COMMIT (SQLite keeps the pages in
+                // its pager cache; a ROLLBACK discards them without the
+                // file ever growing — the eager flush here materialized
+                // an 8 KiB file for a rolled-back CREATE on a fresh
+                // database, and cost every DDL-in-txn an fsync).
+                if !ctx.in_transaction {
+                    ctx.pager.flush()?;
+                }
                 Ok(())
             }
             CreateStatement::Index {
@@ -14629,7 +14640,9 @@ impl Database {
                         crate::storage::btree::Btree::new(ctx.pager, final_root, true);
                     let _ = warm_bt.warm_read_path();
                 }
-                ctx.pager.flush()?;
+                if !ctx.in_transaction {
+                    ctx.pager.flush()?;
+                }
                 Ok(())
             }
             CreateStatement::View {
@@ -14686,7 +14699,9 @@ impl Database {
                     catalog.mark_temp(&view.name);
                 }
                 catalog.add_view(view);
-                ctx.pager.flush()?;
+                if !ctx.in_transaction {
+                    ctx.pager.flush()?;
+                }
                 Ok(())
             }
             CreateStatement::VirtualTable {
@@ -14791,7 +14806,9 @@ impl Database {
                     }
                     Self::create_plain_table(ctx, catalog, &shadow.name, &shadow.create_sql)?;
                 }
-                ctx.pager.flush()?;
+                if !ctx.in_transaction {
+                    ctx.pager.flush()?;
+                }
                 Ok(())
             }
             CreateStatement::Trigger(t) => {
@@ -14868,7 +14885,9 @@ impl Database {
                     catalog.mark_temp(&trig.name);
                 }
                 catalog.add_trigger(trig);
-                ctx.pager.flush()?;
+                if !ctx.in_transaction {
+                    ctx.pager.flush()?;
+                }
                 Ok(())
             }
         }
@@ -14973,7 +14992,9 @@ impl Database {
                         };
                         let _ = Self::execute_drop(drop_shadow, ctx, catalog);
                     }
-                    ctx.pager.flush()?;
+                    if !ctx.in_transaction {
+                        ctx.pager.flush()?;
+                    }
                     return Ok(());
                 }
                 // Free the WHOLE tree, not just the root: every
@@ -15062,7 +15083,9 @@ impl Database {
                     }
                     Ok(())
                 })?;
-                ctx.pager.flush()?;
+                if !ctx.in_transaction {
+                    ctx.pager.flush()?;
+                }
                 Ok(())
             }
             DropKind::Index => {
@@ -15092,19 +15115,25 @@ impl Database {
                 // Same shared-map retirement as DROP TABLE (the freed
                 // root page will be handed out again).
                 ctx.invalidate_index_root(&d.name);
-                ctx.pager.flush()?;
+                if !ctx.in_transaction {
+                    ctx.pager.flush()?;
+                }
                 Ok(())
             }
             DropKind::View => {
                 catalog.drop_view(&d.name);
                 delete_schema_row(ctx.pager, "view", &d.name)?;
-                ctx.pager.flush()?;
+                if !ctx.in_transaction {
+                    ctx.pager.flush()?;
+                }
                 Ok(())
             }
             DropKind::Trigger => {
                 catalog.drop_trigger(&d.name);
                 delete_schema_row(ctx.pager, "trigger", &d.name)?;
-                ctx.pager.flush()?;
+                if !ctx.in_transaction {
+                    ctx.pager.flush()?;
+                }
                 Ok(())
             }
         }
@@ -15187,7 +15216,9 @@ impl Database {
                     rewrite_trigger_tbl_names(ctx.pager, &old_name, &new_name)?;
                 }
 
-                ctx.pager.flush()?;
+                if !ctx.in_transaction {
+                    ctx.pager.flush()?;
+                }
                 Ok(())
             }
             AlterAction::AddColumn { column } => {
@@ -15418,7 +15449,9 @@ impl Database {
                         }
                     }
                 }
-                ctx.pager.flush()?;
+                if !ctx.in_transaction {
+                    ctx.pager.flush()?;
+                }
                 Ok(())
             }
             AlterAction::RenameColumn { old, new } => {
@@ -15613,7 +15646,9 @@ impl Database {
                     );
                     insert_schema_row(ctx.pager, &schema_row)?;
                 }
-                ctx.pager.flush()?;
+                if !ctx.in_transaction {
+                    ctx.pager.flush()?;
+                }
                 Ok(())
             }
             AlterAction::DropColumn { name } => {
@@ -15865,7 +15900,9 @@ impl Database {
                     );
                     insert_schema_row(ctx.pager, &schema_row)?;
                 }
-                ctx.pager.flush()?;
+                if !ctx.in_transaction {
+                    ctx.pager.flush()?;
+                }
                 Ok(())
             }
         }
