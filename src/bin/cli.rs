@@ -2762,13 +2762,21 @@ fn execute_sql(
 
 fn starts_with_keyword(text: &str, keywords: &[&str]) -> bool {
     for kw in keywords {
-        let k = text.len() >= kw.len();
-        if k && text[..kw.len()].eq_ignore_ascii_case(kw) {
-            // Must be followed by whitespace, '(', or end.
-            let rest = &text[kw.len()..];
-            if rest.is_empty() || rest.starts_with(char::is_whitespace) || rest.starts_with('(') {
-                return true;
-            }
+        // BYTE comparison — the old `text[..kw.len()]` slice panicked at
+        // a non-char boundary when a statement opened with a comment
+        // whose 4th byte sat inside a multibyte char (issue #8's
+        // `-- ── catalog ──` box-drawing case).
+        if !text.as_bytes().starts_with(kw.as_bytes()) {
+            continue;
+        }
+        if !text[..kw.len()].eq_ignore_ascii_case(kw) {
+            continue;
+        }
+        // Must be followed by whitespace, '(', or end. kw is pure ASCII,
+        // so kw.len() is a char boundary of any UTF-8 prefix match.
+        let rest = &text[kw.len()..];
+        if rest.is_empty() || rest.starts_with(char::is_whitespace) || rest.starts_with('(') {
+            return true;
         }
     }
     false
