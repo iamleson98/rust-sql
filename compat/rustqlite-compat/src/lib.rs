@@ -5039,29 +5039,33 @@ pub unsafe extern "C" fn sqlite3_backup_step(p: *mut sqlite3_backup, n_page: c_i
         return SQLITE_BUSY;
     };
     let install = if b.dest.is_memory {
-        // Memory engine: image swap (the deserialize path).
+        // Memory engine: image install (the deserialize path) —
+        // IDENTITY-PRESERVING (issue #9's class): live C-ABI
+        // statements (sqlx's per-connection statement cache) borrow the
+        // destination Database; a whole-object replacement dangles
+        // every one of them. The rebuilt store adopts in place, and
+        // the schema-epoch bump re-resolves live statements on their
+        // next step (SQLite's re-prepare contract).
         load_image_as_database(&image).map(|new_db| {
-            let old = std::mem::replace(&mut *wr, new_db);
-            drop(old);
+            wr.adopt_rebuilt_store(new_db);
         })
     } else {
-        // File engine: drop the OLD database first (its Drop flushes its
-        // own state and reclaims its sidecars), then land the image at
-        // the canonical path and reopen from it.
+        // File engine: drop the OLD store first — retired, so its
+        // close-out cannot touch whatever lands at the path next (the
+        // sidecars are reclaimed explicitly below) — then land the
+        // image at the canonical path and reopen from it. The reopened
+        // store ADOPTS in place (the same identity-preserving contract
+        // as the memory arm).
         let path = wr.path().to_path_buf();
         (|| {
-            let old = std::mem::replace(
-                &mut *wr,
-                rustqlite::Database::open_in_memory().map_err(|_| ())?,
-            );
-            drop(old);
+            wr.drop_store_for_rebuild();
             write_image_atomic(&path, &image).map_err(|_| ())?;
             let _ = std::fs::remove_file(rustqlite::storage::wal::wal_path_for(&path));
             let mut spill = path.as_os_str().to_owned();
             spill.push("-spill");
             let _ = std::fs::remove_file(std::path::PathBuf::from(spill));
             let new_db = rustqlite::Database::open(&path).map_err(|_| ())?;
-            *wr = new_db;
+            wr.adopt_rebuilt_store(new_db);
             Ok(())
         })()
     };

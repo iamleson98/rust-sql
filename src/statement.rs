@@ -123,6 +123,14 @@ pub struct Statement<'a> {
     /// DML whose target is a VIEW: it runs INSTEAD OF triggers, which
     /// need the mutable `Database::execute` path (see `targets_view`).
     view_target: bool,
+    /// `Database` schema epoch at the moment this statement's plan /
+    /// fast path were resolved. Compared against the live value at
+    /// every `start()` — a mismatch (VACUUM's catalog adoption, DDL,
+    /// rollback) re-resolves the plan against the CURRENT catalog
+    /// before anything executes: SQLite's transparent re-prepare on a
+    /// schema-cookie bump (issue #9 — a stale plan embeds pre-VACUUM
+    /// `Arc<Table>` roots and walks remapped pages).
+    plan_epoch: u64,
     params: Vec<Value>,
     named: HashMap<String, Value>,
     /// Positional parameter count discovered at prepare time.
@@ -277,6 +285,7 @@ impl<'a> Statement<'a> {
             fast_path: cached.fast_path.clone(),
             has_subqueries: cached.has_subqueries,
             view_target: cached.view_target.is_some(),
+            plan_epoch: db.current_schema_epoch(),
             stmt,
             plan,
             params: vec![Value::Null; param_count],
@@ -774,8 +783,63 @@ impl<'a> Statement<'a> {
     // internals
     // -----------------------------------------------------------------
 
+    /// Re-resolve this statement's plan bundle against the CURRENT
+    /// catalog — SQLite's transparent re-prepare on a schema-cookie
+    /// bump (VACUUM's catalog adoption, DDL). The builder is the
+    /// statement cache's own fill, so the re-resolution is identical to
+    /// a fresh prepare — but the SHARED cache is not touched: only this
+    /// statement's snapshot moves. A table dropped or renamed since
+    /// prepare fails namecheck here, exactly like SQLite's re-prepare
+    /// ("no such table").
+    fn reresolve_plan(&mut self) -> Result<()> {
+        // Attach-bearing statements are never locally planned (the
+        // router decides per execution — get_or_cache_stmt's admission);
+        // a fresh prepare leaves plan/fast_path empty for them, and so
+        // does the re-resolve. Only their schemas re-validate.
+        if crate::attach::stmt_uses_attached(self.db, &self.stmt) {
+            crate::attach::validate_schemas(self.db, &self.stmt)?;
+            self.plan = None;
+            self.fast_path = None;
+            self.has_subqueries = false;
+            self.view_target = false;
+            self.plan_epoch = self.db.current_schema_epoch();
+            return Ok(());
+        }
+        let cached = self.db.cache_stmt_from_ast(&self.stmt)?;
+        self.plan = cached.plan.clone();
+        self.fast_path = cached.fast_path.clone();
+        self.has_subqueries = cached.has_subqueries;
+        self.view_target = cached.view_target.is_some();
+        // Advertised driver columns refresh the way prepare derives
+        // them; materialized shapes re-derive theirs on the next pull.
+        if !self.has_subqueries {
+            if let Some(cols) = self
+                .plan
+                .as_deref()
+                .and_then(try_build_driver)
+                .map(|d| d.columns())
+            {
+                self.columns = Some(cols);
+            }
+        }
+        self.plan_epoch = self.db.current_schema_epoch();
+        Ok(())
+    }
+
     /// Begin execution: choose the streaming driver or materialize.
     fn start(&mut self) -> Result<()> {
+        // SQLite's re-prepare contract (issue #9): the schema epoch
+        // moved since this statement's plan was resolved (a VACUUM
+        // adopted a fresh catalog and remapped the roots; DDL replaced
+        // them). The resolved plan and fast path embed pre-change
+        // `Arc<Table>` / `Arc<Index>` roots — post-VACUUM they walk
+        // remapped pages ("unexpected page type in count", silent
+        // wrong counts); post-DROP they name trees that no longer
+        // exist. Re-resolve against the CURRENT catalog before any
+        // scope is armed or any page is walked.
+        if self.plan_epoch != self.db.current_schema_epoch() {
+            self.reresolve_plan()?;
+        }
         // Deferred-flush consistency (same contract as Database::query).
         if self
             .db

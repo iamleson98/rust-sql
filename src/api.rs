@@ -4240,8 +4240,17 @@ impl Database {
                         if let Some(c) = self.pager.active_page_codec() {
                             let _ = new.pager.set_codec(Some(c));
                         }
-                        new.last_rowid.store(keep_rowid, Ordering::Release);
-                        *self = new;
+                        // Identity-preserving install (issue #9): live
+                        // prepared statements — the C ABI compat layer
+                        // keeps engine `Statement`s alive across the
+                        // VACUUM, lifetime-erased to 'static — borrow THIS
+                        // object. `*self = new` freed it under them; the
+                        // reseeded store adopts in place, and the adopt
+                        // recipe's schema-epoch bump makes each live
+                        // statement re-resolve its plan on the next step
+                        // (SQLite's re-prepare contract).
+                        self.adopt_rebuilt_database(new);
+                        self.last_rowid.store(keep_rowid, Ordering::Release);
                     }
                     src if !wal_install => {
                         // File store, delete-journal mode: publish the
@@ -4303,8 +4312,12 @@ impl Database {
                             None => Self::open(&path)?,
                         };
                         new.path = path;
-                        new.last_rowid.store(keep_rowid, Ordering::Release);
-                        *self = new;
+                        // Same identity-preserving install as the memory
+                        // arm above (issue #9): the reopened store adopts
+                        // in place — live statements keep their borrow and
+                        // re-resolve on the next step.
+                        self.adopt_rebuilt_database(new);
+                        self.last_rowid.store(keep_rowid, Ordering::Release);
                     }
                     // wal_install is false && is_mem is true handled above;
                     // the remaining arm (Image/File, wal_install true) is
@@ -4363,6 +4376,79 @@ impl Database {
         // Committed-view readers key on the schema epoch; the roots moved.
         self.schema_epoch.fetch_add(1, Ordering::AcqRel);
         self.pager.join_build_cache().lock().clear();
+    }
+
+    /// Adopt a rebuilt `Database`'s STORE (pager, catalog, path)
+    /// without replacing this object — the identity-preserving VACUUM
+    /// install for the memory and delete-journal arms (issue #9).
+    ///
+    /// Live prepared statements borrow the `Database`: the C ABI
+    /// compat layer keeps engine `Statement`s alive across a plain
+    /// VACUUM (sqlx's per-connection statement cache), lifetime-erased
+    /// to 'static. The old `*self = new` swap freed the borrowed
+    /// object — every surviving statement then stepped freed memory;
+    /// the reported "unexpected page type in count: LeafIndex" and the
+    /// silent wrong counts (a stale-root `count_subtree` over the
+    /// remapped pages) are its visible faces.
+    ///
+    /// The rebuilt store moves in through field swaps; every derived
+    /// cache resets through the standard adopt recipe, whose
+    /// schema-epoch bump makes each live statement re-resolve its plan
+    /// against the new roots on its next step — SQLite's contract
+    /// (VACUUM bumps the schema cookie; statements transparently
+    /// re-prepare).
+    fn adopt_rebuilt_database(&mut self, mut new: Database) {
+        // Retire the OLD store first: its close-out (checkpoint, file
+        // truncation, sidecar reclamation) must never touch the store
+        // the rebuild published. Idempotent with the file arm's earlier
+        // retire; a memory pager's close-out is empty anyway.
+        self.pager.retire();
+        std::mem::swap(&mut self.pager, &mut new.pager);
+        std::mem::swap(&mut self.path, &mut new.path);
+        let catalog = std::mem::replace(&mut new.catalog, Catalog::new());
+        self.adopt_catalog_after_vacuum(catalog);
+        // `new` drops here holding the retired old store and an empty
+        // catalog; `Database`'s Drop only reconciles a pending
+        // SQLite-format load, which rebuilt databases never carry.
+    }
+
+    /// The C-ABI layer's rebuild installs (sqlite3_backup_step's final
+    /// image install): adopt a rebuilt `Database`'s store without
+    /// replacing this object — the identity-preserving contract of
+    /// [`Self::adopt_rebuilt_database`] (issue #9's class: live C-ABI
+    /// statements borrow the destination; a whole-object replacement
+    /// dangles them).
+    pub fn adopt_rebuilt_store(&mut self, new: Database) {
+        self.adopt_rebuilt_database(new);
+    }
+
+    /// The C-ABI backup install's file destination: detach + drop the
+    /// CURRENT store immediately — with its close-out retired, so the
+    /// drop cannot touch whatever lands at the path next — while
+    /// keeping the `Database` object (and every live statement's borrow
+    /// of it) valid. Follow with [`Self::adopt_rebuilt_store`] once the
+    /// replacement store is open.
+    pub fn drop_store_for_rebuild(&mut self) {
+        self.pager.retire();
+        let placeholder = Pager::open_memory(DEFAULT_CACHE_PAGES).unwrap_or_else(|_| {
+            // Unreachable: an empty memory pager allocates.
+            panic!("drop_store_for_rebuild: placeholder pager")
+        });
+        let old = std::mem::replace(&mut self.pager, Arc::new(placeholder));
+        drop(old);
+        // The catalog describes the dropped store: nothing between
+        // this and the adopt may walk it.
+        self.catalog = Catalog::new();
+        self.maps_populated.store(false, Ordering::Release);
+        *self.maps.write() = empty_maps();
+        self.invalidate_stmt_cache();
+    }
+
+    /// The current schema epoch (see the `schema_epoch` field):
+    /// prepared statements snapshot it at plan-resolution time and
+    /// re-resolve when it moves — SQLite's re-prepare contract.
+    pub(crate) fn current_schema_epoch(&self) -> u64 {
+        self.schema_epoch.load(Ordering::Acquire)
     }
 
     /// Build the compacted image. Two paths:
@@ -6426,6 +6512,19 @@ impl Database {
         *self.bound_delete_memo.lock() = None;
     }
 
+    /// Statement-cache invalidation for events that make CACHED — and
+    /// LIVE-PREPARED — plans stale (DDL, ANALYZE, DETACH): bump the
+    /// schema epoch so every live `Statement` re-resolves its plan on
+    /// the next step (SQLite's re-prepare contract, issue #9), not just
+    /// future preparations. The plain [`Self::invalidate_stmt_cache`]
+    /// stays for the per-DML bookkeeping sites (insert-chain flush,
+    /// autocommit recovery) where plans do NOT go stale and the epoch
+    /// must not move.
+    fn invalidate_stmt_cache_and_epoch(&self) {
+        self.invalidate_stmt_cache();
+        self.schema_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
     /// Execute a statement that does not return rows (INSERT/UPDATE/DELETE/CREATE/...).
     ///
     /// Takes `&mut self` because the outer `RwLock<Database>` write lock
@@ -6914,7 +7013,7 @@ impl Database {
             // by tests/attach_triggers.rs).
             self.catalog
                 .dorm_triggers_bound_to(&name.to_ascii_lowercase());
-            self.invalidate_stmt_cache();
+            self.invalidate_stmt_cache_and_epoch();
             return Ok(());
         }
         // ------------------------------------------------------------------
@@ -7888,9 +7987,12 @@ impl Database {
         // ANALYZE changes the statistics every plan was costed with, so
         // SQLite expires every prepared statement (OP_Expire); a plan
         // cached before it kept its old index choice and its rowid-seek
-        // verdict.
+        // verdict. Both also move the schema epoch so LIVE-prepared
+        // statements re-resolve on their next step (issue #9's class:
+        // a dropped table must error "no such table" at re-step, not
+        // walk the dropped tree's stale plan).
         if result.is_ok() && (is_ddl || is_analyze) {
-            self.invalidate_stmt_cache();
+            self.invalidate_stmt_cache_and_epoch();
         }
         // If deferred_flush is enabled, force a flush when the dirty-page
         // count exceeds the threshold.
