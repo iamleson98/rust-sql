@@ -11395,6 +11395,112 @@ impl Database {
 
     /// Execute a mixed SELECT (or DML-RETURNING through the query path)
     /// through the foreign channel: materialize, plan, execute.
+    /// The shared DML epilogue for the `&self` cross-channel execution
+    /// paths (`exec_foreign_select_with_cols`, `exec_with_injected_channel`):
+    /// the query-path DML bookkeeping on success, and the writer path's
+    /// FULL failure machinery on error. The ctx is dropped at return, so
+    /// recovery MUST run here — the old `?` propagated errors before the
+    /// statement journal could replay, leaving a failed statement's landed
+    /// rows in the table (issue #8's abort-midway report: a UNIQUE-aborted
+    /// bulk INSERT..SELECT from an ATTACHed source left 92 of its rows).
+    fn finish_channel_dml_epilogue(
+        &self,
+        ctx: &mut ExecContext<'_>,
+        ok: bool,
+        dirty_at_start: usize,
+    ) -> Result<()> {
+        crate::executor::change_counters::record_outcome(
+            &self.change_counts,
+            ok,
+            ctx.changes,
+            ctx.trigger_changes,
+        );
+        if !ok {
+            // A constraint resolved as FAIL keeps its pre-violation
+            // changes (sqlite3VdbeHalt's OE_Fail); everything else
+            // rolls the statement back.
+            let keep_partial =
+                ctx.halt_action == Some(ConflictResolution::Fail) && !ctx.rolled_back;
+            if !keep_partial && !ctx.stmt_undo.is_empty() {
+                let entries = std::mem::take(&mut ctx.stmt_undo);
+                if let Err(undo_err) = crate::executor::replay_stmt_undo(ctx, entries) {
+                    eprintln!("stmt-undo replay failed after foreign-DML error: {undo_err}");
+                }
+            }
+            if !keep_partial {
+                ctx.forget_max_rowids();
+                // Page-level autocommit restore (gates mirror the writer
+                // path): a failed autocommit statement's half-finished
+                // splits / freelist pops must not survive to the next
+                // flush as if they were a commit.
+                if !ctx.in_transaction
+                    && !ctx.deferred_flush
+                    && self.pager.dirty_set_marked() != dirty_at_start
+                {
+                    match self.restore_failed_autocommit_stmt_pages() {
+                        Err(rb_err) => eprintln!(
+                            "autocommit-statement rollback failed after foreign-DML error: {rb_err}"
+                        ),
+                        Ok(true) => {
+                            // The overlays point at pages the restore just
+                            // discarded — clear them so the merge below is
+                            // a no-op (the invalidation lists stay and
+                            // replay, exactly like the writer path).
+                            ctx.root_overrides.clear();
+                            ctx.max_rowids.clear();
+                            ctx.index_roots.clear();
+                        }
+                        Ok(false) => {}
+                    }
+                }
+            }
+        }
+        self.pager.note_rows_modified(ctx.changes);
+        if ok && ctx.changes > 0 && !ctx.in_transaction {
+            self.pager.note_tx_autocommit();
+        }
+        // Bump the write epoch on BOTH arms: a failed statement may still
+        // have dirtied pages (a declined restore keeps them), and the
+        // memoized COUNT(*) answers must never outlive it.
+        self.write_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        // Merge the root overlays / max-rowid / index-root bookkeeping
+        // COMPLETELY (issue #8): this used to merge the root overlays but
+        // skip the maps-populated flag, the invalidation removals, and —
+        // the durable half — `sync_schema_roots_inner`. A bulk
+        // INSERT..SELECT from an ATTACHed source that split the target's
+        // root then left the sqlite_schema row naming the ORIGINAL leaf:
+        // every later session opened the truncated one-leaf tree (the
+        // split pages orphaned in the schema), and the stale flag made
+        // FastPath::CountStar fall back to the stale catalog Arc
+        // mid-session too.
+        if ctx.roots_changed || ctx.max_rowids_changed || ctx.index_roots_changed {
+            let mut m = self.maps.write();
+            let shared_mut = Arc::make_mut(&mut *m);
+            if ctx.roots_changed {
+                shared_mut.roots.extend(ctx.root_overrides.drain());
+                for k in ctx.roots_invalidated.drain(..) {
+                    shared_mut.roots.remove(&k);
+                }
+            }
+            if ctx.max_rowids_changed {
+                shared_mut.max_rowids.extend(ctx.max_rowids.drain());
+                for k in ctx.max_rowids_invalidated.drain(..) {
+                    shared_mut.max_rowids.remove(&k);
+                }
+            }
+            if ctx.index_roots_changed {
+                shared_mut.index_roots.extend(ctx.index_roots.drain());
+                for k in ctx.index_roots_invalidated.drain(..) {
+                    shared_mut.index_roots.remove(&k);
+                }
+            }
+            let nonempty = !shared_mut.roots.is_empty() || !shared_mut.index_roots.is_empty();
+            self.maps_populated.store(nonempty, Ordering::Release);
+        }
+        self.sync_schema_roots_inner()
+    }
+
     pub(crate) fn exec_foreign_select(
         &self,
         stmt: &Statement,
@@ -11452,7 +11558,27 @@ impl Database {
         if crate::executor::plan_has_subqueries(&plan) {
             plan = crate::executor::rewrite_plan_subqueries(&plan, &mut ctx)?;
         }
-        let res = crate::executor::execute(&plan, &mut ctx)?;
+        let dirty_at_start = self.pager.dirty_set_marked();
+        let dml_res = crate::executor::execute(&plan, &mut ctx);
+        let res = match dml_res {
+            Ok(r) => r,
+            Err(e) => {
+                if !had_channel {
+                    ctx.foreign = None;
+                }
+                // Failure recovery MUST run while the ctx is alive (the
+                // journal + page restore; issue #8's abort-midway bug).
+                if matches!(
+                    plan,
+                    crate::planner::plan::Plan::Insert { .. }
+                        | crate::planner::plan::Plan::Update { .. }
+                        | crate::planner::plan::Plan::Delete { .. }
+                ) {
+                    let _ = self.finish_channel_dml_epilogue(&mut ctx, false, dirty_at_start);
+                }
+                return Err(e);
+            }
+        };
         if !had_channel {
             ctx.foreign = None;
         }
@@ -11464,24 +11590,8 @@ impl Database {
                 | crate::planner::plan::Plan::Update { .. }
                 | crate::planner::plan::Plan::Delete { .. }
         ) {
-            crate::executor::change_counters::record_outcome(
-                &self.change_counts,
-                true,
-                ctx.changes,
-                ctx.trigger_changes,
-            );
-            self.pager.note_rows_modified(ctx.changes);
-            if ctx.changes > 0 && !ctx.in_transaction {
-                self.pager.note_tx_autocommit();
-            }
-            self.write_epoch
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
-            if ctx.roots_changed || ctx.max_rowids_changed || ctx.index_roots_changed {
-                let mut m = self.maps.write();
-                let shared_mut = Arc::make_mut(&mut m);
-                shared_mut.roots.extend(ctx.root_overrides.drain());
-                shared_mut.max_rowids.extend(ctx.max_rowids.drain());
-            }
+            let epilogue = self.finish_channel_dml_epilogue(&mut ctx, true, dirty_at_start);
+            epilogue?;
         }
         Ok((res.columns.to_vec(), res.rows))
     }
@@ -11541,32 +11651,18 @@ impl Database {
         if crate::executor::plan_has_subqueries(&plan) {
             plan = crate::executor::rewrite_plan_subqueries(&plan, &mut ctx)?;
         }
-        let res = crate::executor::execute(&plan, &mut ctx)?;
+        let dirty_at_start = self.pager.dirty_set_marked();
+        let dml_res = crate::executor::execute(&plan, &mut ctx);
         ctx.foreign = None;
-        // DML bookkeeping (the exec_foreign_select_with_cols pattern).
+        // DML bookkeeping (the exec_foreign_select_with_cols pattern) —
+        // with the full failure machinery while the ctx is alive.
         if matches!(
             plan,
             crate::planner::plan::Plan::Update { .. } | crate::planner::plan::Plan::Delete { .. }
         ) {
-            crate::executor::change_counters::record_outcome(
-                &self.change_counts,
-                true,
-                ctx.changes,
-                ctx.trigger_changes,
-            );
-            self.pager.note_rows_modified(ctx.changes);
-            if ctx.changes > 0 && !ctx.in_transaction {
-                self.pager.note_tx_autocommit();
-            }
-            self.write_epoch
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
-            if ctx.roots_changed || ctx.max_rowids_changed || ctx.index_roots_changed {
-                let mut m = self.maps.write();
-                let shared_mut = Arc::make_mut(&mut m);
-                shared_mut.roots.extend(ctx.root_overrides.drain());
-                shared_mut.max_rowids.extend(ctx.max_rowids.drain());
-            }
+            let _ = self.finish_channel_dml_epilogue(&mut ctx, dml_res.is_ok(), dirty_at_start);
         }
+        let res = dml_res?;
         Ok((res.columns.to_vec(), res.rows))
     }
 
