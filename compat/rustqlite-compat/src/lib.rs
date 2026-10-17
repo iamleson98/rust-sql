@@ -529,6 +529,14 @@ struct ConnState {
     /// `sqlite3_changes` — row count of the most recently completed
     /// statement on this connection.
     changes: AtomicI64,
+    /// This connection's SAVEPOINT stack (outermost first). Names track
+    /// which RELEASE / ROLLBACK TO unwind what; the engine keeps its own
+    /// depth, this stack drives the CONNECTION's tx bookkeeping.
+    savepoints: StdMutex<Vec<String>>,
+    /// True while the open transaction was STARTED by an outermost
+    /// SAVEPOINT (not BEGIN) — releasing that savepoint COMMITS (the
+    /// engine's `savepoint_txn` rule, mirrored here).
+    savepoint_txn: AtomicBool,
     total_changes: AtomicI64,
     last_rowid: AtomicI64,
     err_code: AtomicI64,
@@ -820,7 +828,7 @@ fn is_table_valued_read_pragma(name: &str) -> bool {
 /// COMMIT/ROLLBACK need slot bookkeeping; SAVEPOINT/RELEASE just execute
 /// under the write lock (SQLite semantics preserved from the old
 /// re-parse-and-match code).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum TxKind {
     /// BEGIN — `concurrent` distinguishes `BEGIN CONCURRENT` (the
     /// multi-writer regime: no `tx_owner` slot, several connections may
@@ -831,8 +839,25 @@ enum TxKind {
         concurrent: bool,
     },
     Commit,
-    Rollback,
-    SavepointOrRelease,
+    /// `to` — `ROLLBACK TO <savepoint>`: the transaction STAYS OPEN
+    /// (only the savepoint and everything after it unwinds); `None` is
+    /// a full ROLLBACK that ends the transaction.
+    Rollback {
+        to: Option<String>,
+    },
+    /// SAVEPOINT <name>. On a connection with no open transaction this
+    /// STARTS one (SQLite's savepoint_txn semantics — the engine tracks
+    /// its side with `savepoint_txn`): it must take the cross-connection
+    /// `tx_owner` slot exactly like a plain BEGIN, or the engine's
+    /// transaction is ANONYMOUS — other connections' BEGIN then fails
+    /// "cannot start a transaction within a transaction" while their
+    /// DML silently joins, and the teardown rollback eats foreign rows
+    /// (issue #7).
+    Savepoint(String),
+    /// RELEASE [SAVEPOINT] <name>. Releasing the OUTERMOST savepoint of
+    /// a savepoint-started transaction COMMITS it (the engine's
+    /// `savepoint_txn` rule).
+    Release(String),
 }
 
 fn tx_kind_of(stmt: &rustqlite::sql::ast::Statement) -> Option<TxKind> {
@@ -842,8 +867,11 @@ fn tx_kind_of(stmt: &rustqlite::sql::ast::Statement) -> Option<TxKind> {
             concurrent: matches!(b.mode, rustqlite::sql::ast::BeginMode::Concurrent),
         }),
         S::Commit => Some(TxKind::Commit),
-        S::Rollback(_) => Some(TxKind::Rollback),
-        S::Savepoint(_) | S::Release(_) => Some(TxKind::SavepointOrRelease),
+        S::Rollback(r) => Some(TxKind::Rollback {
+            to: r.savepoint.clone(),
+        }),
+        S::Savepoint(name) => Some(TxKind::Savepoint(name.clone())),
+        S::Release(name) => Some(TxKind::Release(name.clone())),
         _ => None,
     }
 }
@@ -1507,6 +1535,8 @@ fn new_conn_opts(engine: Option<Arc<Engine>>, readonly: bool, shared_cache: bool
         readonly,
         state: ConnState {
             in_tx: AtomicBool::new(false),
+            savepoints: StdMutex::new(Vec::new()),
+            savepoint_txn: AtomicBool::new(false),
             tx_concurrent: AtomicBool::new(false),
             shared_cache,
             busy_timeout_ms: AtomicI64::new(0),
@@ -2695,9 +2725,20 @@ fn run_once(stmt: &mut Stmt) -> c_int {
         _ => unreachable!(),
     };
 
-    // Transaction-control handling: BEGIN waits for the engine-level tx
-    // slot (cross-connection serialization, SQLite-style BUSY).
-    if let Some(tx) = stmt.tx_kind {
+    // Transaction-control handling: BEGIN (and an OUTERMOST SAVEPOINT,
+    // which STARTS a transaction — SQLite's savepoint_txn semantics)
+    // waits for the engine-level tx slot (cross-connection
+    // serialization, SQLite-style BUSY).
+    if let Some(tx) = stmt.tx_kind.as_ref() {
+        // An outermost SAVEPOINT takes the slot exactly like a plain
+        // BEGIN: without it the engine's transaction is ANONYMOUS
+        // (tx_owner = 0) — foreign BEGINs then fail with "cannot start
+        // a transaction within a transaction" while foreign DML
+        // silently joins the anonymous transaction, and the teardown
+        // rollback eats foreign rows (issue #7's production loss).
+        let sp_starts_tx = matches!(tx, TxKind::Savepoint(_))
+            && !conn.state.in_tx.load(Ordering::Acquire)
+            && !conn.state.tx_concurrent.load(Ordering::Acquire);
         if let TxKind::Begin { concurrent } = tx {
             if conn.state.in_tx.load(Ordering::Acquire) {
                 return conn.set_err(
@@ -2732,6 +2773,24 @@ fn run_once(stmt: &mut Stmt) -> c_int {
                     return conn.set_err(SQLITE_BUSY, "database is locked");
                 }
             }
+        } else if sp_starts_tx {
+            // Same discipline as a plain BEGIN (a savepoint-started
+            // transaction IS a plain transaction): wait foreign plain
+            // holders and the concurrent regime out.
+            let plain_foreign = {
+                let owner = engine.tx_owner.load(Ordering::Acquire);
+                owner != 0 && owner != conn.id
+            };
+            let blocked = plain_foreign || engine.db.read().concurrent_regime_active();
+            if blocked {
+                if conn.state.shared_cache {
+                    return conn.set_err(SQLITE_LOCKED, "database table is locked");
+                }
+                let timeout = conn.state.busy_timeout_ms.load(Ordering::Acquire);
+                if !await_tx_slot(&engine, conn.id, timeout, true) {
+                    return conn.set_err(SQLITE_BUSY, "database is locked");
+                }
+            }
         }
         // Arm THIS connection's identity for the engine call: the BEGIN
         // CONCURRENT regime keys transaction ownership, COMMIT/ROLLBACK
@@ -2749,7 +2808,7 @@ fn run_once(stmt: &mut Stmt) -> c_int {
             Ok(()) => {
                 match tx {
                     TxKind::Begin { concurrent } => {
-                        if concurrent {
+                        if *concurrent {
                             // Multi-writer regime: NO tx_owner slot —
                             // several concurrent transactions may be
                             // open at once; the engine tracks owners by
@@ -2760,21 +2819,80 @@ fn run_once(stmt: &mut Stmt) -> c_int {
                             conn.state.tx_concurrent.store(false, Ordering::Release);
                         }
                         conn.state.in_tx.store(true, Ordering::Release);
+                        conn.state.savepoints.lock().unwrap().clear();
+                        conn.state.savepoint_txn.store(false, Ordering::Release);
                         metrics::bump(&metrics::TX_BEGUN);
                     }
                     TxKind::Commit => {
                         release_tx_hold(&engine, &conn);
                         conn.state.in_tx.store(false, Ordering::Release);
+                        conn.state.savepoints.lock().unwrap().clear();
+                        conn.state.savepoint_txn.store(false, Ordering::Release);
                         metrics::bump(&metrics::TX_COMMITTED);
                         fire_commit_hook(&conn);
                     }
-                    TxKind::Rollback => {
+                    TxKind::Rollback { to: None } => {
                         release_tx_hold(&engine, &conn);
                         conn.state.in_tx.store(false, Ordering::Release);
+                        conn.state.savepoints.lock().unwrap().clear();
+                        conn.state.savepoint_txn.store(false, Ordering::Release);
                         metrics::bump(&metrics::TX_ROLLED_BACK);
                         fire_rollback_hook(&conn);
                     }
-                    TxKind::SavepointOrRelease => {}
+                    TxKind::Rollback { to: Some(_) } => {
+                        // ROLLBACK TO <savepoint>: the transaction STAYS
+                        // OPEN (the savepoint and everything above it
+                        // unwinds). Truncate the connection's savepoint
+                        // stack to keep it — the engine's depth drops,
+                        // this stack must follow, or a later RELEASE of
+                        // the outermost mis-decides whether it ends the
+                        // transaction.
+                        let name = match tx {
+                            TxKind::Rollback { to: Some(n) } => n.clone(),
+                            _ => unreachable!(),
+                        };
+                        let mut sp = conn.state.savepoints.lock().unwrap();
+                        if let Some(pos) = sp.iter().position(|n| n == &name) {
+                            sp.truncate(pos + 1);
+                        }
+                    }
+                    TxKind::Savepoint(name) => {
+                        let started = !conn.state.in_tx.load(Ordering::Acquire);
+                        let mut sp = conn.state.savepoints.lock().unwrap();
+                        sp.push(name.clone());
+                        drop(sp);
+                        if started {
+                            // The OUTERMOST savepoint started a plain
+                            // transaction: claim the cross-connection
+                            // slot (see the gate above — issue #7).
+                            engine.tx_owner.store(conn.id, Ordering::Release);
+                            conn.state.in_tx.store(true, Ordering::Release);
+                            conn.state.savepoint_txn.store(true, Ordering::Release);
+                            conn.state.tx_concurrent.store(false, Ordering::Release);
+                            metrics::bump(&metrics::TX_BEGUN);
+                        }
+                    }
+                    TxKind::Release(name) => {
+                        // RELEASE of the OUTERMOST savepoint of a
+                        // savepoint-started transaction COMMITS (the
+                        // engine's savepoint_txn rule); releasing a
+                        // nested savepoint just unwinds it and
+                        // everything above it — the transaction stays.
+                        let mut sp = conn.state.savepoints.lock().unwrap();
+                        let outermost = conn.state.savepoint_txn.load(Ordering::Acquire)
+                            && sp.first().is_some_and(|n| n == name);
+                        if let Some(pos) = sp.iter().position(|n| n == name) {
+                            sp.truncate(pos);
+                        }
+                        drop(sp);
+                        if outermost {
+                            release_tx_hold(&engine, &conn);
+                            conn.state.in_tx.store(false, Ordering::Release);
+                            conn.state.savepoint_txn.store(false, Ordering::Release);
+                            metrics::bump(&metrics::TX_COMMITTED);
+                            fire_commit_hook(&conn);
+                        }
+                    }
                 }
                 conn.clear_err();
                 SQLITE_OK
@@ -2788,7 +2906,8 @@ fn run_once(stmt: &mut Stmt) -> c_int {
                 // the success path, or every later plain writer waits
                 // out a transaction that no longer exists. A failed
                 // PLAIN commit keeps the transaction open (SQLite).
-                if matches!(tx, TxKind::Commit | TxKind::Rollback)
+                let rollback_full = matches!(tx, TxKind::Rollback { to: None });
+                if (matches!(tx, TxKind::Commit | TxKind::Begin { .. }) || rollback_full)
                     && conn.state.tx_concurrent.load(Ordering::Acquire)
                 {
                     release_tx_hold(&engine, &conn);
