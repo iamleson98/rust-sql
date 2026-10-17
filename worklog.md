@@ -2233,3 +2233,75 @@ Stage Summary:
   self-heal, ran-vs-unreached accounting). The weekly suite can no longer
   report partial coverage as success, and its headline divergence number
   now separates real wrong answers from harness cutoffs.
+
+---
+Task ID: issues-7-8 (session 2026-10-17, the ATTACH-truth and savepoint-slot round)
+Agent: main (Super Z)
+
+Work Log:
+- Issue #8, the durable half (bulk ATTACH copy "loses rows"): root-caused to
+  the cross-schema DML path running through the READER-shaped federation
+  machinery (exec_foreign_select_with_cols), whose DML tail merged root
+  overlays but skipped the maps-populated flag, the invalidation removals,
+  and sync_schema_roots_inner. The WRITE side was always correct — the file
+  held every row; the sqlite_schema row still named the ORIGINAL root leaf,
+  so every fresh session opened a one-leaf table (78/800 uuid, 261/800
+  heap, "Page 2..5 never used") while mid-session FastPath::CountStar
+  resolved the stale catalog Arc through the stale flag, counted one leaf,
+  and CACHED the wrong answer under the live write epoch. Both foreign DML
+  tails (this one and exec_with_injected_channel) now mirror the
+  query-path epilogue completely (ea5cfdf).
+- Issue #8, the atomicity half ("abort partway leaves index entries for
+  rows never inserted"): the same path's execute(...)? propagated errors
+  BEFORE the statement journal could replay — a UNIQUE abort at row 300/700
+  left 92 landed rows in the table. Fixed with finish_channel_dml_epilogue:
+  the full failure machinery (stmt_undo reverse replay with the OE_Fail
+  keep-partial exception, forget_max_rowids, the page-level autocommit
+  restore with overlay clearing) runs while the ctx is still alive.
+  Pinned: attach_bulk_abort_midway_leaves_nothing (nothing remains,
+  integrity ok, a clean re-copy afterwards completes).
+- The gate test attach_bulk_insert_select_builds_complete_indexes is
+  UN-IGNORED and green (its integrity assertion now expects SQLite's TEXT
+  "ok"). examples/zz_attach.rs: the four-shape probe (uuid PK, integer key
+  + secondary index, no-index heap, WITHOUT ROWID) with the differential
+  gate the issue asked for — bulk vs row-by-row content checksums, not
+  just counts; green at 2000 and 6000 rows. The CLI multibyte-comment
+  panic (starts_with_keyword slicing at a char boundary) fixed by
+  byte-prefix matching (e1a8cc8).
+- Issue #7 (pooled-connection bleed, nested-BEGIN 500s, swallowed writes):
+  built the harness the user specced (4 pooled C-ABI handles, 6 rounds of
+  BEGIN -> 20 indexed INSERTs -> COMMIT, mid-tx interleave attempt,
+  abandoned-tx class, scan == PK point lookups == secondary index ==
+  integrity_check after every round) — GREEN at HEAD and at the
+  production engine 50464a8. The production shape needed one more piece:
+  sqlx NESTED transactions issue SAVEPOINT (no BEGIN). ROOT CAUSE
+  (reproduced at HEAD before the fix): an outermost SAVEPOINT starts an
+  engine transaction (savepoint_txn semantics) but TxKind::
+  SavepointOrRelease did NO bookkeeping — the engine tx was ANONYMOUS
+  (tx_owner=0): foreign BEGINs got "cannot start a transaction within a
+  transaction" (the 500s) while foreign DML silently joined (the
+  swallowed writes, lost at the pool-teardown rollback); ROLLBACK TO had
+  the mirror bug (cleared the connection's tx bookkeeping while the engine
+  kept the transaction open). FIXED (56d7879): TxKind::Savepoint(name)/
+  Release(name)/Rollback{to}; an outermost SAVEPOINT takes the cross-
+  connection slot exactly like a plain BEGIN (BUSY discipline); RELEASE of
+  the outermost savepoint of a savepoint-started tx COMMITS; ROLLBACK TO
+  truncates the savepoint stack and keeps the tx open. Three pinned tests
+  in compat/rustqlite-compat/tests/issue7_multi_handle_interleave.rs; the
+  whole compat suite green (100 tests).
+- CI: e1a8cc8 red (clippy x4 — CI clippy checks EXAMPLES and zz_attach
+  had a dead initializer, fixed 3b0da67; torture windows S14 vacuum_ms
+  3.9 vs 1.8ms — the documented shared-runner draw class on an untouched
+  path). 39006673382 (3b0da67): green after one failed-jobs rerun — the
+  macOS semantics battery flaked ONCE on derived_column_types' CAST(i AS
+  TEXT) x = 5 (1 of 4061 statements; the path is untouched by this round,
+  passed at e1a8cc8 hours earlier, and 540 local executions (40 battery +
+  500 single-statement hammers) never reproduced it — tracked as a rare
+  macOS/aarch64 nondeterminism, separate from this round).
+
+Stage Summary:
+- Both open issues closed at the source: #8's durable schema-roots
+  staleness + statement-atomicity hole, and #7's anonymous savepoint
+  transactions. The write path needed no changes — every #8 "lost row"
+  was read-side staleness, which is why the differential checksums (not
+  just counts) are the gate that catches this class. CI green at 3b0da67.
