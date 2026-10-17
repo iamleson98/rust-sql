@@ -1963,6 +1963,14 @@ fn sig_walk(e: &Expr, h: &mut SigHasher) {
     }
 }
 
+/// One registry-resolution record: (binding key, comparison affinity,
+/// declared collation) — see [`column_resolutions`].
+type ColRes = (
+    String,
+    Option<crate::types::Affinity>,
+    Option<Option<String>>,
+);
+
 /// Everything an operator scope's construction read, besides the tree.
 #[derive(PartialEq)]
 struct ScopeInputs {
@@ -1971,6 +1979,17 @@ struct ScopeInputs {
     collated_frames: u32,
     collate_seen: bool,
     condition: bool,
+    /// The statement-scoped REGISTRY's answers for every column
+    /// reference in the compiled expressions (deterministic walk
+    /// order): (binding key, comparison affinity, declared collation).
+    /// The compiled `CExpr` bakes these resolutions at compile time
+    /// (`CExpr::Bin { aff, coll }`), so a cached scope built under
+    /// DIFFERENT registry frames must never serve them — see
+    /// `column_resolutions` (the macOS semantics-battery flake's
+    /// mechanism: a stale INTEGER-baked comparison for a no-affinity
+    /// compound-derived column). Empty when the context carries its
+    /// own affinity map (the registry is not consulted then).
+    colres: Vec<ColRes>,
 }
 
 struct CachedScope {
@@ -2002,6 +2021,136 @@ pub(crate) struct OperatorScope {
     flags: Option<SubqueryScope>,
 }
 
+/// The registry's answers for every column reference in `exprs`, in a
+/// deterministic depth-first walk order (subquery subtrees excluded —
+/// they compile under their own scopes): for each `Expr::Column`, the
+/// binding key (its qualifier, or the one the row layout resolves a
+/// bare name to), the comparison affinity the registry resolves, and
+/// its declared collation. This is the exact input set the compiled
+/// `CExpr` bakes through `comparison_column_affinity` /
+/// `binary_comparison_collation` — keying the operator scope cache on
+/// it closes the stale-frame hole: a cached scope built under one set
+/// of registry frames can never serve a predicate whose columns
+/// resolve differently (the macOS semantics-battery flake — see
+/// `scope_cache_never_serves_a_foreign_registry_frame`).
+///
+/// Empty when the context carries its own affinity map: the registry
+/// is then never consulted (the map answers every probe).
+fn column_resolutions(exprs: &[&Expr], ctx: &EvalContext<'_>) -> Vec<ColRes> {
+    if ctx.column_affinities.is_some() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for e in exprs {
+        collect_column_resolutions(e, ctx, &mut out);
+    }
+    out
+}
+
+fn collect_column_resolutions(e: &Expr, ctx: &EvalContext<'_>, out: &mut Vec<ColRes>) {
+    match e {
+        Expr::Column { table, name } => {
+            let q = ctx.source_qualifier(table.as_deref(), name);
+            let aff = affinity_scope_lookup(q.as_deref(), name);
+            let coll = collation_scope_lookup_ex(q.as_deref(), name);
+            let key = match (table.as_deref(), q.as_deref()) {
+                (Some(t), _) => format!("{}:{}", t.to_ascii_lowercase(), name.to_ascii_lowercase()),
+                (None, Some(q)) => format!("{q}:{}", name.to_ascii_lowercase()),
+                (None, None) => name.to_ascii_lowercase(),
+            };
+            out.push((key, aff, coll));
+        }
+        Expr::Literal(_) | Expr::Parameter(_) | Expr::Subquery(_) | Expr::Exists(_) => {}
+        Expr::Binary { left, right, .. } | Expr::Is { left, right, .. } => {
+            collect_column_resolutions(left, ctx, out);
+            collect_column_resolutions(right, ctx, out);
+        }
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } | Expr::Cast { expr, .. } => {
+            collect_column_resolutions(expr, ctx, out);
+        }
+        Expr::Collate { expr, .. } => collect_column_resolutions(expr, ctx, out),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_column_resolutions(expr, ctx, out);
+            collect_column_resolutions(low, ctx, out);
+            collect_column_resolutions(high, ctx, out);
+        }
+        Expr::In { expr, source, .. } => {
+            collect_column_resolutions(expr, ctx, out);
+            if let crate::sql::ast::InSource::List(l) = source {
+                for x in l.iter() {
+                    collect_column_resolutions(x, ctx, out);
+                }
+            }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            collect_column_resolutions(expr, ctx, out);
+            collect_column_resolutions(pattern, ctx, out);
+            if let Some(x) = escape {
+                collect_column_resolutions(x, ctx, out);
+            }
+        }
+        Expr::Function {
+            args,
+            filter,
+            over,
+            order_by,
+            ..
+        } => {
+            for a in args {
+                collect_column_resolutions(a, ctx, out);
+            }
+            if let Some(f) = filter {
+                collect_column_resolutions(f, ctx, out);
+            }
+            if let Some(o) = over {
+                match o.as_ref() {
+                    crate::sql::ast::WindowSpec::Named(_) => {}
+                    crate::sql::ast::WindowSpec::Inline(w) => {
+                        for t in w.partition_by.iter() {
+                            collect_column_resolutions(t, ctx, out);
+                        }
+                        for t in w.order_by.iter() {
+                            collect_column_resolutions(&t.expr, ctx, out);
+                        }
+                    }
+                }
+            }
+            for t in order_by {
+                collect_column_resolutions(&t.expr, ctx, out);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(o) = operand {
+                collect_column_resolutions(o, ctx, out);
+            }
+            for w in whens {
+                collect_column_resolutions(&w.0, ctx, out);
+                collect_column_resolutions(&w.1, ctx, out);
+            }
+            if let Some(x) = else_ {
+                collect_column_resolutions(x, ctx, out);
+            }
+        }
+        Expr::Row(xs) => {
+            for x in xs {
+                collect_column_resolutions(x, ctx, out);
+            }
+        }
+        Expr::Raise { .. } => {}
+    }
+}
+
 impl OperatorScope {
     /// Scopes for a CONDITION evaluated per row over `ctx`'s layout.
     pub(crate) fn condition(e: &Expr, ctx: &EvalContext<'_>) -> Self {
@@ -2022,6 +2171,10 @@ impl OperatorScope {
         let collated_frames = COLLATED_FRAMES.with(|c| c.get());
         let collate_seen =
             crate::sql::lexer::COLLATE_SEEN.load(std::sync::atomic::Ordering::Relaxed);
+        // The registry's answers under the CURRENT frames — part of the
+        // key (see ScopeInputs::colres). Computed BEFORE the hit test so
+        // a cached entry built under other frames cannot serve.
+        let colres = column_resolutions(exprs, ctx);
         // Compared borrowed (no per-run clone of the names); owned copies
         // are made only for a new entry.
         let same = |x: &CachedScope| {
@@ -2036,6 +2189,7 @@ impl OperatorScope {
                 && x.inputs.collated_frames == collated_frames
                 && x.inputs.collate_seen == collate_seen
                 && x.inputs.condition == condition
+                && x.inputs.colres == colres
         };
         let hit = SCOPE_CACHE.with(|c| {
             let mut c = c.borrow_mut();
@@ -2059,6 +2213,7 @@ impl OperatorScope {
                     collated_frames,
                     collate_seen,
                     condition,
+                    colres,
                 };
                 let subq_free = !exprs.iter().any(|e| contains_subquery(e));
                 let coll_free = !exprs.iter().any(|e| contains_collate(e));
@@ -6306,6 +6461,78 @@ mod tests {
                 panic!("not a simple select");
             }
             _ => panic!("not a select"),
+        }
+    }
+
+    /// The macOS semantics-battery flake (derived_column_types.sql, runs
+    /// 39006673382-attempt-1 and 39062950385), distilled to its
+    /// mechanism: the operator scope cache keyed a compiled predicate by
+    /// its tree ADDRESSES + the row layout — but the comparison affinity
+    /// baked into the compiled CExpr is resolved through the
+    /// statement-scoped REGISTRY FRAMES, which the key ignored. Two
+    /// structurally identical `x = '5'` predicates from DIFFERENT
+    /// statements (heap address reuse by the allocator's LIFO free lists
+    /// replayed the whole tree's addresses) false-hit the earlier
+    /// entry: the compound-derived statement evaluated with the simple
+    /// derived statement's INTEGER affinity and returned
+    /// [Int(5), Text("5")] where SQLite — and we, on every honest draw —
+    /// return [Text("5")].
+    ///
+    /// Here ONE live tree runs under TWO registry frames: the second
+    /// evaluation must answer with the LIVE frame's semantics, never the
+    /// first frame's baked-in affinity.
+    #[test]
+    fn scope_cache_never_serves_a_foreign_registry_frame() {
+        use crate::executor::derived::{synthetic_column, synthetic_table};
+        use crate::types::Affinity;
+
+        let pred = parse_expr("x = '5'");
+        let names = vec!["x".to_string()];
+        let p = params();
+        let np = named_params();
+
+        // Frame A: the derived table's x is INTEGER (a simple
+        // `SELECT i AS x FROM m` derived column) — '5' converts, Int(5)
+        // matches.
+        let int_frame = synthetic_table(
+            "d",
+            vec![synthetic_column("x", Affinity::Integer, String::new())],
+        );
+        {
+            let _f = AffinityScope::push(vec![("d".to_string(), int_frame.clone())]);
+            let ctx = EvalContext::new(&[Value::Integer(5)], &names, &p, &np);
+            let _s = OperatorScope::condition(&pred, &ctx);
+            assert!(
+                evaluate_where(&pred, &ctx).unwrap(),
+                "INTEGER x: Int(5) = '5' must convert and match"
+            );
+        } // scope dropped -> the compiled form returns to the cache
+
+        // Frame B: a DIFFERENT derived table whose x carries no
+        // affinity (the compound's mixed-arms BLOB rule, or no x at
+        // all) — Int(5) = '5' compares RAW (false), Text("5") = '5' is
+        // true. A stale INTEGER-baked compile answers TRUE for the Int
+        // row — the observed flap.
+        let plain_frame = synthetic_table(
+            "d",
+            vec![synthetic_column("y", Affinity::Integer, String::new())],
+        );
+        {
+            let _f = AffinityScope::push(vec![("d".to_string(), plain_frame.clone())]);
+            let ctx = EvalContext::new(&[Value::Integer(5)], &names, &p, &np);
+            let _s = OperatorScope::condition(&pred, &ctx);
+            assert!(
+                !evaluate_where(&pred, &ctx).unwrap(),
+                "no-affinity x: Int(5) = '5' must compare raw — a stale \
+                 registry frame's baked-in affinity was served"
+            );
+            let ctx2_row = [Value::Text("5".into())];
+            let ctx2 = EvalContext::new(&ctx2_row, &names, &p, &np);
+            let _s2 = OperatorScope::condition(&pred, &ctx2);
+            assert!(
+                evaluate_where(&pred, &ctx2).unwrap(),
+                "no-affinity x: Text(\"5\") = '5' is a raw match"
+            );
         }
     }
 }

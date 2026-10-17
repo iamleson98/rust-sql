@@ -451,7 +451,7 @@ pub(crate) fn collation_table(cols: Vec<(String, String)>) -> Arc<Table> {
     )
 }
 
-fn synthetic_column(name: &str, affinity: Affinity, collation: String) -> Column {
+pub(crate) fn synthetic_column(name: &str, affinity: Affinity, collation: String) -> Column {
     Column {
         name: name.to_string(),
         affinity,
@@ -472,7 +472,7 @@ fn synthetic_column(name: &str, affinity: Affinity, collation: String) -> Column
     }
 }
 
-fn synthetic_table(qualifier: &str, columns: Vec<Column>) -> Arc<Table> {
+pub(crate) fn synthetic_table(qualifier: &str, columns: Vec<Column>) -> Arc<Table> {
     let name = qualifier.to_ascii_lowercase();
     let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
     let qualified: Vec<String> = col_names.iter().map(|c| format!("{name}.{c}")).collect();
