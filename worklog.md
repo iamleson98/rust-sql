@@ -2305,3 +2305,77 @@ Stage Summary:
   transactions. The write path needed no changes — every #8 "lost row"
   was read-side staleness, which is why the differential checksums (not
   just counts) are the gate that catches this class. CI green at 3b0da67.
+
+---
+Task ID: issues-9 + s14 (session 2026-10-18, the re-prepare contract round)
+Agent: main (Super Z)
+
+Work Log:
+- Issue #9 (statements prepared before a plain VACUUM walk stale roots,
+  "unexpected page type in count: LeafIndex"): the repro through the C ABI
+  (sqlx's statement-cache shape — prepare, fully step, VACUUM, reset,
+  re-step) FAILED on the memory arm first, with a twist the report didn't
+  have: not an error but a SILENT WRONG COUNT (194 vs 1000 through the
+  stale handle, while a fresh statement on the same connection was
+  correct and integrity_check was ok).
+- Root cause, both layers: (1) execute_vacuum's !wal_install arms
+  (delete-journal file, memory) installed the rebuilt database as
+  *self = new — but the compat layer keeps engine Statement<'static>
+  handles alive across the VACUUM, and every one of them borrows the
+  Database: the swap FREED the borrowed object (use-after-free; the
+  LeafIndex error and the garbage counts are its draw-dependent faces).
+  (2) Even without a swap, live statements hold their plan/fast-path
+  snapshot (Arc<Table> with pre-VACUUM roots) — the WAL arms' catalog
+  adoption never reached them, and neither did plain DDL: a stale
+  SELECT after DROP TABLE walked the dropped tree (SQLITE_CORRUPT face
+  in the local repro).
+- The fix, both directions of SQLite's contract (VACUUM bumps the
+  schema cookie; statements transparently re-prepare on the next step):
+  1. Identity-preserving installs — adopt_rebuilt_database swaps the
+     rebuilt STORE in (pager/catalog/path, old store retired first) and
+     runs the full adopt recipe; *self = new is gone from both VACUUM
+     arms, and the compat backup install's two whole-object
+     mem::replace sites (memory image swap + file reopen) take the same
+     medicine (adopt_rebuilt_store / drop_store_for_rebuild).
+  2. Statement-level re-prepare — Statement snapshots the schema epoch
+     at plan-resolution time; every start() compares and re-resolves
+     through the cache's own builder when it moved (no shared-cache
+     touch). Attach-bearing statements keep the never-locally-planned
+     admission (re-validate + re-route). DDL/ANALYZE/DETACH now bump
+     the epoch through invalidate_stmt_cache_and_epoch; the per-DML
+     invalidation sites (insert-chain flush, autocommit recovery)
+     deliberately keep the plain form so mixed-OLTP plans stay cached.
+- Pinned: 8 C-ABI tests in issue9_vacuum_stmt_reuse.rs — delete-journal
+  row-level + page-level, memory, WAL (live-statement staleness), stale
+  INSERT re-target (the corrupting-write class), DROP -> "no such
+  table", backup install, attach-across-local-DDL. The engine's own
+  tests/vacuum_reclaim could never see this (native db.query is a fresh
+  statement per call; the borrow checker makes the bug shape
+  inexpressible) — exactly the issue's blind-spot analysis.
+- S14 vacuum_ms (the 611104d push run's windows torture red, 4.2 vs
+  1.8ms): five runs of draw history on unchanged vacuum code show the
+  same binaries TIE/WIN on macOS and 2x-WIN on ubuntu EVERY draw, while
+  windows draws rq 2.9-4.2 vs sq 1.5-2.4 (abs diff 1.4-2.4ms,
+  straddling the 2.0ms generic floor) — the delete-journal rewrite's
+  file dance under Defender, open_first_query_ms's cold-file-op class.
+  ('S14','vacuum_ms') => 5.0ms floor with the full draw disclosure;
+  pinned by s14_vacuum_floor (envelope absorbed; an 8ms regression
+  still fails). Also repaired the stale interleave-merge self-test
+  (still pinning the old OR-merge after the AND-semantics tightening —
+  invisible because the CI matrix jobs never run the harness's
+  #[cfg(test)] module).
+- Validation on the local box (9.9G disk, stable 1.99.1, frugal
+  profiles): lib 315/315 (+298/298 under --no-default-features
+  --features oom-injection); the FULL tests/ sweep green (148 suite
+  verdicts, disk-frugal one-binary-at-a-time battery); the compat
+  suite green (issue7 3/3, issue9 8/8, backup 8/8, compat_abi 57, ...);
+  OOM spot checks on the round's suites green; torture harness
+  self-tests 11/11; fmt clean; clippy -D warnings clean in all four
+  configs (default / sqlx / no-default / workspace).
+
+Stage Summary:
+- Both open work items closed at the source: issue #9's use-after-free
+  + stale-root class (the VACUUM arms, the WAL arms' live statements,
+  plain DDL, and the backup install — one contract, four surfaces) and
+  the S14 windows torture flap (evidence-based floor, cross-platform
+  same-binary disclosure). CI verdict pending.
