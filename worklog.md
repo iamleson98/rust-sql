@@ -2172,3 +2172,64 @@ Work Log:
 
 Stage Summary:
 - One root cause (the magic-blind probe reading the wrong file) explained all three red classes: the M5 corruption (reopen-storm cache clears racing OCC commits), the windows 4R1W collapse (reopen per reader statement), and surfaced S13's pre-existing near-gate draw. The fix is layered (decode magic gate + sidecar read + short-lock snapshot); append_batch keeps its hardening (single-pass atomicity + guaranteed commit marker); the PASSIVE checkpoint design is fully restored.
+
+---
+Task ID: speedtest1-truth (session 2026-10-16, the 38872978367 red round)
+Agent: main (Super Z)
+
+Work Log:
+- Run 38872978367 (8bbc862, tcl-only dispatch): 7/8 shards green; shard 3's
+  runner died 100 s in ("The runner has received a shutdown signal", exit
+  143) — infrastructure, not code. The damage: NO tcl-shard-3 artifact, and
+  the report job still happily merged a 7/8-shard tcl-suite.json (955
+  files). A quietly-partial weekly report is worse than a red run.
+- Committed 923c102 fix(json): Jb::type_name folded Jb::False into the
+  "true" arm — json_type('false') returned "true" in all three forms
+  (scalar, jsonb blob, path target in a stored JSONB doc); json_each/
+  json_tree's `type` column shares the method. Found by speedtest1's J1
+  replay (its 141 section GROUPs json_type over `[#-N].y` paths where a
+  quarter of values are false — the whole false group was lost). Pinned in
+  tests/json1.rs; oracle-verified both surfaces. scripts/difftest.py (the
+  per-statement chaser, paths now env-overridable) + scripts/oracle.c
+  (39-line stdin oracle against the bundled amalgamation) committed.
+- Committed 9cbead3 test(ci), the round proper:
+  * speedtest1 job: SQLite's own benchmark (pinned corpus ref, bundled
+    amalgamation) captured at --size 100 (716,454 statements) and replayed
+    through both engines; GATED on correctness only — identical rows on
+    non-random sections, same statements erroring; timings printed, never
+    gated. speedtest_replay's random flag went set-level data-lineage
+    (sections 3:140/3:141/7:130/7:140 query random()-built tables of their
+    set — false mismatches before).
+  * Tcl report completeness: the report job fails when any expected shard
+    artifact is missing (simulated both ways: 8/8 green, 7/8 red).
+  * self-heal: a SCHEDULED first attempt that lost a suite job to infra
+    dispatches one replacement full run (retry=1 blocks loops; the damaged
+    attempt stays red).
+  * ran-vs-unreached split: run.py records which sqlite-passing tests our
+    side RAN and failed vs never reached; summarize.py reports both. On the
+    real 7/8 report: 940 files completed on both engines, 4,696 of 186,334
+    sqlite passes diverge there (2.52%) — versus the old single number
+    (1.49M "divergences", ~93% never-reached loop bodies in faultsim
+    mega-files like corruptC's 1.37M).
+  * shim.tcl: the capability prose comment lived inside the braced list —
+    Tcl list elements, the word "pragma" zeroed ::sqlite_options(pragma)
+    (run 38855855625; 18 files misrouted via ifcapable).
+    ::sqlite_open_file_count now starts at 0 (finalize_testing reads it
+    from EVERY finish_test with no unset guard — early finishes crashed
+    whole files).
+- Local validation: full replay GATE OK (716k stmts, 0 mismatches, 0 error
+  splits; dev-box aggregate 0.77x, 49 losses/14 wins — ungated by design);
+  json1 7/7; fmt + clippy -D warnings clean; workflow YAML lint (6 jobs);
+  run.py+summarize.py smoke on select1/join plus the real 7/8 report;
+  oracle cross-check json_type+json_each; shard-completeness simulation.
+- Pushed 8bbc862..9cbead3; both push runs green (CI 38893622298, suites
+  smoke 38893622380). Full verdict dispatch deferred — the next round
+  (issues #7/#8) supersedes it; this worklog entry recreates the lost
+  local commit after the workspace was restored from a stale snapshot.
+
+Stage Summary:
+- Two commits: the engine truth fix (json_type false) and the suite-honesty
+  round (speedtest1 correctness gate in CI, shard-loss detection, one-shot
+  self-heal, ran-vs-unreached accounting). The weekly suite can no longer
+  report partial coverage as success, and its headline divergence number
+  now separates real wrong answers from harness cutoffs.
