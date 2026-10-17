@@ -2379,3 +2379,51 @@ Stage Summary:
   plain DDL, and the backup install — one contract, four surfaces) and
   the S14 windows torture flap (evidence-based floor, cross-platform
   same-binary disclosure). CI verdict pending.
+
+---
+Task ID: macos-flake (session 2026-10-18, continued — the 39062950385 macOS battery red)
+Agent: main (Super Z)
+
+Work Log:
+- The fad3f84 push run (39062950385): 40/41 jobs green (S14's new floor
+  held on windows; all clippy/bench/stress/torture green) — the one red:
+  test (macos-latest, all configs), semantics_battery, 1 of 4061
+  statements: the compound-derived `x = '5'` returning [Int(5), Text("5")]
+  where SQLite returns [Text("5")] — the SAME flake class the issues-7-8
+  round waved off ("rare macOS/aarch64 nondeterminism"), now 2 hits in 3
+  days. Chased instead of rerun.
+- Evidence gathered: 2540 fresh-layout executions of the fixture on
+  x86-linux (2000 this round + the previous round's 540) — zero flaps;
+  the parallel executor ruled out (min-rows 131072 vs m's 2 rows); no
+  timing-based plan decisions; no uninit/unsafe on the path; every
+  pointer use in the evaluator equality-verified.
+- ROOT CAUSE (proven): the operator scope cache keys a compiled
+  predicate by its tree's ADDRESSES + row layout, but the comparison
+  affinity/collation baked into the compiled CExpr resolve through the
+  statement-scoped REGISTRY FRAMES, which the key ignored. Two
+  structurally identical `x = '5'` predicates from different statements
+  (simple derived: x INTEGER; compound: mixed arms -> BLOB) share every
+  key input; when the allocator's LIFO free lists replay the freed
+  tree's addresses for the later statement's same-shaped tree, the
+  root-pointer key matches and the earlier statement's INTEGER-baked
+  comparison serves — per-process heap layout is the coin flip,
+  arch-specific allocator geometry the macOS/x86 rate asymmetry.
+- THE PIN: scope_cache_never_serves_a_foreign_registry_frame — one live
+  tree under two registry frames; FAILED pre-fix exactly as the CI flap,
+  passes post-fix. No allocator luck needed.
+- THE FIX: ScopeInputs::colres — the registry's per-column answers
+  (binding key, affinity, collation) recorded by a deterministic walk
+  before the hit test; compared on hit, stored on miss. Same-frame hits
+  unchanged; foreign frames can never serve. Empty for ctx-affinity
+  contexts (the hot single-table paths pay nothing).
+- Validation: lib 316/316, full semantics battery, compat issue9 8/8,
+  fuzz/parity sweep green (identical wall times pre/post), 1500-layout
+  loop green, fmt + clippy -D warnings x4 clean.
+- Also: the round's CI verdict validated the S14 floor (windows torture
+  green at the same draw class that redded 611104d) and every other
+  job.
+
+Stage Summary:
+- The "tracked nondeterminism" is a mechanism with a name, a pin, and a
+  fix: stale registry frames served through an address-keyed compiled
+  cache. CI verdict pending on the flake-fix push.
