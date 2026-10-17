@@ -94,7 +94,7 @@ fn run_case(case: &Case, n: usize) -> bool {
     let dst_slow = tmpdb("slow");
 
     // Source: row-at-a-time (the known-correct incremental path).
-    let mut source_rows: Vec<Vec<Value>> = Vec::new();
+    let source_rows: Vec<Vec<Value>>;
     {
         let mut src = Database::open(&src_path).unwrap();
         src.execute(case.create, ()).unwrap();
