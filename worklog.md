@@ -2427,3 +2427,22 @@ Stage Summary:
 - The "tracked nondeterminism" is a mechanism with a name, a pin, and a
   fix: stale registry frames served through an address-keyed compiled
   cache. CI verdict pending on the flake-fix push.
+
+---
+Task ID: macos-flake (final verdict)
+Agent: main (Super Z)
+
+Work Log:
+- Run 39069243054 (25b1bc2): ALL GREEN — 41/41 jobs, all three platforms.
+- The macOS semantics battery — the run that would have drawn the
+  ~1-in-3 flap — green with the scope-cache fix in; the windows torture
+  job green with the S14 floor (second consecutive green at the draw
+  class that redded 611104d); the compat suite green with all 8
+  issue-#9 pins.
+
+Stage Summary:
+- Round total at 25b1bc2: issue #9 closed at the source (re-prepare
+  contract on four surfaces, 8 C-ABI pins), S14's windows flap
+  recalibrated on cross-platform evidence, and the tracked macOS
+  nondeterminism root-caused + pinned + fixed. CI fully green at
+  remote HEAD.
