@@ -16550,6 +16550,13 @@ fn window_output_order(
         }
         keys.push(k);
     }
+    // The explicit NULLS FIRST/LAST of each ORDER BY term (the base
+    // comparator is NULLS-smallest; Default resolves per direction).
+    // The key layout is [partition terms..., order terms...] — the
+    // partition terms carry no NULLS preference.
+    let mut nulls: Vec<crate::sql::ast::NullsOrder> =
+        vec![crate::sql::ast::NullsOrder::Default; w.partition_by.len()];
+    nulls.extend(w.order_by.iter().map(|t| t.nulls));
     let mut order: Vec<usize> = (0..rows.len()).collect();
     order.sort_by(|&a, &b| {
         for i in 0..desc.len() {
@@ -16559,6 +16566,27 @@ fn window_output_order(
             };
             if desc[i] {
                 ord = ord.reverse();
+            }
+            let a_null = keys[a][i].is_null();
+            let b_null = keys[b][i].is_null();
+            if a_null != b_null {
+                match nulls[i] {
+                    crate::sql::ast::NullsOrder::Last => {
+                        ord = if a_null {
+                            std::cmp::Ordering::Greater
+                        } else {
+                            std::cmp::Ordering::Less
+                        }
+                    }
+                    crate::sql::ast::NullsOrder::First => {
+                        ord = if a_null {
+                            std::cmp::Ordering::Less
+                        } else {
+                            std::cmp::Ordering::Greater
+                        }
+                    }
+                    crate::sql::ast::NullsOrder::Default => {}
+                }
             }
             if ord != std::cmp::Ordering::Equal {
                 return ord;
@@ -16659,6 +16687,34 @@ fn exec_one_window(
                     let mut ord = order_cmp(i, &ka[i], &kb[i]);
                     if t.order == Order::Desc {
                         ord = ord.reverse();
+                    }
+                    // An explicit NULLS FIRST/LAST overrides ONLY the
+                    // null-vs-non-null relation (values keep their
+                    // direction). The base comparator is NULLS-smallest,
+                    // which is SQLite's default for ASC (and LAST for
+                    // DESC via the reversal above) — window8's 7.x
+                    // family: `ORDER BY b NULLS LAST` sorted the NULL
+                    // keys to the FRONT, inverting the output order.
+                    let a_null = ka[i].is_null();
+                    let b_null = kb[i].is_null();
+                    if a_null != b_null {
+                        match t.nulls {
+                            crate::sql::ast::NullsOrder::Last => {
+                                ord = if a_null {
+                                    std::cmp::Ordering::Greater
+                                } else {
+                                    std::cmp::Ordering::Less
+                                }
+                            }
+                            crate::sql::ast::NullsOrder::First => {
+                                ord = if a_null {
+                                    std::cmp::Ordering::Less
+                                } else {
+                                    std::cmp::Ordering::Greater
+                                }
+                            }
+                            crate::sql::ast::NullsOrder::Default => {}
+                        }
                     }
                     if ord != std::cmp::Ordering::Equal {
                         return ord;
@@ -16762,6 +16818,30 @@ fn exec_one_window(
         } else {
             Vec::new()
         };
+        // nth_value's N and lag/lead's offset + default are ordinary
+        // expressions evaluated PER ROW (SQLite stores them as columns
+        // of the window's ephemeral table and reads the current row's
+        // value at each output — windowReturnOneRow). A literal is just
+        // the degenerate case and flows through the same path.
+        let extra_vals: Vec<Vec<Option<Value>>> = match w.func.as_str() {
+            "nth_value" if !w.extra_args.is_empty() => vec![sorted
+                .iter()
+                .map(|&ri| {
+                    eval_row(&w.extra_args[0], &rows[ri], columns, params, named_params).map(Some)
+                })
+                .collect::<Result<_>>()?],
+            "lag" | "lead" => w
+                .extra_args
+                .iter()
+                .map(|e| {
+                    sorted
+                        .iter()
+                        .map(|&ri| eval_row(e, &rows[ri], columns, params, named_params).map(Some))
+                        .collect::<Result<_>>()
+                })
+                .collect::<Result<_>>()?,
+            _ => Vec::new(),
+        };
         // min()/max() compare through the argument's collation.
         let arg_coll: Option<String> = w
             .arg
@@ -16772,6 +16852,7 @@ fn exec_one_window(
             dense: &dense,
             seps: &seps,
             arg_coll: arg_coll.as_deref(),
+            extra_vals: &extra_vals,
         };
         for p in 0..np {
             let val = compute_window_at(
@@ -16803,73 +16884,114 @@ fn resolve_frame(
     peer: (usize, usize),
 ) -> (usize, usize) {
     let empty_frame = (p + 1, p); // fs > fe => empty
-    let frame = match &w.frame {
+    let npi = np as i64 - 1; // last valid position; -1 when np == 0
+                             // Bounds live in i64 position space: a ROWS bound may legitimately
+                             // point outside the partition (a start before row 0 clips in; an
+                             // end BEFORE row 0 or a start PAST the last row is an EMPTY frame —
+                             // the old saturating arithmetic clamped `p - n` to row 0 and
+                             // answered a one-row frame where SQLite answers none, and the old
+                             // `start.min(end)` SWAP invented frames for inverted bounds that
+                             // SQLite also answers empty). Intersect with [0, np-1] at the end.
+    let frame: (i64, i64) = match &w.frame {
         None => {
             // Default: ORDER BY present -> RANGE UNBOUNDED PRECEDING ..
             // CURRENT ROW (peers included); absent -> whole partition.
             if w.order_by.is_empty() {
-                (0, np.saturating_sub(1))
+                (0, npi)
             } else {
-                (0, peer.1.saturating_sub(1))
+                (0, peer.1 as i64 - 1)
             }
         }
         Some(f) => {
             let kind = f.kind;
-            let start = match f.start.as_ref() {
-                FrameBound::UnboundedPreceding => 0usize,
+            let start: i64 = match f.start.as_ref() {
+                FrameBound::UnboundedPreceding => 0,
                 FrameBound::CurrentRow => match kind {
-                    FrameKind::Rows => p,
-                    _ => peer.0, // RANGE / GROUPS: CURRENT ROW start = first peer
+                    FrameKind::Rows => p as i64,
+                    _ => peer.0 as i64, // RANGE / GROUPS: first peer
                 },
                 FrameBound::Preceding(e) => match kind {
-                    FrameKind::Rows => p.saturating_sub(eval_frame_offset(e)),
-                    FrameKind::Groups => groups_back(p, keys, eval_frame_offset(e)),
-                    FrameKind::Range => {
-                        // RANGE <k> PRECEDING (single numeric key only).
-                        range_preceding_start(w, keys, p, e, peer)
-                    }
+                    // Clips at the partition start via the intersection.
+                    FrameKind::Rows => p as i64 - eval_frame_offset(e) as i64,
+                    FrameKind::Groups => groups_back(p, keys, eval_frame_offset(e)) as i64,
+                    FrameKind::Range => range_preceding_start(w, keys, p, e, peer) as i64,
                 },
                 FrameBound::Following(e) => match kind {
-                    FrameKind::Rows => (p + eval_frame_offset(e)).min(np.saturating_sub(1)),
-                    FrameKind::Groups => groups_fwd(p, keys, eval_frame_offset(e), np),
-                    FrameKind::Range => range_following_start(w, keys, p, e, np, peer),
+                    // May point past the last row: EMPTY, not clipped
+                    // (SQLite: a start beyond the partition is an empty
+                    // frame; the old `.min(np-1)` returned the last row).
+                    FrameKind::Rows => p as i64 + eval_frame_offset(e) as i64,
+                    // GROUPS n FOLLOWING start: first row of the group n
+                    // after mine; a nonexistent group starts NOTHING
+                    // (empty frame), not the last row.
+                    FrameKind::Groups => match groups_fwd(p, keys, eval_frame_offset(e), np) {
+                        Some(g) => g as i64,
+                        None => npi + 1,
+                    },
+                    FrameKind::Range => range_following_start(w, keys, p, e, np, peer) as i64,
                 },
-                FrameBound::UnboundedFollowing => 0, // invalid as start; clamp
+                // Invalid as a start (SQLite rejects the query); answer
+                // the empty frame, never "the whole partition".
+                FrameBound::UnboundedFollowing => npi + 1,
             };
-            let end = match f.end.as_ref() {
+            let end: i64 = match f.end.as_ref() {
                 None => match kind {
-                    FrameKind::Rows => p,
-                    _ => peer.1.saturating_sub(1), // default end = CURRENT ROW
+                    FrameKind::Rows => p as i64,
+                    _ => peer.1 as i64 - 1, // default end = CURRENT ROW
                 },
                 Some(b) => match b.as_ref() {
-                    FrameBound::UnboundedPreceding => 0,
+                    // The frame ends before the partition begins:
+                    // EMPTY (the old value of 0 made row 0 the frame).
+                    FrameBound::UnboundedPreceding => -1,
                     FrameBound::Preceding(e) => match kind {
-                        FrameKind::Rows => p.saturating_sub(eval_frame_offset(e)),
-                        FrameKind::Groups => groups_back(p, keys, eval_frame_offset(e)),
-                        FrameKind::Range => {
-                            let s = range_preceding_start(w, keys, p, e, peer);
-                            s.min(np.saturating_sub(1))
+                        FrameKind::Rows => p as i64 - eval_frame_offset(e) as i64,
+                        // GROUPS n PRECEDING end: the LAST row of the
+                        // group n before mine = one before the start of
+                        // the group n-1 before mine (0 PRECEDING ends
+                        // with my own group). When that group boundary
+                        // saturates to row 0 the end lands at -1: EMPTY,
+                        // exactly SQLite (window8's 1.1 family).
+                        FrameKind::Groups => {
+                            let n = eval_frame_offset(e);
+                            if n == 0 {
+                                peer.1 as i64 - 1
+                            } else {
+                                groups_back(p, keys, n - 1) as i64 - 1
+                            }
                         }
+                        FrameKind::Range => range_preceding_end(w, keys, p, e, np, peer),
                     },
                     FrameBound::CurrentRow => match kind {
-                        FrameKind::Rows => p,
-                        _ => peer.1.saturating_sub(1),
+                        FrameKind::Rows => p as i64,
+                        _ => peer.1 as i64 - 1,
                     },
                     FrameBound::Following(e) => match kind {
-                        FrameKind::Rows => (p + eval_frame_offset(e)).min(np.saturating_sub(1)),
-                        FrameKind::Groups => groups_fwd(p, keys, eval_frame_offset(e), np),
-                        FrameKind::Range => {
-                            range_following_end(w, keys, p, e, np, peer).min(np.saturating_sub(1))
+                        FrameKind::Rows => p as i64 + eval_frame_offset(e) as i64,
+                        // GROUPS n FOLLOWING end: the LAST row of the
+                        // group n after mine = one before the start of
+                        // the group n+1 after mine; when that group does
+                        // not exist the frame clips to the partition end.
+                        FrameKind::Groups => {
+                            match groups_fwd(p, keys, eval_frame_offset(e) + 1, np) {
+                                Some(g) => g as i64 - 1,
+                                None => npi,
+                            }
                         }
+                        FrameKind::Range => range_following_end(w, keys, p, e, np, peer) as i64,
                     },
-                    FrameBound::UnboundedFollowing => np.saturating_sub(1),
+                    FrameBound::UnboundedFollowing => npi,
                 },
             };
-            (start.min(end), end)
+            (start, end)
         }
     };
-    let _ = empty_frame;
-    frame
+    let fs = frame.0.max(0);
+    let fe = frame.1.min(npi);
+    if np == 0 || fs > fe {
+        empty_frame
+    } else {
+        (fs as usize, fe as usize)
+    }
 }
 
 /// Evaluate a frame offset expression to a row/offset count.
@@ -16894,10 +17016,10 @@ fn eval_frame_offset(e: &Expr) -> usize {
 /// GROUPS <k> PRECEDING: first row of the peer group k groups before the
 /// row's group.
 fn groups_back(p: usize, keys: &[Vec<Value>], k: usize) -> usize {
-    if keys.is_empty() || k == 0 {
-        return p;
+    // No ORDER BY: the partition is ONE group (its start is row 0).
+    if keys.is_empty() {
+        return 0;
     }
-    // Walk back over k group boundaries.
     let mut group_starts: Vec<usize> = Vec::new();
     let mut prev: Option<&Vec<Value>> = None;
     for (i, key) in keys.iter().enumerate() {
@@ -16907,15 +17029,21 @@ fn groups_back(p: usize, keys: &[Vec<Value>], k: usize) -> usize {
         prev = Some(key);
     }
     let my_group = group_starts.partition_point(|&g| g <= p) - 1;
-    let target = my_group.saturating_sub(k);
-    group_starts.get(target).copied().unwrap_or(0)
+    // k == 0 is the start of MY OWN group — NOT `p`: a GROUPS bound is
+    // constant across a group's rows (the old early-out returned `p`
+    // and made `... AND 1 PRECEDING` a per-row running window).
+    group_starts
+        .get(my_group.saturating_sub(k))
+        .copied()
+        .unwrap_or(0)
 }
 
 /// GROUPS <k> FOLLOWING: first row of the peer group k groups after the
-/// row's group.
-fn groups_fwd(p: usize, keys: &[Vec<Value>], k: usize, np: usize) -> usize {
-    if keys.is_empty() || k == 0 {
-        return p;
+/// row's group; None when that group does not exist.
+fn groups_fwd(p: usize, keys: &[Vec<Value>], k: usize, _np: usize) -> Option<usize> {
+    // No ORDER BY: the partition is ONE group — nothing follows it.
+    if keys.is_empty() {
+        return if k == 0 { Some(0) } else { None };
     }
     let mut group_starts: Vec<usize> = Vec::new();
     let mut prev: Option<&Vec<Value>> = None;
@@ -16927,10 +17055,10 @@ fn groups_fwd(p: usize, keys: &[Vec<Value>], k: usize, np: usize) -> usize {
     }
     let my_group = group_starts.partition_point(|&g| g <= p) - 1;
     let target = my_group + k;
-    group_starts
-        .get(target)
-        .copied()
-        .unwrap_or(np.saturating_sub(1))
+    // None: the boundary group does not exist (beyond the last group).
+    // A START bound there is an EMPTY frame (never "the last row"); an
+    // END bound there clips to the partition end (resolve_frame).
+    group_starts.get(target).copied()
 }
 
 /// RANGE <k> PRECEDING start: first row whose key is within k of the
@@ -16945,13 +17073,26 @@ fn range_preceding_start(
     if w.order_by.len() != 1 {
         return peer.0; // not a single key: peers (SQLite errors; be lenient)
     }
-    let k = eval_frame_offset(e);
+    let k = eval_frame_offset_real(e);
+    // NULL keys participate in RANGE bounds through their SORT
+    // PLACEMENT (SQLite's sorter encodes NULL as the extreme of the
+    // key space): a NULL that sorts LAST compares as larger than any
+    // real, one that sorts FIRST as smaller. This decides whether a
+    // NULL-keyed CANDIDATE row falls inside a numeric limit
+    // (start-side test — window8's 7.x family: `ORDER BY b NULLS LAST
+    // RANGE BETWEEN 6 FOLLOWING AND UNBOUNDED FOLLOWING` must include
+    // the NULL rows for every numeric current row).
+    let nulls_last = match w.order_by[0].nulls {
+        crate::sql::ast::NullsOrder::Last => true,
+        crate::sql::ast::NullsOrder::First => false,
+        crate::sql::ast::NullsOrder::Default => w.order_by[0].order == Order::Desc,
+    };
     let (num, desc) = match keys.get(p).and_then(|kk| kk.first()) {
         Some(Value::Integer(i)) => (*i as f64, w.order_by[0].order == Order::Desc),
         Some(Value::Real(r)) => (*r, w.order_by[0].order == Order::Desc),
         _ => return peer.0,
     };
-    let limit = if desc { num + k as f64 } else { num - k as f64 };
+    let limit = if desc { num + k } else { num - k };
     // First position with key within the limit.
     let mut s = 0usize;
     while s < p {
@@ -16972,6 +17113,7 @@ fn range_preceding_start(
                     v >= limit
                 }
             }
+            Some(Value::Null) => nulls_last,
             _ => false,
         };
         if within {
@@ -16982,28 +17124,47 @@ fn range_preceding_start(
     s
 }
 
-/// RANGE <k> FOLLOWING start.
-fn range_following_start(
+/// RANGE <k> PRECEDING as an END bound: the LAST row whose key is
+/// within k BELOW the current key (ASC: key <= cur-k; DESC: key >=
+/// cur+k). Returns np (one past the last position) when no row is
+/// within — resolve_frame's intersection turns that into an EMPTY
+/// frame. The old code reused the START-position helper, which finds
+/// the FIRST row at/above the limit — a different span end entirely
+/// (window8's 3.x family).
+fn range_preceding_end(
     w: &WindowExpr,
     keys: &[Vec<Value>],
     p: usize,
     e: &Expr,
     np: usize,
     peer: (usize, usize),
-) -> usize {
+) -> i64 {
     if w.order_by.len() != 1 {
-        return peer.1.saturating_sub(1);
+        return peer.1.saturating_sub(1) as i64;
     }
-    let k = eval_frame_offset(e);
+    let k = eval_frame_offset_real(e);
+    // NULL keys participate in RANGE bounds through their SORT
+    // PLACEMENT (SQLite's sorter encodes NULL as the extreme of the
+    // key space): a NULL that sorts LAST compares as larger than any
+    // real, one that sorts FIRST as smaller. This decides whether a
+    // NULL-keyed CANDIDATE row falls inside a numeric limit
+    // (end-side test — window8's 7.x family: `ORDER BY b NULLS LAST
+    // RANGE BETWEEN 6 FOLLOWING AND UNBOUNDED FOLLOWING` must include
+    // the NULL rows for every numeric current row).
+    let nulls_last = match w.order_by[0].nulls {
+        crate::sql::ast::NullsOrder::Last => true,
+        crate::sql::ast::NullsOrder::First => false,
+        crate::sql::ast::NullsOrder::Default => w.order_by[0].order == Order::Desc,
+    };
     let (num, desc) = match keys.get(p).and_then(|kk| kk.first()) {
         Some(Value::Integer(i)) => (*i as f64, w.order_by[0].order == Order::Desc),
         Some(Value::Real(r)) => (*r, w.order_by[0].order == Order::Desc),
-        _ => return peer.1.saturating_sub(1),
+        _ => return peer.1.saturating_sub(1) as i64,
     };
-    let limit = if desc { num - k as f64 } else { num + k as f64 };
-    let mut s = p;
-    while s < np {
-        let within = match keys[s].first() {
+    let limit = if desc { num + k } else { num - k };
+    let mut s = np;
+    while s > 0 {
+        let within = match keys[s - 1].first() {
             Some(Value::Integer(i)) => {
                 let v = *i as f64;
                 if desc {
@@ -17020,6 +17181,88 @@ fn range_following_start(
                     v <= limit
                 }
             }
+            Some(Value::Null) => !nulls_last,
+            _ => false,
+        };
+        if within {
+            break;
+        }
+        s -= 1;
+    }
+    if s == 0 {
+        // No row within k below the current key: the frame ends BEFORE
+        // the partition begins — the empty-frame sentinel (-1 in the
+        // i64 position space resolve_frame intersects).
+        -1
+    } else {
+        s as i64 - 1
+    }
+}
+
+/// RANGE <k> FOLLOWING start.
+fn range_following_start(
+    w: &WindowExpr,
+    keys: &[Vec<Value>],
+    p: usize,
+    e: &Expr,
+    np: usize,
+    peer: (usize, usize),
+) -> usize {
+    // Fallbacks (multi-key, or a NULL key — NULL +/- k never matches):
+    // the frame degenerates to the CURRENT PEER GROUP (SQLite: a NULL
+    // key's RANGE frame is its peers). The START of that frame is
+    // peer.0 — the old peer.1-1 returned a one-row frame's position
+    // and the peer group's rows answered as empty (window8 4.2.x).
+    if w.order_by.len() != 1 {
+        return peer.0;
+    }
+    let k = eval_frame_offset_real(e);
+    // NULL keys participate in RANGE bounds through their SORT
+    // PLACEMENT (SQLite's sorter encodes NULL as the extreme of the
+    // key space): a NULL that sorts LAST compares as larger than any
+    // real, one that sorts FIRST as smaller. This decides whether a
+    // NULL-keyed CANDIDATE row falls inside a numeric limit
+    // (start-side test — window8's 7.x family: `ORDER BY b NULLS LAST
+    // RANGE BETWEEN 6 FOLLOWING AND UNBOUNDED FOLLOWING` must include
+    // the NULL rows for every numeric current row).
+    let nulls_last = match w.order_by[0].nulls {
+        crate::sql::ast::NullsOrder::Last => true,
+        crate::sql::ast::NullsOrder::First => false,
+        crate::sql::ast::NullsOrder::Default => w.order_by[0].order == Order::Desc,
+    };
+    let (num, desc) = match keys.get(p).and_then(|kk| kk.first()) {
+        Some(Value::Integer(i)) => (*i as f64, w.order_by[0].order == Order::Desc),
+        Some(Value::Real(r)) => (*r, w.order_by[0].order == Order::Desc),
+        _ => return peer.0,
+    };
+    let limit = if desc { num - k } else { num + k };
+    // The first row, in sort order, whose key crosses the limit:
+    // ASC -> the first key >= cur+k; DESC -> the first key <= cur-k.
+    // (The old tests were flipped — both broke immediately at `p`,
+    // making every "RANGE k FOLLOWING" start at the current row.)
+    // Walking from 0 also catches earlier ties for k == 0 (peers).
+    // Running off the end returns np — one past the last position —
+    // which resolve_frame's intersection turns into an EMPTY frame.
+    let mut s = 0usize;
+    while s < np {
+        let within = match keys[s].first() {
+            Some(Value::Integer(i)) => {
+                let v = *i as f64;
+                if desc {
+                    v <= limit
+                } else {
+                    v >= limit
+                }
+            }
+            Some(Value::Real(r)) => {
+                let v = *r;
+                if desc {
+                    v <= limit
+                } else {
+                    v >= limit
+                }
+            }
+            Some(Value::Null) => nulls_last,
             _ => false,
         };
         if within {
@@ -17042,13 +17285,26 @@ fn range_following_end(
     if w.order_by.len() != 1 {
         return peer.1.saturating_sub(1);
     }
-    let k = eval_frame_offset(e);
+    let k = eval_frame_offset_real(e);
+    // NULL keys participate in RANGE bounds through their SORT
+    // PLACEMENT (SQLite's sorter encodes NULL as the extreme of the
+    // key space): a NULL that sorts LAST compares as larger than any
+    // real, one that sorts FIRST as smaller. This decides whether a
+    // NULL-keyed CANDIDATE row falls inside a numeric limit
+    // (end-side test — window8's 7.x family: `ORDER BY b NULLS LAST
+    // RANGE BETWEEN 6 FOLLOWING AND UNBOUNDED FOLLOWING` must include
+    // the NULL rows for every numeric current row).
+    let nulls_last = match w.order_by[0].nulls {
+        crate::sql::ast::NullsOrder::Last => true,
+        crate::sql::ast::NullsOrder::First => false,
+        crate::sql::ast::NullsOrder::Default => w.order_by[0].order == Order::Desc,
+    };
     let (num, desc) = match keys.get(p).and_then(|kk| kk.first()) {
         Some(Value::Integer(i)) => (*i as f64, w.order_by[0].order == Order::Desc),
         Some(Value::Real(r)) => (*r, w.order_by[0].order == Order::Desc),
         _ => return peer.1.saturating_sub(1),
     };
-    let limit = if desc { num - k as f64 } else { num + k as f64 };
+    let limit = if desc { num - k } else { num + k };
     let mut e2 = np.saturating_sub(1);
     loop {
         let within = match keys.get(e2).and_then(|kk| kk.first()) {
@@ -17068,6 +17324,7 @@ fn range_following_end(
                     v <= limit
                 }
             }
+            Some(Value::Null) => !nulls_last,
             _ => false,
         };
         if within || e2 == 0 {
@@ -17089,6 +17346,46 @@ struct WindowAux<'a> {
     seps: &'a [String],
     /// The aggregate argument's non-BINARY collation (min / max).
     arg_coll: Option<&'a str>,
+    /// Per-extra-argument values, per sorted position: nth_value's N,
+    /// lag/lead's offset and default — all ordinary per-row expressions
+    /// (SQLite evaluates them as columns of the window's ephemeral
+    /// table, windowReturnOneRow).
+    extra_vals: &'a [Vec<Option<Value>>],
+}
+
+/// OP_MustBeInt for a window argument (nth_value's N): numeric
+/// affinity must land on an integer — INTEGER, a losslessly-integral
+/// REAL, or numeric-looking TEXT (applyNumericAffinity); NULL, BLOB and
+/// any other text fail. Sign is checked here too (windowCheckValue's
+/// OP_Gt 0).
+/// RANGE frame offsets keep their FRACTION (SQLite: `RANGE BETWEEN
+/// 10.2 PRECEDING AND 5.4 PRECEDING` uses the exact reals; ROWS/GROUPS
+/// require integers — window8's 3.8-3.12 family).
+fn eval_frame_offset_real(e: &Expr) -> f64 {
+    match e {
+        Expr::Literal(Value::Integer(i)) => *i as f64,
+        Expr::Literal(Value::Real(r)) => *r,
+        _ => 0.0,
+    }
+}
+
+fn must_be_positive_window_int(v: &Value) -> Option<i64> {
+    let i = match v {
+        Value::Integer(i) => *i,
+        Value::Real(f) => {
+            if f.is_finite() && *f == (*f as i64) as f64 {
+                *f as i64
+            } else {
+                return None;
+            }
+        }
+        Value::Text(s) => match crate::types::numeric::apply_numeric_affinity(s.as_bytes()) {
+            Some(crate::types::numeric::NumericAffinity::Integer(i)) => i,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    (i > 0).then_some(i)
 }
 
 fn compute_window_at(
@@ -17152,47 +17449,102 @@ fn compute_window_at(
             Ok(Value::Integer(bucket as i64 + 1))
         }
         "lag" | "lead" => {
-            let off = match w.extra_args.first() {
-                Some(Expr::Literal(Value::Integer(i))) => *i,
-                _ => 1,
-            };
-            let off = if off < 0 { 0 } else { off as usize };
-            let target = if w.func == "lag" {
-                p.checked_sub(off)
-            } else {
-                Some(p + off).filter(|&t| t < np)
+            // The offset is an ordinary PER-ROW expression: SQLite's VM
+            // reads it as a column of the window's ephemeral table
+            // (windowReturnOneRow) and OP_SeekRowid's the computed
+            // position — with NO type check. A NULL / non-integral
+            // offset simply misses the seek and yields the DEFAULT
+            // (itself a per-row expression); a NEGATIVE offset is legal
+            // and moves the opposite direction. The old code demanded
+            // an integer literal (else offset=1), clamped negatives to
+            // 0, and only allowed a literal default.
+            let one_based = p as i64 + 1;
+            let target: Option<i64> = match aux.extra_vals.first().and_then(|v| v.get(p)) {
+                Some(Some(v)) => {
+                    let off: Option<i64> = match v {
+                        Value::Integer(i) => Some(*i),
+                        // OP_SeekRowid accepts a losslessly-integral REAL.
+                        Value::Real(f) if f.is_finite() && *f == (*f as i64) as f64 => {
+                            Some(*f as i64)
+                        }
+                        _ => None,
+                    };
+                    off.map(|o| {
+                        if w.func == "lag" {
+                            one_based - o
+                        } else {
+                            one_based + o
+                        }
+                    })
+                    .filter(|&t| t >= 1 && t <= np as i64)
+                }
+                _ => {
+                    // No offset argument: the implicit 1 / -1.
+                    let t = if w.func == "lag" {
+                        one_based - 1
+                    } else {
+                        one_based + 1
+                    };
+                    Some(t).filter(|&t| t >= 1 && t <= np as i64)
+                }
             };
             match target {
-                Some(t) => Ok(val_of(t)),
-                None => match w.extra_args.get(1) {
-                    // Constant default (SQLite: must be constant).
-                    Some(Expr::Literal(lit)) => Ok(lit.clone()),
-                    _ => Ok(Value::Null),
-                },
+                Some(t) => Ok(val_of((t - 1) as usize)),
+                None => Ok(aux
+                    .extra_vals
+                    .get(1)
+                    .and_then(|v| v.get(p))
+                    .and_then(|x| x.clone())
+                    .unwrap_or(Value::Null)),
             }
         }
         "first_value" | "last_value" | "nth_value" => {
             let (fs, fe) = resolve_frame(w, p, np, keys, peer);
-            if fs > fe {
-                return Ok(Value::Null);
-            }
+            // EXCLUDE applies to the value functions exactly as to the
+            // frame aggregates (window3's 1.18/1.20 families): the
+            // candidate positions are the frame minus the excluded set.
+            let excluded = |pos: usize| -> bool {
+                match w.frame.as_ref().map(|f| f.exclude) {
+                    Some(FrameExclude::CurrentRow) => pos == p,
+                    Some(FrameExclude::Group) => pos >= peer.0 && pos < peer.1,
+                    // TIES: drop the current row's peers, keep the row.
+                    Some(FrameExclude::Ties) => pos != p && pos >= peer.0 && pos < peer.1,
+                    _ => false,
+                }
+            };
+            // fs > fe yields an empty RangeInclusive: no candidates.
+            let first_pos = (fs..=fe).find(|&x| !excluded(x));
+            let last_pos = (fs..=fe).rfind(|&x| !excluded(x));
             match w.func.as_str() {
-                "first_value" => Ok(val_of(fs)),
-                "last_value" => Ok(val_of(fe)),
+                "first_value" => Ok(first_pos.map(val_of).unwrap_or(Value::Null)),
+                "last_value" => Ok(last_pos.map(val_of).unwrap_or(Value::Null)),
                 _ => {
-                    let n = match w.extra_args.first() {
-                        Some(Expr::Literal(Value::Integer(i))) => *i,
-                        _ => return Ok(Value::Null),
+                    // N is an ordinary PER-ROW expression (the VM reads
+                    // it as an ephemeral-table column and windowCheckValue
+                    // validates it at EVERY row — BEFORE the frame-bounds
+                    // test, so a bad N errors even on an empty frame):
+                    // numeric affinity must land on a positive integer,
+                    // else the statement fails with SQLite's exact message.
+                    // The old code required an integer literal and returned
+                    // NULL for anything else (silently wrong for e.g.
+                    // nth_value(b, b+1) — window3's 1.1.10 family).
+                    let nv = aux
+                        .extra_vals
+                        .first()
+                        .and_then(|v| v.get(p))
+                        .and_then(|x| x.as_ref());
+                    let n: i64 = match nv {
+                        Some(v) => must_be_positive_window_int(v).ok_or_else(|| {
+                            Error::runtime(
+                                "second argument to nth_value must be a positive integer",
+                            )
+                        })?,
+                        None => return Ok(Value::Null),
                     };
-                    if n < 1 {
-                        return Ok(Value::Null);
-                    }
-                    let pos = fs + (n as usize) - 1;
-                    if pos > fe {
-                        Ok(Value::Null)
-                    } else {
-                        Ok(val_of(pos))
-                    }
+                    // The n-th NON-EXCLUDED candidate (SQLite's slow-mode
+                    // stepper only ever sees the post-EXCLUDE frame).
+                    let pos = (fs..=fe).filter(|&x| !excluded(x)).nth(n as usize - 1);
+                    Ok(pos.map(val_of).unwrap_or(Value::Null))
                 }
             }
         }
