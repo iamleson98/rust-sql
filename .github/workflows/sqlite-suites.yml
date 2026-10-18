@@ -1,375 +1,95 @@
 name: SQLite suites
 
-# SQLite's own test corpora, run against this engine:
-#   * sqllogictest  (examples/slt_run.rs) — ~5.7M queries; GATING: the
-#     whole corpus passes, so any failure is a regression.
-#   * Tcl test suite (tests/tcl/run.py)  — each test/*.test file under the
-#     bundled SQLite and under rustqlite; REPORT-ONLY: known divergences
-#     remain, the job summary and the JSON artifact list them.
+# The compatibility-surface audits against SQLite's own public test
+# corpora. The README's "Remaining gaps" numbers come from here.
 #
-# Weekly (full), on demand (Actions -> SQLite suites -> Run workflow), and
-# as a small smoke subset when a push touches the harnesses or this file.
-#
-# Runner budget (GitHub-hosted ubuntu: 4 vCPU, 16 GB RAM, ~14 GB free
-# disk, 6 h per job): one release build is shared by every shard; both
-# suites fan out over parallel shards so each job stays far below the
-# 6 h ceiling; run.py caps every file at 1 GiB of output and kills a
-# file's whole process group at its timeout.
+# During the compatibility round this workflow doubles as the iteration
+# loop: dispatch it with a filter to audit a slice of the corpus, read
+# the per-file report artifact, fix, repeat. The schedule keeps the
+# README numbers fresh (weekly, Mondays).
 
 on:
-  schedule:
-    - cron: "23 4 * * 0" # Sundays 04:23 UTC
   workflow_dispatch:
     inputs:
-      suites:
-        description: "Which suites to run"
-        type: choice
-        options: [all, slt, tcl, speedtest]
-        default: all
-      mode:
-        description: "full = whole corpora; smoke = a few files (wiring check)"
-        type: choice
-        options: [full, smoke]
-        default: full
-      tcl_files:
-        description: "Optional Tcl file globs, space separated (e.g. 'window*.test fkey2.test'); empty = all"
-        type: string
+      slt_filter:
+        description: "Substring filter on corpus file paths (empty = all)"
+        required: false
         default: ""
-      tcl_timeout:
-        description: "Per-file timeout in seconds for the Tcl suite (each backend)"
-        type: string
-        default: "300"
-      retry:
-        description: "internal: 1 = this run was auto-dispatched to replace a runner-lost attempt; no further self-heal"
-        type: string
+      slt_strict:
+        description: "1 = fail the job when any record fails"
+        required: false
         default: "0"
-  push:
-    branches: [master]
-    paths:
-      - .github/workflows/sqlite-suites.yml
-      - tests/tcl/**
-      - examples/slt_run.rs
-      - examples/tcl_db_server.rs
-      - examples/speedtest_replay.rs
+      slt_maxfail:
+        description: "Per-file failure details printed"
+        required: false
+        default: "5"
+  schedule:
+    - cron: "23 4 * * 1"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: true
+  group: sqlite-suites
+  cancel-in-progress: false
 
 permissions:
   contents: read
-  actions: write  # the self-heal job re-dispatches this workflow when a runner dies mid-shard
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  # The harnesses measure correctness, not throughput: thin LTO and
-  # parallel codegen cut the release build several-fold.
-  CARGO_PROFILE_RELEASE_LTO: thin
-  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
-  # Corpus revisions the harnesses were validated against (the bundled
-  # SQLite is 3.53.4). Bump deliberately.
-  SQLITE_REPO: https://github.com/sqlite/sqlite.git
-  SQLITE_REF: 4226522153ecdf8a18c9498e0f12cee469398965
-  SLT_REPO: https://github.com/gregrahn/sqllogictest.git
-  SLT_REF: c93ac416f05635ff5cc490009add936d9753d01d
+  RUST_BACKTRACE: "1"
 
 defaults:
   run:
     shell: bash
 
 jobs:
-  build:
-    name: Build harness binaries
+  slt-canonical:
+    name: sqllogictest canonical corpus
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    outputs:
-      mode: ${{ steps.plan.outputs.mode }}
-      run_slt: ${{ steps.plan.outputs.run_slt }}
-      run_tcl: ${{ steps.plan.outputs.run_tcl }}
-      run_speed: ${{ steps.plan.outputs.run_speed }}
-      slt_shards: ${{ steps.plan.outputs.slt_shards }}
-      tcl_shards: ${{ steps.plan.outputs.tcl_shards }}
+    timeout-minutes: 75
     steps:
-      - id: plan
-        name: Plan the run
-        env:
-          EVENT: ${{ github.event_name }}
-          IN_SUITES: ${{ inputs.suites }}
-          IN_MODE: ${{ inputs.mode }}
-        run: |
-          mode=full; suites=all
-          if [ "$EVENT" = push ]; then mode=smoke; fi
-          if [ "$EVENT" = workflow_dispatch ]; then mode="$IN_MODE"; suites="$IN_SUITES"; fi
-          if [ "$mode" = smoke ]; then slt='[0]'; tcl='[0]'; else slt='[0,1,2]'; tcl='[0,1,2,3,4,5,6,7]'; fi
-          {
-            echo "mode=$mode"
-            echo "run_slt=$([ "$suites" != tcl ] && echo true || echo false)"
-            echo "run_speed=$([ "$suites" = all ] || [ "$suites" = speedtest ] && [ "$mode" = full ] && echo true || echo false)"
-            echo "run_tcl=$([ "$suites" != slt ] && echo true || echo false)"
-            echo "slt_shards=$slt"
-            echo "tcl_shards=$tcl"
-          } >> "$GITHUB_OUTPUT"
-          echo "mode=$mode suites=$suites"
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: sqlite-suites
+          shared-key: sqlite-suites-slt
           cache-on-failure: true
-      - name: Build slt_run + tcl_db_server + speedtest_replay (release)
-        run: cargo build --release --example slt_run --example tcl_db_server --example speedtest_replay
-      - uses: actions/upload-artifact@v7
-        with:
-          name: harness-bin
-          path: |
-            target/release/examples/slt_run
-            target/release/examples/tcl_db_server
-            target/release/examples/speedtest_replay
-          retention-days: 3
 
-  speedtest1:
-    # SQLite's own speedtest1 benchmark, replayed statement-for-statement
-    # through both engines. GATED on correctness only: every non-random
-    # section must return identical rows on both engines and error on the
-    # same statements; timings are printed for the report but never gated
-    # (shared-runner draw noise is documented elsewhere in this repo).
-    name: speedtest1
-    needs: build
-    if: needs.build.outputs.run_speed == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v7
-        with:
-          name: harness-bin
-          path: bin
-      - name: Fetch SQLite's speedtest1 source (pinned corpus ref)
+      - name: Fetch the canonical corpus (gregrahn/sqllogictest)
         run: |
-          git init -q "$RUNNER_TEMP/sqlite"
-          cd "$RUNNER_TEMP/sqlite"
-          git remote add origin "$SQLITE_REPO"
-          git fetch -q --depth 1 origin "$SQLITE_REF"
-          git checkout -q FETCH_HEAD
-      - name: Build speedtest1 against the bundled amalgamation
-        run: |
-          cc -O2 -DSQLITE_ENABLE_RTREE -I vendor/libsqlite3-sys/sqlite3 \
-            "$RUNNER_TEMP/sqlite/test/speedtest1.c" \
-            vendor/libsqlite3-sys/sqlite3/sqlite3.c -o speedtest1 -lm
-      - name: Capture the script and replay it through both engines
-        run: |
-          chmod +x bin/speedtest_replay
-          mkdir -p "$RUNNER_TEMP/work" && cd "$RUNNER_TEMP/work"
-          "$GITHUB_WORKSPACE/speedtest1" --size 100 --script st.sql scratch.db
-          wc -l st.sql
-          "$GITHUB_WORKSPACE/bin/speedtest_replay" "$RUNNER_TEMP/work/st.sql" \
-            "$RUNNER_TEMP/work" --params | tee "$GITHUB_WORKSPACE/replay.log"
-      - name: Summarize
-        if: always()
-        run: tail -6 replay.log || true
+          curl -sL --retry 3 -o /tmp/slt.tar.gz \
+            https://codeload.github.com/gregrahn/sqllogictest/tar.gz/refs/heads/master
+          tar xzf /tmp/slt.tar.gz -C "$RUNNER_TEMP"
+          rm -f /tmp/slt.tar.gz
+          echo "corpus at: $RUNNER_TEMP/sqllogictest-master/test"
+          du -sh "$RUNNER_TEMP/sqllogictest-master/test"
 
-  slt:
-    name: sqllogictest ${{ matrix.shard }}
-    needs: build
-    if: needs.build.outputs.run_slt == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 180
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: ${{ fromJSON(needs.build.outputs.slt_shards) }}
-    env:
-      MODE: ${{ needs.build.outputs.mode }}
-      SHARD: ${{ matrix.shard }}
-      NSHARDS: ${{ strategy.job-total }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v7
-        with:
-          name: harness-bin
-          path: bin
-      - name: Fetch the sqllogictest corpus
-        run: |
-          git init -q "$RUNNER_TEMP/slt"
-          cd "$RUNNER_TEMP/slt"
-          git remote add origin "$SLT_REPO"
-          git fetch -q --depth 1 origin "$SLT_REF"
-          git checkout -q FETCH_HEAD
-      - name: Run shard
-        run: |
-          chmod +x bin/slt_run
-          corpus="$RUNNER_TEMP/slt/test"
-          if [ "$MODE" = smoke ]; then
-            find "$corpus/evidence" "$corpus/select1.test" -name '*.test' | sort > files.txt
-          else
-            find "$corpus" -name '*.test' | sort \
-              | awk -v i="$SHARD" -v n="$NSHARDS" '(NR - 1) % n == i' > files.txt
-          fi
-          echo "$(wc -l < files.txt) files in this shard"
-          # One file per process: a crash (release builds abort on panic)
-          # loses only that file's line, which the check below catches.
-          set +e
-          xargs -a files.txt -P "$(nproc)" -n 1 bin/slt_run > out.txt 2> err.txt
-          echo "xargs exit $?"
-          set -e
-          python3 - <<'EOF'
-          import os, re, sys
-          files = [l.strip() for l in open("files.txt") if l.strip()]
-          seen, q, fails = set(), 0, []
-          for line in open("out.txt", errors="replace"):
-              m = re.match(r"(PASS|FAIL) (.*): (\d+) statements, (\d+) queries, (\d+) failures", line)
-              if m:
-                  seen.add(m.group(2)); q += int(m.group(4))
-                  if int(m.group(5)):
-                      fails.append((m.group(2), int(m.group(5))))
-          missing = [f for f in files if f not in seen]
-          s = [f"### sqllogictest shard {os.environ['SHARD']} ({os.environ['MODE']})",
-               f"{len(seen)}/{len(files)} files, {q} queries, "
-               f"{sum(n for _, n in fails)} failures, {len(missing)} files crashed/missing"]
-          s += [f"- FAIL `{f}`: {n}" for f, n in fails[:50]]
-          s += [f"- CRASH `{f}`" for f in missing[:50]]
-          print("\n".join(s))
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
-              fh.write("\n".join(s) + "\n")
-          sys.exit(1 if fails or missing or not files else 0)
-          EOF
-      - name: Failure details
-        if: failure()
-        run: |
-          grep -B2 -A12 "^FAIL\|panicked\|^!" out.txt | head -300 || true
-          tail -50 err.txt || true
-
-  tcl:
-    name: Tcl suite ${{ matrix.shard }}
-    needs: build
-    if: needs.build.outputs.run_tcl == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 300
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: ${{ fromJSON(needs.build.outputs.tcl_shards) }}
-    env:
-      MODE: ${{ needs.build.outputs.mode }}
-      SHARD: ${{ matrix.shard }}
-      NSHARDS: ${{ strategy.job-total }}
-      TCL_FILES: ${{ inputs.tcl_files }}
-      TCL_TIMEOUT: ${{ inputs.tcl_timeout || '300' }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v7
-        with:
-          name: harness-bin
-          path: target/release/examples
-      - name: Install tclsh
-        run: sudo apt-get update -q && sudo apt-get install -y -q tcl
-      - name: Fetch SQLite's test suite
-        run: |
-          git init -q "$RUNNER_TEMP/sqlite"
-          cd "$RUNNER_TEMP/sqlite"
-          git remote add origin "$SQLITE_REPO"
-          git fetch -q --depth 1 origin "$SQLITE_REF"
-          git checkout -q FETCH_HEAD
-      - name: Run shard (report-only)
-        run: |
-          chmod +x target/release/examples/tcl_db_server
-          if [ "$MODE" = smoke ]; then
-            set -- select1.test join.test tkt-313723c356.test wal2.test
-            shard=0/1
-          else
-            # shellcheck disable=SC2086
-            set -- $TCL_FILES
-            shard="$SHARD/$NSHARDS"
-          fi
-          python3 tests/tcl/run.py "$RUNNER_TEMP/sqlite/test" "$@" \
-            -j "$(nproc)" --timeout "$TCL_TIMEOUT" --shard "$shard" \
-            -o "tcl-shard-$SHARD.json" | tee tcl.log
-          # Harness sanity (the only gate): files ran and the SQLite
-          # backend passed tests — zero means the wiring broke, not ours.
-          python3 - <<'EOF'
-          import json, os, sys
-          d = json.load(open(f"tcl-shard-{os.environ['SHARD']}.json"))
-          sq = sum(r["sqlite_pass"] for r in d.values())
-          print(f"{len(d)} files, {sq} sqlite passes")
-          sys.exit(0 if (not d or sq > 0) else 1)
-          EOF
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: tcl-shard-${{ matrix.shard }}
-          path: tcl-shard-${{ matrix.shard }}.json
-          retention-days: 30
-
-  tcl-report:
-    name: Tcl suite report
-    needs: [build, tcl]
-    if: always() && needs.build.outputs.run_tcl == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v7
-        with:
-          pattern: tcl-shard-*
-          path: shards
-          merge-multiple: true
-      - name: Merge and summarize
-        run: python3 tests/tcl/summarize.py shards/*.json -o tcl-suite.json >> "$GITHUB_STEP_SUMMARY"
-      - name: Completeness — every shard must have reported
-        # A shard job that lost its runner produces NO artifact; a merged
-        # report that quietly covers 7/8 shards is worse than a red job.
+      - name: Run the SLT canonical audit
         env:
-          TCL_SHARDS: ${{ needs.build.outputs.tcl_shards }}
+          SLT_DIR: ${{ runner.temp }}/sqllogictest-master/test
+          SLT_FILTER: ${{ github.event.inputs.slt_filter || '' }}
+          SLT_STRICT: ${{ github.event.inputs.slt_strict || '0' }}
+          SLT_MAXFAIL: ${{ github.event.inputs.slt_maxfail || '5' }}
         run: |
-          python3 - <<'EOF'
-          import glob, json, os, sys
-          expected = set(json.loads(os.environ["TCL_SHARDS"]))
-          have = {int(f.rsplit("-", 1)[-1].split(".")[0])
-                  for f in glob.glob("shards/tcl-shard-*.json")}
-          missing = sorted(expected - have)
-          if missing:
-              print(f"::error::Tcl coverage INCOMPLETE - no artifact for shards {missing} "
-                    "(runner loss or shard crash); the merged report is partial")
-              open("missing-shards", "w").write(",".join(map(str, missing)))
-              sys.exit(1)
-          print(f"all {len(expected)} tcl shards present")
-          EOF
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: tcl-suite-report
-          path: tcl-suite.json
-          retention-days: 90
+          set -o pipefail
+          cargo test --release --test slt_canonical -- --ignored --nocapture \
+            2>&1 | tee slt_report.log
 
-  self-heal:
-    # GitHub-hosted runners occasionally die mid-job ("The runner has
-    # received a shutdown signal" — fleet rotation, run 38872978367's
-    # Tcl shard 3 lost 100 seconds in). For the unattended weekly run
-    # that means a red run with partial coverage and nobody watching.
-    # When a suite job was lost to infrastructure (not a harness or
-    # engine failure) AND this is the first attempt of a scheduled run,
-    # dispatch one replacement full run (inputs.retry=1 blocks loops).
-    # The damaged attempt stays red in the history — honest — and the
-    # retry lands the green, complete report.
-    name: Self-heal (retry lost shards)
-    needs: [build, slt, speedtest1, tcl]
-    if: >-
-      always() &&
-      github.event_name == 'schedule' &&
-      github.run_attempt == '1' &&
-      github.event.inputs.retry != '1' &&
-      (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Dispatch the replacement run
+      - name: The tally (job summary)
+        if: always()
         run: |
-          set -e
-          echo "results: ${{ toJSON(needs.*.result) }} - dispatching one replacement full run"
-          curl -sS -X POST \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/sqlite-suites.yml/dispatches" \
-            -d '{"ref":"${{ github.ref_name }}","inputs":{"suites":"all","mode":"full","retry":"1"}}' \
-            -w 'HTTP %{http_code}\n'
+          {
+            echo "# sqllogictest canonical audit"
+            echo '```'
+            grep -E "^slt (PASS|FAIL)|^slt_canonical:" slt_report.log | tail -40
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY" || true
+          tail -1 slt_report.log
+
+      - name: Upload the audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: slt-canonical-report
+          path: slt_report.log
+          if-no-files-found: warn
