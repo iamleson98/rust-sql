@@ -2480,14 +2480,21 @@ Work Log:
   repo re-synced to 0488910, the toolchain reinstalled, and this
   entry re-landed. Consequence adopted: all round work is pushed to
   the remote as it completes, since only the remote is durable.
-- DISCOVERY: the README's "SQLite suites" workflow and tests/tcl/
-  harness (the source of the Tcl-suite numbers in Remaining gaps)
-  were never committed — that infrastructure lived only on the lost
-  dev box. The in-repo SLT audit (tests/slt_canonical.rs, slt_runner)
-  IS committed and is the real compatibility surface; the canonical
-  corpus (gregrahn/sqllogictest, 622 files) is now staged at
-  /home/z/my-project/corpus/sqllogictest-master/test for the audit
-  round.
+- DISCOVERY (CORRECTED): an early exploration concluded the README's
+  "SQLite suites" workflow and tests/tcl/ harness were never committed
+  — that was WRONG: the exploration ran against the pre-reset snapshot
+  at b773cd5, which predates them. At the real HEAD (0488910) BOTH
+  exist (53a0353, 9cbead3): tests/tcl/{run.py, shim.tcl,
+  summarize.py}, examples/slt_run.rs (~5.7M-query SLT corpus runner),
+  and the full "SQLite suites" workflow (slt + tcl + speedtest suites,
+  sharded, dispatchable with tcl_files globs). One casualty: a
+  well-meant but redundant 55-line rewrite briefly clobbered the
+  335-line workflow (368e1b1) — restored verbatim in the next commit.
+  The iteration strategy is the user's: heavy corpora run on GitHub
+  CI via dispatch; the sandbox only reproduces small slices and lands
+  fixes; the corpus is staged locally at
+  /home/z/my-project/corpus/sqllogictest-master/test for local
+  cross-checks.
 
 Stage Summary:
 - 0488910 reproduces the repo's CI claims fully on a fresh box (all
