@@ -2523,3 +2523,22 @@ Work Log:
 
 Stage Summary:
 - The window-function compatibility surface is CLOSED at the corpus scale: both of SQLite's window torture files pass in full. The fixes are semantic (per-row args, empty-vs-clamped bounds, group arithmetic, EXCLUDE, fractional RANGE, NULLS placement, NULL sentinels), each pinned by a regression test. CI verdict pending (dispatch window*.test through the SQLite suites workflow).
+
+---
+Task ID: win-1 (CI verdict + the next-round inventory)
+Agent: main (Super Z)
+Task: The window round's CI verdict (dispatch tcl_files=window*.test at 437354c) and the scoped inventory for the rounds that follow.
+
+Work Log:
+- CI RUN 39104810815 (437354c): all 8 Tcl shards + the report job GREEN. window3.test 0 diverge, window8.test 0 diverge — the round's 561-test fix verified on real CI. Main CI (41 jobs) at 437354c in flight at the time of writing.
+- THE FULL window*.test FAMILY ON CI (the dispatch glob caught 16 files): window1 133, windowB 23, window6 20, windowerr 11, windowpushd 6, window9 5, windowC 2, windowD 2, window4 1 — window2/3/5/7/8/A/E all 0. FAMILY RESIDUAL: 203. Next window targets in order: window1 (133 — the EXCLUDE/rowid-in-frame torture file), windowB (23), window6 (20).
+- fkey2.test LOCAL INVENTORY (243 diverge = 154 ran-failed + 89 never-reached at the 300s timeout; the run needs tcl_timeout 900+ or shard splitting):
+  - PRAGMA count_changes (fkey2 1.3/1.4, ~34): SQLite returns the changed-row count as a result row for INSERT/UPDATE/DELETE when the pragma is on; the pragma parses (api.rs whitelist) but the DML result plumbing is absent. Setter arm near api.rs:16158 (mirror foreign_keys); reader near api.rs:17311; DML completion sites write a one-row "N" result.
+  - DEFERRABLE INITIALLY DEFERRED (fkey2-2 block, 59): enforcement must move to COMMIT; a mid-txn FK violation statement fails WITHOUT ending the txn (our widen_special_error_rollback kills it — fkey2-2.5's "cannot commit - no transaction is active"); RELEASE/ROLLBACK TO of savepoints re-checks deferred constraints (fkey2-2.40 "no such savepoint: outer" — the SAVEPOINT naming/RELEASE semantics with FK re-check).
+  - FK schema-error wording (8): SQLite reports "no such table: main.nosuchtable" / "foreign key mismatch - ..." plainly at DML time; we wrap in "FOREIGN KEY constraint failed: ...".
+  - UPDATE ... SET rowid = N (5): rowid/oid/_rowid_ as an assignment target (rowid MOVE = delete+reinsert; when the rowid is a parent key it must trip the FK parent-key-change check — namecheck.rs validate_update accepts it for vtabs only; executor assignments are (column_index, Expr) and have no rowid slot).
+  - FK enforcement core (~55): under-enforcement (42 expected "FOREIGN KEY constraint failed" where we returned success — need per-shape triage) and over-enforcement (13).
+- Technique notes: the differential harness locally = `python3 tests/tcl/run.py /home/z/my-project/corpus/sqlite/test FILE.test -j 2 -o out.json` with tclsh at ~/.local/bin (built from source) and target/release/examples/tcl_db_server (CARGO_PROFILE_RELEASE_LTO=off to fit the 4G box). A per-file deep-log: run the shim directly (tclsh tests/tcl/shim.tcl <server> ours <testdir> <ABSOLUTE file path>) and read the "! name expected: X got: Y" lines.
+
+Stage Summary:
+- Window round closed end-to-end (engine fixes + 9 pins + CI green on both files). The compatibility board after this round: window3/window8 join the green column; the family residual is 203 (window1 next), fkey2 is 243 with the four mechanical clusters scoped above (count_changes, deferred FKs, error wording, SET rowid) plus the FK enforcement core.
