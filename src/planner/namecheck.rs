@@ -968,7 +968,7 @@ fn window_builtin_arity_error(name: &str, n: usize) -> Option<String> {
 /// The first OVER-bearing function call in `e` (NOT descending into
 /// subqueries — a window function inside a subquery of WHERE is legal
 /// in that subquery's own select list).
-fn find_window_call<'a>(e: &'a Expr) -> Option<&'a str> {
+pub(crate) fn find_window_call<'a>(e: &'a Expr) -> Option<&'a str> {
     if let Expr::Function { name, over, .. } = e {
         if over.is_some() {
             return Some(name.as_str());
@@ -1000,6 +1000,23 @@ fn check_window_misuse(s: &SimpleSelect) -> Result<()> {
     if let Some(f) = &s.from {
         find_on_window_call(f)?;
     }
+    // A window call nested inside an aggregate's arguments/FILTER is a
+    // misuse regardless of clause (the aggregate and the window are
+    // distinct levels).
+    for e in s
+        .columns
+        .iter()
+        .filter_map(|c| match c {
+            ResultColumn::Expr { expr, .. } => Some(expr),
+            _ => None,
+        })
+        .chain(s.having.iter())
+        .chain(s.group_by.iter())
+    {
+        if let Some(w) = find_window_in_aggregate(e) {
+            return Err(Error::semantic(format!("misuse of window function {w}()")));
+        }
+    }
     Ok(())
 }
 
@@ -1020,6 +1037,35 @@ fn find_on_window_call(te: &TableExpression) -> Result<()> {
         find_on_window_call(right)?;
     }
     Ok(())
+}
+
+/// A window call nested inside an AGGREGATE call's arguments or FILTER
+/// is a misuse (SQLite: aggregates and windows are distinct levels —
+/// `count(row_number() OVER ())` errors with the window's name).
+fn find_window_in_aggregate(e: &Expr) -> Option<String> {
+    if let Expr::Function {
+        name,
+        args,
+        filter,
+        over,
+        ..
+    } = e
+    {
+        let star = matches!(args.as_slice(), [Expr::Column { name, .. }] if name == "*");
+        let n = if star { 0 } else { args.len() };
+        if over.is_none() && crate::planner::is_aggregate_call(&name.to_ascii_lowercase(), n) {
+            let inner = args
+                .iter()
+                .chain(filter.as_deref())
+                .find_map(find_window_call);
+            if let Some(w) = inner {
+                return Some(w.to_string());
+            }
+        }
+    }
+    expr_children(e)
+        .into_iter()
+        .find_map(find_window_in_aggregate)
 }
 
 fn check_aggregate_misuse(s: &SimpleSelect, scope: &Scope) -> Result<()> {

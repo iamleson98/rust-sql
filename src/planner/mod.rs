@@ -3364,6 +3364,37 @@ pub fn rewrite_aggregates(e: &Expr, aggregates: &[AggExpr], n_group: usize) -> E
 }
 
 /// Check if an expression contains an aggregate function call.
+/// A bare aggregate inside a window specification (PARTITION BY /
+/// ORDER BY / frame offsets) belongs to the QUERY, making it an
+/// aggregate query (SQLite: the window's expressions are resolved at
+/// the outer level; window1 63.x / 65.4 — `SELECT max(b) OVER (ORDER
+/// BY SUM(...)) FROM empty_t` is ONE row, not zero).
+fn window_spec_has_aggregate(spec: &WindowSpec) -> bool {
+    fn frame_has_aggregate(f: &Option<Box<WindowFrame>>) -> bool {
+        f.as_ref().is_some_and(|fr| {
+            let start = matches!(
+                fr.start.as_ref(),
+                FrameBound::Preceding(e) | FrameBound::Following(e) if expr_has_aggregate(e)
+            );
+            let end = fr.end.as_ref().is_some_and(|b| {
+                matches!(
+                    b.as_ref(),
+                    FrameBound::Preceding(e) | FrameBound::Following(e) if expr_has_aggregate(e)
+                )
+            });
+            start || end
+        })
+    }
+    match spec {
+        WindowSpec::Named(_) => false,
+        WindowSpec::Inline(d) => {
+            d.partition_by.iter().any(expr_has_aggregate)
+                || d.order_by.iter().any(|t| expr_has_aggregate(&t.expr))
+                || frame_has_aggregate(&d.frame)
+        }
+    }
+}
+
 pub fn expr_has_aggregate(e: &Expr) -> bool {
     match e {
         Expr::Function {
@@ -3385,6 +3416,10 @@ pub fn expr_has_aggregate(e: &Expr) -> bool {
                 || filter
                     .as_ref()
                     .map(|e| expr_has_aggregate(e))
+                    .unwrap_or(false)
+                || over
+                    .as_ref()
+                    .map(|spec| window_spec_has_aggregate(spec))
                     .unwrap_or(false)
         }
         Expr::Binary { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
@@ -3616,6 +3651,21 @@ pub fn expr_has_window(e: &Expr) -> bool {
         }
         Expr::Cast { expr, .. } => expr_has_window(expr),
         Expr::Collate { expr, .. } => expr_has_window(expr),
+        // LIKE's operands (window1 65.4: `COUNT() OVER () LIKE
+        // lead(...) OVER (...)`), row values, and RAISE never held a
+        // window call — the LIKE case left the query WITHOUT a Window
+        // node and the raw call hit the evaluator.
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_has_window(expr)
+                || expr_has_window(pattern)
+                || escape.as_ref().map(|e| expr_has_window(e)).unwrap_or(false)
+        }
+        Expr::Row(items) => items.iter().any(expr_has_window),
         _ => false,
     }
 }
@@ -3875,6 +3925,18 @@ fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExp
                     }
                     for t in &d.order_by {
                         collect_aggregates_rec(&t.expr, &None, out);
+                    }
+                    // Frame-bound offsets belong to the query's
+                    // aggregate set as well.
+                    if let Some(fr) = &d.frame {
+                        let bounds: Vec<&FrameBound> = std::iter::once(fr.start.as_ref())
+                            .chain(fr.end.as_deref())
+                            .collect();
+                        for b in bounds {
+                            if let FrameBound::Preceding(e) | FrameBound::Following(e) = b {
+                                collect_aggregates_rec(e, &None, out);
+                            }
+                        }
                     }
                 }
             }

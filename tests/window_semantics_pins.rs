@@ -705,3 +705,118 @@ fn bare_star_without_from_is_no_tables_specified() {
     let err = db.query("VALUES(1) INTERSECT SELECT *", ()).err().unwrap();
     assert!(err.sqlite_message().contains("no tables specified"));
 }
+
+/// The window1 round, part 2: compound arity, trigger variables, the
+/// recursive-CTE window rejection, peer output order, and aggregates
+/// inside window specifications.
+#[test]
+fn window1_part2_pins() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE t(x, y); INSERT INTO t VALUES(1, 2)", ())
+        .unwrap();
+    // Compound arms must agree on arity (SQLite's multiSelect check).
+    for sql in [
+        "SELECT 1, 2 UNION ALL SELECT 3",
+        "SELECT 1, 2 UNION SELECT 3",
+        "SELECT 1, 2 EXCEPT SELECT 3",
+        "SELECT 1, 2 INTERSECT SELECT 3",
+        "VALUES(1,2) UNION ALL SELECT 3",
+    ] {
+        let err = db.query(sql, ()).err().unwrap_or_else(|| panic!("{sql}"));
+        assert!(
+            err.sqlite_message()
+                .contains("do not have the same number of result columns"),
+            "{sql}: {}",
+            err.sqlite_message()
+        );
+    }
+    // Host parameters never appear in a trigger (window specs included).
+    let err = db
+        .query(
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN \
+             INSERT INTO t(x) SELECT max(x) OVER w FROM t \
+             WINDOW w AS (PARTITION BY EXISTS(SELECT 1 WHERE y=?1)); \
+             END",
+            (),
+        )
+        .err()
+        .unwrap();
+    assert!(err
+        .sqlite_message()
+        .contains("trigger cannot use variables"));
+    // Recursive CTEs reject window functions outright.
+    let err = db
+        .query(
+            "WITH RECURSIVE q(id) AS (\
+             SELECT 1 UNION ALL SELECT row_number() OVER () FROM q WHERE id < 2) \
+             SELECT * FROM q",
+            (),
+        )
+        .err()
+        .unwrap();
+    assert!(err
+        .sqlite_message()
+        .contains("cannot use window functions in recursive queries"));
+    // ... but a window in the OUTER query over the recursive CTE is
+    // legal, and one inside an aggregate's ARGUMENTS is a misuse.
+    let rows = exec_rows(
+        &mut db,
+        "WITH RECURSIVE q(id) AS (SELECT 1 UNION ALL SELECT id+1 FROM q \
+         WHERE id < 2) SELECT row_number() OVER () FROM q",
+    );
+    assert_eq!(rows.len(), 2);
+    let err = db
+        .query("SELECT count(row_number() OVER ()) FROM t", ())
+        .err()
+        .unwrap();
+    assert!(err
+        .sqlite_message()
+        .contains("misuse of window function row_number()"));
+    // A bare aggregate inside a window spec makes the query aggregate:
+    // one row even over an empty input (the window runs over the
+    // aggregate row).
+    db.execute("CREATE TABLE e(a)", ()).unwrap();
+    let rows = exec_rows(&mut db, "SELECT max(a) OVER (ORDER BY sum(1)) FROM e");
+    assert_eq!(rows.len(), 1);
+    assert!(matches!(rows[0][0], Value::Null));
+    // ... and with data the query still collapses to the single
+    // aggregate row; the window ARG is a bare column, whose
+    // representative is the first-seen row (SQLite answers 1 here).
+    db.execute("CREATE TABLE d(v); INSERT INTO d VALUES(1),(2),(3)", ())
+        .unwrap();
+    let rows = exec_rows(&mut db, "SELECT max(v) OVER (ORDER BY sum(v)) FROM d");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Integer(1));
+    // Window calls on both sides of LIKE (the expr_has_window gap).
+    let rows = exec_rows(
+        &mut db,
+        "SELECT count(v) OVER () LIKE lead(10) OVER () FROM d",
+    );
+    assert_eq!(rows.len(), 3);
+    // Peer order: the FIRST SORTING window's order is the emission
+    // order when the outer query has none (window1 52.3 — a no-sort
+    // `count() OVER ()` does not pin the stream; the next sorting
+    // window's order is what comes out).
+    db.execute("CREATE TABLE p(a, b, c)", ()).unwrap();
+    db.execute(
+        "INSERT INTO p VALUES('AA','bb',356),('CC','aa',158),('BB','aa',399),('FF','bb',938)",
+        (),
+    )
+    .unwrap();
+    let got: Vec<String> = exec_rows(
+        &mut db,
+        "SELECT count() OVER (), sum(c) OVER w, first_value(c) OVER w, \
+         count(a) OVER (ORDER BY b) FROM p \
+         WINDOW w AS (PARTITION BY 6 ORDER BY a)",
+    )
+    .into_iter()
+    .map(|r| match &r[1] {
+        Value::Integer(i) => i.to_string(),
+        other => format!("{other:?}"),
+    })
+    .collect();
+    // Running sums in a-order (AA, BB, CC, FF) — rowid order would
+    // read 356, 514, 913, 1851; the emission order is the first
+    // SORTING window's.
+    assert_eq!(got, vec!["356", "755", "913", "1851"]);
+}

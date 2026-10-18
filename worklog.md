@@ -2619,3 +2619,75 @@ Stage Summary:
   fix oracle-verified against the corpus SQLite). The misuse/
   validation surface and the parser gaps are closed; what remains is
   the flattening-semantics family and one perf cliff.
+---
+Task ID: win-2b (window1 round, part 2: compound arity + trigger/recursive/peer-order/LIKE families; 42 divergences left)
+Agent: main (Super Z)
+
+Work Log:
+- COMPOUND ARITY (a REAL engine bug found while probing 15.0): the
+  SELECTs on either side of UNION / UNION ALL / EXCEPT / INTERSECT
+  were never checked for equal column counts — `SELECT 1,2 UNION ALL
+  SELECT 3` returned two differently-shaped rows on ours. All three
+  set-op executors now enforce multiSelect's contract with SQLite's
+  exact message ("SELECTs to the left and right of UNION ALL do not
+  have the same number of result columns"). Broad win beyond window1
+  (select*.test territory).
+- TRIGGER VARIABLES (9.4x3): the check did not exist. Implemented at
+  the parser level — trigger_depth raised around the WHEN clause +
+  body, the Parameter token errors "trigger cannot use variables"
+  wherever it appears (window specs, frame offsets, subqueries
+  included — the only position-complete hook). Depth restored on
+  every path.
+- RECURSIVE-CTE WINDOWS (15.0): a window function in a RECURSIVE arm
+  errors "cannot use window functions in recursive queries" before
+  any name resolution (the q.id noise never surfaces). The SETUP arm
+  is exempt (it runs pre-recursion; SQLite allows windows there), and
+  a window in the OUTER query over the recursive CTE is legal — both
+  boundaries verified against the corpus SQLite.
+- PEER OUTPUT ORDER (52.3): the emission order after window
+  processing follows the FIRST window that actually needs a sort
+  (PARTITION BY / ORDER BY non-empty) — a leading no-sort window
+  (count() OVER ()) passes the stream through unsorted instead of
+  pinning it.
+- AGGREGATES INSIDE WINDOW SPECS (63.2, 65.4): expr_has_aggregate and
+  collect_aggregates_rec now descend into the OVER spec (PARTITION
+  BY / ORDER BY / frame offsets) — `SELECT max(b) OVER (ORDER BY
+  SUM(...)) FROM empty` is the ONE aggregate row (window over the
+  groups), not zero rows. Frame-bound aggregates join the query's
+  aggregate set.
+- LIKE-SIDED WINDOWS (65.4): expr_has_window missed the Expr::Like
+  and Expr::Row arms — `COUNT() OVER () LIKE lead(...) OVER (...)`
+  built no Window node at all and the raw call hit the evaluator
+  ("no such function: count"). Both arms added.
+- WINDOWS INSIDE AGGREGATE ARGS: `count(row_number() OVER ())` is
+  "misuse of window function row_number()" (find_window_in_aggregate
+  scans aggregate calls' args/FILTER).
+- VALIDATION: lib 316/316, semantics battery, error_parity,
+  column_names, correlated, 16/16 pins; fmt + clippy -D warnings
+  clean. window1 slices: 85 -> 48 -> 42.
+- DEFERRED WITH EVIDENCE (the select-list-subquery reclassification
+  family, ~12 tests): the corpus SQLite collapses the OUTER query to
+  one row when a select-list scalar/IN subquery contains a WINDOW
+  function (no LIMIT): 44.3.2/44.4.2's IN-RHS (MIN + NTILE OVER), the
+  no-FROM outer-ref aggregate (SELECT (SELECT min(c0)) FROM t is ONE
+  row), 57.3's nested-window sum(y), 63.3, 74.1's expr-index count(a)
+  — each mapped to exact probes in /tmp/slt during the round; the
+  rules are (1) no-FROM subquery aggregates whose references bind
+  OUTER hoist to the outer query, (2) window-bearing select-list
+  subqueries without LIMIT reclassify the outer as aggregate, (3) the
+  74.1 expr-index quirk. Also still open: the colon-misuse family
+  (38.x/47.2/59.1/75.1 — hoisted aggregates landing in
+  aggregate-illegal positions), the view/rename family (32.10,
+  73.1-73.4), natural-join star dedup (50.5), row-value misuse (51.1,
+  71.0), collation through IN's LHS (65.2/65.3), correlated no-FROM
+  window subqueries under GROUP BY (76.4/76.5), EQP ORDER counts
+  (23.2-23.6), and 61.1's nested-window perf cliff (8 tests behind
+  it).
+
+Stage Summary:
+- window1: 42 of 85 true divergences remain. Part 2 closed the
+  parser/executor mechanical layer AND one real engine bug (compound
+  arity) with blast radius far beyond window1. The remaining set is
+  dominated by two coherent subsystems — SQLite's select-list
+  subquery reclassification and the view/rename surface — plus one
+  perf cliff.

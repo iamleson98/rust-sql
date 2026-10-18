@@ -18,6 +18,12 @@ pub struct Parser {
     /// guard). Deeply nested input — `SELECT ((((...1...))))` — would
     /// otherwise recurse once per paren and overflow the stack.
     expr_depth: usize,
+    /// Nonzero while parsing a CREATE TRIGGER's WHEN clause or body:
+    /// host parameters are illegal there (resolveExprStep's
+    /// trigger-cannot-use-variables check — window1 9.4's variables
+    /// sit inside a window spec / frame offset, so the only
+    /// position-complete hook is the parameter token itself).
+    trigger_depth: usize,
     /// Unqualified double-quoted identifiers parsed as expressions (the
     /// candidates of SQLite's double-quoted-string fallback).
     dq_idents: Vec<String>,
@@ -46,6 +52,7 @@ impl Parser {
             src: src.to_string(),
             pos: 0,
             expr_depth: 0,
+            trigger_depth: 0,
             dq_idents: Vec::new(),
             dq_literals: Vec::new(),
         })
@@ -1340,7 +1347,40 @@ impl Parser {
         } else {
             false
         };
-        let when_clause = if self.peek().is_keyword("WHEN") {
+        let (when_clause, body) = self.parse_trigger_when_and_body()?;
+        Ok(Statement::Create(CreateStatement::Trigger(CreateTrigger {
+            schema,
+            name,
+            temp,
+            if_not_exists,
+            table,
+            table_schema: if temp { table_schema } else { None },
+            when,
+            events,
+            for_each_row,
+            when_clause,
+            body,
+        })))
+    }
+
+    /// The WHEN clause and body of a CREATE TRIGGER, parsed with
+    /// `trigger_depth` raised so host parameters anywhere in them
+    /// (window specs, frame offsets, subqueries included) are rejected
+    /// with SQLite's message. The depth is ALWAYS restored — every
+    /// error path funnels through the single restore below.
+    fn parse_trigger_when_and_body(
+        &mut self,
+    ) -> Result<(Option<crate::sql::ast::Expr>, Vec<Statement>)> {
+        self.trigger_depth += 1;
+        let r = self.parse_trigger_when_and_body_inner();
+        self.trigger_depth -= 1;
+        r
+    }
+
+    fn parse_trigger_when_and_body_inner(
+        &mut self,
+    ) -> Result<(Option<crate::sql::ast::Expr>, Vec<Statement>)> {
+        let when = if self.peek().is_keyword("WHEN") {
             self.advance();
             Some(self.parse_expr()?)
         } else {
@@ -1355,19 +1395,7 @@ impl Parser {
             }
         }
         self.expect_keyword("END")?;
-        Ok(Statement::Create(CreateStatement::Trigger(CreateTrigger {
-            schema,
-            name,
-            temp,
-            if_not_exists,
-            table,
-            table_schema: if temp { table_schema } else { None },
-            when,
-            events,
-            for_each_row,
-            when_clause,
-            body,
-        })))
+        Ok((when, body))
     }
 
     fn parse_drop(&mut self) -> Result<Statement> {
@@ -3526,6 +3554,12 @@ impl Parser {
                 Ok(Expr::Literal(Value::Blob(b.clone())))
             }
             Token::Parameter(p) => {
+                // Host parameters never live inside a trigger (the WHEN
+                // clause included) — window1 9.4: `... PARTITION BY
+                // EXISTS(SELECT 1 WHERE c=?1)` inside a trigger body.
+                if self.trigger_depth > 0 {
+                    return Err(Error::semantic("trigger cannot use variables"));
+                }
                 self.advance();
                 Ok(Expr::Parameter(p.clone()))
             }

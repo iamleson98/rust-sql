@@ -179,6 +179,41 @@ fn materialize_recursive_cte(
         return Ok((res.rows, res.columns, meta));
     };
     let (base, recursive_op, recursive_arms) = (split.setup, split.op, split.arms);
+    // sqlite3Select: a recursive compound may not use window functions
+    // ANYWHERE in its arms — before any resolution, so the q.id-style
+    // name-resolution noise never surfaces (window1 15.0's exact
+    // message).
+    {
+        use crate::planner::namecheck::find_window_call;
+        use crate::sql::ast::{ResultColumn, SelectBody, SelectStatement};
+        fn has_win_expr(e: &crate::sql::ast::Expr) -> bool {
+            find_window_call(e).is_some()
+        }
+        fn has_win_body(b: &SelectBody) -> bool {
+            match b {
+                SelectBody::Simple(ss) => {
+                    ss.columns
+                        .iter()
+                        .any(|c| matches!(c, ResultColumn::Expr { expr, .. } if has_win_expr(expr)))
+                        || ss.where_clause.as_ref().is_some_and(has_win_expr)
+                        || ss.having.as_ref().is_some_and(has_win_expr)
+                }
+                SelectBody::Binary { left, right, .. } => has_win_body(left) || has_win_body(right),
+            }
+        }
+        fn has_win_stmt(s: &SelectStatement) -> bool {
+            s.order_by.iter().any(|t| has_win_expr(&t.expr)) || has_win_body(&s.body)
+        }
+        // The SETUP arm is exempt: it runs once, before any
+        // recursion (window1 15.0 puts windows in BOTH arms, but a
+        // `WITH RECURSIVE c(a) AS (SELECT row_number() OVER () UNION
+        // ALL SELECT a+1 FROM c...)` is legal on SQLite).
+        if recursive_arms.iter().any(has_win_stmt) {
+            return Err(crate::error::Error::semantic(
+                "cannot use window functions in recursive queries",
+            ));
+        }
+    }
     let sel = &cte.select;
     // computeLimitRegisters: LIMIT first, then (unless it is 0) OFFSET.
     let limit = match &sel.limit {

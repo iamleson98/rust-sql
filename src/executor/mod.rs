@@ -16499,10 +16499,16 @@ fn exec_window(
         row.append(&mut tail);
     }
     // SQLite computes window functions over a sorter keyed on the first
-    // window's PARTITION BY + ORDER BY: without an outer ORDER BY the
-    // rows come out in that order (ties in input order).
-    if let Some(w) = windows.first() {
-        if !w.partition_by.is_empty() || !w.order_by.is_empty() {
+    // SORTING window's PARTITION BY + ORDER BY (a no-sort window —
+    // `count() OVER ()` — passes the rows through unsorted and the
+    // next sorting window's order is the emission order): without an
+    // outer ORDER BY the rows come out in that order (ties in input
+    // order) — window1 52.3.
+    if let Some(w) = windows
+        .iter()
+        .find(|w| !w.partition_by.is_empty() || !w.order_by.is_empty())
+    {
+        {
             let order = window_output_order(w, &inner.rows, &inner.columns, params, named_params)?;
             let mut rows: Vec<Option<Row>> = std::mem::take(&mut inner.rows)
                 .into_iter()
@@ -21555,6 +21561,19 @@ fn compound_collations(left: &Plan, right: &Plan) -> Vec<Option<String>> {
         .collect()
 }
 
+/// multiSelect's prepare-time arity contract, enforced where both arms'
+/// results are in hand: the SELECTs on either side of a compound operator
+/// must return the same number of result columns. The operator is spelled
+/// exactly as written (UNION ALL / UNION / EXCEPT / INTERSECT).
+fn check_compound_arity(op: &str, l: &ExecResult, r: &ExecResult) -> Result<()> {
+    if l.columns.len() != r.columns.len() {
+        return Err(Error::semantic(format!(
+            "SELECTs to the left and right of {op} do not have the same number of result columns"
+        )));
+    }
+    Ok(())
+}
+
 fn exec_union(
     ctx: &mut ExecContext<'_>,
     left: &Plan,
@@ -21563,6 +21582,7 @@ fn exec_union(
 ) -> Result<ExecResult> {
     let l = execute(left, ctx)?;
     let r = execute(right, ctx)?;
+    check_compound_arity(if all { "UNION ALL" } else { "UNION" }, &l, &r)?;
     let columns = l.columns.clone();
     let mut rows = l.rows;
     if all {
@@ -21636,6 +21656,7 @@ fn exec_intersect(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan) -> Resul
         return Ok(l);
     }
     let r = execute(right, ctx)?;
+    check_compound_arity("INTERSECT", &l, &r)?;
     let columns = l.columns.clone();
     let colls = compound_collations(left, right);
     // O(n) membership + dedup (the old Vec::contains scans were O(n^2)).
@@ -21667,6 +21688,7 @@ fn exec_except(ctx: &mut ExecContext<'_>, left: &Plan, right: &Plan) -> Result<E
         return Ok(l);
     }
     let r = execute(right, ctx)?;
+    check_compound_arity("EXCEPT", &l, &r)?;
     let columns = l.columns.clone();
     let colls = compound_collations(left, right);
     // O(n) membership + dedup (the old Vec::contains scans were O(n^2)).
