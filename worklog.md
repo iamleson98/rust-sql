@@ -2785,3 +2785,56 @@ Stage Summary:
   (view declared interfaces + view DML RETURNING), 17 pins. The
   remainder is scoped to four coherent subsystems with the subquery
   cache as the single biggest lever.
+
+---
+Task ID: win-3a (window1 43.x + the 61.x self-deadlock)
+Agent: main (Super Z)
+
+Work Log:
+- 43.x: completed the in-flight namecheck.rs WIP — a WINDOW output
+  alias is legal DIRECTLY in ORDER BY (bare name, arithmetic, ordinal)
+  but a bare reference from INSIDE an ORDER-BY subquery is "misuse of
+  aliased window function {name}" (nested subqueries included). P slice
+  203 -> 206. Pin window1_part4_aliased_window_pins. [c88f5a6]
+- 61.x ROOT CAUSE (NOT exponential cost — a hard self-deadlock): the
+  monster hung with ZERO CPU (futex wait, single thread, value 1).
+  Bisected via /proc (syscall=202, wchan=futex_wait) then TRACE prints:
+  the streaming aggregate machine evaluates expression aggregate args
+  (eval_row) PER ROW INSIDE the scan visitor — scan_subtree_borrowed_fast
+  holds the leaf page Mutex for the whole iteration — the IN-subquery's
+  own scan re-entered the same leaf => self-deadlock. The scan/filter
+  paths already had the guard (pred_may_reenter =
+  filter_predicate.is_some_and(expr_has_subquery)); the streaming
+  aggregate/group-by machines checked ONLY the WHERE predicate, and the
+  fused no-GROUP-BY machine hardcoded false.
+- FIX: streaming_may_reenter(pred, group_by, aggregates) — subquery
+  check over the WHERE predicate, GROUP BY keys, aggregate args,
+  aggregate FILTER clauses and aggregate ORDER BY terms — applied at
+  all five per-row-evaluating scan sites (fused/selective/full-decode
+  of both machines). The fused all-positional fast paths keep false.
+  Verified parallel workers safe by construction (fused_plan_of and
+  the groupby workers DECLINE non-column args / raw filters).
+- HARNESS (sandbox): tests/tcl/run.py needs tclsh — built Tcl 8.6.13
+  lives at /tmp/my-project/corpus/tcl8.6.13/unix/tclsh (symlinked into
+  /home/z/my-project/bin). New scripts/probe.py: per-section
+  differential OURS-vs-oracle (/tmp/oracle from scripts/oracle.c),
+  SQL-comment lines are SECTION METADATA (the CLI's keyword dispatch
+  would classify a leading `--` line as non-query and answer OK —
+  every "empty result" was this harness artifact, NOT an engine bug);
+  `<NULL>` vs '' normalized. Probes under /home/z/my-project/probes/.
+- VERIFIED: all 46 differential probes green (61.1 monster 0.02s,
+  byte-identical; 61.2.1/2, 61.3.1, 61.4.4, towers D1-D3). window1 T1
+  slice via the tcl harness: 17 -> 11 divergences, ZERO unreached
+  (61.1/61.2.x/61.3.x now PASS). lib 316/316, battery, error_parity,
+  correlated, pins 18/18, fmt + clippy --all-targets clean. [e8e7f7a]
+
+Stage Summary:
+- window1 board: 41 -> 32 true divergences (T1 11, T2 11, P 10). One
+  CRITICAL engine bug fixed (a plain SELECT could deadlock the engine
+  single-threaded with zero CPU). Remaining clusters: ntile-arg
+  validation in subqueries (44.x + 59.1), colon-misuse family (47.2,
+  38.x), the select-list subquery reclassification family (53.0, 57.3,
+  61.4.2, 63.3), EQP ORDER counts (23.x), natural-join arity (50.5),
+  row-value misuse (51.1, 71.0), collation-through-IN (65.2/65.3),
+  view/join-order singles (73.3/73.4), 74.x, 75.1, 76.4/76.5, 15.0,
+  31.3, 32.10.
