@@ -20,7 +20,7 @@ fn exec_rows(db: &mut Database, sql: &str) -> Vec<Vec<Value>> {
     db.query(sql, ())
         .expect(sql)
         .iter()
-        .map(|r| r.iter().cloned().collect())
+        .map(|r| r.to_vec())
         .collect()
 }
 
@@ -88,7 +88,7 @@ fn nth_value_dynamic_n() {
 
 #[test]
 fn nth_value_bad_n_is_an_error_not_null() {
-    let mut db = setup();
+    let db = setup();
     // windowCheckValue: N must be a positive integer at EVERY row — a
     // zero/NULL/negative N fails the statement with SQLite's message.
     for bad_n in ["0", "NULL", "-1", "'abc'", "2.5"] {
@@ -97,7 +97,7 @@ fn nth_value_bad_n_is_an_error_not_null() {
             Ok(s) => s,
             Err(_) => continue, // prepare-time rejection is also fine
         };
-        let err = stmt.step().err().expect(bad_n);
+        let err = stmt.step().expect_err(bad_n);
         assert!(
             err.to_string()
                 .contains("second argument to nth_value must be a positive integer"),
@@ -512,7 +512,7 @@ fn frame_offset_value_validation() {
             "SELECT sum(x) OVER (ORDER BY y RANGE BETWEEN {off} PRECEDING \
              AND UNBOUNDED FOLLOWING) FROM a"
         );
-        let err = db.query(&sql, ()).err().expect(off);
+        let err = db.query(&sql, ()).expect_err(off);
         assert!(
             err.sqlite_message()
                 .contains("frame starting offset must be a non-negative number"),
@@ -561,7 +561,7 @@ fn ntile_argument_validation() {
         .unwrap();
     for bad in ["0", "-1", "'zbc'", "2.5", "NULL"] {
         let sql = format!("SELECT ntile({bad}) OVER () FROM t");
-        let err = db.query(&sql, ()).err().expect(bad);
+        let err = db.query(&sql, ()).expect_err(bad);
         assert!(
             err.sqlite_message()
                 .contains("argument of ntile must be a positive integer"),
@@ -697,7 +697,7 @@ fn window_keywords_as_identifiers_and_digit_separators() {
 /// before any other name resolution.
 #[test]
 fn bare_star_without_from_is_no_tables_specified() {
-    let mut db = Database::open_in_memory().unwrap();
+    let db = Database::open_in_memory().unwrap();
     let err = db.query("SELECT *", ()).err().unwrap();
     assert!(err.sqlite_message().contains("no tables specified"));
     let err = db.query("SELECT * WHERE nonexist", ()).err().unwrap();

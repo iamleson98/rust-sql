@@ -33218,6 +33218,13 @@ fn exec_delete(
     })
 }
 
+/// A window-machinery scratch column (`__win_N`): appended by
+/// `exec_window` for the projection's rewritten references — never
+/// visible to `SELECT *`.
+fn is_window_scratch_column(c: &str) -> bool {
+    c.starts_with("__win_")
+}
+
 #[cfg(test)]
 mod perf_probe_tests {
     use super::ExecContext;
@@ -33338,11 +33345,4 @@ mod perf_probe_tests {
             "walk-only = {walk:.1} ns/row   walk+seldecode(val) = {decode1:.1} ns/row   walk+decode_row(full) = {full:.1} ns/row"
         );
     }
-}
-
-/// A window-machinery scratch column (`__win_N`): appended by
-/// `exec_window` for the projection's rewritten references — never
-/// visible to `SELECT *`.
-fn is_window_scratch_column(c: &str) -> bool {
-    c.starts_with("__win_")
 }
