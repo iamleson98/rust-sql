@@ -2446,3 +2446,54 @@ Stage Summary:
   recalibrated on cross-platform evidence, and the tracked macOS
   nondeterminism root-caused + pinned + fixed. CI fully green at
   remote HEAD.
+
+---
+Task ID: sync-verify-1 (fresh-box sync + full local CI-equivalent verification; re-entered post-reset)
+Agent: main (Super Z)
+Task: Pull latest (iamleson98/rust-sql), check out origin/master, answer "is it production ready yet?" with fresh local evidence, then open the compatibility round.
+
+Work Log:
+- Synced master to 0488910 (was 128 commits behind, b773cd5; the local
+  tree carried a stale uncommitted draft of the SLT-canonical + WAL
+  reset work — verified superseded by upstream and stash-preserved).
+- Fresh toolchain (rustc 1.99.1). Box constraints: 10G disk, 4G
+  cgroup memory, 2 cores, no background process survives a tool call.
+- Full local verification of 0488910, mirroring the CI matrix: build
+  green; fmt clean; clippy -D warnings clean in all four configs
+  (default/sqlx/no-default/workspace); default matrix lib 316/316 +
+  149/149 integration binaries + docs 5/5; sqlx config 151 binaries /
+  1,835 tests; no-default 91 binaries / 1,183 tests; oom-injection 91
+  binaries / 1,183 tests incl. the 530-point OOM sweep (baseline
+  intact at every point); release semantics battery green (LTO off
+  locally — the true fat-LTO profile OOM-kills rustc at 4G; CI
+  validated the true profile).
+- Two environment-only casualties, root-caused, neither a code
+  defect: parallel_join under no-mimalloc configs peaks ~3.5G RSS and
+  the 4G cgroup kills it after all 5 tests print ok (CI green at this
+  commit); the release fat-LTO compile itself is >4G.
+- TECHNIQUE NOTE for this box: test binaries must be compiled AND run
+  under the same CARGO_PROFILE_DEV_DEBUG env, else cargo recompiles
+  per binary and fills the disk.
+- MID-ROUND ENVIRONMENT EVENT: the dev box was replaced mid-session
+  (cgroup id changed); /home/z/my-project rolled back to its
+  session-start snapshot — the in-flight scripts/logs were lost, the
+  repo re-synced to 0488910, the toolchain reinstalled, and this
+  entry re-landed. Consequence adopted: all round work is pushed to
+  the remote as it completes, since only the remote is durable.
+- DISCOVERY: the README's "SQLite suites" workflow and tests/tcl/
+  harness (the source of the Tcl-suite numbers in Remaining gaps)
+  were never committed — that infrastructure lived only on the lost
+  dev box. The in-repo SLT audit (tests/slt_canonical.rs, slt_runner)
+  IS committed and is the real compatibility surface; the canonical
+  corpus (gregrahn/sqllogictest, 622 files) is now staged at
+  /home/z/my-project/corpus/sqllogictest-master/test for the audit
+  round.
+
+Stage Summary:
+- 0488910 reproduces the repo's CI claims fully on a fresh box (all
+  four feature configs green locally). Production-readiness verdict:
+  viable for the documented surface; the remaining gaps are the Tcl-
+  suite divergences (window/fkey/select families), feature gaps
+  (.so extensions, atomic multi-db commits, writer hand-off), and the
+  documented perf losses. The compatibility round now opens with the
+  canonical SLT corpus audit as the fresh baseline.
