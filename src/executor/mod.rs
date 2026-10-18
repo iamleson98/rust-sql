@@ -7096,11 +7096,15 @@ fn apply_projection(
         }
         if let Expr::Column { name, .. } = &c.expr {
             if name == "*" {
-                // Expand to all input columns.
+                // Expand to all input columns. Window-appended scratch
+                // columns (`__win_N`) are NOT part of the visible row:
+                // SQLite's star never projects them (window1 9.3 —
+                // `SELECT *, min(z) OVER (...)` over a 3-column CTE is a
+                // 4-column result, not 5).
                 let expanded: Vec<String> = inner
                     .columns
                     .iter()
-                    .filter(|c| !crate::planner::is_hidden_rowid(c))
+                    .filter(|c| !crate::planner::is_hidden_rowid(c) && !is_window_scratch_column(c))
                     .map(|c| {
                         if let Some(pos) = c.rfind('.') {
                             c[pos + 1..].to_string()
@@ -7184,7 +7188,9 @@ fn apply_projection(
         .iter()
         .enumerate()
         .filter(|(_, c)| {
-            !crate::planner::is_hidden_rowid(c) && !crate::executor::vtab_exec::is_aux_slot(c)
+            !crate::planner::is_hidden_rowid(c)
+                && !crate::executor::vtab_exec::is_aux_slot(c)
+                && !is_window_scratch_column(c)
         })
         .map(|(i, _)| i)
         .collect();
@@ -16848,11 +16854,32 @@ fn exec_one_window(
             .as_ref()
             .and_then(|a| coll_ctx.expr_collation(a))
             .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("binary"));
+        // Frame-bound offsets are per-row expressions too: SQLite
+        // materializes them as ephemeral columns and validates each
+        // row's value ("frame starting/ending offset must be a
+        // non-negative integer/number" — window1's 22.x family; a
+        // column offset like `ROWS BETWEEN d FOLLOWING` reads the
+        // current row's d — 31.3).
+        let frame_off_vals = |b: Option<&FrameBound>| -> Result<Option<Vec<Value>>> {
+            match b {
+                Some(FrameBound::Preceding(e)) | Some(FrameBound::Following(e)) => Ok(Some(
+                    sorted
+                        .iter()
+                        .map(|&ri| eval_row(e, &rows[ri], columns, params, named_params))
+                        .collect::<Result<_>>()?,
+                )),
+                _ => Ok(None),
+            }
+        };
+        let frame_start_off = frame_off_vals(w.frame.as_ref().map(|f| f.start.as_ref()))?;
+        let frame_end_off = frame_off_vals(w.frame.as_ref().and_then(|f| f.end.as_deref()))?;
         let aux = WindowAux {
             dense: &dense,
             seps: &seps,
             arg_coll: arg_coll.as_deref(),
             extra_vals: &extra_vals,
+            frame_start_off: &frame_start_off,
+            frame_end_off: &frame_end_off,
         };
         for p in 0..np {
             let val = compute_window_at(
@@ -16875,14 +16902,57 @@ fn exec_one_window(
     Ok(())
 }
 
+/// A frame offset for ROWS/GROUPS bounds: numeric affinity must land
+/// on a NON-NEGATIVE INTEGER (SQLite's OP_MustBeInt on the offset
+/// column — window1 22.x / 31.3).
+fn window_offset_int(v: &Value) -> Option<i64> {
+    let i = match v {
+        Value::Integer(i) => *i,
+        Value::Real(f) if f.is_finite() && *f == (*f as i64) as f64 => *f as i64,
+        Value::Text(s) => match crate::types::numeric::apply_numeric_affinity(s.as_bytes()) {
+            Some(crate::types::numeric::NumericAffinity::Integer(i)) => i,
+            Some(crate::types::numeric::NumericAffinity::Real(r))
+                if r.is_finite() && r == (r as i64) as f64 =>
+            {
+                r as i64
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+    (i >= 0).then_some(i)
+}
+
+/// A frame offset for RANGE bounds: a NON-NEGATIVE NUMBER — integer,
+/// real, or numeric text ('2.0', '1.2'); NULL, BLOB, non-numeric text
+/// and negatives error ("frame starting/ending offset must be a
+/// non-negative number").
+fn window_offset_num(v: &Value) -> Option<f64> {
+    let f = match v {
+        Value::Integer(i) => *i as f64,
+        Value::Real(r) if r.is_finite() => *r,
+        Value::Text(s) => match crate::types::numeric::apply_numeric_affinity(s.as_bytes()) {
+            Some(crate::types::numeric::NumericAffinity::Integer(i)) => i as f64,
+            Some(crate::types::numeric::NumericAffinity::Real(r)) => r,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    (f >= 0.0).then_some(f)
+}
+
 /// Compute the frame [fs, fe] (inclusive, sorted positions) for row `p`.
+/// The frame-bound offset values (per sorted position) arrive as
+/// `start_off` / `end_off`; a bad offset fails with SQLite's message.
 fn resolve_frame(
     w: &WindowExpr,
     p: usize,
     np: usize,
     keys: &[Vec<Value>],
     peer: (usize, usize),
-) -> (usize, usize) {
+    start_off: Option<&[Value]>,
+    end_off: Option<&[Value]>,
+) -> Result<(usize, usize)> {
     let empty_frame = (p + 1, p); // fs > fe => empty
     let npi = np as i64 - 1; // last valid position; -1 when np == 0
                              // Bounds live in i64 position space: a ROWS bound may legitimately
@@ -16904,31 +16974,98 @@ fn resolve_frame(
         }
         Some(f) => {
             let kind = f.kind;
+            // The offset value at THIS sorted position (SQLite evaluates
+            // frame-bound expressions per row and validates each row's
+            // value; a bad offset fails the statement with the exact
+            // window1 22.x messages). Bounds without an expression
+            // (UNBOUNDED / CURRENT ROW) carry no value.
+            let start_int = || {
+                window_offset_int(
+                    &start_off
+                        .and_then(|v| v.get(p))
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                )
+            };
+            let start_num = || {
+                window_offset_num(
+                    &start_off
+                        .and_then(|v| v.get(p))
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                )
+            };
+            let end_int = || {
+                window_offset_int(
+                    &end_off
+                        .and_then(|v| v.get(p))
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                )
+            };
+            let end_num = || {
+                window_offset_num(
+                    &end_off
+                        .and_then(|v| v.get(p))
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                )
+            };
             let start: i64 = match f.start.as_ref() {
                 FrameBound::UnboundedPreceding => 0,
                 FrameBound::CurrentRow => match kind {
                     FrameKind::Rows => p as i64,
                     _ => peer.0 as i64, // RANGE / GROUPS: first peer
                 },
-                FrameBound::Preceding(e) => match kind {
+                FrameBound::Preceding(_) => match kind {
                     // Clips at the partition start via the intersection.
-                    FrameKind::Rows => p as i64 - eval_frame_offset(e) as i64,
-                    FrameKind::Groups => groups_back(p, keys, eval_frame_offset(e)) as i64,
-                    FrameKind::Range => range_preceding_start(w, keys, p, e, peer) as i64,
+                    FrameKind::Rows => {
+                        let n = start_int().ok_or_else(|| {
+                            Error::runtime("frame starting offset must be a non-negative integer")
+                        })?;
+                        p as i64 - n
+                    }
+                    FrameKind::Groups => {
+                        let n = start_int().ok_or_else(|| {
+                            Error::runtime("frame starting offset must be a non-negative integer")
+                        })?;
+                        groups_back(p, keys, n as usize) as i64
+                    }
+                    FrameKind::Range => {
+                        let k = start_num().ok_or_else(|| {
+                            Error::runtime("frame starting offset must be a non-negative number")
+                        })?;
+                        range_preceding_start(w, keys, p, k, peer) as i64
+                    }
                 },
-                FrameBound::Following(e) => match kind {
+                FrameBound::Following(_) => match kind {
                     // May point past the last row: EMPTY, not clipped
                     // (SQLite: a start beyond the partition is an empty
                     // frame; the old `.min(np-1)` returned the last row).
-                    FrameKind::Rows => p as i64 + eval_frame_offset(e) as i64,
+                    FrameKind::Rows => {
+                        let n = start_int().ok_or_else(|| {
+                            Error::runtime("frame starting offset must be a non-negative integer")
+                        })?;
+                        p as i64 + n
+                    }
                     // GROUPS n FOLLOWING start: first row of the group n
                     // after mine; a nonexistent group starts NOTHING
                     // (empty frame), not the last row.
-                    FrameKind::Groups => match groups_fwd(p, keys, eval_frame_offset(e), np) {
-                        Some(g) => g as i64,
-                        None => npi + 1,
-                    },
-                    FrameKind::Range => range_following_start(w, keys, p, e, np, peer) as i64,
+                    FrameKind::Groups => {
+                        let n = start_int().ok_or_else(|| {
+                            Error::runtime("frame starting offset must be a non-negative integer")
+                        })?;
+                        match groups_fwd(p, keys, n as usize, np) {
+                            Some(g) => g as i64,
+                            None => npi + 1,
+                        }
+                    }
+                    FrameKind::Range => {
+                        let k = start_num().ok_or_else(|| {
+                            Error::runtime("frame starting offset must be a non-negative number")
+                        })?;
+                        range_following_start(w, keys, p, k, np, peer) as i64
+                    }
                 },
                 // Invalid as a start (SQLite rejects the query); answer
                 // the empty frame, never "the whole partition".
@@ -16943,8 +17080,13 @@ fn resolve_frame(
                     // The frame ends before the partition begins:
                     // EMPTY (the old value of 0 made row 0 the frame).
                     FrameBound::UnboundedPreceding => -1,
-                    FrameBound::Preceding(e) => match kind {
-                        FrameKind::Rows => p as i64 - eval_frame_offset(e) as i64,
+                    FrameBound::Preceding(_) => match kind {
+                        FrameKind::Rows => {
+                            let n = end_int().ok_or_else(|| {
+                                Error::runtime("frame ending offset must be a non-negative integer")
+                            })?;
+                            p as i64 - n
+                        }
                         // GROUPS n PRECEDING end: the LAST row of the
                         // group n before mine = one before the start of
                         // the group n-1 before mine (0 PRECEDING ends
@@ -16952,32 +17094,52 @@ fn resolve_frame(
                         // saturates to row 0 the end lands at -1: EMPTY,
                         // exactly SQLite (window8's 1.1 family).
                         FrameKind::Groups => {
-                            let n = eval_frame_offset(e);
+                            let n = end_int().ok_or_else(|| {
+                                Error::runtime("frame ending offset must be a non-negative integer")
+                            })?;
                             if n == 0 {
                                 peer.1 as i64 - 1
                             } else {
-                                groups_back(p, keys, n - 1) as i64 - 1
+                                groups_back(p, keys, (n - 1) as usize) as i64 - 1
                             }
                         }
-                        FrameKind::Range => range_preceding_end(w, keys, p, e, np, peer),
+                        FrameKind::Range => {
+                            let k = end_num().ok_or_else(|| {
+                                Error::runtime("frame ending offset must be a non-negative number")
+                            })?;
+                            range_preceding_end(w, keys, p, k, np, peer)
+                        }
                     },
                     FrameBound::CurrentRow => match kind {
                         FrameKind::Rows => p as i64,
                         _ => peer.1 as i64 - 1,
                     },
-                    FrameBound::Following(e) => match kind {
-                        FrameKind::Rows => p as i64 + eval_frame_offset(e) as i64,
+                    FrameBound::Following(_) => match kind {
+                        FrameKind::Rows => {
+                            let n = end_int().ok_or_else(|| {
+                                Error::runtime("frame ending offset must be a non-negative integer")
+                            })?;
+                            p as i64 + n
+                        }
                         // GROUPS n FOLLOWING end: the LAST row of the
                         // group n after mine = one before the start of
                         // the group n+1 after mine; when that group does
                         // not exist the frame clips to the partition end.
                         FrameKind::Groups => {
-                            match groups_fwd(p, keys, eval_frame_offset(e) + 1, np) {
+                            let n = end_int().ok_or_else(|| {
+                                Error::runtime("frame ending offset must be a non-negative integer")
+                            })?;
+                            match groups_fwd(p, keys, n as usize + 1, np) {
                                 Some(g) => g as i64 - 1,
                                 None => npi,
                             }
                         }
-                        FrameKind::Range => range_following_end(w, keys, p, e, np, peer) as i64,
+                        FrameKind::Range => {
+                            let k = end_num().ok_or_else(|| {
+                                Error::runtime("frame ending offset must be a non-negative number")
+                            })?;
+                            range_following_end(w, keys, p, k, np, peer) as i64
+                        }
                     },
                     FrameBound::UnboundedFollowing => npi,
                 },
@@ -16988,28 +17150,9 @@ fn resolve_frame(
     let fs = frame.0.max(0);
     let fe = frame.1.min(npi);
     if np == 0 || fs > fe {
-        empty_frame
+        Ok(empty_frame)
     } else {
-        (fs as usize, fe as usize)
-    }
-}
-
-/// Evaluate a frame offset expression to a row/offset count.
-fn eval_frame_offset(e: &Expr) -> usize {
-    // Constant expressions only (SQLite requires constants); fall back to 0.
-    if let Expr::Literal(Value::Integer(i)) = e {
-        (*i).max(0) as usize
-    } else if let Expr::Literal(Value::Real(r)) = e {
-        r.floor().max(0.0) as usize
-    } else if let Expr::Unary { op, expr } = e {
-        if matches!(op, crate::sql::ast::UnaryOp::Neg) {
-            let _ = expr;
-            0
-        } else {
-            0
-        }
-    } else {
-        0
+        Ok((fs as usize, fe as usize))
     }
 }
 
@@ -17067,13 +17210,12 @@ fn range_preceding_start(
     w: &WindowExpr,
     keys: &[Vec<Value>],
     p: usize,
-    e: &Expr,
+    k: f64,
     peer: (usize, usize),
 ) -> usize {
     if w.order_by.len() != 1 {
         return peer.0; // not a single key: peers (SQLite errors; be lenient)
     }
-    let k = eval_frame_offset_real(e);
     // NULL keys participate in RANGE bounds through their SORT
     // PLACEMENT (SQLite's sorter encodes NULL as the extreme of the
     // key space): a NULL that sorts LAST compares as larger than any
@@ -17135,14 +17277,13 @@ fn range_preceding_end(
     w: &WindowExpr,
     keys: &[Vec<Value>],
     p: usize,
-    e: &Expr,
+    k: f64,
     np: usize,
     peer: (usize, usize),
 ) -> i64 {
     if w.order_by.len() != 1 {
         return peer.1.saturating_sub(1) as i64;
     }
-    let k = eval_frame_offset_real(e);
     // NULL keys participate in RANGE bounds through their SORT
     // PLACEMENT (SQLite's sorter encodes NULL as the extreme of the
     // key space): a NULL that sorts LAST compares as larger than any
@@ -17204,7 +17345,7 @@ fn range_following_start(
     w: &WindowExpr,
     keys: &[Vec<Value>],
     p: usize,
-    e: &Expr,
+    k: f64,
     np: usize,
     peer: (usize, usize),
 ) -> usize {
@@ -17216,7 +17357,6 @@ fn range_following_start(
     if w.order_by.len() != 1 {
         return peer.0;
     }
-    let k = eval_frame_offset_real(e);
     // NULL keys participate in RANGE bounds through their SORT
     // PLACEMENT (SQLite's sorter encodes NULL as the extreme of the
     // key space): a NULL that sorts LAST compares as larger than any
@@ -17278,14 +17418,13 @@ fn range_following_end(
     w: &WindowExpr,
     keys: &[Vec<Value>],
     p: usize,
-    e: &Expr,
+    k: f64,
     np: usize,
     peer: (usize, usize),
 ) -> usize {
     if w.order_by.len() != 1 {
         return peer.1.saturating_sub(1);
     }
-    let k = eval_frame_offset_real(e);
     // NULL keys participate in RANGE bounds through their SORT
     // PLACEMENT (SQLite's sorter encodes NULL as the extreme of the
     // key space): a NULL that sorts LAST compares as larger than any
@@ -17351,6 +17490,11 @@ struct WindowAux<'a> {
     /// (SQLite evaluates them as columns of the window's ephemeral
     /// table, windowReturnOneRow).
     extra_vals: &'a [Vec<Option<Value>>],
+    /// The frame START bound's offset values, per sorted position (an
+    /// ordinary per-row expression, validated each row — window1 22.x).
+    frame_start_off: &'a Option<Vec<Value>>,
+    /// The frame END bound's offset values, per sorted position.
+    frame_end_off: &'a Option<Vec<Value>>,
 }
 
 /// OP_MustBeInt for a window argument (nth_value's N): numeric
@@ -17361,14 +17505,6 @@ struct WindowAux<'a> {
 /// RANGE frame offsets keep their FRACTION (SQLite: `RANGE BETWEEN
 /// 10.2 PRECEDING AND 5.4 PRECEDING` uses the exact reals; ROWS/GROUPS
 /// require integers — window8's 3.8-3.12 family).
-fn eval_frame_offset_real(e: &Expr) -> f64 {
-    match e {
-        Expr::Literal(Value::Integer(i)) => *i as f64,
-        Expr::Literal(Value::Real(r)) => *r,
-        _ => 0.0,
-    }
-}
-
 fn must_be_positive_window_int(v: &Value) -> Option<i64> {
     let i = match v {
         Value::Integer(i) => *i,
@@ -17421,17 +17557,19 @@ fn compute_window_at(
         }
         "cume_dist" => Ok(Value::Real(peer.1 as f64 / np as f64)),
         "ntile" => {
-            // arg = bucket count (constant).
-            let k = match w.extra_args.first() {
-                Some(Expr::Literal(Value::Integer(i))) => *i,
-                _ => match arg_vals.first() {
-                    Some(Some(Value::Integer(i))) => *i,
-                    _ => return Ok(Value::Null),
-                },
+            // The bucket count is an ordinary PER-ROW expression,
+            // validated at EVERY row with windowCheckValue's exact
+            // message: numeric affinity must land on a positive integer
+            // (SQLite: "argument of ntile must be a positive integer").
+            // The old code read only integer literals and silently
+            // returned NULL for 0 / -1 / 'zbc' (window1's 5.x family).
+            let nv = arg_vals.get(p).and_then(|x| x.as_ref());
+            let k: i64 = match nv {
+                Some(v) => must_be_positive_window_int(v).ok_or_else(|| {
+                    Error::runtime("argument of ntile must be a positive integer")
+                })?,
+                None => return Ok(Value::Null),
             };
-            if k < 1 {
-                return Ok(Value::Null);
-            }
             let k = k as usize;
             let base = np / k;
             let rem = np % k;
@@ -17499,7 +17637,15 @@ fn compute_window_at(
             }
         }
         "first_value" | "last_value" | "nth_value" => {
-            let (fs, fe) = resolve_frame(w, p, np, keys, peer);
+            let (fs, fe) = resolve_frame(
+                w,
+                p,
+                np,
+                keys,
+                peer,
+                aux.frame_start_off.as_deref(),
+                aux.frame_end_off.as_deref(),
+            )?;
             // EXCLUDE applies to the value functions exactly as to the
             // frame aggregates (window3's 1.18/1.20 families): the
             // candidate positions are the frame minus the excluded set.
@@ -17557,7 +17703,15 @@ fn compute_window_at(
         // separator, summed TEXT through a Rust float parse and ordered
         // min/max with Rust's Value ordering.
         "sum" | "total" | "avg" | "count" | "min" | "max" | "group_concat" | "string_agg" => {
-            let (fs, fe) = resolve_frame(w, p, np, keys, peer);
+            let (fs, fe) = resolve_frame(
+                w,
+                p,
+                np,
+                keys,
+                peer,
+                aux.frame_start_off.as_deref(),
+                aux.frame_end_off.as_deref(),
+            )?;
             // EXCLUDE handling (subset of SQLite).
             let in_frame = |pos: usize| -> bool {
                 if fs > fe {
@@ -33162,4 +33316,11 @@ mod perf_probe_tests {
             "walk-only = {walk:.1} ns/row   walk+seldecode(val) = {decode1:.1} ns/row   walk+decode_row(full) = {full:.1} ns/row"
         );
     }
+}
+
+/// A window-machinery scratch column (`__win_N`): appended by
+/// `exec_window` for the projection's rewritten references — never
+/// visible to `SELECT *`.
+fn is_window_scratch_column(c: &str) -> bool {
+    c.starts_with("__win_")
 }

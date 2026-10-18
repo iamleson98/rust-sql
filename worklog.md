@@ -2542,3 +2542,80 @@ Work Log:
 
 Stage Summary:
 - Window round closed end-to-end (engine fixes + 9 pins + CI green on both files). The compatibility board after this round: window3/window8 join the green column; the family residual is 203 (window1 next), fkey2 is 243 with the four mechanical clusters scoped above (count_changes, deferred FKs, error wording, SET rowid) plus the FK enforcement core.
+---
+Task ID: win-2a (window1 round, part 1: the mechanical families, 37 of 85 to 0)
+Agent: main (Super Z)
+
+Work Log:
+- TRIAGE INFRASTRUCTURE: window1.test (2427 lines, 332 sqlite-pass tests)
+  sliced at reset_db boundaries into window1_p/t1/t2.test corpus copies
+  (the 300s per-file timeout cut the tail; the slices fit the sandbox
+  tool window). TRUE divergence count: 85 (50+19+16), not the harness's
+  133 (61 ran + 72 "unreached" — the tail mostly passes once given
+  time; the real blocker is 61.1's runtime). Also added
+  scripts/oracle.tcl (sandbox-side, outside the repo): the shim
+  protocol over tcl_db_server with BOTH backends — every SQLite
+  semantic question this round was answered empirically from the
+  pinned corpus binary, not from memory.
+- THE 37 FIXED (verified against the oracle, all clusters):
+  - Frame-offset validation (22.x=10, 31.3 partial): offsets are
+    PER-ROW expressions now (materialized per sorted position like
+    nth_value's N — `ROWS BETWEEN d FOLLOWING` reads the current
+    row's d); ROWS/GROUPS demand a non-negative INTEGER, RANGE a
+    non-negative NUMBER (NULL/blob/garbage-text/negative error with
+    SQLite's exact "frame starting/ending offset" messages). The four
+    RANGE helpers take the validated f64; resolve_frame returns
+    Result.
+  - ntile arg validation (5.1-3, 44.2.1): the bucket count validates
+    at EVERY row through must_be_positive_window_int — "argument of
+    ntile must be a positive integer".
+  - The misuse family (3.1-3, 7.1.1-4/6/8, 6.3, 11.1-4): window-only
+    builtins resolve by NAME — arity checked FIRST (nth_value() =
+    arity error, nth_value(x,1) without OVER = misuse), then the
+    missing-OVER misuse; OVER on non-window-capable functions
+    ("trim() may not be used as a window function"); FILTER only on
+    aggregate window functions; OVER-bearing calls in WHERE/GROUP
+    BY/HAVING/ON = "misuse of window function f()" (check_window_
+    misuse, mirroring check_aggregate_misuse); CREATE INDEX
+    expressions and partial-index WHERE reject window calls outright.
+  - Star vs window scratch columns (9.3): `SELECT *, min(z) OVER ()
+    FROM cte` leaked the __win_N columns through star expansion (5
+    columns for a 4-column answer) — both star-expansion sites now
+    filter the scratch prefix.
+  - Keyword identifiers (21.0/21.1, 10.7/10.8): CURRENT / FILTER /
+    OVER / WINDOW / OUTER joined the fallback-identifier list; bare
+    CURRENT is no longer a CTIME pseudo-function (it is a column
+    reference — `SELECT current FROM k` works, `FROM sales AS outer`
+    correlates).
+  - Numeric separators (79.2/79.3): `_` between digits in decimal,
+    fractional, exponent AND hex literals (1_000_000, 1.5_5, 1e1_0,
+    0x1_f), with SQLite's between-two-digits rule.
+  - "no tables specified" (35.0/35.1): a bare `*` with no FROM errors
+    BEFORE any other name resolution (WHERE included); compound arms
+    included.
+- VALIDATION: lib 316/316, sqlite_keywords, sqlite_semantics_battery,
+  error_parity, column_names, correlated all green; fmt + clippy
+  -D warnings clean; 6 new pins in window_semantics_pins.rs (15/15);
+  window1 slices 85 -> 48 diverge.
+- THE REMAINING 48 (scoped for the next parts): aliased-window
+  misuse (43.x, 3), colon-form aggregate misuse (38.10/38.30, 59.1,
+  75.1, 47.2 — all variants of aggregates hoisted out of scalar
+  subqueries in WHERE/window args), recursive-CTE window rejection +
+  q.id resolution (15.0), trigger-vars-in-window-spec (9.4x3), ALTER
+  RENAME view revalidation (32.10), natural-join star dedup (50.5),
+  row-value misuse (51.1, 71.0), EQP ORDER counts (23.2-23.6, 5),
+  agg-hoist quirks (44.3.2/44.4.2/53.0/57.3/63.2/63.3/74.1 — the
+  forum-bug family where an aggregate subquery in the select list
+  collapses the outer query to one row, some of it expr-index
+  sensitive), collation through IN's LHS (65.2/65.3), count() OVER
+  zero-arg (65.4), view too-complex-to-rename misfire (73.1-73.4),
+  correlated no-FROM window subqueries under GROUP BY (76.4/76.5),
+  peer output order (52.3 — the reorder must follow the LAST
+  sorting window, not the first), and the 61.x performance block (8
+  — 61.1's nested windows run >260s where SQLite is instant).
+
+Stage Summary:
+- window1: 85 true divergences -> 48 in this batch (37 fixed, every
+  fix oracle-verified against the corpus SQLite). The misuse/
+  validation surface and the parser gaps are closed; what remains is
+  the flattening-semantics family and one perf cliff.

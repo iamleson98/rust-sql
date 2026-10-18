@@ -3542,8 +3542,11 @@ impl Parser {
                     self.advance();
                     Ok(Expr::Literal(Value::Integer(0)))
                 }
-                "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP" | "CURRENT" => {
-                    // Treat as a function with no args.
+                "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP" => {
+                    // Treat as a function with no args. (Bare CURRENT is
+                    // NOT one of SQLite's CTIME keywords — it is a
+                    // fallback identifier, so `SELECT current FROM t` is
+                    // a column reference — window1 21.x.)
                     let name = (*k).to_string();
                     self.advance();
                     if self.peek().is_punct('(') {
@@ -4438,10 +4441,18 @@ fn keyword_is_fallback_ident(k: &str) -> bool {
             | "COLUMN"
             | "LIKE"
             | "GLOB"
+            // window1 21.x/10.x: SQLite accepts the window-family
+            // keywords (and OUTER) as plain identifiers —
+            // `CREATE TABLE k(current, exclude, filter, ..., over,
+            // ..., window)` and `FROM sales AS outer` are legal.
+            | "CURRENT"
+            | "FILTER"
+            | "OVER"
+            | "WINDOW"
+            | "OUTER"
             | "REGEXP"
             | "PRAGMA"
             | "RAISE"
-            | "CURRENT"
             | "CURRENT_DATE"
             | "CURRENT_TIME"
             | "CURRENT_TIMESTAMP"

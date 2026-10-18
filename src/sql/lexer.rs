@@ -310,29 +310,75 @@ impl<'a> Lexer<'a> {
     fn lex_number(&mut self) -> Result<Token> {
         let start = self.pos;
         let mut is_float = false;
+        // SQLite 3.46+: underscores may appear BETWEEN the digits of a
+        // numeric literal (`10_000_000_000` — window1 79.x) — never
+        // adjacent to '.', the exponent marker, the ends, or another
+        // underscore. Stripped before value parsing.
         // Hex literal: 0x... (check FIRST, before consuming integer part).
         if self.peek(0) == Some(b'0') && matches!(self.peek(1), Some(b'x') | Some(b'X')) {
             self.advance();
             self.advance();
-            while self.pos < self.src.len() && self.src[self.pos].is_ascii_hexdigit() {
-                self.advance();
+            let mut prev_digit = true;
+            loop {
+                match self.peek(0) {
+                    Some(b'_') => {
+                        if !prev_digit || !self.peek(1).is_some_and(|c| c.is_ascii_hexdigit()) {
+                            return Err(Error::lex(
+                                self.line,
+                                self.col,
+                                "invalid hex literal: \"_\" must sit between digits",
+                            ));
+                        }
+                        self.advance();
+                        prev_digit = false;
+                    }
+                    Some(c) if c.is_ascii_hexdigit() => {
+                        self.advance();
+                        prev_digit = true;
+                    }
+                    _ => break,
+                }
             }
-            let s = std::str::from_utf8(&self.src[start + 2..self.pos]).unwrap();
-            return Ok(Token::Integer(i64::from_str_radix(s, 16).map_err(
+            let s: String = std::str::from_utf8(&self.src[start + 2..self.pos])
+                .unwrap()
+                .chars()
+                .filter(|c| *c != '_')
+                .collect();
+            return Ok(Token::Integer(i64::from_str_radix(&s, 16).map_err(
                 |_| Error::lex(self.line, self.col, "invalid hex literal"),
             )?));
         }
+        // digit run with `_` separators (prev/next digit enforced)
+        let scan_digits = |l: &mut Self, first: bool| -> Result<()> {
+            let mut prev_digit = first;
+            loop {
+                match l.peek(0) {
+                    Some(b'_') => {
+                        if !prev_digit || !l.peek(1).is_some_and(|c| c.is_ascii_digit()) {
+                            return Err(Error::lex(
+                                l.line,
+                                l.col,
+                                "invalid number: \"_\" must sit between digits",
+                            ));
+                        }
+                        l.advance();
+                        prev_digit = false;
+                    }
+                    Some(c) if c.is_ascii_digit() => {
+                        l.advance();
+                        prev_digit = true;
+                    }
+                    _ => return Ok(()),
+                }
+            }
+        };
         // Integer part
-        while self.pos < self.src.len() && self.src[self.pos].is_ascii_digit() {
-            self.advance();
-        }
+        scan_digits(self, false)?;
         // Fractional part
         if self.peek(0) == Some(b'.') {
             is_float = true;
             self.advance();
-            while self.pos < self.src.len() && self.src[self.pos].is_ascii_digit() {
-                self.advance();
-            }
+            scan_digits(self, false)?;
         }
         // Exponent
         if matches!(self.peek(0), Some(b'e') | Some(b'E')) {
@@ -341,11 +387,13 @@ impl<'a> Lexer<'a> {
             if matches!(self.peek(0), Some(b'+') | Some(b'-')) {
                 self.advance();
             }
-            while self.pos < self.src.len() && self.src[self.pos].is_ascii_digit() {
-                self.advance();
-            }
+            scan_digits(self, false)?;
         }
-        let s = std::str::from_utf8(&self.src[start..self.pos]).unwrap();
+        let s: String = std::str::from_utf8(&self.src[start..self.pos])
+            .unwrap()
+            .chars()
+            .filter(|c| *c != '_')
+            .collect();
         if is_float {
             Ok(Token::Float(s.parse().map_err(|_| {
                 Error::lex(self.line, self.col, "invalid float literal")

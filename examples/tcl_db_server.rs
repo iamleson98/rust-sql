@@ -197,7 +197,19 @@ fn returns_rows(sql: &str) -> bool {
 }
 
 fn split(sql: &str) -> Vec<String> {
-    rustqlite::sql::parser::split_script(sql)
+    let out = rustqlite::sql::parser::split_script(sql);
+    if let Ok(log) = std::env::var("TCL_DB_SPLIT") {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+        {
+            for (i, s) in out.iter().enumerate() {
+                let _ = writeln!(f, "[{i}] {}", s.replace('\n', " "));
+            }
+        }
+    }
+    out
 }
 
 /// One parameter token of a statement.

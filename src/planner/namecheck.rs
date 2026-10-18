@@ -861,6 +861,13 @@ fn validate_simple_select(
     ctes: &CteList,
     scope: &mut Scope,
 ) -> Result<()> {
+    // ---- bare star with no FROM (SQLite's expandAllStar error, fired
+    // BEFORE any name resolution — `SELECT * WHERE nonexist` reports
+    // "no tables specified", and a compound arm's `SELECT *` errors the
+    // whole statement — window1 35.x).
+    if s.from.is_none() && s.columns.iter().any(|c| matches!(c, ResultColumn::Star)) {
+        return Err(Error::semantic("no tables specified"));
+    }
     // ---- FROM: build this level's sources (table errors first) ----
     // On SUCCESS the level stays pushed (the SELECT-level caller validates
     // ORDER BY / LIMIT in the same scope, then pops); every error path
@@ -921,6 +928,10 @@ fn validate_simple_select(
             return Err(e);
         }
     }
+    if let Err(e) = check_window_misuse(s) {
+        scope.pop_level();
+        return Err(e);
+    }
     if let Err(e) = check_aggregate_misuse(s, scope) {
         scope.pop_level();
         return Err(e);
@@ -935,6 +946,82 @@ fn validate_simple_select(
 /// is a "misuse of aggregate function f()". Only aggregates that belong
 /// to THIS query count — one whose arguments reference only an outer
 /// query's columns aggregates over that query instead.
+/// Arity of the window-only builtins: checked BEFORE the misuse test
+/// because SQLite's function lookup validates nArg first — `nth_value()`
+/// without OVER reports the ARITY error, not the misuse (window1 7.1.1
+/// vs 7.1.8).
+fn window_builtin_arity_error(name: &str, n: usize) -> Option<String> {
+    let (lo, hi): (usize, usize) = match name.to_ascii_lowercase().as_str() {
+        "row_number" | "rank" | "dense_rank" | "percent_rank" | "cume_dist" => (0, 0),
+        "ntile" | "first_value" | "last_value" => (1, 1),
+        "lag" | "lead" => (1, 3),
+        "nth_value" => (2, 2),
+        _ => return None,
+    };
+    if n < lo || n > hi {
+        Some(format!("wrong number of arguments to function {name}()"))
+    } else {
+        None
+    }
+}
+
+/// The first OVER-bearing function call in `e` (NOT descending into
+/// subqueries — a window function inside a subquery of WHERE is legal
+/// in that subquery's own select list).
+fn find_window_call<'a>(e: &'a Expr) -> Option<&'a str> {
+    if let Expr::Function { name, over, .. } = e {
+        if over.is_some() {
+            return Some(name.as_str());
+        }
+    }
+    expr_children(e).into_iter().find_map(find_window_call)
+}
+
+/// SQLite's clause placement rule: window functions are legal only in
+/// the SELECT list and ORDER BY — an OVER-bearing call in WHERE, GROUP
+/// BY, HAVING or ON is "misuse of window function f()" (window1 3.x,
+/// 7.1.2-7.1.4).
+fn check_window_misuse(s: &SimpleSelect) -> Result<()> {
+    let hit = |e: &Expr| -> Result<()> {
+        if let Some(n) = find_window_call(e) {
+            return Err(Error::semantic(format!("misuse of window function {n}()")));
+        }
+        Ok(())
+    };
+    if let Some(w) = &s.where_clause {
+        hit(w)?;
+    }
+    for g in &s.group_by {
+        hit(g)?;
+    }
+    if let Some(h) = &s.having {
+        hit(h)?;
+    }
+    if let Some(f) = &s.from {
+        find_on_window_call(f)?;
+    }
+    Ok(())
+}
+
+fn find_on_window_call(te: &TableExpression) -> Result<()> {
+    if let TableExpression::Join {
+        left,
+        right,
+        constraint,
+        ..
+    } = te
+    {
+        if let JoinConstraint::On(e) = constraint {
+            if let Some(n) = find_window_call(e) {
+                return Err(Error::semantic(format!("misuse of window function {n}()")));
+            }
+        }
+        find_on_window_call(left)?;
+        find_on_window_call(right)?;
+    }
+    Ok(())
+}
+
 fn check_aggregate_misuse(s: &SimpleSelect, scope: &Scope) -> Result<()> {
     let misuse = |n: &str| {
         Err(Error::semantic(format!(
@@ -1574,6 +1661,43 @@ fn validate_expr(ctx: &Ctx<'_>, e: &Expr, scope: &mut Scope, visible: &CteList) 
             if let Some(msg) = builtin_arity_error(name, n_args) {
                 return Err(Error::semantic(msg));
             }
+            // Window-only builtins resolve by NAME at lookup: the arity
+            // is checked FIRST — `nth_value()` without OVER reports the
+            // ARITY error — and a right-arity reference WITHOUT an OVER
+            // is a "misuse of window function f()" (SQLite resolves
+            // the name to the window-capable def and rejects the missing
+            // OVER — window1's 3.x / 7.1 families).
+            let lname = name.to_ascii_lowercase();
+            if crate::planner::is_window_only_fn(&lname) {
+                if let Some(msg) = window_builtin_arity_error(name, n_args) {
+                    return Err(Error::semantic(msg));
+                }
+                if over.is_none() {
+                    return Err(Error::semantic(format!(
+                        "misuse of window function {name}()"
+                    )));
+                }
+            }
+            // OVER on a function that is neither an aggregate nor a
+            // window builtin cannot form a window function at all
+            // (window1 7.1.6: "trim() may not be used as a window
+            // function").
+            if over.is_some() {
+                let agg = crate::planner::is_aggregate_call(&lname, n_args)
+                    || crate::plugin::lookup_aggregate(&lname).is_some();
+                if !agg && !crate::planner::is_window_only_fn(&lname) {
+                    return Err(Error::semantic(format!(
+                        "{name}() may not be used as a window function"
+                    )));
+                }
+                // FILTER only makes sense for AGGREGATE window functions
+                // (the ones with an xStep) — window1 6.3.
+                if filter.is_some() && !agg {
+                    return Err(Error::semantic(
+                        "FILTER clause may only be used with aggregate window functions",
+                    ));
+                }
+            }
             if over.is_none() && !crate::executor::expr::function_exists(name, n_args) {
                 return Err(Error::NotFound(format!("no such function: {name}")));
             }
@@ -2130,6 +2254,13 @@ fn validate_create(ctx: &Ctx<'_>, c: &CreateStatement, scope: &mut Scope) -> Res
                         vtable: false,
                     });
                     no_subquery(e, "index expressions")?;
+                    // Index expressions carry no window functions at all
+                    // (NC_AllowWin unset — window1 11.1/11.3: "misuse of
+                    // window function sum()" for `CREATE INDEX ... ON
+                    // (sum(b) OVER ())`).
+                    if let Some(n) = find_window_call(e) {
+                        return Err(Error::semantic(format!("misuse of window function {n}()")));
+                    }
                     validate_expr(ctx, e, &mut s, &EMPTY_CTES)?;
                 } else if !table_cols.iter().any(|c| c.eq_ignore_ascii_case(&ic.name)) {
                     return Err(Error::NotFound(format!("no such column: {}", ic.name)));
@@ -2157,6 +2288,9 @@ fn validate_create(ctx: &Ctx<'_>, c: &CreateStatement, scope: &mut Scope) -> Res
                     vtable: false,
                 });
                 no_subquery(w, "partial index WHERE clauses")?;
+                if let Some(n) = find_window_call(w) {
+                    return Err(Error::semantic(format!("misuse of window function {n}()")));
+                }
                 validate_expr(ctx, w, &mut s, &EMPTY_CTES)?;
             }
             Ok(())
