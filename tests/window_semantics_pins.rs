@@ -880,3 +880,81 @@ fn window1_part3_view_rename_pins() {
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0][1], Value::Integer(99));
 }
+
+/// window1 43.x: a window-function output alias may be referenced
+/// DIRECTLY in ORDER BY (`ORDER BY abc`, `ORDER BY abc+5`) but a bare
+/// reference from INSIDE a subquery in the ORDER BY is
+/// "misuse of aliased window function {name}" — a correlated read
+/// cannot reach the window's per-row value.
+#[test]
+fn window1_part4_aliased_window_pins() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute(
+        "CREATE TABLE t1(a INTEGER PRIMARY KEY, b INT);\
+         INSERT INTO t1(a,b) VALUES(1,10),(2,15),(3,-5)",
+        (),
+    )
+    .unwrap();
+    // Direct references are legal and order by the window value.
+    let rows = exec_rows(
+        &mut db,
+        "SELECT a, sum(b) OVER (ORDER BY a) AS abc FROM t1 ORDER BY abc",
+    );
+    assert_eq!(rows.len(), 3);
+    // running sums 10 (a=1), 25 (a=2), 20 (a=3): ascending order.
+    assert_eq!(rows[0][0], Value::Integer(1));
+    assert_eq!(rows[1][0], Value::Integer(3));
+    // Arithmetic on the direct reference too.
+    let rows = exec_rows(
+        &mut db,
+        "SELECT a, sum(b) OVER (ORDER BY a) AS abc FROM t1 ORDER BY abc+5",
+    );
+    assert_eq!(rows[0][0], Value::Integer(1));
+    // ... and ORDER BY <ordinal> 2 (the alias's position) is the same.
+    let rows = exec_rows(
+        &mut db,
+        "SELECT a, sum(b) OVER (ORDER BY a) AS abc FROM t1 ORDER BY 2",
+    );
+    assert_eq!(rows[0][0], Value::Integer(1));
+    // But from inside a subquery it is the misuse — plain alias...
+    let err = db
+        .query("SELECT count() OVER() AS m FROM t1 ORDER BY (SELECT m)", ())
+        .err()
+        .unwrap();
+    assert!(
+        err.sqlite_message()
+            .contains("misuse of aliased window function m"),
+        "{}",
+        err.sqlite_message()
+    );
+    // ... alias of an expression AROUND the window call ...
+    let err = db
+        .query(
+            "SELECT a, 1+sum(b) OVER (ORDER BY a) AS abc FROM t1 \
+             ORDER BY (SELECT abc)",
+            (),
+        )
+        .err()
+        .unwrap();
+    assert!(
+        err.sqlite_message()
+            .contains("misuse of aliased window function abc"),
+        "{}",
+        err.sqlite_message()
+    );
+    // ... even nested two subqueries deep.
+    let err = db
+        .query(
+            "SELECT a, sum(b) OVER (ORDER BY a) AS abc FROM t1 \
+             ORDER BY (SELECT (SELECT abc))",
+            (),
+        )
+        .err()
+        .unwrap();
+    assert!(
+        err.sqlite_message()
+            .contains("misuse of aliased window function abc"),
+        "{}",
+        err.sqlite_message()
+    );
+}

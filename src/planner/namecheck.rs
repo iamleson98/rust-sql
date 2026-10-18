@@ -714,6 +714,28 @@ fn validate_select(
             // HAVING alias extension was attached inside).
             validate_simple_select(ctx, s, &full, scope)?;
             let r = (|| {
+                // Window output aliases read from inside an ORDER-BY
+                // subquery are a misuse (before ordinary resolution).
+                let win_aliases: Vec<String> = s
+                    .columns
+                    .iter()
+                    .filter_map(|c| match c {
+                        ResultColumn::Expr {
+                            expr,
+                            alias: Some(a),
+                        } if crate::planner::expr_has_window(expr) => Some(a.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if !win_aliases.is_empty() {
+                    for t in &stmt.order_by {
+                        if let Some(a) = find_aliased_window_ref(&t.expr, &win_aliases) {
+                            return Err(Error::semantic(format!(
+                                "misuse of aliased window function {a}"
+                            )));
+                        }
+                    }
+                }
                 for t in &stmt.order_by {
                     validate_expr(ctx, &t.expr, scope, &full)?;
                 }
@@ -981,6 +1003,73 @@ pub(crate) fn find_window_call<'a>(e: &'a Expr) -> Option<&'a str> {
 /// the SELECT list and ORDER BY — an OVER-bearing call in WHERE, GROUP
 /// BY, HAVING or ON is "misuse of window function f()" (window1 3.x,
 /// 7.1.2-7.1.4).
+/// A bare reference to a WINDOW output alias from INSIDE a subquery:
+/// SQLite's "misuse of aliased window function {name}" (the alias names
+/// a window-function result; a correlated read from a subquery cannot
+/// reach it — window1 43.x: `ORDER BY (SELECT abc)` where abc is
+/// `sum(b) OVER (...) AS abc`). A DIRECT alias reference in ORDER BY
+/// (`ORDER BY abc`, `ORDER BY abc+5`) is legal.
+fn find_aliased_window_ref<'a>(e: &'a Expr, aliases: &[String]) -> Option<&'a str> {
+    match e {
+        Expr::Subquery(sel) => scan_subquery_for_alias_ref(sel, aliases),
+        _ => expr_children(e)
+            .into_iter()
+            .find_map(|c| find_aliased_window_ref(c, aliases)),
+    }
+}
+
+/// Inside a subquery: a bare alias reference anywhere (nested
+/// subqueries included) is the misuse.
+fn scan_subquery_for_alias_ref<'a>(
+    sel: &'a SelectStatement,
+    aliases: &[String],
+) -> Option<&'a str> {
+    let mut found: Option<&'a str> = None;
+    let mut walk = |x: &'a Expr| {
+        if found.is_none() {
+            found = alias_ref_or_descend(x, aliases);
+        }
+    };
+    match &sel.body {
+        SelectBody::Simple(ss) => {
+            for c in &ss.columns {
+                if let ResultColumn::Expr { expr, .. } = c {
+                    walk(expr);
+                }
+            }
+            if let Some(w) = &ss.where_clause {
+                walk(w);
+            }
+            if let Some(h) = &ss.having {
+                walk(h);
+            }
+            for g in &ss.group_by {
+                walk(g);
+            }
+        }
+        SelectBody::Binary { .. } => {}
+    }
+    for t in &sel.order_by {
+        if found.is_none() {
+            found = alias_ref_or_descend(&t.expr, aliases);
+        }
+    }
+    found
+}
+
+fn alias_ref_or_descend<'a>(e: &'a Expr, aliases: &[String]) -> Option<&'a str> {
+    match e {
+        Expr::Column { table: None, name } => aliases
+            .iter()
+            .find(|a| a.eq_ignore_ascii_case(name))
+            .map(|_| name.as_str()),
+        Expr::Subquery(sel) => scan_subquery_for_alias_ref(sel, aliases),
+        _ => expr_children(e)
+            .into_iter()
+            .find_map(|c| alias_ref_or_descend(c, aliases)),
+    }
+}
+
 fn check_window_misuse(s: &SimpleSelect) -> Result<()> {
     let hit = |e: &Expr| -> Result<()> {
         if let Some(n) = find_window_call(e) {
