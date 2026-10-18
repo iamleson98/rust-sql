@@ -7386,7 +7386,8 @@ impl Database {
             let stmt_clone = cached.stmt.clone();
             let params_vec: Vec<Value> = params.into_iter().collect();
             drop(cached);
-            return self.exec_view_dml(&view_name, &stmt_clone, params_vec);
+            self.exec_view_dml(&view_name, &stmt_clone, params_vec)?;
+            return Ok(());
         }
         // ── IMPLICIT CONCURRENT JOIN ─────────────────────────────────────
         // A plain autocommit DML statement that arrives while the BEGIN
@@ -8882,6 +8883,26 @@ impl Database {
     /// they're sharing a `&Database` reference across threads.
     pub fn query_shared<P: Params>(&self, sql: &str, params: P) -> Result<Vec<Row>> {
         self.query(sql, params)
+    }
+
+    /// DML-with-RETURNING through a MUTABLE handle: a RETURNING
+    /// statement against a VIEW must fire its INSTEAD OF trigger bodies
+    /// (a write) and still surface the clause's rows — the plain query
+    /// path is `&self` and cannot; this entry routes view targets
+    /// through the full view-DML machinery and everything else through
+    /// the ordinary query path.
+    pub fn query_dml_returning_mut(
+        &mut self,
+        sql: &str,
+        params: Vec<Value>,
+    ) -> Result<(Vec<String>, Vec<Row>)> {
+        let stmt = crate::sql::parser::parse(sql)?;
+        if let Some(view_name) = dml_view_target(&stmt, &self.catalog) {
+            let res = self.exec_view_dml(&view_name, &stmt, params)?;
+            let cols = res.columns.iter().map(|c| c.to_string()).collect();
+            return Ok((cols, res.rows));
+        }
+        self.query_with_columns(sql, params)
     }
 
     /// Prepare a statement for repeated execution — the
@@ -10763,12 +10784,23 @@ impl Database {
         for (ri, row) in res.rows.iter().enumerate() {
             // Map the result row onto view-column positions.
             let mut old_view = vec![Value::Null; view_cols.len()];
-            for (i, v) in row.iter().enumerate() {
-                let name = result_cols.get(i).map(|s| s.as_str()).unwrap_or("");
-                if let Some(pos) = view_cols.iter().position(|c| c.eq_ignore_ascii_case(name)) {
-                    old_view[pos] = v.clone();
-                } else if i < old_view.len() {
-                    old_view[i] = v.clone();
+            if view.columns.is_some() {
+                // DECLARED column list: the mapping is POSITIONAL (the
+                // body's own names — bare join names, ambiguous stars —
+                // are not the view's interface; window1 73.x).
+                for (i, v) in row.iter().enumerate() {
+                    if i < old_view.len() {
+                        old_view[i] = v.clone();
+                    }
+                }
+            } else {
+                for (i, v) in row.iter().enumerate() {
+                    let name = result_cols.get(i).map(|s| s.as_str()).unwrap_or("");
+                    if let Some(pos) = view_cols.iter().position(|c| c.eq_ignore_ascii_case(name)) {
+                        old_view[pos] = v.clone();
+                    } else if i < old_view.len() {
+                        old_view[i] = v.clone();
+                    }
                 }
             }
             // WHERE against the view row (view-column names + params).
@@ -10830,12 +10862,23 @@ impl Database {
         let mut out = Vec::new();
         for row in res.rows {
             let mut old_view = vec![Value::Null; view_cols.len()];
-            for (i, v) in row.iter().enumerate() {
-                let name = result_cols.get(i).map(|s| s.as_str()).unwrap_or("");
-                if let Some(pos) = view_cols.iter().position(|c| c.eq_ignore_ascii_case(name)) {
-                    old_view[pos] = v.clone();
-                } else if i < old_view.len() {
-                    old_view[i] = v.clone();
+            if view.columns.is_some() {
+                // DECLARED column list: the mapping is POSITIONAL (the
+                // body's own names — bare join names, ambiguous stars —
+                // are not the view's interface; window1 73.x).
+                for (i, v) in row.iter().enumerate() {
+                    if i < old_view.len() {
+                        old_view[i] = v.clone();
+                    }
+                }
+            } else {
+                for (i, v) in row.iter().enumerate() {
+                    let name = result_cols.get(i).map(|s| s.as_str()).unwrap_or("");
+                    if let Some(pos) = view_cols.iter().position(|c| c.eq_ignore_ascii_case(name)) {
+                        old_view[pos] = v.clone();
+                    } else if i < old_view.len() {
+                        old_view[i] = v.clone();
+                    }
                 }
             }
             if let Some(w) = &del.where_clause {
@@ -12110,14 +12153,20 @@ impl Database {
         view_name: &str,
         stmt: &Statement,
         params: Vec<Value>,
-    ) -> Result<()> {
+    ) -> Result<crate::executor::ExecResult> {
         let view = self
             .catalog
             .get_view(view_name)
             .ok_or_else(|| Error::NotFound(format!("no such table: {}", view_name)))?;
         // View output column names (execution-time: star expansion needs
         // the live catalog).
-        let view_cols: Vec<String> = {
+        let view_cols: Vec<String> = if let Some(declared) = &view.columns {
+            // A view with an explicit column list exposes the DECLARED
+            // names for DML — the body's own output names (a star over
+            // a join yields bare, possibly ambiguous names) never
+            // override them (window1 73.2/73.4).
+            declared.clone()
+        } else {
             let mut planner = Planner::new(&self.catalog);
             let plan = planner.plan_select(&view.select)?;
             let catalog_ptr: *const Catalog = &self.catalog;
@@ -12192,36 +12241,113 @@ impl Database {
         }
         // Build the affected view rows per statement kind, then fire the
         // triggers per row with NEW/OLD bound to the VIEW row.
+        // RETURNING on view DML: one projected row per affected view
+        // row — the NEW row for INSERT / UPDATE, the OLD row for DELETE
+        // (SQLite evaluates the clause against the view's columns; the
+        // trigger bodies run first, per row).
+        let returning_cols: Option<&Vec<crate::sql::ast::ResultColumn>> = match stmt {
+            Statement::Insert(i) => i.returning.as_ref(),
+            Statement::Update(u) => u.returning.as_ref(),
+            Statement::Delete(d) => d.returning.as_ref(),
+            _ => None,
+        };
+        let project_returning = |rows: &[(
+            Option<crate::types::Row>,
+            Option<crate::types::Row>,
+        )]|
+         -> Result<crate::executor::ExecResult> {
+            let mut out_cols: Vec<String> = Vec::new();
+            let mut out_rows: Vec<Vec<Value>> = Vec::new();
+            if let Some(rcs) = returning_cols {
+                for rc in rcs {
+                    match rc {
+                        crate::sql::ast::ResultColumn::Star => {
+                            out_cols.extend(view_cols.iter().cloned());
+                        }
+                        crate::sql::ast::ResultColumn::TableStar(_) => {
+                            out_cols.extend(view_cols.iter().cloned());
+                        }
+                        crate::sql::ast::ResultColumn::Expr { expr, alias } => {
+                            out_cols.push(
+                                alias
+                                    .clone()
+                                    .unwrap_or_else(|| crate::executor::expr_display_name(expr)),
+                            );
+                        }
+                    }
+                }
+                for (new_r, old_r) in rows {
+                    let row = new_r
+                        .as_ref()
+                        .or(old_r.as_ref())
+                        .map(|r| r.as_slice())
+                        .unwrap_or(&[]);
+                    let mut out = Vec::with_capacity(rcs.len());
+                    for rc in rcs {
+                        match rc {
+                            crate::sql::ast::ResultColumn::Star
+                            | crate::sql::ast::ResultColumn::TableStar(_) => {
+                                out.extend_from_slice(row);
+                            }
+                            crate::sql::ast::ResultColumn::Expr { expr, .. } => {
+                                out.push(crate::executor::eval_row_public(
+                                    expr,
+                                    row,
+                                    &view_cols,
+                                    &[],
+                                    &std::collections::HashMap::new(),
+                                )?);
+                            }
+                        }
+                    }
+                    out_rows.push(out);
+                }
+            }
+            Ok(crate::executor::ExecResult {
+                columns: out_cols.into(),
+                rows: out_rows,
+            })
+        };
         match stmt {
             Statement::Insert(ins) => {
                 // Evaluate the source rows (VALUES / SELECT) in a reader
                 // ctx, map them positionally onto the view columns, and
                 // fire per row.
                 let rows = self.eval_view_insert_rows(&view, ins, &view_cols, params.clone())?;
-                self.fire_view_triggers(
-                    view_name,
-                    &view_cols,
-                    &triggers,
-                    phase,
-                    rows.iter().map(|r| (Some(r.clone()), None)).collect(),
-                    params,
+                let pairs: Vec<(Option<crate::types::Row>, Option<crate::types::Row>)> =
+                    rows.iter().map(|r| (Some(r.clone()), None)).collect();
+                self.fire_view_triggers(view_name, &view_cols, &triggers, phase, pairs, params)?;
+                project_returning(
+                    &rows
+                        .iter()
+                        .map(|r| (Some(r.clone()), None))
+                        .collect::<Vec<_>>(),
                 )
             }
             Statement::Update(upd) => {
                 let rows =
                     self.eval_view_update_rows(view_name, &view, upd, &view_cols, params.clone())?;
-                self.fire_view_triggers(view_name, &view_cols, &triggers, phase, rows, params)
-            }
-            Statement::Delete(del) => {
-                let rows =
-                    self.eval_view_delete_rows(view_name, &view, del, &view_cols, params.clone())?;
                 self.fire_view_triggers(
                     view_name,
                     &view_cols,
                     &triggers,
                     phase,
-                    rows.into_iter().map(|r| (None, Some(r))).collect(),
+                    rows.clone(),
                     params,
+                )?;
+                project_returning(&rows)
+            }
+            Statement::Delete(del) => {
+                let rows =
+                    self.eval_view_delete_rows(view_name, &view, del, &view_cols, params.clone())?;
+                let pairs: Vec<(Option<crate::types::Row>, Option<crate::types::Row>)> =
+                    rows.iter().map(|r| (None, Some(r.clone()))).collect();
+                self.fire_view_triggers(view_name, &view_cols, &triggers, phase, pairs, params)?;
+                project_returning(
+                    &rows
+                        .iter()
+                        .map(|r| (None, Some(r.clone())))
+                        .collect::<Vec<_>>(),
                 )
             }
             _ => Err(Error::semantic("cannot modify view")),

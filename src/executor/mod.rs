@@ -2564,15 +2564,25 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
         Plan::Subquery { plan, meta } => {
             let mut res = execute(plan, ctx)?;
             // Output columns answer to the atom's FROM qualifier (`a.k`
-            // vs `b.k` over two derived tables with the same names).
-            if let Some(q) = meta.as_ref().map(|m| m.table.name.as_str()) {
+            // vs `b.k` over two derived tables with the same names) —
+            // POSITIONALLY by the meta's column names when they carry a
+            // rename (`CREATE VIEW v(b, c) AS SELECT * FROM t1 JOIN t1
+            // A` — the atom's interface is v.b / v.c even though the
+            // body's own names are ambiguous bare names; window1 73.x).
+            if let Some(m) = meta.as_ref() {
+                let q = m.table.name.as_str();
                 if !q.is_empty() {
+                    let meta_cols: Vec<&str> =
+                        m.table.columns.iter().map(|c| c.name.as_str()).collect();
                     res.columns = res
                         .columns
                         .iter()
-                        .map(|c| {
+                        .enumerate()
+                        .map(|(i, c)| {
                             if crate::planner::is_hidden_rowid(c) {
                                 c.clone()
+                            } else if let Some(mc) = meta_cols.get(i) {
+                                format!("{q}.{mc}")
                             } else {
                                 let n = c.rsplit_once('.').map_or(c.as_str(), |(_, n)| n);
                                 format!("{q}.{n}")
@@ -21372,8 +21382,11 @@ fn plan_output_collations_defined(plan: &Plan) -> Vec<Option<String>> {
             // (TK_AGG_COLUMN keeps the column's collation).
             | Plan::Aggregate { input, .. } => scope_tables(input, out, derived),
             // A FROM-subquery / view body (or its renaming Project): its
-            // output columns are this scope's derived columns.
-            Plan::Subquery { plan, .. } => derived.push(plan),
+            // output columns are this scope's derived columns. The NODE
+            // (not just its inner plan) goes on the list — the meta's
+            // renamed columns name the atom's interface (a declared
+            // `CREATE VIEW v(z) AS SELECT h ...` answers to z).
+            Plan::Subquery { .. } => derived.push(plan),
             Plan::Project { .. } => derived.push(plan),
             _ => {}
         }
@@ -21381,6 +21394,9 @@ fn plan_output_collations_defined(plan: &Plan) -> Vec<Option<String>> {
     /// The position of output column `name` of a derived table's plan.
     fn derived_position(plan: &Plan, name: &str) -> Option<usize> {
         match plan {
+            // A Subquery atom answers to its META's column names (the
+            // declared rename interface).
+            Plan::Subquery { meta: Some(m), .. } => m.table.find_column(name),
             Plan::Distinct { input }
             | Plan::Sort { input, .. }
             | Plan::Limit { input, .. }
@@ -21487,6 +21503,9 @@ fn plan_output_collations_defined(plan: &Plan) -> Vec<Option<String>> {
         | Plan::Sort { input, .. }
         | Plan::Limit { input, .. }
         | Plan::Filter { input, .. } => plan_output_collations_defined(input),
+        // A Subquery atom's columns carry the INNER plan's per-position
+        // collations (the meta's rename preserves them positionally).
+        Plan::Subquery { plan, .. } => plan_output_collations_defined(plan),
         Plan::Union { left, right, .. }
         | Plan::Intersect { left, right }
         | Plan::Except { left, right } => {

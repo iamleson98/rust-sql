@@ -53,6 +53,29 @@ impl DerivedMeta {
         })
     }
 
+    /// Rename to EXACTLY these names POSITIONALLY, keeping each
+    /// position's analyzed affinity / collation where the analysis
+    /// reached it (a view's declared column inherits the body column's
+    /// declared collation — `CREATE VIEW v(z) AS SELECT h FROM t2`
+    /// keeps h's NOCASE for compound comparisons). A declared list
+    /// longer than the analysis fills with neutral columns; a shorter
+    /// one truncates (window scratch columns skewed the count).
+    pub(crate) fn renamed_positions(&self, qualifier: &str, names: &[String]) -> Arc<DerivedMeta> {
+        let mut cols = self.table.columns.clone();
+        for (i, n) in names.iter().enumerate() {
+            if i < cols.len() {
+                cols[i].name = n.clone();
+            } else {
+                cols.push(synthetic_column(n, Affinity::None, "BINARY".to_string()));
+            }
+        }
+        cols.truncate(names.len());
+        Arc::new(DerivedMeta {
+            table: synthetic_table(qualifier, cols),
+            positional: self.positional,
+        })
+    }
+
     /// A description with no known columns — the atom's FROM qualifier
     /// only (a body whose shape is not analysable).
     pub(crate) fn opaque(qualifier: &str) -> Arc<DerivedMeta> {

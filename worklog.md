@@ -2691,3 +2691,53 @@ Stage Summary:
   dominated by two coherent subsystems — SQLite's select-list
   subquery reclassification and the view/rename surface — plus one
   perf cliff.
+---
+Task ID: win-2c (window1 round, part 3: the view/rename family — 73.1/73.2 closed, declared interfaces honored end-to-end)
+Agent: main (Super Z)
+
+Work Log:
+- THE BUG (73.1): `CREATE VIEW t2(b,c) AS SELECT * FROM t1 JOIN t1 A
+  ORDER BY sum(0) OVER (PARTITION BY 0)` errored "too complex to
+  rename" — the rename path needed the body's output NAMES, and stars
+  over joins have none at AST level (and the meta's own names are the
+  ambiguous bare join names "a","a").
+- THE FIX, in layers:
+  1. The Subquery executor now names its output columns POSITIONALLY
+     from the META (was: re-derived from the inner plan's names) — a
+     declared rename's interface is the meta's column list.
+  2. renamed_positions: a declared column list renames the meta's
+     columns positionally, KEEPING each position's analyzed affinity /
+     collation (the first cut dropped them and broke the battery's
+     compound_defined_collation — `CREATE VIEW v(z) AS SELECT h FROM
+     t2` must keep h's NOCASE for UNION dedup); the wrap Project
+     references the renamed names.
+  3. The compound-collation machinery: the Subquery NODE (not just its
+     inner plan) goes on the derived list; derived_position resolves
+     through the meta's names; collations recurse through Subquery.
+  4. DML on views with declared lists: view_cols = the DECLARED names;
+     row mapping is POSITIONAL (the body's bare names never match).
+  5. RETURNING on view DML: exec_view_dml returns an ExecResult — the
+     clause projects one row per affected view row (NEW for
+     INSERT/UPDATE, OLD for DELETE); new public mutable entry
+     query_dml_returning_mut (the &self query path cannot fire
+     triggers) routed from the harness server for
+     DML-with-RETURNING statements.
+- VERIFIED against the corpus SQLite: 73.1 (SELECT * FROM t2) and
+  73.2 (UPDATE ... WHERE b=4 RETURNING *) now byte-identical; the
+  t4-style aliased-body renames and the NOCASE-through-rename compound
+  stay correct (battery green). 73.3 needs a join-loop ORDER change
+  (SQLite puts the real table outside the view in `FROM t2, t1`) and
+  73.4 needs window evaluation inside UPDATE-SET (both noted for the
+  next pass).
+- VALIDATION: lib 316/316, battery, committed_view, alter_table,
+  column_names, error_parity, correlated, 17/17 pins; fmt + clippy
+  --all-targets -D warnings clean. window1 T2 slice: 12 -> 10.
+- CI: SQLite suites at eae9bd1 GREEN (part 1 verified on real CI);
+  main CI at 6823009 (the win-1 lint debt) in flight.
+
+Stage Summary:
+- window1: ~40 divergences remain. Part 3 closed the declared-view-
+  interface surface (a real engine capability: view column renames over
+  star bodies + view-DML RETURNING). The biggest remaining clusters:
+  the select-list subquery reclassification family (~12), EQP ORDER
+  counts (5), the 61.x perf cliff (8), and the tail singles.

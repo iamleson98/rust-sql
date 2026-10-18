@@ -1963,13 +1963,15 @@ impl<'a> Planner<'a> {
                             (Some(renames), Some(inner_names))
                                 if renames.len() == inner_names.len() =>
                             {
+                                // The wrap references the RENAMED names:
+                                // the Subquery executor exposes the meta's
+                                // (renamed) columns positionally.
                                 let cols: Vec<crate::planner::plan::ProjectExpr> = renames
                                     .iter()
-                                    .zip(inner_names.iter())
-                                    .map(|(new, old)| crate::planner::plan::ProjectExpr {
+                                    .map(|new| crate::planner::plan::ProjectExpr {
                                         expr: Expr::Column {
                                             table: None,
-                                            name: old.clone(),
+                                            name: new.clone(),
                                         },
                                         alias: Some(format!("{}.{}", prefix, new)),
                                     })
@@ -1982,13 +1984,20 @@ impl<'a> Planner<'a> {
                                     columns: cols,
                                 }
                             }
-                            (Some(renames), _) => {
-                                return Err(Error::semantic(format!(
-                                    "view {} declares {} columns but its SELECT is too complex to rename (use explicit column aliases)",
-                                    name,
-                                    renames.len()
-                                )));
-                            }
+                            // A rename whose inner names cannot be
+                            // computed at plan time (a star over a
+                            // join, a compound body): the RENAMED META
+                            // alone carries the mapping — resolution of
+                            // `t2.b` goes through it, and a star over
+                            // the view expands the meta's (renamed)
+                            // columns (window1 73.x: `CREATE VIEW t2(b,c)
+                            // AS SELECT * FROM t1 JOIN t1 A ...`). The
+                            // declared count is checked at execution
+                            // (SQLite checks complex bodies at use).
+                            (Some(renames), _) => Plan::Subquery {
+                                plan: Box::new(inner),
+                                meta: meta.map(|m| m.renamed_positions(&prefix, renames)),
+                            },
                             _ => Plan::Subquery {
                                 plan: Box::new(inner),
                                 meta,

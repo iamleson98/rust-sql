@@ -185,6 +185,18 @@ fn sq_err(e: &rusqlite::Error) -> String {
 /// Statements that produce a result set: queries, PRAGMAs, EXPLAIN, and
 /// DML with RETURNING (sqlite3_column_count > 0). Unparseable text runs
 /// through `execute`, which reports the error.
+/// A DML statement (INSERT / UPDATE / DELETE) carrying a RETURNING
+/// clause — those may target views, which need the mutable query path.
+fn is_dml_returning(sql: &str) -> bool {
+    use rustqlite::sql::ast::Statement as S;
+    match rustqlite::sql::parser::parse(sql) {
+        Ok(S::Insert(i)) => i.returning.is_some(),
+        Ok(S::Update(u)) => u.returning.is_some(),
+        Ok(S::Delete(d)) => d.returning.is_some(),
+        _ => false,
+    }
+}
+
 fn returns_rows(sql: &str) -> bool {
     use rustqlite::sql::ast::Statement as S;
     match rustqlite::sql::parser::parse(sql) {
@@ -368,7 +380,12 @@ fn eval(c: &mut Conn, script: &str, vars: &HashMap<String, Value>) -> Result<Vec
         match c {
             Conn::Ours(db) => {
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    if returns_rows(&sql) {
+                    // DML with RETURNING may target a VIEW (INSTEAD OF
+                    // triggers fire — a write) while still producing
+                    // rows: the mutable entry routes both cases.
+                    if is_dml_returning(&sql) {
+                        db.query_dml_returning_mut(&sql, params.clone())
+                    } else if returns_rows(&sql) {
                         match db.query_with_columns(&sql, params.clone()) {
                             // PRAGMA assignments and the like run through
                             // execute (no result set here).

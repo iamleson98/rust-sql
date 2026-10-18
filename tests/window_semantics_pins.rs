@@ -820,3 +820,63 @@ fn window1_part2_pins() {
     // SORTING window's.
     assert_eq!(got, vec!["356", "755", "913", "1851"]);
 }
+
+/// The window1 round, part 3: views with declared column lists over
+/// star/join bodies — resolution, positional DML mapping, and RETURNING
+/// through INSTEAD OF triggers.
+#[test]
+fn window1_part3_view_rename_pins() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute(
+        "CREATE TABLE t1(a INT); INSERT INTO t1 VALUES(1),(2),(4)",
+        (),
+    )
+    .unwrap();
+    // A star-over-join body with a declared column list: the view's
+    // interface is b/c (the body's own names are ambiguous bare names).
+    db.execute(
+        "CREATE VIEW t2(b,c) AS SELECT * FROM t1 JOIN t1 A \
+         ORDER BY sum(0) OVER (PARTITION BY 0)",
+        (),
+    )
+    .unwrap();
+    let rows = exec_rows(&mut db, "SELECT b, c FROM t2 WHERE b=4");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][0], Value::Integer(4));
+    // Star over the view: renamed interface, real values.
+    let rows = exec_rows(&mut db, "SELECT * FROM t2");
+    assert_eq!(rows.len(), 9);
+    assert_eq!(rows[0][0], Value::Integer(1));
+    // The rename keeps the body columns' DECLARED collations: v(z)
+    // over a NOCASE column still dedups a UNION under NOCASE.
+    db.execute(
+        "CREATE TABLE t2b(id INTEGER PRIMARY KEY, h TEXT COLLATE NOCASE);\
+         INSERT INTO t2b VALUES(1,'a'),(2,'X')",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE VIEW v(z) AS SELECT h FROM t2b", ())
+        .unwrap();
+    let n = exec_rows(
+        &mut db,
+        "SELECT count(*) FROM (SELECT z FROM v UNION SELECT a FROM t1)",
+    );
+    assert_eq!(
+        n[0][0],
+        Value::Integer(5),
+        "NOCASE dedup through the rename"
+    );
+    // UPDATE ... RETURNING through an INSTEAD OF trigger: one projected
+    // NEW row per affected view row.
+    db.execute(
+        "CREATE TRIGGER x1 INSTEAD OF UPDATE ON t2 BEGIN SELECT true; END",
+        (),
+    )
+    .unwrap();
+    let (cols, rows) = db
+        .query_dml_returning_mut("UPDATE t2 SET c=99 WHERE b=4 RETURNING *", Vec::new())
+        .unwrap();
+    assert_eq!(cols, vec!["b".to_string(), "c".to_string()]);
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][1], Value::Integer(99));
+}
