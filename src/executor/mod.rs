@@ -11902,6 +11902,31 @@ fn collect_plan_tables(
     }
 }
 
+/// Can any expression this streaming machine evaluates PER ROW — inside
+/// the scan visitor, i.e. under the leaf page Mutex when `may_reenter`
+/// is false — re-enter the pager? The general paths fall back to
+/// `eval_row` per row for non-column shapes (`sum(CAST(a IN (SELECT …)))`
+/// evaluates its whole argument INSIDE the visitor), and a subquery
+/// argument re-runs a plan mid-scan whose own scan then re-enters the
+/// very leaf the outer machine still holds — a hard single-thread
+/// self-deadlock (found by the window1 61.x probe). Same guard class as
+/// the filter-predicate check on the scan/filter paths; the fused
+/// all-positional fast paths never evaluate an expression inside the
+/// visitor and keep passing `false`.
+fn streaming_may_reenter(
+    filter_predicate: Option<&Expr>,
+    group_by: &[Expr],
+    aggregates: &[AggExpr],
+) -> bool {
+    filter_predicate.is_some_and(expr_has_subquery)
+        || group_by.iter().any(expr_has_subquery)
+        || aggregates.iter().any(|a| {
+            a.arg.as_ref().is_some_and(expr_has_subquery)
+                || a.filter.as_ref().is_some_and(expr_has_subquery)
+                || a.order_by.iter().any(|t| expr_has_subquery(&t.expr))
+        })
+}
+
 pub(crate) fn scan_groupby_grouper(
     ctx: &mut ExecContext<'_>,
     table: Arc<Table>,
@@ -12230,7 +12255,7 @@ pub(crate) fn scan_groupby_grouper(
 
             let mut wide: Vec<Value> = vec![Value::Null; n_cols];
             let mut owned_key: Value = Value::Null;
-            let pred_may_reenter = filter_predicate.is_some_and(expr_has_subquery);
+            let pred_may_reenter = streaming_may_reenter(filter_predicate, group_by, aggregates);
             // An evaluation error aborts the statement (SQLite raises it);
             // it used to be swallowed as "row filtered out".
             let mut scan_err: Option<crate::error::Error> = None;
@@ -12317,7 +12342,7 @@ pub(crate) fn scan_groupby_grouper(
         }
 
         let identity_ref: &[usize] = &identity;
-        let pred_may_reenter = filter_predicate.is_some_and(expr_has_subquery);
+        let pred_may_reenter = streaming_may_reenter(filter_predicate, group_by, aggregates);
         let mut scan_err: Option<crate::error::Error> = None;
         scan_table_maybe_range(ctx, &table, range, pred_may_reenter, |rowid, payload| {
             row_buf.clear();
@@ -14095,7 +14120,13 @@ fn exec_aggregate_no_group_by(
             let mut full_buf: Vec<Value> = Vec::new();
             let rowid_alias = table.rowid_alias;
             let mut decode_err: Option<Error> = None;
-            scan_table_maybe_range(ctx, &table, range, false, |rowid, payload| {
+            // Expression aggregate args evaluate per row inside the
+            // visitor (`full_on_match` → eval_row) — a subquery argument
+            // re-enters the pager under the leaf lock: self-deadlock
+            // (window1 61.x). The fused machine's own fast lanes are
+            // positional; only the eval_row fallback needs the guard.
+            let may_reenter = streaming_may_reenter(filter_predicate, &[], aggregates);
+            scan_table_maybe_range(ctx, &table, range, may_reenter, |rowid, payload| {
                 match pred.raw_eval(payload, rowid_alias) {
                     Some(false) => return true,
                     Some(true) => {}
@@ -14270,7 +14301,7 @@ fn exec_aggregate_no_group_by(
         // Vec<u8> allocation by passing &[u8] borrows directly into the
         // page buffer. For 10k rows, this saves 10k malloc+free pairs.
         let rowid_alias = table.rowid_alias;
-        let pred_may_reenter = filter_predicate.is_some_and(expr_has_subquery);
+        let pred_may_reenter = streaming_may_reenter(filter_predicate, &[], aggregates);
         scan_table_maybe_range(ctx, &table, range, pred_may_reenter, |rowid, payload| {
             // Decode only the wanted columns.
             if let Err(e) =
@@ -14357,7 +14388,7 @@ fn exec_aggregate_no_group_by(
         // Fallback: decode the entire row.
         let mut row_buf: Vec<Value> = Vec::with_capacity(n_cols);
         let rowid_alias = table.rowid_alias;
-        let pred_may_reenter = filter_predicate.is_some_and(expr_has_subquery);
+        let pred_may_reenter = streaming_may_reenter(filter_predicate, &[], aggregates);
         scan_table_maybe_range(ctx, &table, range, pred_may_reenter, |rowid, payload| {
             row_buf.clear();
             if let Err(e) = decode_row_into(payload, n_cols, rowid, rowid_alias, &mut row_buf) {
