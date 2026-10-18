@@ -2741,3 +2741,47 @@ Stage Summary:
   star bodies + view-DML RETURNING). The biggest remaining clusters:
   the select-list subquery reclassification family (~12), EQP ORDER
   counts (5), the 61.x perf cliff (8), and the tail singles.
+---
+Task ID: win-2-status (session checkpoint: CI verdicts + the scoped remainder)
+Agent: main (Super Z)
+
+Work Log:
+- CI VERDICTS: SQLite suites at eae9bd1 GREEN (part 1's 37 fixes
+  verified on real CI hardware). Main CI at 6823009 failed ONLY
+  bench-gate (windows): "txn: 100 inserts" 4.00ms vs SQLite 3.80ms =
+  5.3% over the 5% tolerance — a 0.2ms margin on a 4ms benchmark, no
+  view/subquery machinery in that path (runner noise; rerun
+  triggered). Every other job green including the four clippy configs.
+  9c6af3c (part 3) in flight on both workflows.
+- 61.x PERF ROOT CAUSE SCOPED: 61.1 is ~7 levels of nested scalar
+  subqueries, each correlated by an `a IN (...)` one level down — 3^7
+  evaluations without a correlated-subquery cache. SQLite collapses
+  the tree with its per-statement subquery cache (correlation key ->
+  cached result); we lack that cache entirely. That is the round that
+  recovers 61.1-61.4 (8 tests).
+- THE REMAINING BOARD (window1, ~37 of 85):
+  - select-list subquery reclassification (~10): no-FROM outer-ref
+    aggregates hoisting to the outer query (SELECT (SELECT min(c0))
+    FROM t is ONE row), window-bearing select-list subqueries without
+    LIMIT collapsing the outer to aggregate (44.x, 57.3, 63.3), the
+    74.1 expr-index count(a) quirk, 53.0's over-collapse on our side.
+  - colon-misuse family (~5): hoisted aggregates landing in
+    aggregate-illegal positions (38.10/38.30 WHERE-subquery AVG, 59.1
+    ntile-arg sum, 75.1 aggregate-with-window-ORDER, 47.2).
+  - EQP ORDER counts (23.2-23.6, 5): window sorts must appear as
+    "USE TEMP B-TREE"-style rows in EXPLAIN QUERY PLAN.
+  - the 61.x perf cliff (8): the correlated-subquery cache.
+  - singles: 43.x aliased-window-in-ORDER-BY-subquery (3), 32.10
+    ALTER RENAME view revalidation, 51.1/71.0 row-value misuse,
+    65.2/65.3 collation through IN's LHS, 76.4/76.5 correlated no-FROM
+    window subqueries under GROUP BY, 73.3's join-loop order (real
+    table outer to the view atom), 73.4's window-in-UPDATE-SET, 50.5's
+    nested natural-join arity in subquery position.
+
+Stage Summary:
+- Three batches landed and pushed (eae9bd1, 7bf6ff6, 9c6af3c):
+  window1 85 -> ~37 true divergences, two real engine bugs fixed
+  (compound arity, window-scratch star leak), one new capability
+  (view declared interfaces + view DML RETURNING), 17 pins. The
+  remainder is scoped to four coherent subsystems with the subquery
+  cache as the single biggest lever.
