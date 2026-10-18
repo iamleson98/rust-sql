@@ -2150,11 +2150,16 @@ impl<'a> Planner<'a> {
                         }
                         let cols: Vec<crate::planner::plan::ProjectExpr> = list
                             .iter()
-                            .zip(inner_names.iter())
-                            .map(|(new, old)| crate::planner::plan::ProjectExpr {
+                            .map(|new| crate::planner::plan::ProjectExpr {
+                                // The wrap references the RENAMED names
+                                // (matching the view path): the Subquery
+                                // executor exposes the meta's renamed
+                                // columns (`s.a`, `s.b`) positionally —
+                                // the body's own `k`/`v` names no longer
+                                // exist at this level.
                                 expr: Expr::Column {
                                     table: None,
-                                    name: old.clone(),
+                                    name: new.clone(),
                                 },
                                 alias: Some(format!("{prefix}.{new}")),
                             })
