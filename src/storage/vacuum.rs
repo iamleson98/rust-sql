@@ -24,6 +24,17 @@ use crate::storage::pager::{PageIdHashBuild, PageIdSet, Pager};
 /// Callers: after any mutation through `Btree::new(pager, 0, ..)`, check
 /// `bt.root != 0` and invoke this. Safe under the engine's single-writer
 /// discipline.
+/// Decline-reason instrumentation for the in-place planner's own
+/// decision points (the vacuum's timing env — same flag as the
+/// eligibility walk's `decline!` macro above). Zero cost when off.
+macro_rules! vac_plan_dbg {
+    ($($arg:tt)*) => {
+        if std::env::var_os("RSQL_VAC_TIMING").is_some() {
+            eprintln!("[vac] in-place plan decline: {}", format!($($arg)*));
+        }
+    };
+}
+
 pub(crate) fn repin_schema_root(pager: &Pager, new_root: u32) -> Result<()> {
     if new_root == 0 {
         return Ok(());
@@ -158,29 +169,173 @@ fn remap_zero_children(data: &mut [u8], hdr: usize, to: u32) {
     }
 }
 
+/// Rebuild a schema-tree LEAF in place with re-encoded cells: the
+/// patches replace whole cell payloads (rootpage re-encode — the new
+/// record may differ in width from the old); every other cell keeps its
+/// bytes verbatim. The leaf is re-laid compactly: cells placed
+/// sequentially from the page end, pointer array rewritten in the SAME
+/// order (rowids and cell index stability are the patch contract),
+/// freeblock list and fragment counter reset. Byte-level by design —
+/// the in-place install runs below the btree machinery (one flush at
+/// the end); schema leaves are small (tens of cells, no overflow —
+/// overflowing schema rows decline the plan upstream).
+///
+/// `hdr` is the btree header offset (100 for page 0's hybrid layout, 0
+/// otherwise). Fails loudly (Error::corruption) on malformed cells —
+/// the eligibility walk has already size-validated every leaf, so a
+/// failure here means on-disk corruption, not a shape decision.
+pub(crate) fn rebuild_schema_leaf(
+    data: &mut [u8],
+    hdr: usize,
+    patches: &[(u16, Vec<u8>)],
+) -> Result<()> {
+    // Page layout (see Page's accessors and compact_leaf_if_fragmented —
+    // the engine's own leaf relayout): [type:1][freeblock region:3]
+    // [n_cells:2 BE @+4][content_start:2 BE @+6, 0 = page_size]
+    // [right-most ptr:4 @+8, reserved on leaves][ptr array @+12].
+    let psz = data.len();
+    let ptr_base = hdr + PAGE_HEADER_SIZE as usize;
+    if ptr_base + 2 > psz {
+        return Err(Error::corruption(
+            "schema leaf rebuild: no room for pointer array",
+        ));
+    }
+    let n = u16::from_be_bytes(data[hdr + 4..hdr + 6].try_into().unwrap()) as usize;
+    if ptr_base + 2 * n > psz {
+        return Err(Error::corruption(
+            "schema leaf rebuild: pointer array overruns page",
+        ));
+    }
+    // Pass 1: materialize every cell's new bytes (patched payloads
+    // re-prefixed with their ORIGINAL [rowid varint][length varint]
+    // headers, untouched cells copied verbatim).
+    let mut new_cells: Vec<Vec<u8>> = Vec::with_capacity(n);
+    let mut total = 0usize;
+    for i in 0..n {
+        let off = ptr_base + i * 2;
+        let cell_ptr = u16::from_be_bytes(data[off..off + 2].try_into().unwrap()) as usize;
+        if cell_ptr >= psz {
+            return Err(Error::corruption(
+                "schema leaf rebuild: cell pointer out of range",
+            ));
+        }
+        let Some((rowid, n_rid)) = crate::storage::btree::varint::decode_signed(&data[cell_ptr..])
+        else {
+            return Err(Error::corruption("schema leaf rebuild: undecodable rowid"));
+        };
+        let payload: &[u8] =
+            if let Some((_, new_payload)) = patches.iter().find(|(idx, _)| *idx as usize == i) {
+                new_payload.as_slice()
+            } else {
+                let p = cell_ptr + n_rid;
+                let Some((plen, n_plen)) = crate::storage::btree::varint::decode(&data[p..]) else {
+                    return Err(Error::corruption("schema leaf rebuild: undecodable length"));
+                };
+                let plen = plen as usize;
+                let local = crate::storage::btree::overflow_local_len_for(plen, psz);
+                if local < plen {
+                    return Err(Error::corruption(
+                        "schema leaf rebuild: overflowing schema cell (plan must decline)",
+                    ));
+                }
+                let start = p + n_plen;
+                let end = start + plen;
+                if end > psz {
+                    return Err(Error::corruption(
+                        "schema leaf rebuild: payload overruns page",
+                    ));
+                }
+                &data[start..end]
+            };
+        let mut cell = Vec::with_capacity(n_rid + 3 + payload.len());
+        let mut vbuf = [0u8; 9];
+        let n_enc = crate::storage::btree::varint::encode(rowid as u64, &mut vbuf);
+        cell.extend_from_slice(&vbuf[..n_enc]);
+        // Schema rowids are engine-assigned sequence numbers (>= 1);
+        // the signed varint round-trip only matters for negatives, which
+        // cannot occur here.
+        let n_enc = crate::storage::btree::varint::encode(payload.len() as u64, &mut vbuf);
+        cell.extend_from_slice(&vbuf[..n_enc]);
+        cell.extend_from_slice(payload);
+        total += cell.len();
+        new_cells.push(cell);
+    }
+    // Pass 2: re-lay compactly from the page end (the engine's own
+    // convention — compact_leaf_if_fragmented writes cells tail-down in
+    // pointer order; ascending-from-content_start is the same layout).
+    let content_start = psz
+        .checked_sub(total)
+        .filter(|cs| *cs >= ptr_base + 2 * n)
+        .ok_or_else(|| Error::corruption("schema leaf rebuild: cells do not fit page"))?;
+    let mut cursor = content_start;
+    for (i, cell) in new_cells.iter().enumerate() {
+        let end = cursor + cell.len();
+        data[cursor..end].copy_from_slice(cell);
+        let off = ptr_base + i * 2;
+        data[off] = (cursor >> 8) as u8;
+        data[off + 1] = (cursor & 0xFF) as u8;
+        cursor = end;
+    }
+    // Header: freeblock region zeroed (the engine keeps no chain —
+    // fragmentation compacts instead), n_cells unchanged (same cells,
+    // same order), content start stored with the 0 = page_size
+    // convention of set_cell_content_start.
+    data[hdr + 1..hdr + 4].fill(0);
+    let cs_stored = if content_start >= psz {
+        0u16
+    } else {
+        content_start as u16
+    };
+    data[hdr + 6..hdr + 8].copy_from_slice(&cs_stored.to_be_bytes());
+    Ok(())
+}
+
 // ============================================================================
 // Page-level compact copy (VACUUM's fast path)
 // ============================================================================
 
 use std::collections::HashMap;
 
-/// A schema-row rootpage patch: the schema tree's leaf cells embed each
+/// A schema-row cell patch: the schema tree's leaf cells embed each
 /// object's root page id as column 3 of the row record. When VACUUM moves
-/// a root, the value is rewritten IN PLACE at the recorded offset — same
-/// tag, same byte width (the size class must match, verified at plan
-/// time; a mismatch declines the in-place path).
-#[derive(Clone, Copy)]
-pub(crate) struct SchemaRootPatch {
+/// a root, the row is RE-ENCODED with the new rootpage (the value may
+/// change size class — e.g. a root promoted to a 2-byte id during bulk
+/// load that compacts back into the 1-byte range) and the affected
+/// schema leaf is rebuilt compactly at its new slot (see
+/// [`rebuild_schema_leaf`]). The old in-place byte patch could only
+/// write same-width bodies — and looked the RAW (SQLite 1-based)
+/// rootpage up in the INTERNAL (0-based) id map, so any object whose
+/// root+1 page died spuriously declined the whole in-place path (the
+/// mass-delete-then-VACUUM shape — torture S14 — always fell to the
+/// temp-file image rebuild).
+#[derive(Clone)]
+pub(crate) struct SchemaCellPatch {
     /// OLD id of the schema leaf holding the row (the patch applies at
     /// the leaf's NEW slot — resolved via the map at install time).
     pub leaf_old: u32,
-    /// Absolute in-page offset of the rootpage value's BODY (after the
-    /// tag byte) inside that leaf.
-    pub body_off: u32,
-    /// Byte width of the size class (1, 2, 4, or 8) — old and new match.
-    pub width: u8,
-    /// The new root id (little-endian body).
-    pub new_root: u32,
+    /// Index of the cell in the leaf's pointer array (order-preserving
+    /// across the rebuild).
+    pub cell_idx: u16,
+    /// The re-encoded row record payload (WITHOUT the cell's
+    /// [rowid varint][payload-length varint] prefix — the rebuild
+    /// re-adds those from the original cell).
+    pub payload: Vec<u8>,
+}
+
+/// One schema-tree leaf cell as collected by the walk: enough to
+/// re-encode the row at plan time. `ok = false` marks shapes the
+/// in-place path cannot patch (the row spans an overflow chain, or the
+/// record is undecodable) — the plan declines on those.
+pub(crate) struct SchemaCellRaw {
+    /// OLD id of the schema leaf holding the row.
+    pub page: u32,
+    /// Cell index in the leaf's pointer array.
+    pub cell_idx: u16,
+    /// The row record payload bytes ([type][name][tbl_name][rootpage]
+    /// [sql] — see Value::encode_into).
+    pub payload: Vec<u8>,
+    /// False: overflow-spanning or undecodable — decline the plan.
+    pub ok: bool,
 }
 
 /// The in-place compaction plan: everything needed to compact without
@@ -202,8 +357,16 @@ pub(crate) struct InPlaceCompaction {
     /// HAVE references carry an entry (most leaves have none — empty
     /// Vecs never allocate).
     pub refs: HashMap<u32, Vec<(u32, u32)>, PageIdHashBuild>,
-    /// Schema-row rootpage rewrites (see SchemaRootPatch).
-    pub schema_patches: Vec<SchemaRootPatch>,
+    /// Schema-row rootpage re-encodes (see SchemaCellPatch).
+    pub schema_patches: Vec<SchemaCellPatch>,
+    /// OLD ids of every schema LEAF to re-lay at install time: patched
+    /// leaves plus any leaf that is not already packed (the eligibility
+    /// gate exempts schema leaves from the hollow/empty/waste guards
+    /// precisely because the rebuild re-lays them densely — matching
+    /// the image paths, which re-insert the schema rows into a fresh
+    /// tree). A split schema tree's half-filled leaf would otherwise
+    /// force the whole file onto the row-level rebuild.
+    pub schema_rebuild_leaves: Vec<u32>,
 }
 
 /// VACUUM fast-path eligibility walk: every leaf of every tree must be
@@ -279,11 +442,11 @@ pub(crate) fn trees_eligible_for_page_copy(
         };
         match pt {
             PageType::LeafTable | PageType::LeafIndex => {
-                // (decline_reason, true_slack, n_cells): the slack is
-                // what a row-level re-flow of THIS page would free —
-                // the gap under the content start PLUS the dead cell
-                // bytes inside the content area (the live-byte sum is
-                // the compaction path's own accounting).
+                // (decline_reason, true_slack, n_cells): the
+                // slack is what a row-level re-flow of THIS page would
+                // free — the gap under the content start PLUS the dead
+                // cell bytes inside the content area (the live-byte sum
+                // is the compaction path's own accounting).
                 let (reason, slack, n) = {
                     let b = pr.lock();
                     let n = b.n_cells() as usize;
@@ -395,6 +558,85 @@ pub(crate) fn trees_eligible_for_page_copy(
     Ok(true)
 }
 
+/// Walk the SCHEMA tree (rooted at hybrid page 0) and collect its LEAF
+/// page ids, verifying the one hard precondition of the install's
+/// schema-leaf rebuild: every cell of every leaf must be size-parseable
+/// (rebuild_schema_leaf re-prefixes and re-places each cell). Returns
+/// None on any unparseable cell — the in-place plan declines to the
+/// image path. Shape properties (empty / hollow / slack) are NOT
+/// checked: the rebuild re-lays every schema leaf compactly, so a
+/// split schema tree's half-filled frontier leaf does not disqualify
+/// the file (the object trees' strict gate stays in
+/// trees_eligible_for_page_copy).
+fn schema_tree_leaves_rebuildable(src: &Pager) -> Result<Option<Vec<u32>>> {
+    let psz = src.page_size() as usize;
+    let mut leaves: Vec<u32> = Vec::new();
+    let mut visited: PageIdSet = std::collections::HashSet::default();
+    let mut stack: Vec<u32> = vec![0];
+    while let Some(page_id) = stack.pop() {
+        if !visited.insert(page_id) {
+            continue;
+        }
+        let pr = src.get_page(page_id)?;
+        let pt = {
+            let b = pr.lock();
+            b.page_type()?
+        };
+        match pt {
+            PageType::LeafTable => {
+                let ok = {
+                    let b = pr.lock();
+                    let n = b.n_cells() as usize;
+                    let mut ok = true;
+                    for i in 0..n as u16 {
+                        let p = b.cell_pointer(i) as usize;
+                        if p >= psz {
+                            ok = false;
+                            break;
+                        }
+                        match table_leaf_cell_size_paged(&b.data[p..], psz as u32) {
+                            Some(sz) if sz > 0 && p + sz <= psz => {}
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    ok
+                };
+                drop(pr);
+                if !ok {
+                    return Ok(None);
+                }
+                leaves.push(page_id);
+            }
+            PageType::InteriorTable => {
+                let mut children = Vec::new();
+                {
+                    let b = pr.lock();
+                    let n = b.n_cells() as usize;
+                    let right = b.right_most_pointer();
+                    for i in 0..n {
+                        let cell_ptr = b.cell_pointer(i as u16) as usize;
+                        if cell_ptr + 4 <= b.data.len() {
+                            children.push(u32::from_be_bytes(
+                                b.data[cell_ptr..cell_ptr + 4].try_into().unwrap(),
+                            ));
+                        }
+                    }
+                    if right != 0 {
+                        children.push(right);
+                    }
+                }
+                drop(pr);
+                stack.extend(children);
+            }
+            _ => {}
+        }
+    }
+    Ok(Some(leaves))
+}
+
 /// Walk every live page — the schema tree (hybrid root at page 0) plus
 /// every object tree and overflow chain — and build the in-place
 /// compaction plan. Returns None when the plan is not eligible: a
@@ -408,31 +650,46 @@ pub(crate) fn plan_in_place_compaction(
     roots: &[u32],
 ) -> Result<Option<InPlaceCompaction>> {
     let old_n = src.n_pages();
+    let psz = src.page_size() as usize;
     // Eligibility: the in-place plan moves pages but cannot drop or
     // re-pack any. Mass-delete shapes (empty leaves, hollow survivors)
     // must take an image/row-level path — see
     // trees_eligible_for_page_copy. The schema tree (page 0) is
     // included: the in-place path patches it in place, while the image
     // paths rebuild it densely from the rows.
-    let mut gate_roots: Vec<u32> = Vec::with_capacity(roots.len() + 1);
-    gate_roots.push(0);
-    gate_roots.extend(roots.iter().copied());
-    if !trees_eligible_for_page_copy(src, &gate_roots, false)? {
+    // Two-tier gate. The SCHEMA tree is checked by a dedicated walk
+    // (schema_tree_leaves_rebuildable): its leaves are RE-LAID compactly
+    // by the install (schema_rebuild_leaves), so the shape guards (empty
+    // / hollow / waste budget) do not apply to it — only the structural
+    // requirement that every cell be parseable (the rebuild's own hard
+    // precondition). A split schema tree's half-filled frontier leaf
+    // must not push the whole file onto the row-level rebuild. The
+    // OBJECT trees keep the strict policy: in-place moves pages but
+    // cannot re-flow them (the walker's historical 0-filter means the
+    // old combined call never actually gated the schema tree — the
+    // schema walk below is the first real schema gate).
+    let schema_rebuild_leaves = match schema_tree_leaves_rebuildable(src)? {
+        Some(leaves) => leaves,
+        None => {
+            vac_plan_dbg!("schema tree not rebuildable (unparseable cell)");
+            return Ok(None);
+        }
+    };
+    if !trees_eligible_for_page_copy(src, roots, false)? {
         return Ok(None);
     }
     let mut seen: PageIdSet = std::collections::HashSet::default();
     let mut refs: HashMap<u32, Vec<(u32, u32)>, PageIdHashBuild> = HashMap::default();
-    // Raw schema-row rootpage sites: (schema leaf old id, body offset,
-    // old root value) — collected during the schema-tree walk, resolved
-    // against the map below.
-    let mut schema_sites: Vec<(u32, u32, i64)> = Vec::new();
+    // Raw schema-row cells — collected during the schema-tree walk,
+    // re-encoded against the map below.
+    let mut schema_cells: Vec<SchemaCellRaw> = Vec::new();
     // Pass 1: walk every tree. INTERIORS are fully parsed (their child
     // references are the patch surface). OBJECT-tree leaves are NOT
     // cell-parsed yet — the live set comes from the freelist complement
     // below, and chain-head patches are only collected when overflow
     // pages actually exist (pass 2). Schema-tree leaves are always
     // cell-parsed: their cells embed the rootpage columns.
-    collect_tree(src, 0, true, &mut seen, &mut refs, &mut schema_sites, true)?;
+    collect_tree(src, 0, true, &mut seen, &mut refs, &mut schema_cells, true)?;
     for &root in roots {
         if root == 0 {
             continue;
@@ -443,7 +700,7 @@ pub(crate) fn plan_in_place_compaction(
             false,
             &mut seen,
             &mut refs,
-            &mut schema_sites,
+            &mut schema_cells,
             false,
         )?;
     }
@@ -457,11 +714,13 @@ pub(crate) fn plan_in_place_compaction(
     // Sanity: no btree page may be on the freelist (corruption or a
     // stale freelist — decline to the image path).
     if seen.iter().any(|id| free.contains(id)) {
+        vac_plan_dbg!("btree page on freelist");
         return Ok(None);
     }
     let sorted: Vec<u32> = (0..old_n).filter(|id| !free.contains(id)).collect();
     // A live set smaller than the walked btree set is contradictory.
     if sorted.len() < seen.len() {
+        vac_plan_dbg!("live set smaller than btree set");
         return Ok(None);
     }
     let map: HashMap<u32, u32, PageIdHashBuild> = sorted
@@ -506,32 +765,100 @@ pub(crate) fn plan_in_place_compaction(
             }
         }
     }
-    // Resolve schema sites into patches. Every referenced root must be
-    // live (reachable — it IS in the map) and the new id must fit the
-    // old value's size class.
-    let mut schema_patches: Vec<SchemaRootPatch> = Vec::with_capacity(schema_sites.len());
-    for &(leaf_old, body_off, old_root) in &schema_sites {
-        let Some(&new_root) = map.get(&(old_root as u32)) else {
+    // Resolve schema rows into re-encoded cells. Every referenced root
+    // must be live (reachable — it IS in the map); the new value is the
+    // new INTERNAL id translated back to the SQLite 1-based convention
+    // the column carries. Size-class changes are fine here — the cell
+    // is fully re-encoded, not byte-patched.
+    let mut schema_patches: Vec<SchemaCellPatch> = Vec::with_capacity(schema_cells.len());
+    for cell in &schema_cells {
+        if !cell.ok {
+            vac_plan_dbg!(
+                "schema row overflow/undecodable (page {} cell {})",
+                cell.page,
+                cell.cell_idx
+            );
+            return Ok(None);
+        }
+        let row = match crate::storage::row_codec::decode_row(&cell.payload, 5, 0, None) {
+            Ok(r) => r,
+            Err(_) => {
+                vac_plan_dbg!(
+                    "schema row record undecodable (page {} cell {})",
+                    cell.page,
+                    cell.cell_idx
+                );
+                return Ok(None);
+            }
+        };
+        // Column 3 is the rootpage, SQLite 1-based convention. 0 (views,
+        // triggers) means no tree — nothing to patch.
+        let old_root = match row.get(3) {
+            Some(crate::types::value::Value::Integer(r)) => *r,
+            _ => {
+                vac_plan_dbg!(
+                    "schema row rootpage column not an integer (page {} cell {})",
+                    cell.page,
+                    cell.cell_idx
+                );
+                return Ok(None);
+            }
+        };
+        if old_root <= 0 {
+            continue; // views/triggers: no tree, no patch
+        }
+        let old_internal = (old_root - 1) as u32;
+        let Some(&new_internal) = map.get(&old_internal) else {
+            vac_plan_dbg!(
+                "schema rootpage unreachable (raw {} -> internal {} not in the live map)",
+                old_root,
+                old_internal
+            );
             return Ok(None); // root unreachable: not a shape we patch
         };
-        if new_root as i64 == old_root {
-            continue; // identity: nothing to rewrite
+        let new_root = new_internal as i64 + 1; // back to SQLite convention
+        if new_root == old_root {
+            continue; // identity: the root did not move
         }
-        if int_class(old_root) != int_class(new_root as i64) {
-            return Ok(None); // size-class change: re-encode territory
+        let mut row = row;
+        row[3] = crate::types::value::Value::Integer(new_root);
+        let payload = crate::storage::row_codec::encode_row(&row);
+        // The re-encoded cell must stay whole in the page (schema leaves
+        // are rebuilt byte-level — an overflowing row would need a chain
+        // the rebuild does not build). Decline to the image path.
+        if crate::storage::btree::overflow_local_len_for(payload.len(), psz) < payload.len() {
+            vac_plan_dbg!(
+                "re-encoded schema row would overflow (page {} cell {})",
+                cell.page,
+                cell.cell_idx
+            );
+            return Ok(None);
         }
-        schema_patches.push(SchemaRootPatch {
-            leaf_old,
-            body_off,
-            width: int_class(new_root as i64) as u8,
-            new_root,
+        schema_patches.push(SchemaCellPatch {
+            leaf_old: cell.page,
+            cell_idx: cell.cell_idx,
+            payload,
         });
+        if std::env::var_os("RSQL_VAC_TIMING").is_some() {
+            eprintln!(
+                "[vac] schema cell patch: page {} cell {} rootpage {} -> {}",
+                cell.page, cell.cell_idx, old_root, new_root
+            );
+        }
+    }
+    if std::env::var_os("RSQL_VAC_TIMING").is_some() {
+        eprintln!(
+            "[vac] in-place plan: {} schema leaves to re-lay, {} cell patches",
+            schema_rebuild_leaves.len(),
+            schema_patches.len()
+        );
     }
     Ok(Some(InPlaceCompaction {
         sorted,
         map,
         refs,
         schema_patches,
+        schema_rebuild_leaves,
     }))
 }
 
@@ -765,23 +1092,6 @@ fn parse_leaf_chains(
     Ok(())
 }
 
-/// Value::encode_into's integer size classes: byte width of the BODY
-/// (0x01 zero -> 0, 0x02 i8 -> 1, 0x03 i16 -> 2, 0x04 i32 -> 4,
-/// 0x05 i64 -> 8; see types/value.rs).
-fn int_class(v: i64) -> usize {
-    if v == 0 {
-        0
-    } else if v >= i8::MIN as i64 && v <= i8::MAX as i64 {
-        1
-    } else if v >= i16::MIN as i64 && v <= i16::MAX as i64 {
-        2
-    } else if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
-        4
-    } else {
-        8
-    }
-}
-
 /// Read-only tree walk collecting page ids (btree pages + leaf overflow
 /// chains). Already-seen pages short-circuit (guards cycles). Page 0's
 /// hybrid header is handled by the Page accessors' header_offset.
@@ -791,7 +1101,7 @@ fn collect_tree(
     is_schema_tree: bool,
     seen: &mut PageIdSet,
     refs: &mut HashMap<u32, Vec<(u32, u32)>, PageIdHashBuild>,
-    schema_sites: &mut Vec<(u32, u32, i64)>,
+    schema_cells: &mut Vec<SchemaCellRaw>,
     parse_object_leaf_chains: bool,
 ) -> Result<()> {
     if !seen.insert(page_id) {
@@ -862,25 +1172,39 @@ fn collect_tree(
                         }
                         if is_schema_tree {
                             // A schema row spanning an overflow chain has
-                            // no stable in-page column offsets — decline
-                            // the in-place path for that shape.
-                            schema_sites.push((page_id, u32::MAX, -1));
+                            // no in-page record bytes to re-encode —
+                            // decline the in-place path for that shape.
+                            schema_cells.push(SchemaCellRaw {
+                                page: page_id,
+                                cell_idx: i as u16,
+                                payload: Vec::new(),
+                                ok: false,
+                            });
                         }
                         continue;
                     }
-                    // Schema-tree leaf: locate column 3's (rootpage) body
-                    // offset for the in-place root patch. The row record
-                    // is [type TEXT][name TEXT][tbl_name (TEXT|NULL)]
-                    // [rootpage INT][sql TEXT] — each value is
-                    // [tag][body] (see Value::encode_into).
+                    // Schema-tree leaf: collect the cell for plan-time
+                    // re-encode (the row record is [type TEXT][name TEXT]
+                    // [tbl_name (TEXT|NULL)][rootpage INT][sql TEXT] —
+                    // each value [tag][body], see Value::encode_into).
                     if is_schema_tree {
-                        if let Some((body_off, root)) =
-                            schema_rootpage_site(&b.data[payload_start..])
-                        {
-                            schema_sites.push((page_id, (payload_start + body_off) as u32, root));
+                        let plen = plen as usize;
+                        let end = payload_start + plen;
+                        if end <= b.data.len() {
+                            schema_cells.push(SchemaCellRaw {
+                                page: page_id,
+                                cell_idx: i as u16,
+                                payload: b.data[payload_start..end].to_vec(),
+                                ok: true,
+                            });
                         } else {
-                            // Unparseable row: decline.
-                            schema_sites.push((page_id, u32::MAX, -1));
+                            // Record runs past the page: corrupt — decline.
+                            schema_cells.push(SchemaCellRaw {
+                                page: page_id,
+                                cell_idx: i as u16,
+                                payload: Vec::new(),
+                                ok: false,
+                            });
                         }
                     }
                 }
@@ -969,74 +1293,13 @@ fn collect_tree(
                     is_schema_tree,
                     seen,
                     refs,
-                    schema_sites,
+                    schema_cells,
                     parse_object_leaf_chains,
                 )?;
             }
             Ok(())
         }
         PageType::Overflow => Ok(()), // reached only via collect_overflow
-    }
-}
-
-/// Locate column 3's (rootpage) BODY offset inside a schema row's
-/// record payload, plus its current integer value. Skips the three
-/// leading columns generically (any tag layout Value::encode_into can
-/// produce). Returns None on any parse failure (caller declines).
-fn schema_rootpage_site(payload: &[u8]) -> Option<(usize, i64)> {
-    let mut off = 0usize;
-    for _ in 0..3 {
-        off += value_span(&payload[off..])?;
-    }
-    let tag = *payload.get(off)?;
-    let body = off + 1;
-    let read_body = |n: usize, signed: bool| -> Option<i64> {
-        let raw = payload.get(body..body + n)?;
-        let mut v: i64 = 0;
-        for (i, &b) in raw.iter().enumerate() {
-            v |= (b as i64) << (8 * i); // little-endian bodies
-        }
-        if signed {
-            // Sign-extend from the top bit of the last byte.
-            let bits = 8 * n;
-            if bits < 64 && (v >> (bits - 1)) & 1 == 1 {
-                v -= 1i64 << bits;
-            }
-        }
-        Some(v)
-    };
-    let (val, width) = match tag {
-        0x01 => (0, 0),
-        0x02 => (read_body(1, true)?, 1),
-        0x03 => (read_body(2, true)?, 2),
-        0x04 => (read_body(4, true)?, 4),
-        0x05 => (read_body(8, true)?, 8),
-        _ => return None, // column 3 is not an integer: unexpected shape
-    };
-    let _ = width;
-    Some((body, val))
-}
-
-/// Total encoded byte length of the value starting at `bytes[0]` (tag
-/// first — see Value::encode_into).
-fn value_span(bytes: &[u8]) -> Option<usize> {
-    let tag = *bytes.first()?;
-    match tag {
-        0x00 | 0x01 | 0x09 => Some(1),
-        0x02 => Some(2),
-        0x03 => Some(3),
-        0x06 => Some(9),
-        0x04 => Some(5),
-        0x05 => Some(9),
-        0x07 | 0x08 | 0x0B => {
-            let (len, n) = crate::storage::btree::varint::decode(&bytes[1..])?;
-            Some(1 + n + len as usize)
-        }
-        0x0A => {
-            let (_, n) = crate::storage::btree::varint::decode(&bytes[1..])?;
-            Some(1 + n)
-        }
-        _ => None,
     }
 }
 

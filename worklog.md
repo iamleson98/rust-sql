@@ -2838,3 +2838,88 @@ Stage Summary:
   row-value misuse (51.1, 71.0), collation-through-IN (65.2/65.3),
   view/join-order singles (73.3/73.4), 74.x, 75.1, 76.4/76.5, 15.0,
   31.3, 32.10.
+
+---
+Task ID: vac-1 (the S14 windows red -> the in-place re-encode round)
+Agent: main (Super Z)
+
+Work Log:
+- CI STATE AT OPEN: run 467 (7b5ed4d) red on ONE gate — torture
+  windows S14 vacuum_ms rq 33.6ms vs sq 2.2ms (0.06x, 15x over). The
+  same code drew macos 1.3ms WIN / ubuntu 1.5ms WIN in the SAME run;
+  windows' historical envelope on unchanged vacuum code is 3.4-4.3ms.
+  Re-ran the failed jobs -> run 467 attempt 2 ALL GREEN (the draw was
+  a runner AV/IO-tax storm). But the dig it prompted found three real
+  latent defects in the in-place VACUUM path.
+- ROOT CAUSE 1 (the decline that made S14 slow everywhere): the
+  in-place planner looked the schema row's RAW rootpage (SQLite 1-based
+  convention) up in the live map keyed by INTERNAL 0-based ids. For
+  any object whose root+1 page died (every suffix mass-delete — the
+  truncate DELETE frees the tail past the promoted root), the lookup
+  missed and the whole file fell to the row-level temp-FILE rebuild.
+  S14's shape NEVER took the in-place path. (The monotone pack keeps
+  adjacent live pages adjacent, so the old byte-patch VALUE was
+  accidentally right whenever the lookup hit — a perf bug, not
+  corruption.)
+- ROOT CAUSE 2: the byte patch required same-width rootpage bodies;
+  compacting a root from a 2-byte id (~471) into the 1-byte range (~65)
+  is a size-class change the patch could not write — legitimate
+  re-encode territory, previously declining to the image path.
+- ROOT CAUSE 3 (surfaced by the fix): install_in_place_compaction's
+  move loop started at k=1, so SLOT 0's reference patches never ran —
+  a split schema tree's interior root (page 0) kept pointing at the
+  RETIRED old leaf ids after the moves ("page 57 out of range,
+  n_pages=28"). Masked historically by the planner's near-total
+  decline rate (identity plans need no patches).
+- FIX (vacuum.rs + pager.rs + api.rs debug): SchemaRootPatch (same-
+  width byte patch) replaced by SchemaCellPatch (full row RE-ENCODE —
+  the rootpage column is re-encoded at any width, the overflow-guard
+  declines only genuinely spilling rows) + rebuild_schema_leaf (byte-
+  level compact re-lay of a schema leaf at its NEW slot; engine page
+  layout: n_cells@+4, content_start@+6 with the 0=page_size
+  convention, ptr array@+12 — NOT SQLite's 8-byte header). The site
+  lookup now converts sqlite-convention -> internal before the map
+  query and back (+1) on write.
+- ELIGIBILITY RELAXATION: the schema tree gets a dedicated walk
+  (schema_tree_leaves_rebuildable) collecting its leaf ids and checking
+  only the rebuild's hard precondition (every cell size-parseable).
+  Shape guards (empty/hollow/waste budget) no longer apply to the
+  SCHEMA tree — the install re-lays every schema leaf densely, so a
+  split schema tree's half-filled frontier leaf (the 60-object shape)
+  no longer pushes the whole file onto the row-level rebuild. Object
+  trees keep the strict gate (in-place moves pages but cannot re-flow
+  or prune them). NOTE: the old combined gate call never actually
+  walked the schema tree (the walker's 0-filter) — the dedicated walk
+  is the first real schema gate.
+- INSTALL: the move loop now runs k=0..new_n (page 0's child-ref
+  patches apply; identity guard unchanged), and 1b re-lays EVERY
+  schema leaf (patch lookup by leaf id, safety net for patched leaves
+  missing from the rebuild set).
+- DECLINE INSTRUMENTATION: every silent None/Err branch in the
+  planner + the swallowed compact_page_copy error now print under
+  RSQL_VAC_TIMING (this is how the root causes were found — the
+  dig took 4 rebuild-and-run cycles).
+- VERIFIED (sandbox, release): torture S14 rq vacuum 1.7-2.2ms
+  (row-file) -> 0.72-0.77ms (in-place) vs sq 2.26ms — 2.9x WIN on
+  Linux, and the windows Defender-magnet temp-file dance (create temp
+  DB + write + fsync + read-back + stream install + unlink) is gone
+  for the flagship churn shape. Full local torture matrix at scale
+  0.20: ZERO gate failures. New tests/vacuum_inplace_reencode.rs (2
+  tests): the no-index suffix mass-delete (rootpage 471 -> 65 class
+  change, reopen, DML-after, second identity vacuum) and the
+  60-populated-tables drop-35 shape (15 patches across TWO MOVED
+  schema leaves, k=0 ref fix pinned). Both traced in-place via
+  RSQL_VAC_TIMING. Suites green: lib 316/316, vacuum_reclaim,
+  vacuum_probe, crash_recovery, db_corrupt_fuzz, drop_create_cycle,
+  wal, sorted_batch_index, mega_scale, sqlite_semantics_battery,
+  error_parity, correlated, fuzz_regressions, regression, attach,
+  sqlite_interop, session_differential, integrity_check,
+  pragma_introspect; fmt + clippy --all-targets clean.
+
+Stage Summary:
+- Three latent in-place VACUUM defects fixed (raw-vs-internal rootpage
+  lookup, same-width patch limit, slot-0 ref patches); schema-cell
+  re-encode + schema-leaf re-lay make the in-place path the common
+  case for suffix-churn shapes; S14 vacuum 0.77ms vs SQLite 2.26ms
+  locally. Windows S14's cold-file-op envelope should collapse from
+  the 3.4-4.3ms LOSS class toward the in-place single-commit shape.

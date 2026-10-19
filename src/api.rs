@@ -4571,6 +4571,9 @@ impl Database {
             Ok(m) => m,
             Err(e) => {
                 // Decline: the caller falls back to the row-level path.
+                if std::env::var_os("RSQL_VAC_TIMING").is_some() {
+                    eprintln!("[vac] page-copy image declined: {e}");
+                }
                 let _ = e;
                 drop(tmp);
                 return Ok(None);

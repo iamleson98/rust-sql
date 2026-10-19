@@ -6849,9 +6849,16 @@ impl Pager {
         // 1. THE MOVES (ascending new id — see the monotonicity argument
         //    above). Slot k's destination page is created directly on a
         //    cache miss (no disk read: whatever bytes it holds are about
-        //    to be overwritten).
+        //    to be overwritten). The loop starts at k=0: page 0 never
+        //    MOVES (sorted[0] = 0, the o == k identity guard skips the
+        //    copy) but it carries REFERENCE PATCHES whenever the schema
+        //    tree is an interior root whose leaf children moved — a
+        //    split schema tree's child pointers are re-anchored here
+        //    (starting at k=1 left them pointing at the retired old
+        //    leaf ids — unreachable-memory corruption the old planner's
+        //    near-total decline rate had masked).
         let psz = self.page_size() as usize;
-        for k in 1..new_n {
+        for k in 0..new_n {
             let o = plan.sorted[k as usize];
             if o == k && !plan.refs.contains_key(&o) {
                 continue; // identity, no referenced page moved
@@ -6911,35 +6918,77 @@ impl Pager {
             self.note_dirty(k);
             self.dirty_count_approx.fetch_add(1, Ordering::Relaxed);
         }
-        // 1b. Schema-row rootpage patches: the roots that moved are
-        //     re-anchored in the schema rows' column-3 bodies (same tag,
-        //     same byte width — verified at plan time). Applied at each
-        //     schema leaf's NEW slot after the moves.
-        for patch in &plan.schema_patches {
-            let slot = plan
-                .map
-                .get(&patch.leaf_old)
-                .copied()
-                .unwrap_or(patch.leaf_old);
-            let leaf = self.get_page(slot)?;
-            {
-                let mut d = leaf.lock();
-                let off = patch.body_off as usize;
-                let end = off + patch.width as usize;
-                if end <= d.data.len() {
-                    let v = patch.new_root as i64;
-                    for i in 0..patch.width as usize {
-                        d.data[off + i] = ((v >> (8 * i)) & 0xFF) as u8; // LE body
-                    }
-                    d.touch();
-                } else {
-                    return Err(Error::corruption(format!(
-                        "in-place vacuum: schema rootpage patch out of bounds (page {slot})"
-                    )));
-                }
+        // 1b. Schema-tree re-lay: EVERY schema leaf is rebuilt compactly
+        //     at its NEW slot (after the moves) — leaves whose rows'
+        //     object roots MOVED get those rows re-encoded with the new
+        //     rootpage (full cell re-encode; the value may change size
+        //     class), and hollow/split frontier leaves get their gap
+        //     reclaimed. This is why the plan's gate exempts the schema
+        //     tree from the shape guards the object trees still face.
+        //     Patch lookup by leaf id: a leaf can hold several patched
+        //     rows (the rebuild takes the whole per-leaf patch set at
+        //     once).
+        if !plan.schema_rebuild_leaves.is_empty() {
+            let mut by_leaf: HashMap<u32, Vec<(u16, Vec<u8>)>> = HashMap::new();
+            for patch in &plan.schema_patches {
+                by_leaf
+                    .entry(patch.leaf_old)
+                    .or_default()
+                    .push((patch.cell_idx, patch.payload.clone()));
             }
-            self.note_dirty(slot);
-            self.dirty_count_approx.fetch_add(1, Ordering::Relaxed);
+            for &leaf_old in &plan.schema_rebuild_leaves {
+                let slot = plan.map.get(&leaf_old).copied().unwrap_or(leaf_old);
+                let cell_patches = by_leaf.remove(&leaf_old).unwrap_or_default();
+                if std::env::var_os("RSQL_VAC_TIMING").is_some() {
+                    eprintln!(
+                        "[vac] install: re-laying schema leaf {} -> slot {} ({} cell patches)",
+                        leaf_old,
+                        slot,
+                        cell_patches.len()
+                    );
+                }
+                let leaf = self.get_page(slot)?;
+                {
+                    let mut d = leaf.lock();
+                    let hdr = if slot == 0 {
+                        crate::storage::page::DB_HEADER_SIZE as usize
+                    } else {
+                        0
+                    };
+                    crate::storage::vacuum::rebuild_schema_leaf(&mut d.data, hdr, &cell_patches)
+                        .map_err(|e| {
+                            Error::corruption(format!(
+                                "in-place vacuum: schema leaf rebuild failed (page {slot}): {e}"
+                            ))
+                        })?;
+                    d.touch();
+                }
+                self.note_dirty(slot);
+                self.dirty_count_approx.fetch_add(1, Ordering::Relaxed);
+            }
+            // Safety net: a patched leaf that somehow is not in the
+            // rebuild set must still be re-laid (its rows changed).
+            for (leaf_old, cell_patches) in by_leaf {
+                let slot = plan.map.get(&leaf_old).copied().unwrap_or(leaf_old);
+                let leaf = self.get_page(slot)?;
+                {
+                    let mut d = leaf.lock();
+                    let hdr = if slot == 0 {
+                        crate::storage::page::DB_HEADER_SIZE as usize
+                    } else {
+                        0
+                    };
+                    crate::storage::vacuum::rebuild_schema_leaf(&mut d.data, hdr, &cell_patches)
+                        .map_err(|e| {
+                            Error::corruption(format!(
+                                "in-place vacuum: schema leaf rebuild failed (page {slot}): {e}"
+                            ))
+                        })?;
+                    d.touch();
+                }
+                self.note_dirty(slot);
+                self.dirty_count_approx.fetch_add(1, Ordering::Relaxed);
+            }
         }
         // 2. Reset the freelist BEFORE the tail retirement: moved pages
         //    may have overwritten in-range freelist trunk pages, so the
