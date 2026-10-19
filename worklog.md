@@ -3209,3 +3209,31 @@ Stage Summary:
 - window1 board: 9 divergences (23.x sort-merge EQP x5; 32.10
   ALTER-RENAME view re-validation; 50.5; 73.3 join-order parity; 73.4
   UPDATE-FROM-with-window parse).
+
+---
+Task ID: win-5 (design note for the next round — the 23.x sort-merge)
+Agent: main (Super Z)
+
+Work Log:
+- SCOPED (not implemented this session): window1 23.1-23.6 — SQLite's
+  window-sort merging. Oracle EQP: each DISTINCT window ordering
+  (partition_by ++ order_by sequence, collations + directions) sorts
+  ONCE ("USE TEMP B-TREE FOR ORDER BY" per distinct key); an ordering
+  that an available INDEX provides needs NO sort (23.1: SCAN t5 USING
+  INDEX t5ab, zero ORDER lines — the window's key must feed scan
+  selection).
+- Implementation sketch: (a) exec_window groups windows by sort
+  signature (format!("{:?}") of (partition_by, order_by) — same key
+  shape as WindowExpr::expr_key); split exec_one_window into the
+  partition+sort pass (shared per group: partitions + sorted indices
+  + the order key_cache) and the per-function evaluation pass;
+  (b) EQP: one "USE TEMP B-TREE FOR ORDER BY" per distinct non-index
+  sort above the SCAN line, before "USE WINDOW FUNCTION";
+  (c) index-provided orders: the planner's window collection checks
+  whether the input scan's index covers the first window's key
+  (prefix match, all-ASC) and suppresses the sort (and EQP shows the
+  index scan).
+- The remaining board after this round: 9 (23.x x5; 32.10
+  ALTER-RENAME view re-validation; 50.5 the dbsqlfuzz tower; 73.3
+  join-order parity — t1-outer/t2-inner vs our DP choice under
+  WHERE b=4; 73.4 UPDATE-FROM-with-window parse).
