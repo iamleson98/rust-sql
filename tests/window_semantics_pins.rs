@@ -1369,7 +1369,7 @@ fn recursive_cte_window_error_precedes_resolution() {
     // window1 15.0: windows in a recursive CTE's arms error at prepare
     // time, BEFORE the arms' name resolution (the q.id-style resolution
     // noise never surfaces). The setup arm stays exempt.
-    let mut db = Database::open_in_memory().unwrap();
+    let db = Database::open_in_memory().unwrap();
     let err = db
         .query(
             "WITH t(id, parent) AS (SELECT 1, NULL UNION ALL SELECT 2, NULL), \
