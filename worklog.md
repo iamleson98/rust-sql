@@ -3151,3 +3151,37 @@ Stage Summary:
 - window1 board: 12 divergences (23.x sort-merge EQP counts x5;
   73.3 join-order parity; 73.4 UPDATE-FROM-with-window parse; value
   bugs 15.0, 32.10, 47.2, 50.5, 51.1).
+
+---
+Task ID: win-5c (the GROUP BY window-misuse + row-value prepare checks)
+Agent: main (Super Z)
+
+Work Log:
+- window1 47.2 — the real rule (oracle-mapped across 10 probes):
+  `GROUP BY <ordinal>` resolving to a WINDOW select item is "misuse of
+  window function f()"; `GROUP BY <alias>` of an OVER-aliased select
+  item is "misuse of aliased window function a" (a real source column
+  of the same name wins, like every alias extension). Both fire at
+  PREPARE time in namecheck (a WHERE's OR short-circuit would
+  otherwise skip the subquery that carries the shape — the runtime
+  class of check returned rows instead of the error). The alias check
+  uses alias_ref_or_descend (the DIRECT bare-name arm —
+  find_aliased_window_ref's entry walks subqueries only, the win-43
+  ORDER-BY shape).
+- window1 51.1 — a scalar sub-select whose SINGLE result item is a
+  ROW VALUE is "row value misused" at prepare time (namecheck's
+  Subquery arm): the evaluation-time check never ran over empty
+  tables / zero groups. The multi-COLUMN sub-select form
+  (`(a,b) = (SELECT x,y FROM t)`) stays legal.
+- Mapped-legal controls verified: GROUP BY 1 pointing at a literal;
+  textual window calls in GROUP BY (already errored); windows over
+  GROUP BY queries generally legal (`count(*) OVER() ... GROUP BY x`).
+- VERIFIED: window1 12 -> 10; the 108-shape probe battery at the 5
+  known pre-existing; window3 1482/1482 + window8 361/361 clean; the
+  select1/select4 differential at the documented pre-existing counts;
+  lib 316/316; 25/25 window pins (1 new family); fmt + clippy clean.
+
+Stage Summary:
+- window1 board: 10 divergences (23.x sort-merge EQP x5; 15.0
+  recursive-CTE check ordering; 32.10 ALTER-RENAME view re-validation;
+  50.5; 73.3 join-order parity; 73.4 UPDATE-FROM-with-window parse).

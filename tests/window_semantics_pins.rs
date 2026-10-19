@@ -1291,3 +1291,75 @@ fn star_with_order_only_aggregate_reads_its_own_slot() {
         "star beside order-only aggregate (a=1 group)",
     );
 }
+
+#[test]
+fn group_by_window_misuse_and_row_value_subselect() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE t1(a)", ()).unwrap();
+    db.execute("CREATE TABLE t2(k)", ()).unwrap();
+    db.execute("INSERT INTO t2 VALUES (1)", ()).unwrap();
+    // window1 47.2: GROUP BY <ordinal> resolving to a window select item
+    // is "misuse of window function f()" — at PREPARE time, so a WHERE
+    // OR short-circuit cannot skip the subquery that carries it.
+    let err = db
+        .query(
+            "SELECT 234 FROM t2 WHERE k=1 OR (SELECT k FROM t2 WHERE (SELECT sum(a) OVER() FROM t1 GROUP BY 1))",
+            (),
+        )
+        .err()
+        .unwrap();
+    assert!(
+        err.sqlite_message()
+            .contains("misuse of window function sum()"),
+        "{}",
+        err.sqlite_message()
+    );
+    let err = db
+        .query("SELECT 1, sum(a) OVER() FROM t1 GROUP BY 2", ())
+        .err()
+        .unwrap();
+    assert!(
+        err.sqlite_message()
+            .contains("misuse of window function sum()"),
+        "{}",
+        err.sqlite_message()
+    );
+    // A literal ordinal (pointing at a non-window item) stays legal.
+    db.query("SELECT 1, sum(a) OVER() FROM t1 GROUP BY 1", ())
+        .unwrap();
+    // GROUP BY <alias> of a window item: the aliased misuse message,
+    // unless a real source column of the same name wins.
+    let err = db
+        .query("SELECT sum(a) OVER() AS s FROM t1 GROUP BY s", ())
+        .err()
+        .unwrap();
+    assert!(
+        err.sqlite_message()
+            .contains("misuse of aliased window function s"),
+        "{}",
+        err.sqlite_message()
+    );
+    // window1 51.1: a scalar sub-select whose single result item is a
+    // ROW VALUE is "row value misused" at prepare time (zero-row inputs
+    // never evaluate anything; the HAVING over zero groups would
+    // otherwise skip it entirely).
+    let err = db
+        .query(
+            "SELECT c FROM t1 GROUP BY a HAVING(SELECT(sum(a), sum(a)))",
+            (),
+        )
+        .err()
+        .unwrap();
+    assert!(
+        err.sqlite_message().contains("row value misused"),
+        "{}",
+        err.sqlite_message()
+    );
+    // The multi-COLUMN sub-select form stays legal in row comparisons.
+    db.execute("INSERT INTO t1 VALUES (7)", ()).unwrap();
+    assert_vals(
+        one_col(&mut db, "SELECT (7,7) = (SELECT a, a FROM t1)"),
+        &[Value::Integer(1)],
+        "two-column sub-select vs row comparison",
+    );
+}

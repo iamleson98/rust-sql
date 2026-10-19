@@ -912,6 +912,68 @@ fn validate_simple_select(
         }
     }
     // ---- GROUP BY ----
+    // Window-function misuse, SQLite's prepare-time checks (window1
+    // 47.2: the error must fire before execution — a WHERE's OR
+    // short-circuit would otherwise skip the subquery that carries it):
+    // an ORDINAL resolving to a window select item is "misuse of
+    // window function f()", and a bare reference to an OVER-aliased
+    // select item is "misuse of aliased window function a" (a real
+    // source column of the same name still wins, like every alias
+    // extension).
+    {
+        let win_aliases: Vec<String> = s
+            .columns
+            .iter()
+            .filter_map(|c| match c {
+                ResultColumn::Expr {
+                    expr,
+                    alias: Some(a),
+                } if crate::planner::expr_has_window(expr) => Some(a.clone()),
+                _ => None,
+            })
+            .collect();
+        let sel_exprs: Vec<&Expr> = s
+            .columns
+            .iter()
+            .filter_map(|c| match c {
+                ResultColumn::Expr { expr, .. } => Some(expr),
+                _ => None,
+            })
+            .collect();
+        let source_has = |name: &str| {
+            scope
+                .levels
+                .last()
+                .map(|l| l.sources.iter().any(|src| src.has_column(name)))
+                .unwrap_or(false)
+        };
+        for g in &s.group_by {
+            if let Some(k) = crate::planner::ordinal_term(g) {
+                if let Some(e) = k
+                    .checked_sub(1)
+                    .and_then(|i| usize::try_from(i).ok())
+                    .and_then(|i| sel_exprs.get(i))
+                {
+                    if let Some(w) = find_window_call(e) {
+                        scope.pop_level();
+                        return Err(Error::semantic(format!("misuse of window function {w}()")));
+                    }
+                }
+            } else if !win_aliases.is_empty() {
+                // alias_ref_or_descend: the DIRECT bare-name arm too
+                // (find_aliased_window_ref's entry walks subqueries
+                // only — the win-43 ORDER-BY shape).
+                if let Some(a) = alias_ref_or_descend(g, &win_aliases) {
+                    if !source_has(a) {
+                        scope.pop_level();
+                        return Err(Error::semantic(format!(
+                            "misuse of aliased window function {a}"
+                        )));
+                    }
+                }
+            }
+        }
+    }
     for g in &s.group_by {
         if let Err(e) = validate_expr(ctx, g, scope, ctes) {
             scope.pop_level();
@@ -1908,7 +1970,26 @@ fn validate_expr(ctx: &Ctx<'_>, e: &Expr, scope: &mut Scope, visible: &CteList) 
             }
             Ok(())
         }
-        Expr::Subquery(sel) => validate_select(ctx, sel, scope, visible),
+        Expr::Subquery(sel) => {
+            // A scalar sub-select whose SINGLE result item is a row
+            // value is "row value misused" at PREPARE time (SQLite's
+            // static check — zero-row inputs never evaluate anything,
+            // and a HAVING over zero groups would otherwise skip it
+            // entirely: window1 51.1). The multi-COLUMN form
+            // (`(a,b) = (SELECT x,y FROM t)`) stays legal.
+            if let SelectBody::Simple(ss) = &sel.body {
+                if matches!(
+                    ss.columns.as_slice(),
+                    [ResultColumn::Expr {
+                        expr: Expr::Row(_),
+                        ..
+                    }]
+                ) {
+                    return Err(Error::semantic("row value misused"));
+                }
+            }
+            validate_select(ctx, sel, scope, visible)
+        }
         Expr::Exists(sel) => validate_select(ctx, sel, scope, visible),
         Expr::Cast { expr, .. } => validate_expr(ctx, expr, scope, visible),
         Expr::Collate { expr, .. } => validate_expr(ctx, expr, scope, visible),
