@@ -685,6 +685,82 @@ fn validate_cte_bodies(
     Ok(own)
 }
 
+/// The recursive-CTE window check (SQLite's sqlite3Select rule, hoisted
+/// to validation time): a compound CTE whose tail arms read the CTE's
+/// own name may not carry window functions anywhere in those arms or
+/// the compound's ORDER BY.
+fn recursive_window_check(cte: &Cte) -> Result<()> {
+    fn flatten<'a>(body: &'a SelectBody, out: &mut Vec<&'a SelectBody>) {
+        match body {
+            SelectBody::Binary { left, right, .. } => {
+                flatten(left, out);
+                out.push(right);
+            }
+            simple => out.push(simple),
+        }
+    }
+    fn body_reads_table(body: &SelectBody, name_lc: &str) -> bool {
+        fn from_reads(te: &crate::sql::ast::TableExpression, name_lc: &str) -> bool {
+            match te {
+                crate::sql::ast::TableExpression::Table { name, .. } => {
+                    name.to_ascii_lowercase() == name_lc
+                }
+                crate::sql::ast::TableExpression::Join { left, right, .. } => {
+                    from_reads(left, name_lc) || from_reads(right, name_lc)
+                }
+                _ => false,
+            }
+        }
+        match body {
+            SelectBody::Simple(s) => s
+                .from
+                .as_ref()
+                .map(|f| from_reads(f, name_lc))
+                .unwrap_or(false),
+            SelectBody::Binary { left, right, .. } => {
+                body_reads_table(left, name_lc) || body_reads_table(right, name_lc)
+            }
+        }
+    }
+    fn has_win_body(body: &SelectBody) -> bool {
+        match body {
+            SelectBody::Simple(ss) => {
+                ss.columns.iter().any(|c| {
+                    matches!(c, ResultColumn::Expr { expr, .. } if find_window_call(expr).is_some())
+                }) || ss.where_clause.as_ref().is_some_and(|e| find_window_call(e).is_some())
+                    || ss.having.as_ref().is_some_and(|e| find_window_call(e).is_some())
+            }
+            SelectBody::Binary { left, right, .. } => has_win_body(left) || has_win_body(right),
+        }
+    }
+    let mut arms: Vec<&SelectBody> = Vec::new();
+    flatten(&cte.select.body, &mut arms);
+    if arms.len() < 2 {
+        return Ok(());
+    }
+    let name_lc = cte.name.to_ascii_lowercase();
+    // The recursive region: tail arms that read the CTE's own name.
+    let first_rec = arms.iter().position(|b| body_reads_table(b, &name_lc));
+    let Some(first_rec) = first_rec else {
+        return Ok(());
+    };
+    if first_rec == 0 {
+        return Ok(()); // circular shapes: the executor's split reports them
+    }
+    let recursive_arms_have_win = arms[first_rec..].iter().any(|b| has_win_body(b))
+        || cte
+            .select
+            .order_by
+            .iter()
+            .any(|t| find_window_call(&t.expr).is_some());
+    if recursive_arms_have_win {
+        return Err(Error::semantic(
+            "cannot use window functions in recursive queries",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_select(
     ctx: &Ctx<'_>,
     stmt: &SelectStatement,
@@ -699,6 +775,12 @@ fn validate_select(
     // CTE body validation (each body sees outer + earlier + itself).
     if let Some(w) = &stmt.with {
         for (i, cte) in w.ctes.iter().enumerate() {
+            // WITH RECURSIVE: window functions in the RECURSIVE arms
+            // are a PREPARE-time error — BEFORE the arms' name
+            // resolution, so a q.id-style resolution failure never
+            // masks it (window1 15.0). The setup arm is exempt (it
+            // runs once, before any recursion).
+            recursive_window_check(cte)?;
             let mut body_visible: CteList = visible.to_vec();
             body_visible.extend(own.iter().take(i + 1).cloned());
             let mut body_scope = scope.clone();

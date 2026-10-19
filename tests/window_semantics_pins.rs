@@ -1363,3 +1363,35 @@ fn group_by_window_misuse_and_row_value_subselect() {
         "two-column sub-select vs row comparison",
     );
 }
+
+#[test]
+fn recursive_cte_window_error_precedes_resolution() {
+    // window1 15.0: windows in a recursive CTE's arms error at prepare
+    // time, BEFORE the arms' name resolution (the q.id-style resolution
+    // noise never surfaces). The setup arm stays exempt.
+    let mut db = Database::open_in_memory().unwrap();
+    let err = db
+        .query(
+            "WITH t(id, parent) AS (SELECT 1, NULL UNION ALL SELECT 2, NULL), \
+             q AS (SELECT t.*, ROW_NUMBER() OVER (ORDER BY t.id) AS rn FROM t WHERE parent IS NULL \
+             UNION ALL \
+             SELECT t.*, ROW_NUMBER() OVER (ORDER BY t.id) AS rn FROM q JOIN t ON t.parent = q.id) \
+             SELECT * FROM q",
+            (),
+        )
+        .err()
+        .unwrap();
+    assert!(
+        err.sqlite_message()
+            .contains("cannot use window functions in recursive queries"),
+        "{}",
+        err.sqlite_message()
+    );
+    // The setup arm alone is exempt (runs once, before recursion).
+    db.query(
+        "WITH c(a) AS (SELECT row_number() OVER () UNION ALL SELECT a+1 FROM c WHERE a < 3) \
+         SELECT * FROM c",
+        (),
+    )
+    .unwrap();
+}

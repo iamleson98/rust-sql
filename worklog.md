@@ -3185,3 +3185,27 @@ Stage Summary:
 - window1 board: 10 divergences (23.x sort-merge EQP x5; 15.0
   recursive-CTE check ordering; 32.10 ALTER-RENAME view re-validation;
   50.5; 73.3 join-order parity; 73.4 UPDATE-FROM-with-window parse).
+
+---
+Task ID: win-5d (the recursive-CTE window check at prepare time)
+Agent: main (Super Z)
+
+Work Log:
+- window1 15.0: the recursive-CTE window check existed (cte.rs,
+  execution time — win-2's round) but the q.id-style name-resolution
+  failure fired FIRST (the CLI's prepare runs namecheck, whose CTE
+  body validation errors on the star-setup-arm column inference).
+  The check is now ALSO at validation time (namecheck's
+  validate_select CTE loop — the SELECT path's inline loop, not the
+  DML-only validate_cte_bodies): a compound CTE whose tail arms read
+  its own name may not carry windows in those arms or the compound's
+  ORDER BY — "cannot use window functions in recursive queries",
+  before any resolution. Setup arm exempt (mirrors cte.rs).
+- VERIFIED: window1 10 -> 9; with1/with2 differential SET-IDENTICAL
+  to the pre-change baseline (40 pre-existing, none new); lib 316/316;
+  26/26 window pins (1 new); fmt + clippy clean.
+
+Stage Summary:
+- window1 board: 9 divergences (23.x sort-merge EQP x5; 32.10
+  ALTER-RENAME view re-validation; 50.5; 73.3 join-order parity; 73.4
+  UPDATE-FROM-with-window parse).
