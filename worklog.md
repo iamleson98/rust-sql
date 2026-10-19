@@ -2923,3 +2923,65 @@ Stage Summary:
   case for suffix-churn shapes; S14 vacuum 0.77ms vs SQLite 2.26ms
   locally. Windows S14's cold-file-op envelope should collapse from
   the 3.4-4.3ms LOSS class toward the in-place single-commit shape.
+
+---
+Task ID: win-4a (subquery bare-column semantics under GROUP BY)
+Agent: main (Super Z)
+
+Work Log:
+- BOX RESET mid-round (second this session): toolchain, corpus, tcl
+  harness and the uncommitted vacuum work's working tree rolled back;
+  588a700 (vacuum re-encode) was already pushed — safe. Recovery:
+  hard-reset to origin/master, re-apply subquery_bare.rs + planner
+  wiring onto the win-2-restructured planner (AST drift: Expr::Function
+  grew order_by, limit/offset de-Boxed, CteMaterialization now a
+  3-tuple), rebuild toolchain + tclsh + tcl_db_server + the SQLite
+  test-dir sparse clone.
+- BUG (window1 76.4/76.5, minimal repro `SELECT (SELECT y) FROM t3
+  JOIN t4 ON x=y GROUP BY x` -> all NULL): correlated references that
+  LEAK OUT of select-list / HAVING / ORDER BY subqueries bind, at
+  runtime, through the outer-scope frame stack against the AGGREGATE
+  OUTPUT row ([group keys..., __agg_N...]) — which carries no
+  bare-column values. collect_bare_refs treats subqueries as scope
+  boundaries, so no bare(y) slot was ever collected and the lookup
+  fell through to silent NULL. Group-KEY correlations worked (76.1);
+  joined-table bare columns did not.
+- FIX (new src/planner/subquery_bare.rs): scope-aware collection +
+  rewrite sharing ONE scope model — the same pooled-source + CTE
+  checks the runtime classifier (subquery_is_correlated) uses. Outer
+  refs of subquery atoms in aggregate queries are collected as
+  `func:"bare"` pseudo-aggregate slots (build_full_agg_set merge) and
+  rewritten INSIDE the subquery tree to the slot's `__agg_N` output
+  column (4 rewrite hooks: HAVING, select exprs, star expansion,
+  ORDER terms), so the frame lookup binds against the Aggregate's
+  output. Group-term cutoff on both sides (a group-key display match
+  resolves through the group output column).
+- REGRESSION CAUGHT AND BOUNDARIED (the first iteration broke 37.10/
+  37.20/61.1 — "no such function: max/sum"): the rewrite descended
+  into AGGREGATE-CALL ARGUMENTS (max((SELECT ... a ...))), mutating
+  the arg and breaking the display-match against the collected
+  aggregate — the unmatched call then evaluated as a SCALAR. Aggregate
+  and window calls now own their arguments on BOTH the collection walk
+  and the top-level rewrite (their args evaluate per INPUT row, where
+  the raw columns bind directly — no bare slot needed).
+- VERIFIED: window1 board 31 -> 29 (76.4/76.5 fixed, zero collateral);
+  baseline-vs-new differential on SQLite's own select1-5.test: the 37
+  pre-existing divergences are SET-IDENTICAL (no new breaks; the
+  residue is qualified-column-name display parity, error-message
+  wording, ORDER BY range validation). lib 316/316, semantics battery,
+  error_parity, correlated, fuzz_regressions, regression, window pins,
+  feature_parity, join_reorder, nested_join, pushdown_subquery,
+  vacuum_inplace_reencode all green; fmt + clippy --all-targets clean.
+- CI 468 (588a700): all green except torture-class windows bench-gate
+  "Mixed R/W (4 readers + 1 writer)" rq 18,553 vs sq 34,350 (0.54x,
+  best-of-3 on a vacuum-only diff; the row's windows history is 1.18x-
+  2.02x WIN at 41-77k ops/s while SQLite held its normal 30-38k) — a
+  runner-side CPU-contention storm of the documented macOS MRMW class,
+  this time on a windows runner. Re-run requested.
+
+Stage Summary:
+- window1 board: 29 true divergences (T1 10, T2 11, P 8). Subquery
+  bare-column semantics under GROUP BY now complete (group keys AND
+  joined bare columns). The select-list-subquery family's remaining
+  members (53.0, 57.3, 61.4.2/3, 63.3) are window-in-FROM-less-
+  subquery shapes — a different root cause, next round's lever.

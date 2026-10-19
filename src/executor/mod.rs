@@ -5699,7 +5699,7 @@ fn cte_scope_of(
 
 /// Collect source aliases/table names from a SELECT's FROM clause,
 /// including join trees and nested subqueries-in-FROM.
-fn collect_select_sources(
+pub(crate) fn collect_select_sources(
     sel: &SelectStatement,
     catalog: &crate::schema::Catalog,
     sources: &mut std::collections::HashSet<String>,
@@ -5771,7 +5771,7 @@ fn collect_table_expression_sources(
 
 /// Collect every column reference in a SELECT statement (all clauses,
 /// including nested subqueries).
-fn collect_select_refs(sel: &SelectStatement) -> Vec<(Option<String>, String)> {
+pub(crate) fn collect_select_refs(sel: &SelectStatement) -> Vec<(Option<String>, String)> {
     let mut out = Vec::new();
     collect_body_refs(&sel.body, &mut out);
     for t in &sel.order_by {

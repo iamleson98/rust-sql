@@ -12,6 +12,7 @@ pub(crate) mod fold;
 pub mod namecheck;
 pub mod plan;
 pub(crate) mod sqlite_cost;
+mod subquery_bare;
 mod using;
 
 pub use plan::*;
@@ -1566,8 +1567,13 @@ impl<'a> Planner<'a> {
                 // expression first so the aggregate rewrite below sees
                 // the real aggregate call.
                 let having_unaliased = resolve_having_aliases(having, &alias_cols);
-                let rewritten_having = rewrite_aggregates_and_groups(
+                let having_outer = self.rewrite_subquery_outer_refs(
                     &having_unaliased,
+                    &aggregates,
+                    &resolved_group_by,
+                );
+                let rewritten_having = rewrite_aggregates_and_groups(
+                    &having_outer,
                     &aggregates,
                     &resolved_group_by,
                     n_group,
@@ -1651,11 +1657,16 @@ impl<'a> Planner<'a> {
                         }
                     }
                     ResultColumn::Expr { expr, alias } => {
+                        // Correlated outer refs inside select-list
+                        // subqueries first (see planner::subquery_bare):
+                        // they bind to bare-column __agg_N slots.
+                        let outer_fixed =
+                            self.rewrite_subquery_outer_refs(expr, &aggregates, &resolved_group_by);
                         let windowed;
                         let expr = if agg_windows.is_empty() {
-                            expr
+                            &outer_fixed
                         } else {
-                            windowed = rewrite_window_refs(expr, &agg_windows);
+                            windowed = rewrite_window_refs(&outer_fixed, &agg_windows);
                             &windowed
                         };
                         let rewritten = rewrite_aggregates_and_groups(
@@ -2438,6 +2449,10 @@ impl<'a> Planner<'a> {
         for c in &s.columns {
             if let ResultColumn::Expr { expr, .. } = c {
                 collect_bare_refs(expr, &resolved_group_by, &mut bare);
+                // Correlated references that LEAK OUT of select-list
+                // subqueries bind into THIS query's bare-column
+                // semantics under GROUP BY (see planner::subquery_bare).
+                self.collect_subquery_bare_refs(expr, &resolved_group_by, &mut bare);
             }
         }
         // Star expansions contribute their columns as bare refs (or group
@@ -2445,6 +2460,7 @@ impl<'a> Planner<'a> {
         if let Some(expanded) = self.expand_star_exprs(s) {
             for e in &expanded {
                 collect_bare_refs(e, &resolved_group_by, &mut bare);
+                self.collect_subquery_bare_refs(e, &resolved_group_by, &mut bare);
             }
         }
         if let Some(h) = &s.having {
@@ -2453,9 +2469,11 @@ impl<'a> Planner<'a> {
             // same post-substitution shape.
             let unaliased = resolve_having_aliases(h, &alias_cols);
             collect_bare_refs(&unaliased, &resolved_group_by, &mut bare);
+            self.collect_subquery_bare_refs(&unaliased, &resolved_group_by, &mut bare);
         }
         for t in order_terms {
             collect_bare_refs(&t.expr, &resolved_group_by, &mut bare);
+            self.collect_subquery_bare_refs(&t.expr, &resolved_group_by, &mut bare);
         }
         for e in bare {
             let display = match &e {
@@ -2739,8 +2757,9 @@ impl<'a> Planner<'a> {
                         // The named side's columns: matched below.
                     }
                 }
+                let e2 = self.rewrite_subquery_outer_refs(e, &aggregates, &resolved_group_by);
                 let rewritten =
-                    rewrite_aggregates_and_groups(e, &aggregates, &resolved_group_by, n_group);
+                    rewrite_aggregates_and_groups(&e2, &aggregates, &resolved_group_by, n_group);
                 cols.push(ProjectExpr {
                     expr: rewritten,
                     alias: Some(name.clone()),
@@ -2827,8 +2846,10 @@ impl<'a> Planner<'a> {
             .iter()
             .enumerate()
             .map(|(i, t)| {
+                let t_expr2 =
+                    self.rewrite_subquery_outer_refs(&t.expr, &aggregates, &resolved_group_by);
                 let rewritten =
-                    rewrite_aggregates_and_groups(&t.expr, &aggregates, &resolved_group_by, n);
+                    rewrite_aggregates_and_groups(&t_expr2, &aggregates, &resolved_group_by, n);
                 // Explicit-COLLATE re-attach (the ORIGINAL term's): the
                 // group-key match consumes a whole `v COLLATE X` term and
                 // returns the bare group output column — the wrapper
