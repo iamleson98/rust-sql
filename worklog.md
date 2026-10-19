@@ -3117,3 +3117,37 @@ Stage Summary:
   correctness bugs that predated it (wrong-side projection after
   reorder; NULLed inner columns under restorations) plus the
   star/order-only-aggregate slot drift.
+
+---
+Task ID: win-5b (the collating-aggregate + derived-scope follow-ups)
+Agent: main (Super Z)
+
+Work Log:
+- window1 65.2/65.3 (collation through aggregates): NEEDCOLL
+  aggregates (min/max/group_concat/string_agg) propagate an EXPLICIT
+  COLLATE in their arguments to the RESULT's comparisons — the
+  aggregate rewrite's bare __agg_N slot read stripped it (the direct
+  `=`, IN-list and IN-subquery comparisons all fell to BINARY). New
+  planner helper collating_slot_read(): the slot read is wrapped in a
+  transparent Collate when the call is a collating aggregate whose
+  args carry an explicit collate — wired into the direct rewrite, the
+  subquery-promotion rewrite, and rewrite_window_refs (window calls
+  over collating aggregates); the projection's slot-naming path looks
+  through the wrapper. Oracle-mapped: count does NOT propagate; a
+  DECLARED column collation does NOT propagate (only EP_Collate —
+  the explicit nodes — flows through).
+- window1 71.0 (the compound-subquery misuse): CurrentScope now
+  resolves DERIVED TABLES' OUTPUT column names (bare) —
+  `(SELECT a AS b FROM t0)` in the FROM makes b resolvable, so
+  sum(b) in the WHERE compound subquery correctly promotes into the
+  query and the WHERE landing fires the misuse error.
+- VERIFIED: window1 15 -> 12; window3 1482/1482 + window8 361/361
+  clean; the select1-5/join differential set-identical to the
+  documented pre-existing counts (window8 1 -> 0 was the 9.2 fix);
+  lib 316/316; 24/24 window pins; all touched suites green; the two
+  collation probe rounds (15 shapes) fully match.
+
+Stage Summary:
+- window1 board: 12 divergences (23.x sort-merge EQP counts x5;
+  73.3 join-order parity; 73.4 UPDATE-FROM-with-window parse; value
+  bugs 15.0, 32.10, 47.2, 50.5, 51.1).

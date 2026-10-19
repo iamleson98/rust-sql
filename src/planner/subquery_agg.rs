@@ -50,16 +50,26 @@ use std::sync::Arc;
 pub(crate) struct CurrentScope {
     quals: HashSet<String>,
     tables: Vec<Arc<Table>>,
+    /// Derived tables' OUTPUT column names (bare) — `(SELECT a AS b FROM
+    /// t0)` in the FROM makes `b` resolvable here (window1 71.0: the
+    /// compound subquery's `sum(b)` promotes into this query and the
+    /// WHERE landing errors).
+    derived_cols: HashSet<String>,
 }
 
 impl CurrentScope {
     fn of(p: &Planner<'_>, s: &crate::sql::ast::SimpleSelect) -> Self {
         let mut quals = HashSet::new();
         let mut tables = Vec::new();
+        let mut derived_cols = HashSet::new();
         if let Some(from) = &s.from {
-            collect_from_sources(from, p, &mut quals, &mut tables);
+            collect_from_sources(from, p, &mut quals, &mut tables, &mut derived_cols);
         }
-        Self { quals, tables }
+        Self {
+            quals,
+            tables,
+            derived_cols,
+        }
     }
 
     /// Mirrors `SubqueryScope::is_local` (the same checks the runtime
@@ -73,7 +83,9 @@ impl CurrentScope {
                     t.find_column(name).is_some()
                         || (crate::planner::is_rowid_spelling(name) && !t.without_rowid)
                 });
-                known_table || p.cte_column_in_scope(name)
+                known_table
+                    || self.derived_cols.contains(&name.to_ascii_lowercase())
+                    || p.cte_column_in_scope(name)
             }
         }
     }
@@ -87,6 +99,7 @@ fn collect_from_sources(
     p: &Planner<'_>,
     quals: &mut HashSet<String>,
     tables: &mut Vec<Arc<Table>>,
+    derived_cols: &mut HashSet<String>,
 ) {
     match te {
         TableExpression::Table { name, alias, .. } => {
@@ -104,11 +117,17 @@ fn collect_from_sources(
             if let Some(a) = alias {
                 quals.insert(a.to_ascii_lowercase());
             }
-            collect_body_sources(&select.body, p, quals, tables);
+            // The derived table's OUTPUT names resolve here (bare).
+            let mut names = Vec::new();
+            collect_body_output_names(&select.body, &mut names);
+            for n in names {
+                derived_cols.insert(n.to_ascii_lowercase());
+            }
+            collect_body_sources(&select.body, p, quals, tables, derived_cols);
         }
         TableExpression::Join { left, right, .. } => {
-            collect_from_sources(left, p, quals, tables);
-            collect_from_sources(right, p, quals, tables);
+            collect_from_sources(left, p, quals, tables, derived_cols);
+            collect_from_sources(right, p, quals, tables, derived_cols);
         }
         TableExpression::Function { .. } => {}
     }
@@ -119,16 +138,17 @@ fn collect_body_sources(
     p: &Planner<'_>,
     quals: &mut HashSet<String>,
     tables: &mut Vec<Arc<Table>>,
+    derived_cols: &mut HashSet<String>,
 ) {
     match body {
         SelectBody::Simple(s) => {
             if let Some(from) = &s.from {
-                collect_from_sources(from, p, quals, tables);
+                collect_from_sources(from, p, quals, tables, derived_cols);
             }
         }
         SelectBody::Binary { left, right, .. } => {
-            collect_body_sources(left, p, quals, tables);
-            collect_body_sources(right, p, quals, tables);
+            collect_body_sources(left, p, quals, tables, derived_cols);
+            collect_body_sources(right, p, quals, tables, derived_cols);
         }
     }
 }
@@ -903,10 +923,11 @@ fn rewrite_agg_expr(
         let all_outer = !refs.is_empty() && refs.iter().all(|(t, n)| !pooled.is_local(p, t, n));
         if all_outer {
             if let Some(i) = crate::planner::aggregate_slot_for_call(e, aggregates) {
-                return Expr::Column {
+                let slot = Expr::Column {
                     table: None,
                     name: format!("__agg_{}", i),
                 };
+                return crate::planner::collating_slot_read(slot, e);
             }
         }
         // No slot: the call stays (pass-through binding, or a local

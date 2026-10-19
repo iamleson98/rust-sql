@@ -1723,7 +1723,14 @@ impl<'a> Planner<'a> {
                             n_group,
                         );
                         let alias = alias.clone().or_else(|| {
-                            if let Expr::Column { name, .. } = &rewritten {
+                            // The collating-aggregate wrapper (a
+                            // transparent Collate around the slot read)
+                            // must not hide the slot for naming.
+                            let named = match &rewritten {
+                                Expr::Collate { expr, .. } => expr,
+                                other => other,
+                            };
+                            if let Expr::Column { name, .. } = named {
                                 if let Some(i) = name
                                     .strip_prefix("__win_")
                                     .and_then(|n| n.parse::<usize>().ok())
@@ -3140,6 +3147,40 @@ fn resolve_having_aliases(having: &Expr, columns: &[ResultColumn]) -> Expr {
     subst(having, &aliases)
 }
 
+/// A slot read (`__agg_N` / `__win_N`) for a COLLATING aggregate call
+/// (min / max / group_concat / string_agg) whose arguments hold an
+/// EXPLICIT COLLATE: the collation propagates to the RESULT's
+/// comparisons (sqlite3ExprCollSeq's function arm follows EP_Collate
+/// through the arguments — oracle: `max(c1 COLLATE nocase) = 'aBCd'`
+/// is 1, `count(c1 COLLATE nocase) = 'aBCd'` is 0, and a DECLARED
+/// column collation does NOT propagate). The rewrite that replaces the
+/// call with a bare column read would otherwise strip it.
+pub(crate) fn collating_slot_read(slot: Expr, call: &Expr) -> Expr {
+    let Expr::Function { name, args, .. } = call else {
+        return slot;
+    };
+    let needcoll = matches!(
+        name.to_ascii_lowercase().as_str(),
+        "min" | "max" | "group_concat" | "string_agg"
+    );
+    if needcoll {
+        if let Some(coll) = crate::executor::expr::explicit_collation(&Expr::Function {
+            name: name.clone(),
+            distinct: false,
+            args: args.clone(),
+            over: None,
+            filter: None,
+            order_by: Vec::new(),
+        }) {
+            return Expr::Collate {
+                expr: Box::new(slot),
+                collation: coll,
+            };
+        }
+    }
+    slot
+}
+
 /// The slot index of aggregate CALL `e` (as written) against the
 /// aggregate set — the shared matcher of the DIRECT rewrite
 /// (`rewrite_aggregates_and_groups`) and the subquery-promotion
@@ -3314,10 +3355,11 @@ pub fn rewrite_aggregates_and_groups(
             // the query.
             if over.is_none() && is_aggregate_call(&name.to_ascii_lowercase(), args.len()) {
                 if let Some(i) = aggregate_slot_for_call(e, aggregates) {
-                    return Expr::Column {
+                    let slot = Expr::Column {
                         table: None,
                         name: format!("__agg_{}", i),
                     };
+                    return collating_slot_read(slot, e);
                 }
                 e.clone()
             } else {
@@ -3598,10 +3640,17 @@ pub fn expr_has_aggregate(e: &Expr) -> bool {
 pub(crate) fn rewrite_window_refs(e: &Expr, windows: &[WindowExpr]) -> Expr {
     let key = format!("{:?}", e);
     if let Some(i) = windows.iter().position(|w| w.expr_key == key) {
-        return Expr::Column {
+        let slot = Expr::Column {
             table: None,
             name: format!("__win_{i}"),
         };
+        // A WINDOW call over a collating aggregate (max/min/group_concat
+        // with an explicit COLLATE argument) keeps the collation on its
+        // result's comparisons.
+        if let Expr::Function { over: Some(_), .. } = e {
+            return collating_slot_read(slot, e);
+        }
+        return slot;
     }
     // Recurse: rebuild the expression with rewritten children.
     match e {
