@@ -16907,19 +16907,45 @@ fn exec_one_window(
         // non-negative integer/number" — window1's 22.x family; a
         // column offset like `ROWS BETWEEN d FOLLOWING` reads the
         // current row's d — 31.3).
-        let frame_off_vals = |b: Option<&FrameBound>| -> Result<Option<Vec<Value>>> {
+        let frame_off_vals = |b: Option<&FrameBound>, is_start: bool| -> Result<Option<Vec<Value>>> {
             match b {
-                Some(FrameBound::Preceding(e)) | Some(FrameBound::Following(e)) => Ok(Some(
-                    sorted
-                        .iter()
-                        .map(|&ri| eval_row(e, &rows[ri], columns, params, named_params))
-                        .collect::<Result<_>>()?,
-                )),
+                Some(FrameBound::Preceding(e)) | Some(FrameBound::Following(e)) => {
+                    // SQLite requires frame offsets to be CONSTANT
+                    // expressions (window1 31.3): ROWS/GROUPS offsets
+                    // fold to non-negative integers, RANGE offsets to
+                    // non-negative numbers — anything referencing a
+                    // column, parameter, function call or subquery
+                    // errors on the first partition row ("frame
+                    // starting/ending offset must be a non-negative
+                    // integer/number"); an empty input evaluates no
+                    // partition and errors nowhere (oracle-verified
+                    // against the vendored 3.53.4: local columns,
+                    // correlated columns and function calls all
+                    // error; `1+1`, `2*1+0` and constant CASE fold).
+                    if !frame_offset_is_constant(e) {
+                        let what = if is_start { "starting" } else { "ending" };
+                        let kind_word = match w.frame.as_ref().map(|f| f.kind) {
+                            Some(FrameKind::Range) => "number",
+                            _ => "integer",
+                        };
+                        return Err(Error::runtime(format!(
+                            "frame {what} offset must be a non-negative {kind_word}"
+                        )));
+                    }
+                    Ok(Some(
+                        sorted
+                            .iter()
+                            .map(|&ri| eval_row(e, &rows[ri], columns, params, named_params))
+                            .collect::<Result<_>>()?,
+                    ))
+                }
                 _ => Ok(None),
             }
         };
-        let frame_start_off = frame_off_vals(w.frame.as_ref().map(|f| f.start.as_ref()))?;
-        let frame_end_off = frame_off_vals(w.frame.as_ref().and_then(|f| f.end.as_deref()))?;
+        let frame_start_off =
+            frame_off_vals(w.frame.as_ref().map(|f| f.start.as_ref()), true)?;
+        let frame_end_off =
+            frame_off_vals(w.frame.as_ref().and_then(|f| f.end.as_deref()), false)?;
         let aux = WindowAux {
             dense: &dense,
             seps: &seps,
@@ -16974,6 +17000,61 @@ fn window_offset_int(v: &Value) -> Option<i64> {
 /// real, or numeric text ('2.0', '1.2'); NULL, BLOB, non-numeric text
 /// and negatives error ("frame starting/ending offset must be a
 /// non-negative number").
+/// Is a frame-bound offset expression CONSTANT (SQLite's window frame
+/// rule — see the frame_off_vals site)? Literals, literal arithmetic,
+/// constant CASE/Cast/Collate/Between/Is/IsNull/Like/Row trees fold;
+/// ANY column reference, bound parameter, function call (even a
+/// deterministic one), subquery or RAISE makes the offset non-constant
+/// and errors at the first partition row.
+fn frame_offset_is_constant(e: &Expr) -> bool {
+    match e {
+        Expr::Column { .. }
+        | Expr::Function { .. }
+        | Expr::Subquery(_)
+        | Expr::Exists(_)
+        | Expr::Parameter(_)
+        | Expr::Raise { .. } => false,
+        Expr::Binary { left, right, .. } => {
+            frame_offset_is_constant(left) && frame_offset_is_constant(right)
+        }
+        Expr::Unary { expr, .. } => frame_offset_is_constant(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            frame_offset_is_constant(expr)
+                && frame_offset_is_constant(low)
+                && frame_offset_is_constant(high)
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            frame_offset_is_constant(expr)
+                && frame_offset_is_constant(pattern)
+                && escape.as_ref().map(|x| frame_offset_is_constant(x)).unwrap_or(true)
+        }
+        Expr::IsNull { expr, .. } => frame_offset_is_constant(expr),
+        Expr::Is { left, right, .. } => {
+            frame_offset_is_constant(left) && frame_offset_is_constant(right)
+        }
+        Expr::Cast { expr, .. } => frame_offset_is_constant(expr),
+        Expr::Collate { expr, .. } => frame_offset_is_constant(expr),
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            operand.as_ref().map(|o| frame_offset_is_constant(o)).unwrap_or(true)
+                && whens.iter().all(|(c, v)| frame_offset_is_constant(c) && frame_offset_is_constant(v))
+                && else_.as_ref().map(|x| frame_offset_is_constant(x)).unwrap_or(true)
+        }
+        Expr::Row(items) => items.iter().all(frame_offset_is_constant),
+        _ => true, // literals and anything else value-less
+    }
+}
+
 fn window_offset_num(v: &Value) -> Option<f64> {
     let f = match v {
         Value::Integer(i) => *i as f64,

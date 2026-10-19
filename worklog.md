@@ -2985,3 +2985,42 @@ Stage Summary:
   joined bare columns). The select-list-subquery family's remaining
   members (53.0, 57.3, 61.4.2/3, 63.3) are window-in-FROM-less-
   subquery shapes — a different root cause, next round's lever.
+
+---
+Task ID: win-4b (frame offset constantness — window1 31.3)
+Agent: main (Super Z)
+
+Work Log:
+- RULE (oracle-mapped against the vendored 3.53.4): SQLite requires
+  window frame-bound offsets to be CONSTANT expressions — ROWS/GROUPS
+  fold to non-negative integers, RANGE to non-negative numbers.
+  Anything else errors at the FIRST partition row: "frame
+  {starting|ending} offset must be a non-negative {integer|number}".
+  Oracle probes: local column (`e FOLLOWING`), correlated column
+  (window1 31.3's `d FOLLOWING`), function calls (even `abs(2)`),
+  parameters and subqueries ALL error; `1+1`, `2*1+0` and constant
+  CASE fold fine; an EMPTY input evaluates no partition and errors
+  nowhere. Our engine instead evaluated per-row offsets through the
+  frame stack (accepting column offsets and silently returning values
+  or NULL).
+- FIX (executor): frame_offset_is_constant (literals, literal
+  arithmetic, constant CASE/Cast/Collate/Between/Is/IsNull/Like/Row
+  fold; Column/Parameter/Function/Subquery/Exists/Raise do not) wired
+  into the frame_off_vals site — the error fires on the first
+  partition row, matching the empty-input non-error.
+- VERIFIED: all seven oracle probe shapes byte-parity (incl. the
+  empty-table no-error); window1 board 29 -> 28 (31.3 fixed, zero
+  collateral); lib 316/316, semantics/correlated/fuzz/regression/
+  window pins/vacuum suites green; fmt + clippy clean.
+- CI note: run 469 (fca9b10) got CANCELLED by the 468 rerun (same
+  concurrency group) — the next push re-covers both commits.
+
+Stage Summary:
+- window1 board: 28 true divergences. Frame-offset constantness now
+  byte-parity with SQLite. Remaining clusters: the aggregate-pullup
+  family (59.1, 61.4.2/3, 38.10/38.30 — aggregates inside subqueries
+  referencing outer columns: promotion to the outer query, or the
+  "misuse of aggregate" error when the target is WHERE), ntile-arg
+  validation (44.x), colon misuse (38.x remnant, 47.2), EQP ORDER
+  counts (23.x), and the value bugs (53.0, 57.3, 63.3, 65.2/3, 71.0,
+  73.3/4, 74.1, 75.1).
