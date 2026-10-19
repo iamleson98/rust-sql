@@ -12485,6 +12485,14 @@ impl Database {
         }
     }
 
+    /// Debug utility (examples/tools): plan one parsed statement.
+    pub fn plan_for_statement_dbg(
+        catalog: &Catalog,
+        stmt: &Statement,
+    ) -> Result<Option<crate::planner::plan::Plan>> {
+        Self::plan_for_statement(catalog, stmt)
+    }
+
     /// Detect a pre-compilable point-lookup fast path in a plan (see
     /// `FastPath`). Conservative: any shape other than
     /// `Project(RowidLookup)` / `Project(IndexLookup)` with bare-column

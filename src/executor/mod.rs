@@ -5900,12 +5900,33 @@ fn collect_expr_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
             collect_expr_refs(left, out);
             collect_expr_refs(right, out);
         }
-        Expr::Function { args, filter, .. } => {
+        Expr::Function {
+            args,
+            filter,
+            order_by,
+            over,
+            ..
+        } => {
             for a in args {
                 collect_expr_refs(a, out);
             }
             if let Some(f) = filter {
                 collect_expr_refs(f, out);
+            }
+            for t in order_by {
+                collect_expr_refs(&t.expr, out);
+            }
+            // Window SPEC expressions carry references like any other
+            // site (mirrors collect_expr_selects' OVER coverage).
+            if let Some(spec) = over {
+                if let crate::sql::ast::WindowSpec::Inline(d) = spec.as_ref() {
+                    for pe in &d.partition_by {
+                        collect_expr_refs(pe, out);
+                    }
+                    for t in &d.order_by {
+                        collect_expr_refs(&t.expr, out);
+                    }
+                }
             }
         }
         Expr::Case {
@@ -6035,6 +6056,7 @@ fn collect_expr_selects<'a>(e: &'a Expr, out: &mut Vec<&'a SelectStatement>) {
             args,
             filter,
             order_by,
+            over,
             ..
         } => {
             for a in args {
@@ -6045,6 +6067,22 @@ fn collect_expr_selects<'a>(e: &'a Expr, out: &mut Vec<&'a SelectStatement>) {
             }
             for t in order_by {
                 collect_expr_selects(&t.expr, out);
+            }
+            // Window SPEC expressions (PARTITION BY / ORDER BY inside the
+            // OVER) hold subqueries too — `max(x) OVER (ORDER BY (SELECT
+            // sum(a) FROM t1))` used to hide the inner atom from the
+            // POOLED scope, so t1's columns looked non-local and the
+            // planner's promotion pass claimed the atom's aggregates
+            // (window8 9.2: one row where SQLite returns none).
+            if let Some(spec) = over {
+                if let crate::sql::ast::WindowSpec::Inline(d) = spec.as_ref() {
+                    for pe in &d.partition_by {
+                        collect_expr_selects(pe, out);
+                    }
+                    for t in &d.order_by {
+                        collect_expr_selects(&t.expr, out);
+                    }
+                }
             }
         }
         Expr::Case {

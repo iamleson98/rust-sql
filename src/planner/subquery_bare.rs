@@ -41,13 +41,13 @@ use std::sync::Arc;
 /// nested subquery atoms during the rewrite: a reference that binds at
 /// an intermediate level is in the pooled set (left for the runtime
 /// frame stack), and one that binds nowhere inside binds here.
-struct SubqueryScope {
+pub(crate) struct SubqueryScope {
     quals: HashSet<String>,
     tables: Vec<Arc<Table>>,
 }
 
 impl SubqueryScope {
-    fn of(p: &Planner<'_>, sel: &SelectStatement) -> Self {
+    pub(crate) fn of(p: &Planner<'_>, sel: &SelectStatement) -> Self {
         let mut quals = HashSet::new();
         let mut tables = Vec::new();
         crate::executor::collect_select_sources(sel, p.catalog, &mut quals, &mut tables);
@@ -56,7 +56,7 @@ impl SubqueryScope {
 
     /// Does the reference (as written) resolve inside the subquery's
     /// own scope? Mirrors `subquery_is_correlated`'s checks exactly.
-    fn is_local(&self, p: &Planner<'_>, table: &Option<String>, name: &str) -> bool {
+    pub(crate) fn is_local(&self, p: &Planner<'_>, table: &Option<String>, name: &str) -> bool {
         match table {
             Some(q) => self.quals.contains(&q.to_ascii_lowercase()),
             None => {

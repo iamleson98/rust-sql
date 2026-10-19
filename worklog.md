@@ -3024,3 +3024,96 @@ Stage Summary:
   validation (44.x), colon misuse (38.x remnant, 47.2), EQP ORDER
   counts (23.x), and the value bugs (53.0, 57.3, 63.3, 65.2/3, 71.0,
   73.3/4, 74.1, 75.1).
+
+---
+Task ID: win-5 (the aggregate-promotion round + the reorder/covering correctness pair)
+Agent: main (Super Z)
+
+Work Log:
+- CI 39202176300 (9848f98) verdict: the bench-gate (windows) red was
+  bench_sqlx_native's "txn: 100 inserts" — 5.20ms vs 4.80ms (8.3%,
+  tolerance 5%) on a ~5ms micro-row while the SAME binary drew 9.39x
+  (ubuntu) and 6.05x (macos) WINS on the same row, and the previous
+  green run drew it 1.25x WIN (SQLite 4.80 vs its own 8.50ms twin) —
+  the documented single-window draw-noise class. Rerun-failed-jobs
+  flipped it green: 9848f98 is ALL GREEN at remote HEAD.
+- AGGREGATE PROMOTION (new src/planner/subquery_agg.rs, ~1,150 lines):
+  SQLite's resolve.c NameContext climb — an aggregate call inside a
+  subquery whose arg/FILTER/ORDER BY refs bind into THIS query belongs
+  to THIS query; the call becomes an AggExpr slot (the SAME
+  collect_aggregates_rec decomposition the direct path uses) and the
+  rewrite replaces it inside the subquery tree with an __agg_N output
+  read (the win-4a bare-slot mechanism's sibling).
+  * Oracle-mapped contract (5 probe rounds, 75 shapes): select list /
+    HAVING(agg query) / ORDER BY(agg query) / window-SPEC exprs are
+    legal landings; WHERE / ON / GROUP BY / window-call ARGS /
+    aggregate-call ARGS error "misuse of aggregate: {name}()" (the
+    name AS WRITTEN — window1 38.10's uppercase AVG()); ORDER BY of a
+    query that isn't aggregate by other means errors even though the
+    promotion itself would make it aggregate; EXISTS never promotes;
+    IN-sources promote with their IN's position; a MIXED aggregate
+    (any ref local to the atom) stays inside as a correlated
+    aggregate; the promotion recurses — a call whose refs bind at an
+    INTERMEDIATE subquery promotes there when that subquery is planned
+    (53.0's `FROM a AS d`).
+  * The pooled-scope model extended: the scan/rewrite descend into
+    FROM-subquery bodies and nested atoms' window SPEC expressions;
+    refs that match a nested statement's OWN output aliases (its
+    ORDER BY) are local to it, not promotion evidence (63.3's
+    compound ORDER BY c).
+  * has_aggregates flips when promotions land (the query BECOMES an
+    aggregate query — `SELECT (SELECT sum(a)) FROM t1` returns ONE
+    row {5}); the projection path now runs rewrite_window_refs FIRST
+    (the agg/bare rewrites change window-spec internals and would
+    break the Debug-key match, dropping the call to scalar dispatch).
+  * HAVING on a non-aggregate query now errors SQLite's message (the
+    clause is legal only when the query aggregates by its own means —
+    a subquery-borne aggregate does NOT rescue it).
+- THE PAIR OF PRE-EXISTING JOIN-CORRECTNESS BUGS the round uncovered
+  (visible at remote HEAD, exposed by 53.0's join shape):
+  * Bug A — atom_out_cols for IndexLookup/RowidRange/RowidIn/IndexIn
+    returned PLAIN table.col_names while every one of those executors
+    emits scan_output_columns naming (alias-qualified; TABLE-qualified
+    "a.c" for unaliased drivers): a reordered spine's restoration
+    Project built bare "c" refs that SUFFIX-matched some other side's
+    "*.c" — `SELECT a.c FROM a JOIN a AS b ON a.c=4 JOIN a AS e ON
+    a.c=e.c` projected b's values ({4,0,9,-9} for SQLite's
+    {4,4,4,4}). All four arms now mirror the executor exactly.
+  * Bug B — inlj_walk's Project arm collected NO refs (the "dead
+    unless the statement reads it" assumption): a reorder-born
+    RESTORATION Project reads EVERY atom column, so a covering INLJ
+    below it NULLed inner columns the restoration then projected. The
+    arm now collects (statement projections add nothing — already
+    seeded).
+  * Also fixed: expand_star_for_aggregate rebuilt the aggregate set
+    WITHOUT the ORDER terms — `SELECT sum(b), * FROM t GROUP BY a
+    ORDER BY count(b)` projected count's slot as the star columns
+    (index drift between the two build sites).
+  * The window-spec hole in the POOLED-scope source collectors
+    (executor's collect_expr_selects / collect_expr_refs skipped the
+    OVER spec): `max(x) OVER (ORDER BY (SELECT sum(a) FROM t1))` hid
+    the inner atom from the pool — window8 9.2's shape wrongly
+    promoted (one row over empty input) and bare refs in specs never
+    became slots. Both walkers now cover the spec exprs.
+- VERIFIED: window1 28 -> 15 (38.10/38.30/44.2.2/44.3.2/44.4.2/53.0/
+  57.3/59.1/61.4.2/61.4.3/63.3/74.1/75.1 — the full aggregate-pullup
+  family plus the ntile-arg-validation trio); window3 1482/1482 and
+  window8 361/361 both CLEAN (the 9.2 regression caught and fixed
+  in-round); select1-5 differential at the documented 37 pre-existing
+  (set-identical); join.test's 24 are pre-existing parser-message
+  gaps; 75-shape probe battery at 5 known pre-existing (ntile-arg
+  values, syntax-error wording). lib 316/316; correlated, bare_columns,
+  join_reorder, nested_join, pushdown_subquery, error_parity,
+  fuzz_regressions, regression, window_semantics_pins (24/24 — 6 new
+  pin families), sqlite_semantics_battery all green; fmt + clippy
+  --all-targets -D warnings clean; bench_compare join rows at parity
+  or better (2-table 1.00x, 3-table 0.98x, join+GROUP BY 1.55x).
+
+Stage Summary:
+- window1 board: 15 true divergences (23.x EQP ORDER counts ×5, the
+  value-bug residue 15.0/32.10/47.2/50.5/51.1/65.2/65.3/71.0/73.3/
+  73.4). The aggregate-promotion semantic is COMPLETE (all 8 family
+  members byte-parity), and the round also fixed two latent join-
+  correctness bugs that predated it (wrong-side projection after
+  reorder; NULLed inner columns under restorations) plus the
+  star/order-only-aggregate slot drift.

@@ -12,6 +12,7 @@ pub(crate) mod fold;
 pub mod namecheck;
 pub mod plan;
 pub(crate) mod sqlite_cost;
+mod subquery_agg;
 mod subquery_bare;
 mod using;
 
@@ -1508,9 +1509,29 @@ impl<'a> Planner<'a> {
         }
         plan = inlj_walk(self.catalog, plan, &stmt_needed);
 
+        // SQLite's HAVING clause on a non-aggregate query: the clause
+        // is legal only when the query aggregates BY ITS OWN MEANS —
+        // GROUP BY, or a direct aggregate in the SELECT list / HAVING.
+        // An aggregate promoted out of a HAVING subquery does NOT
+        // rescue the landing (oracle: `SELECT 1 FROM t HAVING (SELECT
+        // sum(a)) > 0` errors, same as the direct `HAVING 1`).
+        if s.having.is_some()
+            && s.group_by.is_empty()
+            && !self.expr_list_has_aggregates(&s.columns)
+            && !s.having.as_ref().is_some_and(expr_has_aggregate)
+        {
+            return Err(Error::semantic("HAVING clause on a non-aggregate query"));
+        }
+        // Subquery-borne aggregates: SQLite's landing-zone errors
+        // (WHERE / ON / GROUP BY / window-call args / aggregate-call
+        // args / ORDER BY of a non-aggregate query) fire BEFORE any
+        // promotion flips the query's shape.
+        self.check_subquery_agg_misuse(s, order_terms)?;
+
         let has_aggregates = self.expr_list_has_aggregates(&s.columns)
             || s.having.is_some()
-            || !s.group_by.is_empty();
+            || !s.group_by.is_empty()
+            || !self.subquery_agg_promotions(s, order_terms).is_empty();
         // The FULL aggregate set: real aggregates (SELECT + HAVING +
         // ORDER BY — ORDER-ONLY aggregates ride along so the Sort above
         // the Aggregate can reference them) plus one `bare` pseudo-
@@ -1567,8 +1588,16 @@ impl<'a> Planner<'a> {
                 // expression first so the aggregate rewrite below sees
                 // the real aggregate call.
                 let having_unaliased = resolve_having_aliases(having, &alias_cols);
-                let having_outer = self.rewrite_subquery_outer_refs(
+                // Promoted aggregate calls first (their args belong to
+                // the aggregate — per-INPUT-row — and must not become
+                // bare-slot references).
+                let having_agg_fixed = self.rewrite_subquery_agg_calls(
                     &having_unaliased,
+                    &aggregates,
+                    &resolved_group_by,
+                );
+                let having_outer = self.rewrite_subquery_outer_refs(
+                    &having_agg_fixed,
                     &aggregates,
                     &resolved_group_by,
                 );
@@ -1592,7 +1621,11 @@ impl<'a> Planner<'a> {
             {
                 let windows = self.collect_windows_with(&s.columns, &s.window, order_terms)?;
                 let rw = |e: &Expr| {
-                    rewrite_aggregates_and_groups(e, &aggregates, &resolved_group_by, n_group)
+                    // Promoted calls first, then correlated bare refs,
+                    // then the direct aggregate/group-key rewrite.
+                    let a = self.rewrite_subquery_agg_calls(e, &aggregates, &resolved_group_by);
+                    let b = self.rewrite_subquery_outer_refs(&a, &aggregates, &resolved_group_by);
+                    rewrite_aggregates_and_groups(&b, &aggregates, &resolved_group_by, n_group)
                 };
                 let exec_windows: Vec<WindowExpr> = windows
                     .iter()
@@ -1641,7 +1674,7 @@ impl<'a> Planner<'a> {
                     // (subquery atoms) keep the legacy star-over-Aggregate
                     // behavior.
                     ResultColumn::Star | ResultColumn::TableStar(_) => {
-                        let expanded = self.expand_star_for_aggregate(s, c);
+                        let expanded = self.expand_star_for_aggregate(s, c, order_terms);
                         match expanded {
                             Some(cols) => StarArm::Expanded(cols),
                             None => StarArm::Plain(vec![ProjectExpr {
@@ -1657,20 +1690,34 @@ impl<'a> Planner<'a> {
                         }
                     }
                     ResultColumn::Expr { expr, alias } => {
-                        // Correlated outer refs inside select-list
-                        // subqueries first (see planner::subquery_bare):
-                        // they bind to bare-column __agg_N slots.
-                        let outer_fixed =
-                            self.rewrite_subquery_outer_refs(expr, &aggregates, &resolved_group_by);
-                        let windowed;
-                        let expr = if agg_windows.is_empty() {
-                            &outer_fixed
+                        // Window refs FIRST: the whole window call
+                        // collapses to `__win_N` before the agg/bare
+                        // rewrites — those rewrite INSIDE the spec, and
+                        // the key match against the collected window
+                        // would otherwise fail, dropping the call to
+                        // scalar dispatch ("no such function").
+                        let prepped;
+                        let base_expr: &Expr = if agg_windows.is_empty() {
+                            expr
                         } else {
-                            windowed = rewrite_window_refs(&outer_fixed, &agg_windows);
-                            &windowed
+                            prepped = rewrite_window_refs(expr, &agg_windows);
+                            &prepped
                         };
+                        // Promoted aggregate calls next (see the HAVING
+                        // site), then correlated outer refs, then the
+                        // direct aggregate rewrite.
+                        let agg_fixed = self.rewrite_subquery_agg_calls(
+                            base_expr,
+                            &aggregates,
+                            &resolved_group_by,
+                        );
+                        let outer_fixed = self.rewrite_subquery_outer_refs(
+                            &agg_fixed,
+                            &aggregates,
+                            &resolved_group_by,
+                        );
                         let rewritten = rewrite_aggregates_and_groups(
-                            expr,
+                            &outer_fixed,
                             &aggregates,
                             &resolved_group_by,
                             n_group,
@@ -2420,6 +2467,24 @@ impl<'a> Planner<'a> {
                 aggregates.push(oa);
             }
         }
+        // PROMOTED aggregates: calls inside subquery atoms whose
+        // argument / FILTER / ORDER BY references bind into THIS
+        // query (SQLite's aggregate promotion — planner::subquery_agg).
+        // Same (s, order_terms) inputs on every call site, so the
+        // `__agg_i` indices are stable across the projection, ORDER BY
+        // and star rewrites. Deduped against the direct set by the
+        // same call identity (`SELECT sum(a), (SELECT sum(a))` reads
+        // one slot twice).
+        for call in self.subquery_agg_promotions(s, order_terms) {
+            if let Some(pa) = subquery_agg::promoted_call_aggexpr(&call) {
+                if !aggregates
+                    .iter()
+                    .any(|x| subquery_agg::agg_same_call(x, &pa))
+                {
+                    aggregates.push(pa);
+                }
+            }
+        }
         // Bare-column pseudo-aggregates.
         // GROUP BY / HAVING names resolve to a FROM column first, to an
         // output alias only when no column has the name (SQLite's
@@ -2692,6 +2757,7 @@ impl<'a> Planner<'a> {
         &self,
         s: &SimpleSelect,
         c: &ResultColumn,
+        order_terms: &[OrderTerm],
     ) -> Option<Vec<ProjectExpr>> {
         // Only star arms expand.
         if !matches!(c, ResultColumn::Star | ResultColumn::TableStar(_)) {
@@ -2724,7 +2790,13 @@ impl<'a> Planner<'a> {
             })
             .collect();
         let aggregates = self
-            .build_full_agg_set(s, &[])
+            // ORDER terms included: the SAME inputs as the projection
+            // path's build — ORDER-ONLY aggregates and subquery-borne
+            // promotions shift the bare slots' indices, and the star
+            // rewrite's `__agg_i` reads must match the built node
+            // (`SELECT sum(b), * FROM t GROUP BY a ORDER BY count(b)`
+            // used to project count's slot as the star columns).
+            .build_full_agg_set(s, order_terms)
             .ok()
             .or_else(|| Some(Vec::new()))?;
         let n_group = resolved_group_by.len();
@@ -2812,7 +2884,8 @@ impl<'a> Planner<'a> {
         };
         let has_aggregates = self.expr_list_has_aggregates(&s.columns)
             || s.having.is_some()
-            || !s.group_by.is_empty();
+            || !s.group_by.is_empty()
+            || !self.subquery_agg_promotions(s, resolved_terms).is_empty();
         if !has_aggregates {
             return Ok(resolved_terms.to_vec());
         }
@@ -2846,8 +2919,10 @@ impl<'a> Planner<'a> {
             .iter()
             .enumerate()
             .map(|(i, t)| {
+                let agg_fixed =
+                    self.rewrite_subquery_agg_calls(&t.expr, &aggregates, &resolved_group_by);
                 let t_expr2 =
-                    self.rewrite_subquery_outer_refs(&t.expr, &aggregates, &resolved_group_by);
+                    self.rewrite_subquery_outer_refs(&agg_fixed, &aggregates, &resolved_group_by);
                 let rewritten =
                     rewrite_aggregates_and_groups(&t_expr2, &aggregates, &resolved_group_by, n);
                 // Explicit-COLLATE re-attach (the ORIGINAL term's): the
@@ -3065,6 +3140,104 @@ fn resolve_having_aliases(having: &Expr, columns: &[ResultColumn]) -> Expr {
     subst(having, &aliases)
 }
 
+/// The slot index of aggregate CALL `e` (as written) against the
+/// aggregate set — the shared matcher of the DIRECT rewrite
+/// (`rewrite_aggregates_and_groups`) and the subquery-promotion
+/// rewrite (`planner::subquery_agg`): func + distinct + separator +
+/// FILTER + aggregate ORDER BY + the input expression, all through the
+/// same synthesized-arg decomposition `collect_aggregates_rec` uses.
+pub(crate) fn aggregate_slot_for_call(e: &Expr, aggregates: &[AggExpr]) -> Option<usize> {
+    let Expr::Function {
+        name,
+        distinct,
+        args,
+        filter,
+        order_by,
+        ..
+    } = e
+    else {
+        return None;
+    };
+    // The aggregate's INPUT expression: `None` for star / no-arg calls
+    // (COUNT(*)), otherwise the first argument. json_group_object(k, v)
+    // carries the SAME synthesized fragment as `collect_aggregates_rec`
+    // so the structural match succeeds.
+    let synthesized: Option<Expr>;
+    let call_arg: Option<&Expr> = if args.is_empty()
+        || args
+            .first()
+            .map(|a| matches!(a, Expr::Column { name, .. } if name == "*"))
+            .unwrap_or(false)
+    {
+        None
+    } else if (name.eq_ignore_ascii_case("json_group_object")
+        || name.eq_ignore_ascii_case("jsonb_group_object"))
+        && args.len() == 2
+    {
+        let frag_name = if name.eq_ignore_ascii_case("jsonb_group_object") {
+            "__jsonb_object_frag"
+        } else {
+            "__json_object_frag"
+        };
+        synthesized = Some(Expr::Function {
+            name: frag_name.into(),
+            distinct: false,
+            args: args.clone(),
+            over: None,
+            filter: None,
+            order_by: Vec::new(),
+        });
+        synthesized.as_ref()
+    } else if let Some(wrapped) = json_group_array_input(&name.to_ascii_lowercase(), args) {
+        synthesized = Some(wrapped);
+        synthesized.as_ref()
+    } else if let Some((input, _)) = group_concat_input(name, args) {
+        synthesized = Some(input);
+        synthesized.as_ref()
+    } else {
+        args.first()
+    };
+    // A 2-argument group_concat's separator is part of its identity too.
+    let call_sep = group_concat_input(name, args).map(|(_, sep)| sep);
+    for (i, agg) in aggregates.iter().enumerate() {
+        if agg.func != name.to_ascii_lowercase() || agg.distinct != *distinct {
+            continue;
+        }
+        if let Some(sep) = &call_sep {
+            if agg.sep.as_ref() != Some(sep) {
+                continue;
+            }
+        }
+        // FILTER is part of the aggregate's identity: two calls
+        // differing only in FILTER are different aggregates.
+        let filter_match = match (&agg.filter, filter.as_deref()) {
+            (None, None) => true,
+            (Some(a), Some(c)) => expr_eq(a, c),
+            _ => false,
+        };
+        if !filter_match {
+            continue;
+        }
+        // ...and in ORDER BY (`group_concat(x)` vs `group_concat(x
+        // ORDER BY y)` read rows differently).
+        if format!("{:?}", agg.order_by) != format!("{:?}", order_by) {
+            continue;
+        }
+        // Match on the argument expression as well: two calls of the
+        // same function with DIFFERENT arguments are different
+        // aggregates.
+        let args_match = match (&agg.arg, call_arg) {
+            (None, None) => true,
+            (Some(a), Some(c)) => expr_eq(a, c),
+            _ => false,
+        };
+        if args_match {
+            return Some(i);
+        }
+    }
+    None
+}
+
 /// Rewrite an expression, replacing:
 /// - aggregate function calls with column references `__agg_N`
 /// - sub-expressions matching a GROUP BY expression with column references `col{N+1}`
@@ -3140,98 +3313,11 @@ pub fn rewrite_aggregates_and_groups(
             // columns when a real same-name aggregate exists elsewhere in
             // the query.
             if over.is_none() && is_aggregate_call(&name.to_ascii_lowercase(), args.len()) {
-                // The aggregate's INPUT expression: `None` for star / no-arg
-                // calls (COUNT(*)), otherwise the first argument.
-                // json_group_object(k, v) carries the SAME synthesized
-                // fragment as `collect_aggregates_rec` so the structural
-                // match below succeeds.
-                let synthesized: Option<Expr>;
-                let call_arg: Option<&Expr> = if args.is_empty()
-                    || args
-                        .first()
-                        .map(|a| matches!(a, Expr::Column { name, .. } if name == "*"))
-                        .unwrap_or(false)
-                {
-                    None
-                } else if (name.eq_ignore_ascii_case("json_group_object")
-                    || name.eq_ignore_ascii_case("jsonb_group_object"))
-                    && args.len() == 2
-                {
-                    let frag_name = if name.eq_ignore_ascii_case("jsonb_group_object") {
-                        "__jsonb_object_frag"
-                    } else {
-                        "__json_object_frag"
+                if let Some(i) = aggregate_slot_for_call(e, aggregates) {
+                    return Expr::Column {
+                        table: None,
+                        name: format!("__agg_{}", i),
                     };
-                    synthesized = Some(Expr::Function {
-                        name: frag_name.into(),
-                        distinct: false,
-                        args: args.clone(),
-                        over: None,
-                        filter: None,
-                        order_by: Vec::new(),
-                    });
-                    synthesized.as_ref()
-                } else if let Some(wrapped) =
-                    json_group_array_input(&name.to_ascii_lowercase(), args)
-                {
-                    synthesized = Some(wrapped);
-                    synthesized.as_ref()
-                } else if let Some((input, _)) = group_concat_input(name, args) {
-                    synthesized = Some(input);
-                    synthesized.as_ref()
-                } else {
-                    args.first()
-                };
-                // A 2-argument group_concat's separator is part of its
-                // identity too.
-                let call_sep = group_concat_input(name, args).map(|(_, sep)| sep);
-                for (i, agg) in aggregates.iter().enumerate() {
-                    if agg.func != name.to_ascii_lowercase() || agg.distinct != *distinct {
-                        continue;
-                    }
-                    if let Some(sep) = &call_sep {
-                        if agg.sep.as_ref() != Some(sep) {
-                            continue;
-                        }
-                    }
-                    // FILTER is part of the aggregate's identity: two
-                    // calls differing only in FILTER are different
-                    // aggregates (SQLite computes each over its own row
-                    // subset).
-                    let filter_match = match (&agg.filter, filter) {
-                        (None, None) => true,
-                        (Some(a), Some(c)) => expr_eq(a, c),
-                        _ => false,
-                    };
-                    if !filter_match {
-                        continue;
-                    }
-                    // ...and in ORDER BY (`group_concat(x)` vs
-                    // `group_concat(x ORDER BY y)` read rows differently).
-                    if format!("{:?}", agg.order_by) != format!("{:?}", order_by) {
-                        continue;
-                    }
-                    // Match on the argument expression as well: two calls
-                    // of the same function with DIFFERENT arguments are
-                    // different aggregates. Previously only the function
-                    // name + distinct + star-ness were compared, so
-                    // `SELECT SUM(qty), SUM(price) ...` rewrote BOTH to
-                    // __agg_0 and the second aggregate silently reported
-                    // the first one's value. Expr has no PartialEq, so use
-                    // the same Display-based structural heuristic as the
-                    // GROUP BY matcher above.
-                    let args_match = match (&agg.arg, call_arg) {
-                        (None, None) => true,
-                        (Some(a), Some(c)) => expr_eq(a, c),
-                        _ => false,
-                    };
-                    if args_match {
-                        let col_name = format!("__agg_{}", i);
-                        return Expr::Column {
-                            table: None,
-                            name: col_name,
-                        };
-                    }
                 }
                 e.clone()
             } else {
@@ -3813,6 +3899,13 @@ fn group_concat_input(name: &str, args: &[Expr]) -> Option<(Expr, String)> {
             crate::executor::GC_DYN_SEP.to_string(),
         ),
     })
+}
+
+/// The shared decomposition of one aggregate CALL into its AggExpr
+/// (used by the direct collector and by the subquery-promotion pass —
+/// identical slot identities on both paths).
+pub(crate) fn collect_aggregates_rec_pub(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExpr>) {
+    collect_aggregates_rec(e, alias, out)
 }
 
 fn collect_aggregates_rec(e: &Expr, alias: &Option<String>, out: &mut Vec<AggExpr>) {
@@ -9167,12 +9260,19 @@ pub(crate) fn atom_out_cols(plan: &Plan) -> Option<Vec<String>> {
             }
             v
         }
-        Plan::RowidRange { table, .. } | Plan::IndexLookup { table, .. } => {
-            let mut v: Vec<String> = table.col_names.iter().cloned().collect();
+        // The lookup-family executors ALL emit scan_output_columns
+        // naming — alias-qualified, and TABLE-qualified ("a.c", the
+        // qualified_col_names) for unaliased drivers. The old
+        // `table.col_names` (plain) model diverged from every one of
+        // them: a reordered spine's restoration Project built refs from
+        // the PLAIN names, and the bare "c" suffix-matched some other
+        // side's "*.c" — `SELECT a.c FROM a JOIN a AS b ON a.c=4 JOIN
+        // a AS e ON a.c=e.c` projected b's column values (window1 53.0's
+        // join shape).
+        Plan::RowidRange { table, alias, .. } | Plan::IndexLookup { table, alias, .. } => {
+            let mut v = scan_qualified_cols(table, alias);
             if wants_rowid_slot(table) {
-                // Mirrors the executors: alias-less drivers qualify the
-                // hidden slot with the table name.
-                v.push(hidden_rowid_slot(&table.name));
+                v.push(hidden_rowid_slot(alias.as_deref().unwrap_or(&table.name)));
             }
             v
         }
@@ -9188,13 +9288,13 @@ pub(crate) fn atom_out_cols(plan: &Plan) -> Option<Vec<String>> {
             }
             v
         }
-        Plan::RowidIn { table, .. } => table.col_names.iter().cloned().collect(),
+        Plan::RowidIn { table, alias, .. } => scan_qualified_cols(table, alias),
         // exec_index_in emits the hidden slot too (alias-qualified, like
         // exec_scan) — the width an index join above it offsets by.
-        Plan::IndexIn { table, .. } => {
-            let mut v: Vec<String> = table.col_names.iter().cloned().collect();
+        Plan::IndexIn { table, alias, .. } => {
+            let mut v = scan_qualified_cols(table, alias);
             if wants_rowid_slot(table) {
-                v.push(hidden_rowid_slot(&table.name));
+                v.push(hidden_rowid_slot(alias.as_deref().unwrap_or(&table.name)));
             }
             v
         }
@@ -11429,15 +11529,19 @@ fn inlj_walk(catalog: &Catalog, plan: Plan, needed: &NeededCols) -> Plan {
             }
         }
         Plan::Project { input, columns } => {
-            // NO ref collection: a Project's references are either the
-            // statement's own projection (already seeded into the root
-            // context from s.columns) or the reorder pass's mechanical
-            // full-column RESTORATION re-export — dead unless the
-            // statement reads the column, which the seed already
-            // records. Collecting them here would force every join
-            // below a restored spine to materialize all columns.
+            // Ref collection IS required: the reorder pass's mechanical
+            // full-column RESTORATION Project re-exports EVERY atom
+            // column ("b.c", "e.c", hidden slots) — those refs are real
+            // reads the covering gate below must see, and the statement
+            // seed (s.columns) knows nothing about them (a reorder-born
+            // name like e.c need not appear anywhere in the query).
+            // Skipping them let a covering INLJ NULL out inner columns
+            // the restoration then projected. The statement's own
+            // projections add nothing new (already seeded).
+            let exprs: Vec<&Expr> = columns.iter().map(|c| &c.expr).collect();
+            let child = with_exprs(&exprs, needed);
             Plan::Project {
-                input: Box::new(inlj_walk(catalog, *input, needed)),
+                input: Box::new(inlj_walk(catalog, *input, &child)),
                 columns,
             }
         }

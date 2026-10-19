@@ -958,3 +958,336 @@ fn window1_part4_aliased_window_pins() {
         err.sqlite_message()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Aggregate promotion out of subqueries (SQLite's resolve.c NameContext
+// climb) — the window1 pullup round. An aggregate call inside a subquery
+// whose refs bind into the OUTER query belongs to the outer query; the
+// subquery reads the computed slot back. Landing-zone errors fire where
+// the outer query cannot host the aggregate.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn agg_promotion_select_list_classic() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE t1(a)", ()).unwrap();
+    db.execute("INSERT INTO t1 VALUES (2),(3)", ()).unwrap();
+    // The promoted query becomes an aggregate query: ONE row.
+    assert_vals(
+        one_col(&mut db, "SELECT (SELECT sum(a)) FROM t1"),
+        &[Value::Integer(5)],
+        "classic promotion",
+    );
+    // Mixed with a direct aggregate: both read their own slots.
+    let rows = exec_rows(&mut db, "SELECT max(a), (SELECT sum(a)) FROM t1");
+    assert_vals(
+        rows[0].clone(),
+        &[Value::Integer(3), Value::Integer(5)],
+        "promotion beside a direct aggregate",
+    );
+    // GROUP BY: the promoted call reads per GROUP.
+    db.execute("INSERT INTO t1 VALUES (2)", ()).unwrap();
+    let rows = exec_rows(
+        &mut db,
+        "SELECT a%2 AS k, (SELECT sum(a)) FROM t1 GROUP BY a%2 ORDER BY k",
+    );
+    assert_vals(
+        rows[0].clone(),
+        &[Value::Integer(0), Value::Integer(4)],
+        "per-group promotion (k=0: 2+2)",
+    );
+    assert_vals(
+        rows[1].clone(),
+        &[Value::Integer(1), Value::Integer(3)],
+        "per-group promotion (k=1: 3)",
+    );
+    // min/max bare-column rule: a promoted min() drags bare columns to
+    // the min-achieving row.
+    db.execute("CREATE TABLE t2(a, b)", ()).unwrap();
+    db.execute("INSERT INTO t2 VALUES (1,'x'),(5,'y'),(3,'z')", ())
+        .unwrap();
+    let rows = exec_rows(&mut db, "SELECT (SELECT min(a)), (SELECT b) FROM t2");
+    assert_vals(
+        rows[0].clone(),
+        &[Value::Integer(1), Value::Text("x".into())],
+        "promoted min + bare follows min row",
+    );
+    let rows = exec_rows(&mut db, "SELECT (SELECT max(a)), (SELECT b) FROM t2");
+    assert_vals(
+        rows[0].clone(),
+        &[Value::Integer(5), Value::Text("y".into())],
+        "promoted max + bare follows max row",
+    );
+}
+
+#[test]
+fn agg_promotion_misuse_landing_zones() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE t1(a)", ()).unwrap();
+    db.execute("INSERT INTO t1 VALUES (2),(3)", ()).unwrap();
+    // WHERE landing.
+    let err = db
+        .query("SELECT 1 FROM t1 WHERE (SELECT sum(a)) > 0", ())
+        .err()
+        .unwrap();
+    assert!(
+        err.sqlite_message().contains("misuse of aggregate: sum()"),
+        "{}",
+        err.sqlite_message()
+    );
+    // Window function ARGUMENT landing (window1 59.1's ntile shape) —
+    // the name is reported as written.
+    db.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (123)", ()).unwrap();
+    let err = db
+        .query("SELECT ntile((SELECT sum(x))) OVER(ORDER BY x) FROM t", ())
+        .err()
+        .unwrap();
+    assert!(
+        err.sqlite_message().contains("misuse of aggregate: sum()"),
+        "{}",
+        err.sqlite_message()
+    );
+    // FILTER's outer reference promotes (the name AS WRITTEN, uppercase).
+    db.execute("CREATE TABLE t0(c0)", ()).unwrap();
+    db.execute("CREATE TABLE t1c(c0, c1 UNIQUE)", ()).unwrap();
+    db.execute("INSERT INTO t0 VALUES (1)", ()).unwrap();
+    db.execute("INSERT INTO t1c VALUES (2,3)", ()).unwrap();
+    let err = db
+        .query(
+            "SELECT COUNT(*) FROM t0, t1c WHERE (SELECT AVG(0) FILTER(WHERE t1c.c1))",
+            (),
+        )
+        .err()
+        .unwrap();
+    assert!(
+        err.sqlite_message().contains("misuse of aggregate: AVG()"),
+        "{}",
+        err.sqlite_message()
+    );
+    // ORDER BY of a query that is not otherwise aggregate.
+    let err = db
+        .query("SELECT a FROM t1 ORDER BY (SELECT sum(a))", ())
+        .err()
+        .unwrap();
+    assert!(
+        err.sqlite_message().contains("misuse of aggregate: sum()"),
+        "{}",
+        err.sqlite_message()
+    );
+    // ...legal when the query aggregates by its own means.
+    assert_vals(
+        one_col(&mut db, "SELECT sum(a) FROM t1 ORDER BY (SELECT sum(a))"),
+        &[Value::Integer(5)],
+        "ORDER BY landing on an aggregate query",
+    );
+    // GROUP BY landing: SQLite's GROUP-BY-specific message.
+    let err = db
+        .query("SELECT a FROM t1 GROUP BY (SELECT sum(a))", ())
+        .err()
+        .unwrap();
+    assert!(
+        err.sqlite_message()
+            .contains("aggregate functions are not allowed in the GROUP BY clause"),
+        "{}",
+        err.sqlite_message()
+    );
+    // HAVING on a non-aggregate query — a promotion does not rescue it.
+    let err = db
+        .query("SELECT 1 FROM t1 HAVING (SELECT sum(a)) > 0", ())
+        .err()
+        .unwrap();
+    assert!(
+        err.sqlite_message()
+            .contains("HAVING clause on a non-aggregate query"),
+        "{}",
+        err.sqlite_message()
+    );
+    let err = db.query("SELECT 1 FROM t1 HAVING 1", ()).err().unwrap();
+    assert!(
+        err.sqlite_message()
+            .contains("HAVING clause on a non-aggregate query"),
+        "{}",
+        err.sqlite_message()
+    );
+}
+
+#[test]
+fn agg_promotion_window_interplay() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE t1(a)", ()).unwrap();
+    db.execute("CREATE TABLE t2(y)", ()).unwrap();
+    // window1 61.4.2: the promotion makes the outer query aggregate; the
+    // subquery's own windows run over the aggregate output row.
+    assert_vals(
+        one_col(
+            &mut db,
+            "SELECT (SELECT count(a) OVER ( ORDER BY sum(a) ) + total(a) OVER()) FROM t1",
+        ),
+        &[Value::Real(0.0)],
+        "61.4.2 over empty input",
+    );
+    db.execute("INSERT INTO t1 VALUES (2),(3)", ()).unwrap();
+    assert_vals(
+        one_col(
+            &mut db,
+            "SELECT (SELECT count(a) OVER ( ORDER BY sum(a) ) + total(a) OVER()) FROM t1",
+        ),
+        &[Value::Real(3.0)],
+        "61.4.2 over {2,3}: count(bare=2)=1 + total(2)=2.0",
+    );
+    // window1 57.3: the promotion passes THROUGH intermediate subqueries
+    // to the scope where the refs bind (t3), collapsing the output to the
+    // aggregate's one row.
+    db.execute("CREATE TABLE t3(y)", ()).unwrap();
+    db.execute("INSERT INTO t3 VALUES (5),(11),(-9)", ())
+        .unwrap();
+    db.execute("CREATE TABLE t1a(a)", ()).unwrap();
+    db.execute("INSERT INTO t1a VALUES (22)", ()).unwrap();
+    assert_vals(
+        one_col(
+            &mut db,
+            "SELECT (SELECT max(y) OVER( ORDER BY (SELECT x FROM (SELECT sum(y) AS x FROM t1a)))) FROM t3",
+        ),
+        &[Value::Integer(5)],
+        "57.3: one row, max over the bare representative",
+    );
+    // A subquery's OWN aggregate (its refs bind to its own FROM) never
+    // promotes — window8 9.2's shape stays per-row (zero rows over
+    // empty input).
+    assert_vals(
+        one_col(
+            &mut db,
+            "SELECT (SELECT max(a) OVER ( ORDER BY (SELECT sum(a) FROM t1) )) FROM t1 WHERE 0",
+        ),
+        &[],
+        "local aggregate in a spec subquery does not promote",
+    );
+    // A MIXED aggregate (some refs local to the atom, some outer) stays
+    // inside — a correlated aggregate.
+    db.execute("CREATE TABLE t4(b)", ()).unwrap();
+    db.execute("INSERT INTO t4 VALUES (10),(20)", ()).unwrap();
+    let rows = exec_rows(
+        &mut db,
+        "SELECT (SELECT sum(b+a) FROM t4) FROM t1 ORDER BY 1 LIMIT 2",
+    );
+    assert_vals(
+        rows[0].clone(),
+        &[Value::Integer(34)],
+        "mixed aggregate stays inside (2+10+20)",
+    );
+    assert_vals(
+        rows[1].clone(),
+        &[Value::Integer(36)],
+        "mixed aggregate stays inside (3+10+20)",
+    );
+}
+
+#[test]
+fn agg_promotion_intermediate_scope() {
+    // window1 53.0: the promotion lands in the INTERMEDIATE subquery
+    // (`FROM a AS d`), not the top — and the join's constant-ON spine
+    // must project the right side (the reorder/covering round).
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE a(c UNIQUE)", ()).unwrap();
+    db.execute("INSERT INTO a VALUES (4),(0),(9),(-9)", ())
+        .unwrap();
+    let got = one_col(
+        &mut db,
+        "SELECT a.c FROM a JOIN a AS b ON a.c=4 JOIN a AS e ON a.c=e.c \
+         WHERE a.c=(SELECT (SELECT coalesce(lead(2) OVER(),0) + sum(d.c)) FROM a AS d WHERE a.c)",
+    );
+    assert_vals(
+        got,
+        &[
+            Value::Integer(4),
+            Value::Integer(4),
+            Value::Integer(4),
+            Value::Integer(4),
+        ],
+        "53.0: the middle subquery aggregates, the top stays per-row",
+    );
+}
+
+#[test]
+fn reorder_restoration_reads_the_right_sides() {
+    // The atom-column model must match the lookup executors' output
+    // naming (alias-qualified / table-qualified), and a covering INLJ
+    // under a restoration Project must be declined (the restoration
+    // reads every atom column).
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE a(c UNIQUE)", ()).unwrap();
+    db.execute("INSERT INTO a VALUES (4),(0),(9),(-9)", ())
+        .unwrap();
+    // The 3-way self-join with a constant ON: a is constrained to c=4
+    // by the ON; the projection reads a's side.
+    assert_vals(
+        one_col(
+            &mut db,
+            "SELECT a.c FROM a JOIN a AS b ON a.c=4 JOIN a AS e ON a.c=e.c",
+        ),
+        &[
+            Value::Integer(4),
+            Value::Integer(4),
+            Value::Integer(4),
+            Value::Integer(4),
+        ],
+        "constant-ON 3-way self-join projects the constrained side",
+    );
+    // Reading the OTHER sides too (the covering-gate fix: e's columns
+    // must come from the table, not NULLs).
+    let rows = exec_rows(
+        &mut db,
+        "SELECT a.c, b.c, e.c FROM a JOIN a AS b ON a.c=4 JOIN a AS e ON a.c=e.c ORDER BY b.c",
+    );
+    assert_vals(
+        rows[0].clone(),
+        &[Value::Integer(4), Value::Integer(-9), Value::Integer(4)],
+        "all three sides present after the reorder",
+    );
+    // Distinct tables (the aliased-atom naming case).
+    db.execute("CREATE TABLE z(c UNIQUE)", ()).unwrap();
+    db.execute("INSERT INTO z VALUES (4),(1)", ()).unwrap();
+    assert_vals(
+        one_col(
+            &mut db,
+            "SELECT a.c FROM a JOIN a AS b ON a.c=4 JOIN z AS e ON a.c=e.c",
+        ),
+        &[
+            Value::Integer(4),
+            Value::Integer(4),
+            Value::Integer(4),
+            Value::Integer(4),
+        ],
+        "distinct-table 3-way join",
+    );
+}
+
+#[test]
+fn star_with_order_only_aggregate_reads_its_own_slot() {
+    // The star expansion's aggregate-set rebuild must include the ORDER
+    // terms: `SELECT sum(b), * FROM t GROUP BY a ORDER BY count(b)` used
+    // to project count's slot as the star columns (index drift between
+    // the two build sites).
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE t(a, b)", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (1,2),(1,3),(2,4)", ())
+        .unwrap();
+    let rows = exec_rows(
+        &mut db,
+        "SELECT sum(b), * FROM t GROUP BY a ORDER BY count(b)",
+    );
+    // Groups: a=1 -> sum 5, count 2, rep b=2; a=2 -> sum 4, count 1, rep b=4.
+    // ORDER BY count(b): a=2 first (count 1).
+    assert_vals(
+        rows[0].clone(),
+        &[Value::Integer(4), Value::Integer(2), Value::Integer(4)],
+        "star beside order-only aggregate (a=2 group)",
+    );
+    assert_vals(
+        rows[1].clone(),
+        &[Value::Integer(5), Value::Integer(1), Value::Integer(2)],
+        "star beside order-only aggregate (a=1 group)",
+    );
+}
