@@ -5035,13 +5035,28 @@ impl Pager {
             self.peer_seen_gen.store(g, Ordering::Release);
             return Ok(None);
         }
-        if self.has_dirty_pages() {
+        // A deferred-init handle (nothing on disk when it opened) holds a
+        // synthesized, never-written page 0: when a peer has since
+        // created the file, that page is not user data — drop it and
+        // adopt the file.
+        let adopt_created = self.is_new.load(Ordering::Acquire)
+            && self.store.read().len().map(|l| l > 0).unwrap_or(false);
+        if self.has_dirty_pages() && !adopt_created {
             return Ok(None);
         }
         {
             let _gate = self.install_gate_write();
+            if adopt_created {
+                self.dirty_pages.lock().clear();
+                self.dirty_count_approx.store(0, Ordering::Release);
+                self.last_noted_dirty.store(u32::MAX, Ordering::Release);
+                self.is_new.store(false, Ordering::Release);
+            }
             self.cache.write().clear();
             self.lru.lock().clear();
+            if adopt_created {
+                self.read_header()?;
+            }
             self.reload_header_from_committed()?;
         }
         Ok(Some(g))
@@ -5072,11 +5087,6 @@ impl Pager {
         self.cache.write().clear();
         self.lru.lock().clear();
         self.reload_header_from_committed()
-    }
-
-    /// True when other handles share this DELETE-mode file's state.
-    pub(crate) fn peer_active(&self) -> bool {
-        self.peer.get().is_some()
     }
 
     pub(crate) fn peer_mark_seen(&self, g: u64) {

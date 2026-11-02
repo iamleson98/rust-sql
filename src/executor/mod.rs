@@ -33448,7 +33448,7 @@ mod perf_probe_tests {
 
         // Root resolution mirrors api.rs: shared maps (post-split roots)
         // first, catalog table.root_page as the base.
-        let catalog_ptr: *const crate::schema::Catalog = &db.catalog;
+        let catalog_ptr: *const crate::schema::Catalog = &*db.catalog;
         let shared = db.maps.read().clone();
         let ctx = ExecContext::new_reader(&db.pager, catalog_ptr, shared);
         let root = ctx.table_root(&table);

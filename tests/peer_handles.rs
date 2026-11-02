@@ -69,13 +69,9 @@ fn peer_ddl_is_visible() {
     assert!(b.query("SELECT * FROM u", ()).is_err());
     a.execute("CREATE TABLE u(y)", ()).unwrap();
     a.execute("INSERT INTO u VALUES(7)", ()).unwrap();
-    // A writable call adopts the peer's schema; the read-only `&self`
-    // surface reports SQLITE_SCHEMA until then.
-    assert!(b.query("SELECT y FROM u", ()).is_err());
-    b.execute("SELECT 1", ()).unwrap();
+    // The read-only `&self` surface adopts the peer's schema too.
     assert_eq!(ints(&b, "SELECT y FROM u"), vec![7]);
     b.execute("DROP TABLE u", ()).unwrap();
-    a.execute("SELECT 1", ()).unwrap();
     assert!(a.query("SELECT y FROM u", ()).is_err());
     b.execute("CREATE INDEX ti ON t(x)", ()).unwrap();
     a.execute("INSERT INTO t VALUES(1)", ()).unwrap();
@@ -267,6 +263,24 @@ fn wal_threads_with_own_handles_lose_nothing() {
         vec![THREADS * PER]
     );
     integrity_ok(&db);
+}
+
+#[test]
+fn handle_opened_before_the_file_exists_adopts_the_peers_creation() {
+    // Two handles open on a path that does not exist yet (the Tcl suite's
+    // `sqlite3 db test.db; sqlite3 db2 test.db` shape): the first to write
+    // creates the file, the other must adopt it, not keep its own empty one.
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("new.db");
+    let mut a = Database::open(&p).unwrap();
+    let mut b = Database::open(&p).unwrap();
+    assert!(ints(&b, "SELECT count(*) FROM sqlite_master") == vec![0]);
+    a.execute("CREATE TABLE t(x)", ()).unwrap();
+    a.execute("INSERT INTO t VALUES(1)", ()).unwrap();
+    assert_eq!(ints(&b, "SELECT x FROM t"), vec![1]);
+    b.execute("INSERT INTO t VALUES(2)", ()).unwrap();
+    assert_eq!(ints(&a, "SELECT x FROM t ORDER BY x"), vec![1, 2]);
+    integrity_ok(&a);
 }
 
 #[test]

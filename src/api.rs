@@ -377,7 +377,7 @@ impl Drop for WalStmtGuard<'_> {
 
 pub struct Database {
     pub(crate) pager: Arc<Pager>,
-    pub(crate) catalog: Catalog,
+    pub(crate) catalog: crate::schema::CatalogCell,
     path: PathBuf,
     /// Inside an explicit BEGIN..COMMIT/ROLLBACK transaction. Only mutated
     /// by the writer (which holds `&mut self` via the outer write lock),
@@ -2621,7 +2621,7 @@ impl Database {
         }
         Ok(Self {
             pager,
-            catalog,
+            catalog: crate::schema::CatalogCell::new(catalog),
             path,
             in_transaction: AtomicBool::new(false),
             txn_snapshot: Mutex::new(None),
@@ -3029,7 +3029,7 @@ impl Database {
         }
         Self {
             pager,
-            catalog,
+            catalog: crate::schema::CatalogCell::new(catalog),
             path,
             in_transaction: AtomicBool::new(false),
             txn_snapshot: Mutex::new(None),
@@ -4379,7 +4379,7 @@ impl Database {
     /// Adopt the schema a peer handle committed: re-read it from the
     /// (already refreshed) pager, carrying this connection's TEMP
     /// objects over, through the standard adopt recipe.
-    fn reload_schema_from_peer(&mut self) -> Result<()> {
+    fn reload_schema_from_peer(&self) -> Result<()> {
         let mut catalog = Catalog::new();
         catalog.schema_cookie = self.pager.schema_cookie();
         load_schema(&self.pager, &mut catalog)?;
@@ -4411,7 +4411,7 @@ impl Database {
         Ok(())
     }
 
-    fn adopt_catalog_after_vacuum(&mut self, catalog: Catalog) {
+    fn adopt_catalog_after_vacuum(&self, catalog: Catalog) {
         let mut schema_root_pages = HashMap::new();
         for (name, t) in catalog.all_tables() {
             schema_root_pages.insert(format!("table:{}", name), t.root_page);
@@ -4419,7 +4419,7 @@ impl Database {
         for (name, i) in catalog.all_indexes() {
             schema_root_pages.insert(format!("index:{}", name), i.root_page);
         }
-        self.catalog = catalog;
+        self.catalog.swap(catalog);
         *self.schema_root_pages.lock() = schema_root_pages;
         // Root overrides + max-rowid caches describe the OLD tree.
         *self.maps.write() = empty_maps();
@@ -4462,7 +4462,7 @@ impl Database {
         self.pager.retire();
         std::mem::swap(&mut self.pager, &mut new.pager);
         std::mem::swap(&mut self.path, &mut new.path);
-        let catalog = std::mem::replace(&mut new.catalog, Catalog::new());
+        let catalog = std::mem::replace(&mut *new.catalog, Catalog::new());
         self.adopt_catalog_after_vacuum(catalog);
         // `new` drops here holding the retired old store and an empty
         // catalog; `Database`'s Drop only reconciles a pending
@@ -4495,7 +4495,7 @@ impl Database {
         drop(old);
         // The catalog describes the dropped store: nothing between
         // this and the adopt may walk it.
-        self.catalog = Catalog::new();
+        self.catalog.set(Catalog::new());
         self.maps_populated.store(false, Ordering::Release);
         *self.maps.write() = empty_maps();
         self.invalidate_stmt_cache();
@@ -5813,7 +5813,7 @@ impl Database {
         let in_txn = self.in_transaction.load(Ordering::Acquire);
         let txn_snap = self.txn_snapshot.get_mut().take();
         let deferred_flush = self.deferred_flush.load(Ordering::Acquire);
-        let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
+        let catalog_ptr: *const crate::schema::Catalog = &*self.catalog;
         let mut ctx = ExecContext::new(&self.pager, catalog_ptr);
         ctx.in_transaction = in_txn;
         ctx.deferred_flush = deferred_flush;
@@ -6602,15 +6602,8 @@ impl Database {
         // WAL writer role for the statement when handles share the file
         // (taken before the statement reads anything, so it never plans
         // against a peer's older view).
-        let wal_scope = match self.wal_stmt_enter(sql) {
-            Err(Error::Transaction(m)) if m.contains("SQLITE_SCHEMA") => {
-                self.reload_schema_from_peer()?;
-                self.wal_stmt_enter(sql)?;
-                Some(())
-            }
-            r => r.map(|_| Some(()))?,
-        };
-        let _ = wal_scope;
+        self.catalog.reclaim();
+        self.wal_stmt_enter(sql)?;
         let result = self.execute_stmt(sql, params);
         self.wal_stmt_exit();
         if let Err(e) = &result {
@@ -6793,17 +6786,7 @@ impl Database {
         // whole statement — DML reads main-file pages too, and a
         // reader-role handle's INSERT..SELECT walks the pager exactly
         // like a SELECT (see `xread_scope`).
-        let _xread = match self.xread_scope() {
-            // A peer handle changed the schema: this writable surface can
-            // adopt the new catalog (read-only `&self` paths cannot).
-            Err(Error::Transaction(m))
-                if m.contains("SQLITE_SCHEMA") && self.pager.peer_active() =>
-            {
-                self.reload_schema_from_peer()?;
-                self.xread_scope()?
-            }
-            r => r?,
-        };
+        let _xread = self.xread_scope()?;
         // A writer must never read the BEGIN-time (committed) state: a
         // leaked read-view preference or pager scope on this thread is
         // cleared here — `execute` takes `&mut`, so exclusive with every
@@ -7274,7 +7257,7 @@ impl Database {
                 let in_txn = self.in_transaction.load(Ordering::Acquire);
                 let txn_snap = self.txn_snapshot.get_mut().take();
                 let deferred_flush = self.deferred_flush.load(Ordering::Acquire);
-                let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
+                let catalog_ptr: *const crate::schema::Catalog = &*self.catalog;
                 let mut ctx = ExecContext::new(&self.pager, catalog_ptr);
                 ctx.in_transaction = in_txn;
                 ctx.deferred_flush = deferred_flush;
@@ -7321,7 +7304,7 @@ impl Database {
                 let in_txn = self.in_transaction.load(Ordering::Acquire);
                 let txn_snap = self.txn_snapshot.get_mut().take();
                 let deferred_flush = self.deferred_flush.load(Ordering::Acquire);
-                let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
+                let catalog_ptr: *const crate::schema::Catalog = &*self.catalog;
                 let mut ctx = ExecContext::new(&self.pager, catalog_ptr);
                 ctx.in_transaction = in_txn;
                 ctx.deferred_flush = deferred_flush;
@@ -7608,7 +7591,7 @@ impl Database {
         // access — the lock is redundant. For a 1k-row INSERT batch (each
         // statement goes through this path), that's 4k avoided lock
         // acquisitions on `root_overrides` + `max_rowids`.
-        let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
+        let catalog_ptr: *const crate::schema::Catalog = &*self.catalog;
         let mut ctx = ExecContext::new(&self.pager, catalog_ptr);
         ctx.in_transaction = in_txn;
         ctx.deferred_flush = deferred_flush;
@@ -8397,11 +8380,9 @@ impl Database {
             || cat_views != scratch_views
             || cat_triggers != scratch_triggers
         {
-            return Err(Error::Transaction(format!(
-                "database schema changed (SQLITE_SCHEMA): another connection modified the \
-                 schema of {}; close and reopen this connection",
-                self.path.display()
-            )));
+            // A peer changed the schema: adopt it (readers keep the old
+            // catalog alive until the next exclusive call).
+            return self.reload_schema_from_peer();
         }
         let mut roots_moved = false;
         let mut new_roots: HashMap<String, u32> = HashMap::new();
@@ -8853,7 +8834,7 @@ impl Database {
                 let in_txn = self.in_transaction.load(Ordering::Acquire);
                 let txn_snap = self.txn_snapshot_for_ctx();
                 let shared = self.read_maps();
-                let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
+                let catalog_ptr: *const crate::schema::Catalog = &*self.catalog;
                 let mut ctx = ExecContext::new_reader(&self.pager, catalog_ptr, shared);
                 ctx.in_transaction = in_txn;
                 ctx.deferred_flush = self.deferred_flush.load(Ordering::Acquire);
@@ -8920,7 +8901,7 @@ impl Database {
         };
         let plan_opt = cached.plan.clone();
         if plan_opt.is_some() || cte_dml {
-            let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
+            let catalog_ptr: *const crate::schema::Catalog = &*self.catalog;
             let in_txn = self.in_transaction.load(Ordering::Acquire);
             // Skip the txn-snapshot Mutex entirely when not inside a
             // transaction — and skip it under the concurrent regime
@@ -9390,7 +9371,7 @@ impl Database {
                 let in_txn = self.in_transaction.load(Ordering::Acquire);
                 let txn_snap = self.txn_snapshot_for_ctx();
                 let shared = self.read_maps();
-                let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
+                let catalog_ptr: *const crate::schema::Catalog = &*self.catalog;
                 let mut ctx = ExecContext::new_reader(&self.pager, catalog_ptr, shared);
                 ctx.in_transaction = in_txn;
                 ctx.deferred_flush = self.deferred_flush.load(Ordering::Acquire);
@@ -9421,7 +9402,7 @@ impl Database {
                 let rows = self.run_fast_path(fp, params_vec.as_slice())?;
                 return Ok((fp.output_columns().to_vec(), rows));
             }
-            let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
+            let catalog_ptr: *const crate::schema::Catalog = &*self.catalog;
             let in_txn = self.in_transaction.load(Ordering::Acquire);
             let txn_snap = self.txn_snapshot_for_ctx();
             // ONE read-lock + ONE refcount bump (see query()).
@@ -10711,7 +10692,7 @@ impl Database {
             catalog.reset_row_logest();
         }
         catalog.schema_cookie = self.pager.schema_cookie();
-        self.catalog = catalog;
+        self.catalog.set(catalog);
         self.invalidate_stmt_cache();
         self.seen_hashes.lock().clear();
         self.schema_epoch.fetch_add(1, Ordering::AcqRel);
@@ -10844,7 +10825,7 @@ impl Database {
     /// Reader ctx for view-DML evaluation (shares the read-maps snapshot
     /// + bound params; the caller installs plugin/corr guards).
     fn view_reader_ctx(&self, params: &[Value]) -> (ExecContext<'_>, Arc<StmtMaps>) {
-        let catalog_ptr: *const Catalog = &self.catalog;
+        let catalog_ptr: *const Catalog = &*self.catalog;
         let shared = self.read_maps();
         let maps = shared.clone();
         let mut ctx = ExecContext::new_reader(&self.pager, catalog_ptr, shared);
@@ -11115,7 +11096,7 @@ impl Database {
         let in_txn = self.in_transaction.load(Ordering::Acquire);
         let txn_snap = self.txn_snapshot.get_mut().take();
         let deferred_flush = self.deferred_flush.load(Ordering::Acquire);
-        let catalog_ptr: *const Catalog = &self.catalog;
+        let catalog_ptr: *const Catalog = &*self.catalog;
         let mut ctx = ExecContext::new(&self.pager, catalog_ptr);
         ctx.in_transaction = in_txn;
         ctx.deferred_flush = deferred_flush;
@@ -11869,7 +11850,7 @@ impl Database {
         let in_txn = self.in_transaction.load(Ordering::Acquire);
         let txn_snap = self.txn_snapshot_for_ctx();
         let shared = self.read_maps();
-        let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
+        let catalog_ptr: *const crate::schema::Catalog = &*self.catalog;
         let mut ctx = ExecContext::new_reader(&self.pager, catalog_ptr, shared);
         ctx.in_transaction = in_txn;
         ctx.deferred_flush = self.deferred_flush.load(Ordering::Acquire);
@@ -11958,7 +11939,7 @@ impl Database {
         let in_txn = self.in_transaction.load(Ordering::Acquire);
         let txn_snap = self.txn_snapshot_for_ctx();
         let shared = self.read_maps();
-        let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
+        let catalog_ptr: *const crate::schema::Catalog = &*self.catalog;
         let mut ctx = ExecContext::new_reader(&self.pager, catalog_ptr, shared);
         ctx.in_transaction = in_txn;
         ctx.deferred_flush = self.deferred_flush.load(Ordering::Acquire);
@@ -12326,7 +12307,7 @@ impl Database {
             let in_txn = self.in_transaction.load(Ordering::Acquire);
             let txn_snap = self.txn_snapshot_for_ctx();
             let shared = self.read_maps();
-            let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
+            let catalog_ptr: *const crate::schema::Catalog = &*self.catalog;
             let mut ctx = ExecContext::new_reader(&self.pager, catalog_ptr, shared);
             ctx.in_transaction = in_txn;
             ctx.txn_snapshot = txn_snap;
@@ -12369,7 +12350,7 @@ impl Database {
         } else {
             let mut planner = Planner::new(&self.catalog);
             let plan = planner.plan_select(&view.select)?;
-            let catalog_ptr: *const Catalog = &self.catalog;
+            let catalog_ptr: *const Catalog = &*self.catalog;
             let shared = self.read_maps();
             let mut ctx = ExecContext::new_reader(&self.pager, catalog_ptr, shared);
             for v in params.clone() {
@@ -12577,7 +12558,7 @@ impl Database {
                 let in_txn = self.in_transaction.load(Ordering::Acquire);
                 let txn_snap = self.txn_snapshot_for_ctx();
                 let shared = self.read_maps();
-                let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
+                let catalog_ptr: *const crate::schema::Catalog = &*self.catalog;
                 let mut ctx = ExecContext::new_reader(&self.pager, catalog_ptr, shared);
                 ctx.in_transaction = in_txn;
                 ctx.txn_snapshot = txn_snap;
@@ -12618,7 +12599,7 @@ impl Database {
         let in_txn = self.in_transaction.load(Ordering::Acquire);
         let txn_snap = self.txn_snapshot_for_ctx();
         let shared = self.read_maps();
-        let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
+        let catalog_ptr: *const crate::schema::Catalog = &*self.catalog;
         let mut ctx = ExecContext::new_reader(&self.pager, catalog_ptr, shared);
         ctx.in_transaction = in_txn;
         ctx.deferred_flush = self.deferred_flush.load(Ordering::Acquire);
@@ -19602,7 +19583,7 @@ impl Database {
         let in_txn = self.in_transaction.load(Ordering::Acquire);
         let txn_snap = self.txn_snapshot.get_mut().take();
         let deferred_flush = self.deferred_flush.load(Ordering::Acquire);
-        let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
+        let catalog_ptr: *const crate::schema::Catalog = &*self.catalog;
         let mut ctx = ExecContext::new(&self.pager, catalog_ptr);
         ctx.in_transaction = in_txn;
         ctx.deferred_flush = deferred_flush;
@@ -19742,7 +19723,7 @@ impl Database {
         let in_txn = self.in_transaction.load(Ordering::Acquire);
         let txn_snap = self.txn_snapshot.get_mut().take();
         let deferred_flush = self.deferred_flush.load(Ordering::Acquire);
-        let catalog_ptr: *const crate::schema::Catalog = &self.catalog;
+        let catalog_ptr: *const crate::schema::Catalog = &*self.catalog;
         let mut ctx = ExecContext::new(&self.pager, catalog_ptr);
         ctx.in_transaction = in_txn;
         ctx.deferred_flush = deferred_flush;

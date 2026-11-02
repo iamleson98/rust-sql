@@ -3,6 +3,9 @@
 //! The catalog is itself stored as a special table (`sqlite_master` equivalent)
 //! in the database. On open, we read the catalog into memory for fast lookup.
 
+mod catalog_cell;
+pub use catalog_cell::CatalogCell;
+
 use crate::error::{Error, Result};
 use crate::sql::ast::{
     ColumnConstraint, ColumnDef, ConflictResolution, ForeignKeyAction, IndexedColumn, Order,

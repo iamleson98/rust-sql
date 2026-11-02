@@ -558,8 +558,10 @@ fn close_time_checkpoint_folds_while_idle_reader_open() {
 }
 
 /// In-process second handle on a WAL file: reads track the first
-/// handle's commits (the freshness probe's in-process bonus), and the
-/// second handle's WRITE still fails with the in-process busy class.
+/// handle's commits (the freshness probe's in-process bonus), the
+/// second handle's WRITE fails with the in-process busy class only
+/// while the first holds a write transaction, and otherwise the two
+/// take turns holding the writer role.
 #[test]
 fn in_process_second_handle_reads_track_first_handle_commits() {
     let dir = tempdir("inproc");
@@ -570,33 +572,38 @@ fn in_process_second_handle_reads_track_first_handle_commits() {
     h1.execute("INSERT INTO t (v) VALUES ('a')", []).unwrap();
 
     let mut h2 = open_wal(&db_path);
-    let n: i64 = h2.query("SELECT COUNT(*) FROM t", []).unwrap()[0]
-        .first()
-        .unwrap()
-        .as_integer();
-    assert_eq!(n, 1);
+    let count = |h: &rustqlite::Database| -> i64 {
+        h.query("SELECT COUNT(*) FROM t", []).unwrap()[0]
+            .first()
+            .unwrap()
+            .as_integer()
+    };
+    assert_eq!(count(&h2), 1);
 
     h1.execute("INSERT INTO t (v) VALUES ('b')", []).unwrap();
-    let n: i64 = h2.query("SELECT COUNT(*) FROM t", []).unwrap()[0]
-        .first()
-        .unwrap()
-        .as_integer();
-    assert_eq!(n, 2, "second handle freshness must track h1's commit");
+    assert_eq!(
+        count(&h2),
+        2,
+        "second handle freshness must track h1's commit"
+    );
 
-    // Second handle writes: busy (in-process writer lease).
+    // Second handle writes while h1 is inside a transaction: busy.
+    h1.execute("BEGIN", []).unwrap();
+    h1.execute("INSERT INTO t (v) VALUES ('x')", []).unwrap();
     let err = h2
         .execute("INSERT INTO t (v) VALUES ('c')", [])
         .unwrap_err();
     assert!(format!("{err}").contains("SQLITE_BUSY"));
+    h1.execute("ROLLBACK", []).unwrap();
 
-    // First handle keeps working; after it closes, h2 may write.
-    drop(h1);
+    // h1 idle: h2 takes its turn, and h1 sees the result.
     h2.execute("INSERT INTO t (v) VALUES ('c')", []).unwrap();
-    let n: i64 = h2.query("SELECT COUNT(*) FROM t", []).unwrap()[0]
-        .first()
-        .unwrap()
-        .as_integer();
-    assert_eq!(n, 3);
+    assert_eq!(count(&h1), 3);
+    h1.execute("INSERT INTO t (v) VALUES ('d')", []).unwrap();
+    assert_eq!(count(&h2), 4);
+    drop(h1);
+    h2.execute("INSERT INTO t (v) VALUES ('e')", []).unwrap();
+    assert_eq!(count(&h2), 5);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -1235,7 +1235,7 @@ impl<'a> Statement<'a> {
         let _wsg = db
             .concurrent_txn_for_caller()
             .map(|txn| db.pager.arm_writer_scope(txn));
-        let catalog_ptr: *const crate::schema::Catalog = &db.catalog;
+        let catalog_ptr: *const crate::schema::Catalog = &*db.catalog;
         let shared = db.read_maps();
         let in_txn = db.in_transaction.load(std::sync::atomic::Ordering::Acquire);
         // Concurrent-owner statements skip the global snapshot mutex
@@ -2078,7 +2078,7 @@ impl Driver for GroupByDriver {
                     ))
                 }
             };
-            let catalog_ptr: *const crate::schema::Catalog = &db.catalog;
+            let catalog_ptr: *const crate::schema::Catalog = &*db.catalog;
             let shared = db.read_maps();
             let mut ctx = ExecContext::new_reader(&db.pager, catalog_ptr, shared);
             for p in params {
@@ -2379,7 +2379,7 @@ impl Driver for ProjectedScanDriver {
         if self.eof {
             return Ok(Vec::new());
         }
-        let catalog_ptr: *const crate::schema::Catalog = &db.catalog;
+        let catalog_ptr: *const crate::schema::Catalog = &*db.catalog;
         let shared = db.read_maps();
         let ctx = ExecContext::new_reader(&db.pager, catalog_ptr, shared);
         let root = ctx.table_root(&self.table);
@@ -2461,7 +2461,7 @@ impl Driver for ProjectedScanDriver {
                 },
             )));
         }
-        let catalog_ptr: *const crate::schema::Catalog = &db.catalog;
+        let catalog_ptr: *const crate::schema::Catalog = &*db.catalog;
         let shared = db.read_maps();
         let ctx = ExecContext::new_reader(&db.pager, catalog_ptr, shared);
         let root = ctx.table_root(&self.table);
@@ -2556,7 +2556,7 @@ impl Driver for ProjectedRangeDriver {
         if self.eof {
             return Ok(Vec::new());
         }
-        let catalog_ptr: *const crate::schema::Catalog = &db.catalog;
+        let catalog_ptr: *const crate::schema::Catalog = &*db.catalog;
         let shared = db.read_maps();
         let mut ctx = ExecContext::new_reader(&db.pager, catalog_ptr, shared);
         for p in params {
@@ -2693,7 +2693,7 @@ impl Driver for ProjectedRangeDriver {
                 },
             )));
         }
-        let catalog_ptr: *const crate::schema::Catalog = &db.catalog;
+        let catalog_ptr: *const crate::schema::Catalog = &*db.catalog;
         let shared = db.read_maps();
         let ctx = ExecContext::new_reader(&db.pager, catalog_ptr, shared);
         let root = ctx.table_root(&self.table);
@@ -2784,7 +2784,7 @@ impl Driver for ScanDriver {
         if self.eof {
             return Ok(Vec::new());
         }
-        let catalog_ptr: *const crate::schema::Catalog = &db.catalog;
+        let catalog_ptr: *const crate::schema::Catalog = &*db.catalog;
         let shared = db.read_maps();
         let mut ctx = ExecContext::new_reader(&db.pager, catalog_ptr, shared);
         for p in params {
@@ -2977,7 +2977,7 @@ impl Driver for FilteredScanDriver {
         if self.eof {
             return Ok(Vec::new());
         }
-        let catalog_ptr: *const crate::schema::Catalog = &db.catalog;
+        let catalog_ptr: *const crate::schema::Catalog = &*db.catalog;
         let shared = db.read_maps();
         let mut ctx = ExecContext::new_reader(&db.pager, catalog_ptr, shared);
         for p in params {
@@ -3347,7 +3347,7 @@ impl Driver for RangeDriver {
         if self.eof {
             return Ok(Vec::new());
         }
-        let catalog_ptr: *const crate::schema::Catalog = &db.catalog;
+        let catalog_ptr: *const crate::schema::Catalog = &*db.catalog;
         let shared = db.read_maps();
         let mut ctx = ExecContext::new_reader(&db.pager, catalog_ptr, shared);
         for p in params {
