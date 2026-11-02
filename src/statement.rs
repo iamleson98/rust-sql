@@ -1075,6 +1075,13 @@ impl<'a> Statement<'a> {
             // / C ABI hold the outer write lock, so at most one statement
             // runs at a time.
             let caller_cw_txn = self.db.concurrent_txn_for_caller();
+            // WAL writer role for a stepped DML statement when handles
+            // share the file (held until the step returns).
+            let _wal_dml = if is_dml && caller_cw_txn.is_none() {
+                Some(self.db.wal_stmt_scope()?)
+            } else {
+                None
+            };
             let mut plain_dml_gate = if is_dml && caller_cw_txn.is_none() {
                 Some(self.db.enter_plain_dml()?)
             } else {

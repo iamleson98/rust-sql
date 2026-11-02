@@ -147,3 +147,124 @@ fn concurrent_threads_with_own_handles_lose_nothing() {
     );
     integrity_ok(&db);
 }
+
+// ---- WAL mode: handles take turns holding the writer role ----
+
+fn wal_db(p: &std::path::Path) -> Database {
+    let mut db = Database::open(p).unwrap();
+    db.execute("PRAGMA journal_mode = WAL", ()).unwrap();
+    db
+}
+
+#[test]
+fn wal_alternating_writers() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("w.db");
+    let mut a = wal_db(&p);
+    a.execute("CREATE TABLE t(x)", ()).unwrap();
+    // `a` wrote first and is now idle; `b` must be able to write.
+    let mut b = Database::open(&p).unwrap();
+    for i in 0..30 {
+        b.execute(&format!("INSERT INTO t VALUES({})", 100 + i), ())
+            .unwrap();
+        a.execute(&format!("INSERT INTO t VALUES({})", 200 + i), ())
+            .unwrap();
+    }
+    assert_eq!(ints(&a, "SELECT count(*) FROM t"), vec![60]);
+    assert_eq!(ints(&b, "SELECT count(*) FROM t"), vec![60]);
+    integrity_ok(&b);
+    drop(a);
+    drop(b);
+    let c = Database::open(&p).unwrap();
+    assert_eq!(ints(&c, "SELECT count(*) FROM t"), vec![60]);
+    integrity_ok(&c);
+}
+
+#[test]
+fn wal_open_transaction_keeps_the_writer_role() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("w.db");
+    let mut a = wal_db(&p);
+    a.execute("CREATE TABLE t(x)", ()).unwrap();
+    let mut b = Database::open(&p).unwrap();
+    a.execute("BEGIN", ()).unwrap();
+    a.execute("INSERT INTO t VALUES(1)", ()).unwrap();
+    // A peer's write waits out (here: fails fast with) the open transaction.
+    let e = b
+        .execute("INSERT INTO t VALUES(2)", ())
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("locked"), "unexpected: {e}");
+    a.execute("COMMIT", ()).unwrap();
+    b.execute("INSERT INTO t VALUES(2)", ()).unwrap();
+    assert_eq!(ints(&a, "SELECT x FROM t ORDER BY x"), vec![1, 2]);
+    // Rolled-back work releases the role as well.
+    b.execute("BEGIN", ()).unwrap();
+    b.execute("INSERT INTO t VALUES(3)", ()).unwrap();
+    b.execute("ROLLBACK", ()).unwrap();
+    a.execute("INSERT INTO t VALUES(4)", ()).unwrap();
+    assert_eq!(ints(&b, "SELECT x FROM t ORDER BY x"), vec![1, 2, 4]);
+    integrity_ok(&a);
+}
+
+#[test]
+fn wal_peer_ddl_and_returning_and_prepared_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("w.db");
+    let mut a = wal_db(&p);
+    a.execute("CREATE TABLE t(x)", ()).unwrap();
+    let mut b = Database::open(&p).unwrap();
+    b.execute("CREATE TABLE u(y)", ()).unwrap();
+    // `a` adopts `b`'s schema change when it next writes.
+    a.execute("INSERT INTO u VALUES(5)", ()).unwrap();
+    // DML-RETURNING through the query surface takes turns too.
+    let r = b.query("INSERT INTO t VALUES(9) RETURNING x", ()).unwrap();
+    assert_eq!(r, vec![vec![Value::Integer(9)]]);
+    let r = a.query("INSERT INTO t VALUES(10) RETURNING x", ()).unwrap();
+    assert_eq!(r, vec![vec![Value::Integer(10)]]);
+    assert_eq!(ints(&b, "SELECT y FROM u"), vec![5]);
+    assert_eq!(ints(&a, "SELECT x FROM t ORDER BY x"), vec![9, 10]);
+    integrity_ok(&a);
+}
+
+#[test]
+fn wal_threads_with_own_handles_lose_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("w.db");
+    {
+        let mut db = wal_db(&p);
+        db.execute("CREATE TABLE t(w, i)", ()).unwrap();
+    }
+    const THREADS: i64 = 4;
+    const PER: i64 = 100;
+    let handles: Vec<_> = (0..THREADS)
+        .map(|w| {
+            let p = p.clone();
+            std::thread::spawn(move || {
+                let mut db = Database::open(&p).unwrap();
+                for i in 0..PER {
+                    loop {
+                        match db.execute(&format!("INSERT INTO t VALUES({w}, {i})"), ()) {
+                            Ok(_) => break,
+                            Err(e) if e.to_string().contains("locked") => {
+                                std::thread::yield_now();
+                            }
+                            Err(e) => panic!("insert failed: {e}"),
+                        }
+                    }
+                    let _ = db.query("SELECT count(*) FROM t", ()).unwrap();
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    let db = Database::open(&p).unwrap();
+    assert_eq!(ints(&db, "SELECT count(*) FROM t"), vec![THREADS * PER]);
+    assert_eq!(
+        ints(&db, "SELECT count(DISTINCT w * 1000 + i) FROM t"),
+        vec![THREADS * PER]
+    );
+    integrity_ok(&db);
+}

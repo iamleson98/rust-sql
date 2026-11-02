@@ -1006,7 +1006,7 @@ pub struct Pager {
     /// fast-path check that lets writer handles skip per-statement read
     /// gating + freshness probes entirely (they are the only possible
     /// writer, and their own commits maintain their committed map).
-    xlock_write_held: std::sync::atomic::AtomicBool,
+    xlock_write_held: Arc<std::sync::atomic::AtomicBool>,
     /// Freeze-watch: consecutive freshness probes that found the sidecar
     /// grown past our horizon yet absorbed ZERO visible frames (an
     /// uncommitted tail is normal between a writer's commit marks; a
@@ -1019,6 +1019,11 @@ pub struct Pager {
     /// In-process coordination with other handles on this DELETE-mode
     /// file (see `storage::peer`); unset for memory stores.
     peer: std::sync::OnceLock<Arc<crate::storage::peer::PeerShared>>,
+    /// Inside a statement or transaction, or holding unflushed pages: a
+    /// peer must not relieve this handle of the WAL writer role.
+    pub(crate) writer_busy: Arc<AtomicBool>,
+    /// Shared with this handle's peer-registry entry.
+    member_xlock: Arc<Mutex<Option<Arc<crate::storage::xlock::XLock>>>>,
     /// The peer commit generation this handle's cache reflects.
     peer_seen_gen: AtomicU64,
     /// This handle's own live read scopes (a commit never waits on them).
@@ -1963,6 +1968,9 @@ impl Drop for Pager {
         // WITHOUT Drop (std::mem::forget / a leak) keeps the lease and
         // later writers get SQLITE_BUSY — the same behavior a leaked
         // sqlite3* connection exhibits through its held POSIX locks.
+        if let Some(p) = self.peer.get() {
+            p.leave(self.instance_id);
+        }
         if !self.store.read().is_memory() {
             crate::storage::wal::release_wal_lease_key(self.wal_lease_key(), self.instance_id);
             // The cross-process WRITE byte releases with it — the OS
@@ -2535,7 +2543,9 @@ impl Pager {
             write_version: std::sync::atomic::AtomicU64::new(0),
             wal: RwLock::new(None),
             xlock: std::sync::OnceLock::new(),
-            xlock_write_held: AtomicBool::new(false),
+            xlock_write_held: Arc::new(AtomicBool::new(false)),
+            writer_busy: Arc::new(AtomicBool::new(false)),
+            member_xlock: Arc::new(Mutex::new(None)),
             xlock_empty_absorb_streak: AtomicU64::new(0),
             seen_fold_gen: AtomicU64::new(0),
             peer: std::sync::OnceLock::new(),
@@ -2599,6 +2609,12 @@ impl Pager {
             pager
                 .peer_seen_gen
                 .store(shared.generation(), Ordering::Release);
+            shared.join(crate::storage::peer::Member {
+                id: pager.instance_id,
+                busy: pager.writer_busy.clone(),
+                role: pager.xlock_write_held.clone(),
+                xlock: pager.member_xlock.clone(),
+            });
             let _ = pager.peer.set(shared);
         }
         let file_size = pager.store.read().len()?;
@@ -5060,6 +5076,86 @@ impl Pager {
         self.peer_seen_gen.store(g, Ordering::Release);
     }
 
+    /// Take the WAL writer role for one write statement when other
+    /// handles share this file in-process. The role was sticky (held until
+    /// the first writer closed); with peers it is now held per statement /
+    /// transaction, and an IDLE holder is relieved of it, so handles can
+    /// take turns writing. Returns `Some(refreshed)` when the role is held
+    /// on return (`refreshed`: the peers' frames were absorbed and the
+    /// caller must revalidate its caches), `None` when the legacy sticky
+    /// path applies (sole handle, no WAL, memory store).
+    pub(crate) fn wal_write_begin(&self) -> Result<Option<bool>> {
+        let Some(p) = self.peer.get() else {
+            return Ok(None);
+        };
+        if Arc::strong_count(p) < 2 || self.wal.read().is_none() || self.xlock.get().is_none() {
+            return Ok(None);
+        }
+        let key = self.wal_lease_key().to_path_buf();
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(self.busy_timeout_ms().max(0) as u64);
+        let id = self.instance_id;
+        let held_before = self.xlock_is_writer();
+        loop {
+            match crate::storage::wal::acquire_wal_lease_relieving(
+                &key,
+                id,
+                |h| p.revoke_if_idle(h),
+                || self.writer_busy.store(true, Ordering::SeqCst),
+            ) {
+                Ok(_) => break,
+                Err(foreign) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(Error::Transaction(format!(
+                            "database is locked (SQLITE_BUSY): {}",
+                            crate::storage::wal::wal_lease_busy(foreign)
+                        )));
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+            }
+        }
+        if !held_before || !self.xlock_is_writer() {
+            if let Err(e) = self.xlock_take_writer_role() {
+                crate::storage::wal::release_wal_lease_key(&key, id);
+                self.writer_busy.store(false, Ordering::SeqCst);
+                return Err(e);
+            }
+            // A peer wrote since this handle last held the role.
+            return match self.resync_after_role_change() {
+                Ok(r) => Ok(Some(r)),
+                Err(e) => {
+                    self.wal_write_release();
+                    Err(e)
+                }
+            };
+        }
+        Ok(Some(false))
+    }
+
+    /// Hand the writer role back (peers present, nothing left to flush).
+    pub(crate) fn wal_write_release(&self) {
+        self.writer_busy.store(false, Ordering::SeqCst);
+        crate::storage::wal::release_wal_lease_key(self.wal_lease_key(), self.instance_id);
+        self.xlock_drop_writer_role();
+    }
+
+    /// Forget every dirty mark WITHOUT touching the cache (the pages hold
+    /// committed bytes — see the caller).
+    pub(crate) fn discard_dirty_marks(&self) {
+        if self.dirty_count_approx.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        self.dirty_pages.lock().clear();
+        self.dirty_count_approx.store(0, Ordering::Release);
+        self.last_noted_dirty.store(u32::MAX, Ordering::Release);
+    }
+
+    /// Peers share this file in-process (WAL role handoff applies).
+    pub(crate) fn wal_has_peers(&self) -> bool {
+        self.peer.get().is_some_and(|p| Arc::strong_count(p) >= 2)
+    }
+
     // ============================================================ xlock ==
     // Cross-process locking (see storage::xlock for the protocol). All of
     // these are no-ops for pagers without a lock file (in-memory stores,
@@ -5273,7 +5369,19 @@ impl Pager {
     /// with local dirty state (mid-write-transaction handles are the
     /// writer by construction, but belt-and-braces).
     pub fn resync_foreign_commits_if_stale(&self) -> Result<bool> {
-        if self.xlock.get().is_none() || self.xlock_is_writer() {
+        self.resync_foreign_commits_inner(false)
+    }
+
+    /// [`Self::resync_foreign_commits_if_stale`] for a handle that has
+    /// just taken the writer role from a peer: its view is behind the
+    /// frames the previous holder appended, so the role-holder skip must
+    /// not apply.
+    pub(crate) fn resync_after_role_change(&self) -> Result<bool> {
+        self.resync_foreign_commits_inner(true)
+    }
+
+    fn resync_foreign_commits_inner(&self, force: bool) -> Result<bool> {
+        if self.xlock.get().is_none() || (!force && self.xlock_is_writer()) {
             return Ok(false);
         }
         if self.has_dirty_pages() {
@@ -5606,6 +5714,7 @@ impl Pager {
                 .map_err(crate::error::Error::Io)?;
             self.seen_fold_gen
                 .store(xl.fold_generation(), Ordering::Release);
+            *self.member_xlock.lock() = Some(xl.clone());
             let _ = self.xlock.set(xl);
         }
         // Flush pending dirty pages in DELETE mode first.

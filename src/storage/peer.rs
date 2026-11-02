@@ -28,7 +28,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -45,7 +45,21 @@ struct State {
     waiting_own: u32,
 }
 
+/// One live handle's WAL-writer control block, visible to its peers so an
+/// idle holder of the writer role can be relieved of it (see
+/// [`PeerShared::revoke_if_idle`]).
+pub(crate) struct Member {
+    pub id: u64,
+    /// Inside a statement or transaction, or holding unflushed pages.
+    pub busy: Arc<AtomicBool>,
+    /// Mirrors the pager's `xlock_write_held`.
+    pub role: Arc<AtomicBool>,
+    /// The handle's lock file, once it has one (WAL files).
+    pub xlock: Arc<parking_lot::Mutex<Option<Arc<crate::storage::xlock::XLock>>>>,
+}
+
 pub(crate) struct PeerShared {
+    members: Mutex<Vec<Member>>,
     gen: AtomicU64,
     st: Mutex<State>,
     cv: Condvar,
@@ -56,6 +70,41 @@ pub(crate) struct PeerShared {
 const WAIT: Duration = Duration::from_millis(500);
 
 impl PeerShared {
+    pub(crate) fn join(&self, m: Member) {
+        self.members
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(m);
+    }
+
+    pub(crate) fn leave(&self, id: u64) {
+        self.members
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|m| m.id != id);
+    }
+
+    /// Strip the cross-process WRITE byte and the in-process role flag from
+    /// handle `id` when it is idle. The caller holds the WAL lease registry
+    /// lock, and a handle marks itself busy under that same lock, so an
+    /// "idle" verdict cannot race the owner starting a statement.
+    pub(crate) fn revoke_if_idle(&self, id: u64) -> bool {
+        let members = self.members.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(m) = members.iter().find(|m| m.id == id) else {
+            // The owner is gone (its Drop releases the lease; a leaked
+            // handle never does) — nothing to strip.
+            return false;
+        };
+        if m.busy.load(Ordering::SeqCst) {
+            return false;
+        }
+        if let Some(xl) = m.xlock.lock().as_ref() {
+            let _ = xl.unlock(crate::storage::xlock::WRITE_BYTE);
+        }
+        m.role.store(false, Ordering::Release);
+        true
+    }
+
     pub(crate) fn generation(&self) -> u64 {
         self.gen.load(Ordering::Acquire)
     }
@@ -170,6 +219,7 @@ pub(crate) fn attach(key: PathBuf) -> Arc<PeerShared> {
     // on the (rare) insert so the map tracks only live paths.
     reg.retain(|_, w| w.strong_count() > 0);
     let fresh = Arc::new(PeerShared {
+        members: Mutex::new(Vec::new()),
         gen: AtomicU64::new(0),
         st: Mutex::new(State::default()),
         cv: Condvar::new(),

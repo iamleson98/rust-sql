@@ -364,6 +364,17 @@ pub(crate) struct XReadScope {
     _peer: Option<crate::storage::peer::PeerReadGuard>,
 }
 
+/// A write statement's hold on the WAL writer role (see
+/// [`Database::wal_stmt_scope`]); the role is handed back on drop when
+/// peers share the file and nothing is left in flight.
+pub(crate) struct WalStmtGuard<'a>(&'a Database);
+
+impl Drop for WalStmtGuard<'_> {
+    fn drop(&mut self) {
+        self.0.wal_stmt_exit();
+    }
+}
+
 pub struct Database {
     pub(crate) pager: Arc<Pager>,
     pub(crate) catalog: Catalog,
@@ -410,6 +421,8 @@ pub struct Database {
     /// COMMIT / ROLLBACK): between statements a checkpoint must not fold
     /// and reset the log under the transaction's view of it.
     txn_read_guards: Mutex<Vec<crate::storage::xlock::XReadGuard>>,
+    /// Nesting depth of write statements in flight (see `wal_stmt_enter`).
+    exec_depth: std::sync::atomic::AtomicU32,
     /// A ROLLBACK's pre-DDL catalog awaiting reinstatement once the
     /// statement that rolled back returns (see `execute_cached_stmt`).
     catalog_restore_pending: Mutex<Option<Arc<Catalog>>>,
@@ -2623,6 +2636,7 @@ impl Database {
             savepoint_catalogs: Mutex::new(Vec::new()),
             savepoint_roots: Mutex::new(Vec::new()),
             txn_read_guards: Mutex::new(Vec::new()),
+            exec_depth: std::sync::atomic::AtomicU32::new(0),
             catalog_restore_pending: Mutex::new(None),
             halt_rollback: std::sync::atomic::AtomicBool::new(false),
             change_counts: Default::default(),
@@ -3030,6 +3044,7 @@ impl Database {
             savepoint_catalogs: Mutex::new(Vec::new()),
             savepoint_roots: Mutex::new(Vec::new()),
             txn_read_guards: Mutex::new(Vec::new()),
+            exec_depth: std::sync::atomic::AtomicU32::new(0),
             catalog_restore_pending: Mutex::new(None),
             halt_rollback: std::sync::atomic::AtomicBool::new(false),
             change_counts: Default::default(),
@@ -6584,7 +6599,20 @@ impl Database {
                 eprintln!("transaction rollback after a ROLLBACK conflict failed: {rb}");
             }
         }
+        // WAL writer role for the statement when handles share the file
+        // (taken before the statement reads anything, so it never plans
+        // against a peer's older view).
+        let wal_scope = match self.wal_stmt_enter(sql) {
+            Err(Error::Transaction(m)) if m.contains("SQLITE_SCHEMA") => {
+                self.reload_schema_from_peer()?;
+                self.wal_stmt_enter(sql)?;
+                Some(())
+            }
+            r => r.map(|_| Some(()))?,
+        };
+        let _ = wal_scope;
         let result = self.execute_stmt(sql, params);
+        self.wal_stmt_exit();
         if let Err(e) = &result {
             if is_sqlite_full(e) {
                 self.widen_special_error_rollback(sql);
@@ -6598,6 +6626,74 @@ impl Database {
             }
         }
         result
+    }
+
+    /// Enter a write statement: with peers sharing a WAL file, take the
+    /// writer role now (absorbing the previous holder's frames). Nested
+    /// entries (script parts, hook re-entry) only count.
+    fn wal_stmt_enter(&self, sql: &str) -> Result<()> {
+        if self.exec_depth.fetch_add(1, Ordering::SeqCst) > 0 {
+            return Ok(());
+        }
+        self.pager.writer_busy.store(true, Ordering::SeqCst);
+        let r = self.wal_stmt_begin(sql);
+        if r.is_err() {
+            self.wal_stmt_exit();
+        }
+        r
+    }
+
+    fn wal_stmt_begin(&self, sql: &str) -> Result<()> {
+        let head = sql.trim_start();
+        let concurrent = self.concurrent_active.load(Ordering::Acquire)
+            || (head.len() >= 16
+                && head.as_bytes()[..16].eq_ignore_ascii_case(b"BEGIN CONCURRENT"));
+        if concurrent {
+            return Ok(());
+        }
+        if let Some(refreshed) = self.pager.wal_write_begin()? {
+            if refreshed {
+                self.write_epoch.fetch_add(1, Ordering::AcqRel);
+                self.break_insert_chain();
+                {
+                    let mut m = self.maps.write();
+                    Arc::make_mut(&mut *m).max_rowids.clear();
+                }
+                self.refresh_foreign_roots_and_schema()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn wal_stmt_exit(&self) {
+        if self.exec_depth.fetch_sub(1, Ordering::SeqCst) != 1 {
+            return;
+        }
+        if !self.in_transaction.load(Ordering::Acquire)
+            && self.pager.wal_has_peers()
+            && self.pager.xlock_is_writer()
+            && !self.deferred_flush.load(Ordering::Acquire)
+        {
+            // Outside a transaction the statement either committed (no
+            // dirty pages left) or was rolled back, which restores the
+            // pre-images into the cache and re-dirties them. Those bytes
+            // equal the committed state, but a stale dirty mark would let
+            // this handle's NEXT commit overwrite a peer's work with
+            // them once the role changes hands: forget the marks.
+            self.pager.discard_dirty_marks();
+        }
+        let busy = self.in_transaction.load(Ordering::Acquire) || self.pager.has_dirty_pages();
+        self.pager.writer_busy.store(busy, Ordering::SeqCst);
+        if !busy && self.pager.wal_has_peers() && self.pager.xlock_is_writer() {
+            self.pager.wal_write_release();
+        }
+    }
+
+    /// RAII form of enter/exit for the `&self` write paths (stepped
+    /// statements, DML-RETURNING queries).
+    pub(crate) fn wal_stmt_scope(&self) -> Result<WalStmtGuard<'_>> {
+        self.wal_stmt_enter("")?;
+        Ok(WalStmtGuard(self))
     }
 
     /// `sqlite3_get_autocommit`: true when no transaction is open on this
@@ -8434,6 +8530,14 @@ impl Database {
                 // changes).
                 if self.pager.resync_foreign_commits_if_stale()? {
                     self.write_epoch.fetch_add(1, Ordering::AcqRel);
+                    // The foreign commits moved every table's high-water
+                    // rowid: a cached one would hand this handle's next
+                    // INSERT a rowid a peer already used.
+                    self.break_insert_chain();
+                    {
+                        let mut m = self.maps.write();
+                        Arc::make_mut(&mut *m).max_rowids.clear();
+                    }
                     self.refresh_foreign_roots_and_schema()?;
                 }
             }
@@ -8451,6 +8555,11 @@ impl Database {
                             && db.pager.resync_foreign_commits_if_stale()?
                         {
                             db.write_epoch.fetch_add(1, Ordering::AcqRel);
+                            db.break_insert_chain();
+                            {
+                                let mut m = db.maps.write();
+                                Arc::make_mut(&mut *m).max_rowids.clear();
+                            }
                             db.refresh_foreign_roots_and_schema()?;
                         }
                     }
@@ -8677,6 +8786,14 @@ impl Database {
             && self.concurrent_txn_for_caller().is_none()
         {
             self.pager.plain_reader_gate()
+        } else {
+            None
+        };
+        let _wal_dml = if matches!(
+            cached.stmt.as_ref(),
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+        ) {
+            Some(self.wal_stmt_scope()?)
         } else {
             None
         };

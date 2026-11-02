@@ -309,10 +309,11 @@ fn wal_mode_persists_across_reopen() {
 
 #[test]
 fn concurrent_second_writer_handle_gets_busy_not_corruption() {
-    // Two INDEPENDENT Database handles on one native file: the WAL
-    // writer lease must reject the second handle's writes with a busy
-    // error (never corrupt the sidecar). The first handle's data stays
-    // intact and the second handle's reads keep working.
+    // Two INDEPENDENT Database handles on one native file: while the
+    // first holds a write TRANSACTION the WAL writer lease rejects the
+    // second handle's writes with a busy error (never corrupting the
+    // sidecar). Between the first handle's statements the role is free:
+    // the handles take turns. Both see each other's commits.
     let path = tmpdb("lease");
     {
         let mut a = Database::open(&path).unwrap();
@@ -324,28 +325,34 @@ fn concurrent_second_writer_handle_gets_busy_not_corruption() {
         // b reads fine (WAL frames are plain positioned reads).
         let rows = b.query("SELECT COUNT(*) FROM t", []).unwrap();
         assert_eq!(rows[0][0].as_integer(), 1);
-        // b's write is rejected while a holds the write lease.
+        // b's write is rejected while a's transaction holds the lease.
+        a.execute("BEGIN", []).unwrap();
+        a.execute("INSERT INTO t (v) VALUES ('three')", []).unwrap();
         let r = b.execute("INSERT INTO t (v) VALUES ('two')", []);
         let msg = r.err().unwrap().to_string();
         assert!(
             msg.contains("SQLITE_BUSY") && msg.contains("lease"),
             "expected lease busy error, got: {msg}"
         );
-        // a keeps writing and reading.
-        a.execute("INSERT INTO t (v) VALUES ('three')", []).unwrap();
+        // a keeps writing and reading, then commits; b takes its turn.
         let rows = a.query("SELECT COUNT(*) FROM t", []).unwrap();
         assert_eq!(rows[0][0].as_integer(), 2);
+        a.execute("COMMIT", []).unwrap();
+        b.execute("INSERT INTO t (v) VALUES ('two')", []).unwrap();
+        let rows = a.query("SELECT COUNT(*) FROM t", []).unwrap();
+        assert_eq!(rows[0][0].as_integer(), 3);
         drop(a);
+        drop(b);
     }
-    // After the owner retires, the next handle takes the lease cleanly.
+    // After the owners retire, the next handle takes the lease cleanly.
     let mut c = Database::open(&path).unwrap();
     let rows = c.query("SELECT COUNT(*) FROM t", []).unwrap();
-    assert_eq!(rows[0][0].as_integer(), 2);
+    assert_eq!(rows[0][0].as_integer(), 3);
     c.execute("INSERT INTO t (v) VALUES ('four')", []).unwrap();
     drop(c);
     let db = Database::open(&path).unwrap();
     let rows = db.query("SELECT COUNT(*) FROM t", []).unwrap();
-    assert_eq!(rows[0][0].as_integer(), 3);
+    assert_eq!(rows[0][0].as_integer(), 4);
     drop(db);
     cleanup(&path);
 }
