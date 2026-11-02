@@ -80,7 +80,10 @@ fn peer_ddl_is_visible() {
 }
 
 #[test]
-fn stale_transaction_commit_conflicts_instead_of_overwriting() {
+fn open_read_transaction_blocks_a_peers_commit() {
+    // SQLite's SHARED lock: a transaction that has read holds it until it
+    // ends, and a rollback-journal commit (in-place page rewrites) cannot
+    // proceed under it — the peer gets SQLITE_BUSY, nothing is lost.
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path().join("a.db");
     let mut a = Database::open(&p).unwrap();
@@ -90,16 +93,56 @@ fn stale_transaction_commit_conflicts_instead_of_overwriting() {
 
     a.execute("BEGIN", ()).unwrap();
     assert_eq!(ints(&a, "SELECT count(*) FROM t"), vec![1]);
-    // `b` commits while `a`'s transaction is open on the old state.
-    b.execute("INSERT INTO t VALUES(2)", ()).unwrap();
-    a.execute("INSERT INTO t VALUES(3)", ()).unwrap();
-    let e = a.execute("COMMIT", ()).unwrap_err().to_string();
+    let e = b
+        .execute("INSERT INTO t VALUES(2)", ())
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("locked"), "unexpected error: {e}");
-
-    // Nothing was lost or torn; `a` retries on the fresh state.
+    // a's write takes RESERVED; its commit proceeds (no peer reader).
     a.execute("INSERT INTO t VALUES(3)", ()).unwrap();
-    assert_eq!(ints(&b, "SELECT x FROM t ORDER BY x"), vec![1, 2, 3]);
+    a.execute("COMMIT", ()).unwrap();
+    // b retries on the fresh state.
+    b.execute("INSERT INTO t VALUES(2)", ()).unwrap();
+    assert_eq!(ints(&a, "SELECT x FROM t ORDER BY x"), vec![1, 2, 3]);
+    integrity_ok(&b);
+
+    // A COMMIT refused because a peer reads keeps its transaction open.
+    b.execute("BEGIN", ()).unwrap();
+    b.execute("INSERT INTO t VALUES(4)", ()).unwrap();
+    a.execute("BEGIN", ()).unwrap();
+    assert_eq!(ints(&a, "SELECT count(*) FROM t"), vec![3]);
+    let e = b.execute("COMMIT", ()).unwrap_err().to_string();
+    assert!(e.contains("locked"), "unexpected error: {e}");
+    a.execute("COMMIT", ()).unwrap();
+    b.execute("COMMIT", ()).unwrap();
+    assert_eq!(ints(&a, "SELECT count(*) FROM t"), vec![4]);
     integrity_ok(&a);
+}
+
+#[test]
+fn write_transaction_holds_reserved_against_peer_writers() {
+    // SQLite's RESERVED lock: the first write statement of a transaction
+    // (even one that changes nothing) shuts out other writers until the
+    // transaction ends; readers and deferred BEGINs are unaffected.
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("a.db");
+    let mut a = Database::open(&p).unwrap();
+    a.execute("CREATE TABLE t(x)", ()).unwrap();
+    a.execute("INSERT INTO t VALUES(1)", ()).unwrap();
+    let mut b = Database::open(&p).unwrap();
+    a.execute("BEGIN", ()).unwrap();
+    a.execute("UPDATE t SET x = 0 WHERE 0", ()).unwrap();
+    b.execute("BEGIN", ()).unwrap();
+    let e = b.execute("UPDATE t SET x = 5", ()).unwrap_err().to_string();
+    assert!(e.contains("locked"), "unexpected error: {e}");
+    b.execute("ROLLBACK", ()).unwrap();
+    assert!(b.execute("BEGIN IMMEDIATE", ()).is_err());
+    assert_eq!(ints(&b, "SELECT x FROM t"), vec![1]);
+    a.execute("ROLLBACK", ()).unwrap();
+    b.execute("BEGIN IMMEDIATE", ()).unwrap();
+    b.execute("UPDATE t SET x = 5", ()).unwrap();
+    b.execute("COMMIT", ()).unwrap();
+    assert_eq!(ints(&a, "SELECT x FROM t"), vec![5]);
 }
 
 #[test]

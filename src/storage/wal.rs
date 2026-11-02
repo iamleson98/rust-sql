@@ -519,16 +519,21 @@ pub(crate) fn acquire_wal_lease_key(key: PathBuf, owner: u64) -> WalLease {
 /// Take the lease at `key` for `owner`, relieving an IDLE holder of it
 /// (`relieve(holder)` strips the holder's role and says whether it was
 /// idle). `busy_mark` runs under the registry lock on success, so the
-/// winner is marked busy before any peer can judge it idle. `Err` carries
-/// the current holder's display key.
+/// winner is marked busy before any peer can judge it idle;
+/// `others_reserved` reports a peer holding RESERVED without the lease.
+/// `Err` carries the current holder's display key.
 pub(crate) fn acquire_wal_lease_relieving(
     key: &Path,
     owner: u64,
     relieve: impl Fn(u64) -> bool,
     busy_mark: impl Fn(),
+    others_reserved: impl Fn() -> bool,
 ) -> std::result::Result<WalLease, String> {
     let mut leases = wal_writer_leases().lock().unwrap();
     match leases.get(key).copied() {
+        // Free, but a peer that was alone when its write began holds
+        // RESERVED without having registered (the sole-handle path).
+        None if others_reserved() => Err(key.display().to_string()),
         None => {
             leases.insert(key.to_path_buf(), owner);
             busy_mark();
@@ -548,6 +553,11 @@ pub(crate) fn acquire_wal_lease_relieving(
             }
         }
     }
+}
+
+/// The current holder of the lease at `key`, if any.
+pub(crate) fn wal_lease_owner(key: &Path) -> Option<u64> {
+    wal_writer_leases().lock().unwrap().get(key).copied()
 }
 
 /// The busy-class error for a foreign lease, with the actionable hint.

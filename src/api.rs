@@ -364,6 +364,68 @@ pub(crate) struct XReadScope {
     _peer: Option<crate::storage::peer::PeerReadGuard>,
 }
 
+/// Does a statement take the writer role (SQLite's RESERVED lock) when it
+/// starts? Reads, deferred `BEGIN`, transaction ends and connection-local
+/// pragmas do not; `BEGIN IMMEDIATE/EXCLUSIVE` and every write do. The
+/// empty string is the stepped / RETURNING DML callers (always writes).
+fn stmt_takes_write_role(sql: &str) -> bool {
+    let mut words = sql
+        .split(|c: char| c.is_whitespace() || c == ';' || c == '(' || c == '=')
+        .filter(|w| !w.is_empty());
+    let Some(first) = words.next() else {
+        return true;
+    };
+    let is = |w: &str, k: &str| w.eq_ignore_ascii_case(k);
+    if [
+        "SELECT",
+        "VALUES",
+        "EXPLAIN",
+        "COMMIT",
+        "END",
+        "ROLLBACK",
+        "SAVEPOINT",
+        "RELEASE",
+        "ATTACH",
+        "DETACH",
+    ]
+    .iter()
+    .any(|k| is(first, k))
+    {
+        return false;
+    }
+    if is(first, "BEGIN") {
+        return words
+            .next()
+            .is_some_and(|w| is(w, "IMMEDIATE") || is(w, "EXCLUSIVE"));
+    }
+    if is(first, "PRAGMA") {
+        // Only pragmas that write the database file; a schema prefix
+        // (`main.user_version`) is stripped.
+        let name = words.next().unwrap_or("");
+        let name = name.rsplit('.').next().unwrap_or(name);
+        let writes = [
+            "user_version",
+            "application_id",
+            "schema_version",
+            "journal_mode",
+            "page_size",
+            "auto_vacuum",
+            "incremental_vacuum",
+            "wal_checkpoint",
+            "optimize",
+        ]
+        .iter()
+        .any(|k| is(name, k));
+        let assigns = sql.contains('=') || sql.contains('(');
+        return writes
+            && (assigns
+                || is(name, "incremental_vacuum")
+                || is(name, "wal_checkpoint")
+                || is(name, "optimize"));
+    }
+    true
+}
+
 /// A write statement's hold on the WAL writer role (see
 /// [`Database::wal_stmt_scope`]); the role is handed back on drop when
 /// peers share the file and nothing is left in flight.
@@ -423,6 +485,8 @@ pub struct Database {
     txn_read_guards: Mutex<Vec<crate::storage::xlock::XReadGuard>>,
     /// Nesting depth of write statements in flight (see `wal_stmt_enter`).
     exec_depth: std::sync::atomic::AtomicU32,
+    /// The open transaction ran a write statement (holds RESERVED).
+    txn_wrote: AtomicBool,
     /// A ROLLBACK's pre-DDL catalog awaiting reinstatement once the
     /// statement that rolled back returns (see `execute_cached_stmt`).
     catalog_restore_pending: Mutex<Option<Arc<Catalog>>>,
@@ -2637,6 +2701,7 @@ impl Database {
             savepoint_roots: Mutex::new(Vec::new()),
             txn_read_guards: Mutex::new(Vec::new()),
             exec_depth: std::sync::atomic::AtomicU32::new(0),
+            txn_wrote: AtomicBool::new(false),
             catalog_restore_pending: Mutex::new(None),
             halt_rollback: std::sync::atomic::AtomicBool::new(false),
             change_counts: Default::default(),
@@ -3045,6 +3110,7 @@ impl Database {
             savepoint_roots: Mutex::new(Vec::new()),
             txn_read_guards: Mutex::new(Vec::new()),
             exec_depth: std::sync::atomic::AtomicU32::new(0),
+            txn_wrote: AtomicBool::new(false),
             catalog_restore_pending: Mutex::new(None),
             halt_rollback: std::sync::atomic::AtomicBool::new(false),
             change_counts: Default::default(),
@@ -6628,7 +6694,6 @@ impl Database {
         if self.exec_depth.fetch_add(1, Ordering::SeqCst) > 0 {
             return Ok(());
         }
-        self.pager.writer_busy.store(true, Ordering::SeqCst);
         let r = self.wal_stmt_begin(sql);
         if r.is_err() {
             self.wal_stmt_exit();
@@ -6642,9 +6707,27 @@ impl Database {
             || (head.len() >= 16
                 && head.as_bytes()[..16].eq_ignore_ascii_case(b"BEGIN CONCURRENT"));
         if concurrent {
+            self.pager.writer_busy.store(true, Ordering::SeqCst);
             return Ok(());
         }
+        if !stmt_takes_write_role(sql) {
+            return Ok(());
+        }
+        // RESERVED from here until the statement (autocommit) or the
+        // transaction ends. Published BEFORE the peer check inside
+        // `wal_write_begin`, so a handle that was alone when its write
+        // started is still seen by a peer that opens mid-transaction.
+        self.pager.writer_busy.store(true, Ordering::SeqCst);
+        self.txn_wrote.store(true, Ordering::Release);
         if let Some(refreshed) = self.pager.wal_write_begin()? {
+            // DELETE mode, first write of a transaction: nothing written
+            // yet, so write against the newest committed state rather
+            // than conflict at COMMIT with a peer that committed since
+            // BEGIN (statement starts outside a transaction refresh in
+            // `xread_scope`).
+            if self.in_transaction.load(Ordering::Acquire) && !self.pager.has_dirty_pages() {
+                self.peer_refresh()?;
+            }
             if refreshed {
                 self.write_epoch.fetch_add(1, Ordering::AcqRel);
                 self.break_insert_chain();
@@ -6655,6 +6738,33 @@ impl Database {
                 self.refresh_foreign_roots_and_schema()?;
             }
         }
+        let mut words = sql.split_whitespace();
+        if words
+            .next()
+            .is_some_and(|w| w.eq_ignore_ascii_case("BEGIN"))
+            && words
+                .next()
+                .is_some_and(|w| w.eq_ignore_ascii_case("EXCLUSIVE"))
+        {
+            self.pager.peer_take_exclusive()?;
+        }
+        Ok(())
+    }
+
+    /// Bring a view a peer's DELETE-mode commit made stale up to date
+    /// (no-op when fresh or when this handle has uncommitted pages).
+    fn peer_refresh(&self) -> Result<()> {
+        if let Some(g) = self.pager.peer_resync_if_stale()? {
+            self.write_epoch.fetch_add(1, Ordering::AcqRel);
+            // A peer's inserts moved every table's high-water rowid.
+            self.break_insert_chain();
+            {
+                let mut m = self.maps.write();
+                Arc::make_mut(&mut *m).max_rowids.clear();
+            }
+            self.refresh_foreign_roots_and_schema()?;
+            self.pager.peer_mark_seen(g);
+        }
         Ok(())
     }
 
@@ -6664,7 +6774,7 @@ impl Database {
         }
         if !self.in_transaction.load(Ordering::Acquire)
             && self.pager.wal_has_peers()
-            && self.pager.xlock_is_writer()
+            && self.pager.writer_role_held()
             && !self.deferred_flush.load(Ordering::Acquire)
         {
             // Outside a transaction the statement either committed (no
@@ -6675,9 +6785,16 @@ impl Database {
             // them once the role changes hands: forget the marks.
             self.pager.discard_dirty_marks();
         }
-        let busy = self.in_transaction.load(Ordering::Acquire) || self.pager.has_dirty_pages();
+        let in_txn = self.in_transaction.load(Ordering::Acquire);
+        if !in_txn {
+            self.pager.peer_txn_read_clear();
+            self.pager.peer_drop_exclusive();
+            self.txn_wrote.store(false, Ordering::Release);
+        }
+        let busy =
+            (in_txn && self.txn_wrote.load(Ordering::Acquire)) || self.pager.has_dirty_pages();
         self.pager.writer_busy.store(busy, Ordering::SeqCst);
-        if !busy && self.pager.wal_has_peers() && self.pager.xlock_is_writer() {
+        if !busy && self.pager.wal_has_peers() && self.pager.writer_role_held() {
             self.pager.wal_write_release();
         }
     }
@@ -6786,7 +6903,7 @@ impl Database {
         // whole statement — DML reads main-file pages too, and a
         // reader-role handle's INSERT..SELECT walks the pager exactly
         // like a SELECT (see `xread_scope`).
-        let _xread = self.xread_scope()?;
+        let _xread = self.xread_scope_sql(sql)?;
         // A writer must never read the BEGIN-time (committed) state: a
         // leaked read-view preference or pager scope on this thread is
         // cleared here — `execute` takes `&mut`, so exclusive with every
@@ -8449,27 +8566,28 @@ impl Database {
     /// semantics); the READ byte is still taken per statement so a
     /// checkpointing peer cannot tear main-file reads.
     pub(crate) fn xread_scope(&self) -> Result<Option<XReadScope>> {
+        self.xread_scope_sql("")
+    }
+
+    /// [`Self::xread_scope`] knowing the statement text: a `PRAGMA` inside
+    /// a deferred transaction reads nothing and takes no SHARED lock.
+    pub(crate) fn xread_scope_sql(&self, sql: &str) -> Result<Option<XReadScope>> {
         // In-process peers on a DELETE-mode file (storage::peer): shut
         // out a peer's in-place commit for the statement, then refresh a
         // view a peer's commit made stale. Inside an explicit
         // transaction the snapshot stands; its COMMIT detects a
         // conflicting peer commit.
         let peer = self.pager.peer_read_enter()?;
-        let fresh_gen = if self.in_transaction.load(Ordering::Acquire) {
-            None
+        if !self.in_transaction.load(Ordering::Acquire) {
+            self.peer_refresh()?;
         } else {
-            self.pager.peer_resync_if_stale()?
-        };
-        if let Some(g) = fresh_gen {
-            self.write_epoch.fetch_add(1, Ordering::AcqRel);
-            // A peer's inserts moved every table's high-water rowid.
-            self.break_insert_chain();
-            {
-                let mut m = self.maps.write();
-                Arc::make_mut(&mut *m).max_rowids.clear();
+            // A statement inside an explicit transaction: the
+            // transaction now holds SHARED until it ends.
+            let head = sql.trim_start();
+            let pragma = head.len() >= 6 && head.as_bytes()[..6].eq_ignore_ascii_case(b"PRAGMA");
+            if !pragma {
+                self.pager.peer_txn_read_mark();
             }
-            self.refresh_foreign_roots_and_schema()?;
-            self.pager.peer_mark_seen(g);
         }
         if self.pager.xlock_handle().is_none() {
             return Ok(peer.map(|p| XReadScope {
@@ -8590,7 +8708,7 @@ impl Database {
         }
         // Cross-process read scope (freshness + READ byte) for the whole
         // statement — see `xread_scope`.
-        let _xread = self.xread_scope()?;
+        let _xread = self.xread_scope_sql(sql)?;
         let cached = self.get_or_cache_stmt(sql)?;
         // Cross-database trigger firing on LOCAL tables (query path /
         // DML-RETURNING): the thread-db bridge + a spanning aux
@@ -9244,7 +9362,7 @@ impl Database {
         // `query`: without it a handle that only ever read through this
         // surface kept its view of a log another handle had folded and
         // removed — reads past the end of the main file.
-        let _xread = self.xread_scope()?;
+        let _xread = self.xread_scope_sql(sql)?;
         let cached = self.get_or_cache_stmt(sql)?;
         // ATTACH routing (see query_cached_stmt): the statement runs on
         // its owning engine or through the foreign channel.
@@ -14347,6 +14465,15 @@ impl Database {
                 // is an error (mirrors the ROLLBACK arm below).
                 if !ctx.in_transaction && !ctx.pager.concurrent_writers_active() {
                     return Err(Error::semantic("cannot commit - no transaction is active"));
+                }
+                if ctx.pager.has_dirty_pages() && !ctx.pager.peer_commit_may_proceed() {
+                    // SQLite: COMMIT returns SQLITE_BUSY and the
+                    // transaction stays open for a retry.
+                    return Err(Error::Transaction(
+                        "database is locked (SQLITE_BUSY): another connection has an open \
+                         read transaction"
+                            .into(),
+                    ));
                 }
                 if ctx.pager.peer_conflict() {
                     // A peer handle committed since this transaction's

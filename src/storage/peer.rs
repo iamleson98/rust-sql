@@ -60,6 +60,14 @@ pub(crate) struct Member {
 
 pub(crate) struct PeerShared {
     members: Mutex<Vec<Member>>,
+    /// Handles inside an explicit transaction that has read the database
+    /// (SQLite's SHARED lock held across a read transaction): while any
+    /// other handle is listed, a DELETE-mode commit — which rewrites
+    /// main-file pages in place — must not proceed.
+    txn_readers: Mutex<Vec<u64>>,
+    /// Handle id holding SQLite's EXCLUSIVE lock (`BEGIN EXCLUSIVE` in
+    /// DELETE mode): other handles may not even read. 0 = none.
+    exclusive: AtomicU64,
     gen: AtomicU64,
     st: Mutex<State>,
     cv: Condvar,
@@ -77,7 +85,55 @@ impl PeerShared {
             .push(m);
     }
 
+    /// Another handle holds RESERVED (or has unflushed pages).
+    pub(crate) fn any_other_busy(&self, id: u64) -> bool {
+        self.members
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|m| m.id != id && m.busy.load(Ordering::SeqCst))
+    }
+
+    pub(crate) fn txn_read_mark(&self, id: u64) {
+        let mut v = self.txn_readers.lock().unwrap_or_else(|e| e.into_inner());
+        if !v.contains(&id) {
+            v.push(id);
+        }
+    }
+
+    pub(crate) fn txn_read_clear(&self, id: u64) {
+        self.txn_readers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|&x| x != id);
+    }
+
+    /// Another handle holds an open read transaction.
+    pub(crate) fn others_in_read_txn(&self, id: u64) -> bool {
+        self.txn_readers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|&x| x != id)
+    }
+
+    pub(crate) fn exclusive_holder(&self) -> u64 {
+        self.exclusive.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_exclusive(&self, id: u64) {
+        self.exclusive.store(id, Ordering::Release);
+    }
+
+    pub(crate) fn clear_exclusive(&self, id: u64) {
+        let _ = self
+            .exclusive
+            .compare_exchange(id, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
+
     pub(crate) fn leave(&self, id: u64) {
+        self.txn_read_clear(id);
+        self.clear_exclusive(id);
         self.members
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -220,6 +276,8 @@ pub(crate) fn attach(key: PathBuf) -> Arc<PeerShared> {
     reg.retain(|_, w| w.strong_count() > 0);
     let fresh = Arc::new(PeerShared {
         members: Mutex::new(Vec::new()),
+        txn_readers: Mutex::new(Vec::new()),
+        exclusive: AtomicU64::new(0),
         gen: AtomicU64::new(0),
         st: Mutex::new(State::default()),
         cv: Condvar::new(),

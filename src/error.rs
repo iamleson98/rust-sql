@@ -110,8 +110,14 @@ impl Error {
             | Error::Runtime(m)
             | Error::NotFound(m)
             | Error::AlreadyExists(m)
-            | Error::InvalidArgument(m)
-            | Error::Transaction(m) => m.clone(),
+            | Error::InvalidArgument(m) => m.clone(),
+            // Busy-class errors carry a diagnostic tail after SQLite's
+            // text ("database is locked (SQLITE_BUSY): ..."); errmsg is
+            // the bare text, which drivers and tests match exactly.
+            Error::Transaction(m) if m.starts_with("database is locked") => {
+                "database is locked".to_string()
+            }
+            Error::Transaction(m) => m.clone(),
             Error::Unsupported(m) => m.to_string(),
             Error::Corruption(_) | Error::Btree(_) => {
                 "database disk image is malformed".to_string()

@@ -5004,6 +5004,14 @@ impl Pager {
         if Arc::strong_count(p) < 2 || self.wal.read().is_some() {
             return Ok(None);
         }
+        let ex = p.exclusive_holder();
+        if ex != 0 && ex != self.instance_id {
+            return Err(Error::Transaction(
+                "database is locked (SQLITE_BUSY): another connection holds an exclusive \
+                 transaction"
+                    .into(),
+            ));
+        }
         if !p.read_enter() {
             return Err(Error::Transaction(
                 "database is locked (SQLITE_BUSY): another connection is committing".into(),
@@ -5105,7 +5113,14 @@ impl Pager {
         let Some(p) = self.peer.get() else {
             return Ok(None);
         };
-        if Arc::strong_count(p) < 2 || self.wal.read().is_none() || self.xlock.get().is_none() {
+        if Arc::strong_count(p) < 2 {
+            return Ok(None);
+        }
+        // DELETE mode: the role is SQLite's RESERVED lock — one writer at
+        // a time, readers unaffected; freshness comes from the peer
+        // generation probe, not from the log.
+        let wal_mode = self.wal.read().is_some();
+        if wal_mode && self.xlock.get().is_none() {
             return Ok(None);
         }
         let key = self.wal_lease_key().to_path_buf();
@@ -5119,10 +5134,18 @@ impl Pager {
                 id,
                 |h| p.revoke_if_idle(h),
                 || self.writer_busy.store(true, Ordering::SeqCst),
+                || p.any_other_busy(id),
             ) {
                 Ok(_) => break,
                 Err(foreign) => {
                     if std::time::Instant::now() >= deadline {
+                        if !wal_mode {
+                            return Err(Error::Transaction(
+                                "database is locked (SQLITE_BUSY): another connection holds \
+                                 a write transaction on this database"
+                                    .into(),
+                            ));
+                        }
                         return Err(Error::Transaction(format!(
                             "database is locked (SQLITE_BUSY): {}",
                             crate::storage::wal::wal_lease_busy(foreign)
@@ -5131,6 +5154,9 @@ impl Pager {
                     std::thread::sleep(std::time::Duration::from_micros(200));
                 }
             }
+        }
+        if !wal_mode {
+            return Ok(Some(false));
         }
         if !held_before || !self.xlock_is_writer() {
             if let Err(e) = self.xlock_take_writer_role() {
@@ -5166,6 +5192,89 @@ impl Pager {
         self.dirty_pages.lock().clear();
         self.dirty_count_approx.store(0, Ordering::Release);
         self.last_noted_dirty.store(u32::MAX, Ordering::Release);
+    }
+
+    /// Mark / clear this handle's open read transaction (DELETE mode with
+    /// peers only; see `PeerShared::txn_readers`).
+    pub(crate) fn peer_txn_read_mark(&self) {
+        if let Some(p) = self.peer.get() {
+            if Arc::strong_count(p) >= 2 && self.wal.read().is_none() {
+                p.txn_read_mark(self.instance_id);
+            }
+        }
+    }
+
+    pub(crate) fn peer_txn_read_clear(&self) {
+        if let Some(p) = self.peer.get() {
+            if Arc::strong_count(p) >= 2 {
+                p.txn_read_clear(self.instance_id);
+            }
+        }
+    }
+
+    /// Wait (up to the busy timeout) until no other handle holds an open
+    /// read transaction; `false` when one still does — the DELETE-mode
+    /// commit must then fail SQLITE_BUSY with its transaction intact.
+    pub(crate) fn peer_commit_may_proceed(&self) -> bool {
+        let Some(p) = self.peer.get() else {
+            return true;
+        };
+        if Arc::strong_count(p) < 2 || self.wal.read().is_some() {
+            return true;
+        }
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(self.busy_timeout_ms().max(0) as u64);
+        loop {
+            if !p.others_in_read_txn(self.instance_id) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+    }
+
+    /// `BEGIN EXCLUSIVE` in DELETE mode: once no other handle holds an
+    /// open read transaction (waiting up to the busy timeout), take
+    /// SQLite's EXCLUSIVE lock — peers' reads fail SQLITE_BUSY until this
+    /// transaction ends.
+    pub(crate) fn peer_take_exclusive(&self) -> Result<()> {
+        let Some(p) = self.peer.get() else {
+            return Ok(());
+        };
+        if self.wal.read().is_some() {
+            return Ok(());
+        }
+        if !self.peer_commit_may_proceed() {
+            return Err(Error::Transaction(
+                "database is locked (SQLITE_BUSY): another connection has an open read \
+                 transaction"
+                    .into(),
+            ));
+        }
+        p.set_exclusive(self.instance_id);
+        Ok(())
+    }
+
+    pub(crate) fn peer_drop_exclusive(&self) {
+        if let Some(p) = self.peer.get() {
+            p.clear_exclusive(self.instance_id);
+        }
+    }
+
+    /// Other handles are open on this file in this process.
+    pub(crate) fn has_open_peers(&self) -> bool {
+        self.peer.get().is_some_and(|p| Arc::strong_count(p) >= 2)
+    }
+
+    /// This handle holds the writer role (WAL: the WRITE byte; DELETE
+    /// mode: the in-process lease, SQLite's RESERVED lock).
+    pub(crate) fn writer_role_held(&self) -> bool {
+        if self.wal.read().is_some() {
+            return self.xlock_is_writer();
+        }
+        crate::storage::wal::wal_lease_owner(self.wal_lease_key()) == Some(self.instance_id)
     }
 
     /// Peers share this file in-process (WAL role handoff applies).
@@ -5797,6 +5906,15 @@ impl Pager {
         // see storage::wal::lifecycle_guard (the datxevui WAL-deletion
         // race: this removal must never delete a freshly created WAL
         // belonging to a new engine generation).
+        // SQLite: leaving WAL mode needs the database to itself — with
+        // another connection open it fails "database is locked".
+        if self.has_open_peers() {
+            return Err(Error::Transaction(
+                "database is locked (SQLITE_BUSY): cannot leave WAL mode while another \
+                 connection is open"
+                    .into(),
+            ));
+        }
         let _guard = crate::storage::wal::lifecycle_guard().lock();
         // WRITER LEASE: only the lease owner may checkpoint + reset the
         // sidecar (a read-only second handle flipping its OWN mode must
@@ -7513,6 +7631,13 @@ impl Pager {
                 self.peer_seen_gen.store(p.bump(), Ordering::Release);
             }
             return r;
+        }
+        if !self.peer_commit_may_proceed() {
+            return Err(Error::Transaction(
+                "database is locked (SQLITE_BUSY): another connection has an open read \
+                 transaction"
+                    .into(),
+            ));
         }
         let own = self.peer_own_reads.load(Ordering::Acquire);
         if !p.commit_enter(own) {
