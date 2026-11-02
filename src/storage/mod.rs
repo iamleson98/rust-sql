@@ -11,6 +11,7 @@ pub mod join_cache;
 pub mod mvcc;
 pub mod page;
 pub mod pager;
+pub(crate) mod peer;
 pub mod preimage;
 pub mod row_codec;
 pub mod sqlitefmt;

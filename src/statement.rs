@@ -196,7 +196,7 @@ pub struct Statement<'a> {
     /// step-driven statement: freshness probe ran once at start(); the
     /// shared READ byte stays held until the statement drops so a
     /// checkpointing peer cannot rewrite main-file pages mid-walk.
-    xread_scope: Option<Vec<crate::storage::xlock::XReadGuard>>,
+    xread_scope: Option<crate::api::XReadScope>,
     /// The file text encoding armed for this statement's WHOLE streaming
     /// lifetime (RAII: dropped on reset/finalize, restoring the previous
     /// tag). The first `step()`'s `start()` runs comparisons under it,

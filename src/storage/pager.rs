@@ -1016,6 +1016,13 @@ pub struct Pager {
     /// The lock file's fold generation as this handle's view last saw it
     /// (see `XLock::fold_generation`).
     seen_fold_gen: std::sync::atomic::AtomicU64,
+    /// In-process coordination with other handles on this DELETE-mode
+    /// file (see `storage::peer`); unset for memory stores.
+    peer: std::sync::OnceLock<Arc<crate::storage::peer::PeerShared>>,
+    /// The peer commit generation this handle's cache reflects.
+    peer_seen_gen: AtomicU64,
+    /// This handle's own live read scopes (a commit never waits on them).
+    peer_own_reads: Arc<std::sync::atomic::AtomicU32>,
     /// DELETE-mode mid-transaction page spill (see `DeleteSpill`):
     /// `None` until the first cache-pressure eviction of a dirty page
     /// during a write transaction; dropped (file deleted) at COMMIT
@@ -2531,6 +2538,9 @@ impl Pager {
             xlock_write_held: AtomicBool::new(false),
             xlock_empty_absorb_streak: AtomicU64::new(0),
             seen_fold_gen: AtomicU64::new(0),
+            peer: std::sync::OnceLock::new(),
+            peer_seen_gen: AtomicU64::new(0),
+            peer_own_reads: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             delete_spill: Mutex::new(None),
             ckpt_scratch: Mutex::new(Vec::new()),
             del_spill_arena: Mutex::new(Vec::new()),
@@ -2581,6 +2591,16 @@ impl Pager {
             v5_magic: std::sync::atomic::AtomicBool::new(false),
         };
 
+        // Attach BEFORE the first header read: a peer commit landing
+        // after this point moves the generation past what the initial
+        // read reflects, and the first statement resyncs.
+        if !store_is_memory {
+            let shared = crate::storage::peer::attach(crate::storage::wal::lease_key(&pager.path));
+            pager
+                .peer_seen_gen
+                .store(shared.generation(), Ordering::Release);
+            let _ = pager.peer.set(shared);
+        }
         let file_size = pager.store.read().len()?;
         if file_size == 0 {
             pager.is_new.store(true, Ordering::Release);
@@ -4947,6 +4967,99 @@ impl Pager {
         Ok(())
     }
 
+    // ============================================================ peer ==
+    // In-process coordination of several handles on one DELETE-mode file
+    // (see storage::peer for the protocol).
+
+    /// Enter this handle's read scope against peers' commits. `None` for
+    /// a sole handle, a WAL file (its sidecar coordinates) or a memory
+    /// store.
+    pub(crate) fn peer_read_enter(&self) -> Result<Option<crate::storage::peer::PeerReadGuard>> {
+        let Some(p) = self.peer.get() else {
+            return Ok(None);
+        };
+        if Arc::strong_count(p) < 2 || self.wal.read().is_some() {
+            return Ok(None);
+        }
+        if !p.read_enter() {
+            return Err(Error::Transaction(
+                "database is locked (SQLITE_BUSY): another connection is committing".into(),
+            ));
+        }
+        Ok(Some(crate::storage::peer::PeerReadGuard::new(
+            p.clone(),
+            self.peer_own_reads.clone(),
+        )))
+    }
+
+    /// Freshness probe at statement start: when a peer committed since
+    /// this handle's cache was built, drop the cache and re-read the
+    /// header. Returns the generation the refreshed view reflects; the
+    /// caller bumps its write epoch, re-validates the schema, and only
+    /// then records it with [`Self::peer_mark_seen`] (a schema the
+    /// handle cannot adopt keeps the view marked stale). A handle with
+    /// uncommitted dirty pages keeps its view — its COMMIT detects the
+    /// conflict instead.
+    pub(crate) fn peer_resync_if_stale(&self) -> Result<Option<u64>> {
+        let Some(p) = self.peer.get() else {
+            return Ok(None);
+        };
+        let g = p.generation();
+        if g == self.peer_seen_gen.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        if self.wal.read().is_some() {
+            self.peer_seen_gen.store(g, Ordering::Release);
+            return Ok(None);
+        }
+        if self.has_dirty_pages() {
+            return Ok(None);
+        }
+        {
+            let _gate = self.install_gate_write();
+            self.cache.write().clear();
+            self.lru.lock().clear();
+            self.reload_header_from_committed()?;
+        }
+        Ok(Some(g))
+    }
+
+    /// A peer committed since this handle's view while it holds dirty
+    /// pages: its COMMIT must not overwrite the peer's work.
+    pub(crate) fn peer_conflict(&self) -> bool {
+        match self.peer.get() {
+            Some(p) => {
+                p.generation() != self.peer_seen_gen.load(Ordering::Acquire)
+                    && self.wal.read().is_none()
+                    && self.has_dirty_pages()
+            }
+            None => false,
+        }
+    }
+
+    /// After a conflicting transaction was rolled back: its restored
+    /// pre-images equal the main file's bytes (DELETE mode never touches
+    /// the file before COMMIT), so forget every dirty mark and the cache —
+    /// the next statement resyncs the view from the peer's commit.
+    pub(crate) fn peer_discard_view(&self) -> Result<()> {
+        let _gate = self.install_gate_write();
+        self.dirty_pages.lock().clear();
+        self.dirty_count_approx.store(0, Ordering::Release);
+        self.last_noted_dirty.store(u32::MAX, Ordering::Release);
+        self.cache.write().clear();
+        self.lru.lock().clear();
+        self.reload_header_from_committed()
+    }
+
+    /// True when other handles share this DELETE-mode file's state.
+    pub(crate) fn peer_active(&self) -> bool {
+        self.peer.get().is_some()
+    }
+
+    pub(crate) fn peer_mark_seen(&self, g: u64) {
+        self.peer_seen_gen.store(g, Ordering::Release);
+    }
+
     // ============================================================ xlock ==
     // Cross-process locking (see storage::xlock for the protocol). All of
     // these are no-ops for pagers without a lock file (in-memory stores,
@@ -7264,6 +7377,40 @@ impl Pager {
     /// intermediate pages-then-header order left a dangling-child window
     /// (both were found by the OOM fault-injection suite).
     pub(crate) fn flush_inner_delete(&self) -> Result<()> {
+        let Some(p) = self.peer.get() else {
+            return self.flush_inner_delete_body();
+        };
+        if Arc::strong_count(p) < 2 {
+            // Sole handle: no exclusion, just publish the new state.
+            let r = self.flush_inner_delete_body();
+            if r.is_ok() {
+                self.peer_seen_gen.store(p.bump(), Ordering::Release);
+            }
+            return r;
+        }
+        let own = self.peer_own_reads.load(Ordering::Acquire);
+        if !p.commit_enter(own) {
+            return Err(Error::Transaction(
+                "database is locked (SQLITE_BUSY): another connection is reading".into(),
+            ));
+        }
+        if p.generation() != self.peer_seen_gen.load(Ordering::Acquire) {
+            p.commit_exit(false);
+            return Err(Error::SnapshotConflict(
+                "another connection committed to this database since this transaction \
+                 began; retry the transaction"
+                    .into(),
+            ));
+        }
+        let r = self.flush_inner_delete_body();
+        let g = p.commit_exit(r.is_ok());
+        if r.is_ok() {
+            self.peer_seen_gen.store(g, Ordering::Release);
+        }
+        r
+    }
+
+    fn flush_inner_delete_body(&self) -> Result<()> {
         let n_pages_val = self.n_pages.load(Ordering::Acquire);
         let freelist_head_val = self.freelist_head.load(Ordering::Acquire);
         let freelist_count_val = self.freelist_count.load(Ordering::Acquire);

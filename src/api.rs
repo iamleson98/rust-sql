@@ -357,6 +357,13 @@ impl Drop for ConnIdentityGuard {
 /// and run queries concurrently. Writers take the outer write lock to get
 /// `&mut Database`, which serializes them — but reads proceed without
 /// blocking on the outer lock.
+/// What one statement holds against other handles and processes: the
+/// cross-process READ byte(s) and the in-process peer read scope.
+pub(crate) struct XReadScope {
+    _guards: Vec<crate::storage::xlock::XReadGuard>,
+    _peer: Option<crate::storage::peer::PeerReadGuard>,
+}
+
 pub struct Database {
     pub(crate) pager: Arc<Pager>,
     pub(crate) catalog: Catalog,
@@ -4354,6 +4361,41 @@ impl Database {
     /// layout (cached plans, root-override maps, count memo, advisory
     /// leaf/join caches, schema epoch) is reset or invalidated; a query
     /// after VACUUM re-plans from the new roots.
+    /// Adopt the schema a peer handle committed: re-read it from the
+    /// (already refreshed) pager, carrying this connection's TEMP
+    /// objects over, through the standard adopt recipe.
+    fn reload_schema_from_peer(&mut self) -> Result<()> {
+        let mut catalog = Catalog::new();
+        catalog.schema_cookie = self.pager.schema_cookie();
+        load_schema(&self.pager, &mut catalog)?;
+        for (n, t) in self.catalog.all_tables() {
+            if self.catalog.is_temp(&n) {
+                catalog.add_table((*t).clone());
+                catalog.mark_temp(&n);
+            }
+        }
+        for (n, i) in self.catalog.all_indexes() {
+            if self.catalog.is_temp(&n) {
+                catalog.add_index((*i).clone());
+                catalog.mark_temp(&n);
+            }
+        }
+        for (n, v) in self.catalog.all_views() {
+            if self.catalog.is_temp(&n) {
+                catalog.add_view((*v).clone());
+                catalog.mark_temp(&n);
+            }
+        }
+        for (n, t) in self.catalog.all_triggers() {
+            if self.catalog.is_temp(&n) {
+                catalog.add_trigger((*t).clone());
+                catalog.mark_temp(&n);
+            }
+        }
+        self.adopt_catalog_after_vacuum(catalog);
+        Ok(())
+    }
+
     fn adopt_catalog_after_vacuum(&mut self, catalog: Catalog) {
         let mut schema_root_pages = HashMap::new();
         for (name, t) in catalog.all_tables() {
@@ -6655,7 +6697,17 @@ impl Database {
         // whole statement — DML reads main-file pages too, and a
         // reader-role handle's INSERT..SELECT walks the pager exactly
         // like a SELECT (see `xread_scope`).
-        let _xread = self.xread_scope()?;
+        let _xread = match self.xread_scope() {
+            // A peer handle changed the schema: this writable surface can
+            // adopt the new catalog (read-only `&self` paths cannot).
+            Err(Error::Transaction(m))
+                if m.contains("SQLITE_SCHEMA") && self.pager.peer_active() =>
+            {
+                self.reload_schema_from_peer()?;
+                self.xread_scope()?
+            }
+            r => r?,
+        };
         // A writer must never read the BEGIN-time (committed) state: a
         // leaked read-view preference or pager scope on this thread is
         // cleared here — `execute` takes `&mut`, so exclusive with every
@@ -8319,9 +8371,34 @@ impl Database {
     /// (the BEGIN-time snapshot stands — SQLite read-transaction
     /// semantics); the READ byte is still taken per statement so a
     /// checkpointing peer cannot tear main-file reads.
-    pub(crate) fn xread_scope(&self) -> Result<Option<Vec<crate::storage::xlock::XReadGuard>>> {
+    pub(crate) fn xread_scope(&self) -> Result<Option<XReadScope>> {
+        // In-process peers on a DELETE-mode file (storage::peer): shut
+        // out a peer's in-place commit for the statement, then refresh a
+        // view a peer's commit made stale. Inside an explicit
+        // transaction the snapshot stands; its COMMIT detects a
+        // conflicting peer commit.
+        let peer = self.pager.peer_read_enter()?;
+        let fresh_gen = if self.in_transaction.load(Ordering::Acquire) {
+            None
+        } else {
+            self.pager.peer_resync_if_stale()?
+        };
+        if let Some(g) = fresh_gen {
+            self.write_epoch.fetch_add(1, Ordering::AcqRel);
+            // A peer's inserts moved every table's high-water rowid.
+            self.break_insert_chain();
+            {
+                let mut m = self.maps.write();
+                Arc::make_mut(&mut *m).max_rowids.clear();
+            }
+            self.refresh_foreign_roots_and_schema()?;
+            self.pager.peer_mark_seen(g);
+        }
         if self.pager.xlock_handle().is_none() {
-            return Ok(None);
+            return Ok(peer.map(|p| XReadScope {
+                _guards: Vec::new(),
+                _peer: Some(p),
+            }));
         }
         let mut guards = Vec::new();
         let in_txn = self.in_transaction.load(Ordering::Acquire);
@@ -8380,10 +8457,13 @@ impl Database {
                 }
             }
         }
-        Ok(if guards.is_empty() {
+        Ok(if guards.is_empty() && peer.is_none() {
             None
         } else {
-            Some(guards)
+            Some(XReadScope {
+                _guards: guards,
+                _peer: peer,
+            })
         })
     }
 
@@ -14169,6 +14249,31 @@ impl Database {
                 // is an error (mirrors the ROLLBACK arm below).
                 if !ctx.in_transaction && !ctx.pager.concurrent_writers_active() {
                     return Err(Error::semantic("cannot commit - no transaction is active"));
+                }
+                if ctx.pager.peer_conflict() {
+                    // A peer handle committed since this transaction's
+                    // view: roll back (the ROLLBACK arm's restore) and
+                    // surface the retriable conflict.
+                    let restored = ctx.pager.rollback_bottom_savepoint()?;
+                    if !restored {
+                        ctx.pager.clear_savepoints();
+                        if let Some(snap) = ctx.txn_snapshot.take() {
+                            ctx.pager.clear_committed_view();
+                            ctx.pager.rollback_to(&snap)?;
+                        }
+                    }
+                    ctx.in_transaction = false;
+                    ctx.root_overrides.clear();
+                    ctx.index_roots.clear();
+                    ctx.max_rowids.clear();
+                    ctx.rolled_back = true;
+                    ctx.pager.note_tx_rolled_back();
+                    ctx.pager.peer_discard_view()?;
+                    return Err(Error::SnapshotConflict(
+                        "another connection committed to this database since this transaction \
+                         began; the transaction was rolled back, retry it"
+                            .into(),
+                    ));
                 }
                 ctx.in_transaction = false;
                 ctx.txn_snapshot = None;
