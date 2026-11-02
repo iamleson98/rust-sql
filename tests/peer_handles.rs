@@ -268,3 +268,29 @@ fn wal_threads_with_own_handles_lose_nothing() {
     );
     integrity_ok(&db);
 }
+
+#[test]
+fn autocommit_update_and_delete_reach_the_file_at_statement_end() {
+    // The fused in-place UPDATE/DELETE patchers noted their page in the
+    // dirty set without bumping the dirty counter `flush` gates on, so a
+    // committed autocommit statement stayed in the cache until some later
+    // write flushed it (lost on a crash; invisible to every other
+    // handle). A leaked handle stands in for the crash.
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("d.db");
+    let mut a = Database::open(&p).unwrap();
+    a.execute("CREATE TABLE t1(a int, b int)", ()).unwrap();
+    a.execute("INSERT INTO t1 VALUES(1,2)", ()).unwrap();
+    a.execute("INSERT INTO t1 VALUES(3,4)", ()).unwrap();
+    a.execute("UPDATE t1 SET a = 100", ()).unwrap();
+    let c = Database::open(&p).unwrap();
+    assert_eq!(ints(&c, "SELECT a FROM t1 ORDER BY b"), vec![100, 100]);
+    drop(c);
+    a.execute("DELETE FROM t1 WHERE b = 2", ()).unwrap();
+    let c = Database::open(&p).unwrap();
+    assert_eq!(ints(&c, "SELECT b FROM t1"), vec![4]);
+    drop(c);
+    std::mem::forget(a);
+    let c = Database::open(&p).unwrap();
+    assert_eq!(ints(&c, "SELECT b FROM t1"), vec![4]);
+}

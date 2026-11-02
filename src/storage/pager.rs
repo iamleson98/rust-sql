@@ -3474,7 +3474,14 @@ impl Pager {
         // skips work, and in-place payload patches bump no epoch. See
         // the capture-side comment for the full invariant.
         let mut dp = self.dirty_pages.lock();
-        dp.insert(id);
+        if dp.insert(id) {
+            // `flush` skips on `dirty_count_approx == 0`; a page noted
+            // dirty by a path that never bumped the counter (the fused
+            // in-place UPDATE/DELETE patchers) was otherwise never
+            // written — a committed autocommit statement lost on a crash
+            // until some later write happened to flush it.
+            self.dirty_count_approx.fetch_add(1, Ordering::Relaxed);
+        }
         self.last_noted_dirty.store(id, Ordering::Relaxed);
     }
 
