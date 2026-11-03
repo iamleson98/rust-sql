@@ -318,3 +318,81 @@ fn fk_index_maintenance_on_cascade_delete() {
     let rows = db.query("SELECT tag FROM c WHERE tag = 'two'", []).unwrap();
     assert_eq!(rows.len(), 1);
 }
+
+fn fk_err(db: &mut Database, sql: &str) -> String {
+    db.execute(sql, []).unwrap_err().sqlite_message()
+}
+
+/// DEFERRABLE INITIALLY DEFERRED (fkey2.test 2.x): an autocommit
+/// statement fails at once; inside a transaction the violation waits
+/// for COMMIT, which fails (transaction kept open) until it is resolved.
+#[test]
+fn deferred_keys_are_checked_at_commit() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute("PRAGMA foreign_keys = ON", []).unwrap();
+    db.execute(
+        "CREATE TABLE node(nodeid PRIMARY KEY, \
+         parent REFERENCES node DEFERRABLE INITIALLY DEFERRED)",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        fk_err(&mut db, "INSERT INTO node VALUES(1, 0)"),
+        "FOREIGN KEY constraint failed"
+    );
+    db.execute("BEGIN", []).unwrap();
+    db.execute("INSERT INTO node VALUES(1, 0)", []).unwrap();
+    assert_eq!(fk_err(&mut db, "COMMIT"), "FOREIGN KEY constraint failed");
+    assert!(!db.is_autocommit(), "a failed COMMIT keeps the transaction");
+    db.execute("UPDATE node SET parent = NULL", []).unwrap();
+    db.execute("COMMIT", []).unwrap();
+    // PRAGMA defer_foreign_keys defers every key, for one transaction.
+    db.execute("CREATE TABLE c(x REFERENCES node)", []).unwrap();
+    db.execute("BEGIN", []).unwrap();
+    db.execute("PRAGMA defer_foreign_keys = ON", []).unwrap();
+    db.execute("INSERT INTO c VALUES(7)", []).unwrap();
+    assert_eq!(fk_err(&mut db, "COMMIT"), "FOREIGN KEY constraint failed");
+    db.execute("ROLLBACK", []).unwrap();
+    assert_eq!(
+        db.query("PRAGMA defer_foreign_keys", []).unwrap(),
+        vec![vec![Value::Integer(0)]]
+    );
+}
+
+/// PRAGMA foreign_key_check reports (table, rowid, parent, fkid), and a
+/// parent key with no usable index is SQLite's prepare-time mismatch.
+#[test]
+fn foreign_key_check_and_mismatch_errors() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE p(a PRIMARY KEY, b)", []).unwrap();
+    db.execute("CREATE TABLE c(x REFERENCES p, y)", []).unwrap();
+    db.execute("INSERT INTO p VALUES(1, 1)", []).unwrap();
+    db.execute("INSERT INTO c VALUES(1, 0), (2, 0), (NULL, 0)", [])
+        .unwrap();
+    assert_eq!(
+        db.query("PRAGMA foreign_key_check(c)", []).unwrap(),
+        vec![vec![
+            Value::Text("c".into()),
+            Value::Integer(2),
+            Value::Text("p".into()),
+            Value::Integer(0)
+        ]]
+    );
+    db.execute("PRAGMA foreign_keys = ON", []).unwrap();
+    db.execute("CREATE TABLE c2(x REFERENCES p(b))", [])
+        .unwrap();
+    assert_eq!(
+        fk_err(&mut db, "INSERT INTO c2 VALUES(1)"),
+        "foreign key mismatch - \"c2\" referencing \"p\""
+    );
+    assert_eq!(
+        fk_err(&mut db, "DELETE FROM p"),
+        "foreign key mismatch - \"c2\" referencing \"p\""
+    );
+    db.execute("CREATE TABLE c3(x REFERENCES nosuch)", [])
+        .unwrap();
+    assert_eq!(
+        fk_err(&mut db, "INSERT INTO c3 VALUES(1)"),
+        "no such table: main.nosuch"
+    );
+}

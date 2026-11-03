@@ -131,6 +131,9 @@ pub struct ForeignKeyClause {
     pub ref_columns: Vec<String>,
     pub on_delete: ForeignKeyAction,
     pub on_update: ForeignKeyAction,
+    /// `DEFERRABLE INITIALLY DEFERRED`: a NO ACTION violation inside a
+    /// transaction is checked at COMMIT instead of failing at once.
+    pub deferred: bool,
 }
 
 /// A table in the catalog.
@@ -1740,6 +1743,7 @@ pub fn build_table(
                 columns: rc,
                 on_delete,
                 on_update,
+                deferred,
             } = constraint
             {
                 foreign_keys.push(ForeignKeyClause {
@@ -1748,6 +1752,7 @@ pub fn build_table(
                     ref_columns: rc.clone(),
                     on_delete: *on_delete,
                     on_update: *on_update,
+                    deferred: *deferred,
                 });
             }
         }
@@ -1759,6 +1764,7 @@ pub fn build_table(
             ref_columns,
             on_delete,
             on_update,
+            deferred,
         } = c
         {
             let mut child_idx = Vec::with_capacity(cols.len());
@@ -1782,6 +1788,7 @@ pub fn build_table(
                 ref_columns: ref_columns.clone(),
                 on_delete: *on_delete,
                 on_update: *on_update,
+                deferred: *deferred,
             });
         }
     }

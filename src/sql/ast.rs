@@ -211,6 +211,8 @@ pub enum ColumnConstraint {
         columns: Vec<String>,
         on_delete: ForeignKeyAction,
         on_update: ForeignKeyAction,
+        /// `DEFERRABLE INITIALLY DEFERRED`: checked at COMMIT.
+        deferred: bool,
     },
     GeneratedAs {
         expr: Expr,
@@ -253,6 +255,8 @@ pub enum TableConstraint {
         ref_columns: Vec<String>,
         on_delete: ForeignKeyAction,
         on_update: ForeignKeyAction,
+        /// `DEFERRABLE INITIALLY DEFERRED`: checked at COMMIT.
+        deferred: bool,
     },
 }
 

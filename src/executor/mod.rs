@@ -3263,7 +3263,7 @@ fn fk_parent_exists(
 /// non-partial UNIQUE index on exactly those columns, each with the
 /// column's own collation?
 fn fk_parent_key_usable(
-    ctx: &ExecContext<'_>,
+    catalog: &crate::schema::Catalog,
     parent: &Table,
     fk: &crate::schema::ForeignKeyClause,
 ) -> bool {
@@ -3290,28 +3290,123 @@ fn fk_parent_key_usable(
             c
         }
     }
-    ctx.catalog()
-        .indexes_on_table(&parent.name)
+    catalog.indexes_on_table(&parent.name).iter().any(|idx| {
+        idx.unique
+            && idx.partial_expr.is_none()
+            && idx.columns.len() == n
+            && idx.columns.iter().all(|ic| {
+                ic.expr.is_none()
+                    && parent
+                        .columns
+                        .iter()
+                        .find(|c| c.name.eq_ignore_ascii_case(&ic.name))
+                        .is_some_and(|c| {
+                            binary(&ic.collation).eq_ignore_ascii_case(binary(&c.collation))
+                        })
+                    && fk
+                        .ref_columns
+                        .iter()
+                        .any(|r| r.eq_ignore_ascii_case(&ic.name))
+            })
+    })
+}
+
+/// A foreign key violation by `fk`. SQLite defers a NO ACTION violation
+/// of a DEFERRABLE INITIALLY DEFERRED key (or of any key under PRAGMA
+/// defer_foreign_keys) to COMMIT when a transaction is open; RESTRICT and
+/// autocommit statements fail at once.
+fn fk_violation(
+    ctx: &ExecContext<'_>,
+    fk: &crate::schema::ForeignKeyClause,
+    restrict: bool,
+) -> Result<()> {
+    if !restrict && ctx.in_transaction && (fk.deferred || ctx.pager.defer_foreign_keys()) {
+        ctx.pager.set_fk_pending(true);
+        return Ok(());
+    }
+    Err(Error::constraint("FOREIGN KEY constraint failed"))
+}
+
+/// PRAGMA foreign_key_check over one child table: (rowid — `None` for a
+/// WITHOUT ROWID table — parent table, fkid) per violating row and key,
+/// in SQLite's order (rows by rowid, keys by fkid). `deferred_only`
+/// limits it to the keys COMMIT re-checks; `first_only` stops at the
+/// first hit. A parent without a usable key is SQLite's mismatch error.
+pub(crate) fn fk_check_table(
+    ctx: &ExecContext<'_>,
+    table: &Table,
+    deferred_only: bool,
+    first_only: bool,
+) -> Result<Vec<(Option<i64>, String, usize)>> {
+    let catalog = ctx.catalog();
+    let defer_all = ctx.pager.defer_foreign_keys();
+    // SQLite numbers keys newest-first (foreign_key_list's id).
+    let fks: Vec<(usize, &crate::schema::ForeignKeyClause)> = table
+        .foreign_keys
         .iter()
-        .any(|idx| {
-            idx.unique
-                && idx.partial_expr.is_none()
-                && idx.columns.len() == n
-                && idx.columns.iter().all(|ic| {
-                    ic.expr.is_none()
-                        && parent
-                            .columns
-                            .iter()
-                            .find(|c| c.name.eq_ignore_ascii_case(&ic.name))
-                            .is_some_and(|c| {
-                                binary(&ic.collation).eq_ignore_ascii_case(binary(&c.collation))
-                            })
-                        && fk
-                            .ref_columns
-                            .iter()
-                            .any(|r| r.eq_ignore_ascii_case(&ic.name))
-                })
-        })
+        .rev()
+        .enumerate()
+        .filter(|(_, fk)| !deferred_only || fk.deferred || defer_all)
+        .collect();
+    let mut out = Vec::new();
+    if fks.is_empty() {
+        return Ok(out);
+    }
+    for (_, fk) in &fks {
+        if let Some(p) = catalog.get_table(&fk.ref_table) {
+            if !fk_parent_key_usable(catalog, &p, fk) {
+                return Err(Error::semantic(format!(
+                    "foreign key mismatch - \"{}\" referencing \"{}\"",
+                    table.name, fk.ref_table
+                )));
+            }
+        }
+    }
+    let root = ctx.table_root(table);
+    if root == 0 {
+        return Ok(out);
+    }
+    let n_cols = table.n_columns();
+    let mut rows: Vec<Row> = Vec::new();
+    let mut rowids: Vec<i64> = Vec::new();
+    let mut decode_err = None;
+    Btree::new(ctx.pager, root, false).scan_table(|rowid, payload| {
+        match decode_row(payload, n_cols, rowid, table.rowid_alias) {
+            Ok(r) => {
+                rows.push(r);
+                rowids.push(rowid);
+                true
+            }
+            Err(e) => {
+                decode_err = Some(e);
+                false
+            }
+        }
+    })?;
+    if let Some(e) = decode_err {
+        return Err(e);
+    }
+    for (row, rowid) in rows.iter().zip(rowids) {
+        for (id, fk) in &fks {
+            let key: Vec<Value> = fk
+                .columns
+                .iter()
+                .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+                .collect();
+            if key.iter().any(Value::is_null) {
+                continue;
+            }
+            let ok = catalog.get_table(&fk.ref_table).is_some() && fk_parent_exists(ctx, fk, &key)?;
+            if !ok {
+                let rid = (!table.without_rowid).then_some(rowid);
+                out.push((rid, fk.ref_table.clone(), *id));
+                if first_only {
+                    return Ok(out);
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Which side of its foreign keys a DML statement touches.
@@ -3335,6 +3430,47 @@ pub(crate) fn fk_dml_check(ctx: &ExecContext<'_>, table: &Table, dml: FkDml<'_>)
     if !ctx.pager.foreign_keys_enabled() {
         return Ok(());
     }
+    fk_dml_check_catalog(ctx.catalog(), table, dml)
+}
+
+/// [`fk_dml_check`] for a parsed statement, before any plan runs (the
+/// API's entry: zero-row UPDATE / DELETE statements fail too).
+pub(crate) fn fk_dml_check_stmt(
+    catalog: &crate::schema::Catalog,
+    stmt: &crate::sql::ast::Statement,
+) -> Result<()> {
+    use crate::sql::ast::{InsertSource, Statement as S};
+    let (name, dml_cols, kind): (&str, Vec<usize>, u8) = match stmt {
+        S::Insert(i) => (&i.table, Vec::new(), 0),
+        S::Update(u) => {
+            let Some(t) = catalog.get_table(&u.table) else {
+                return Ok(());
+            };
+            let cols = u.set.iter().filter_map(|(c, _)| t.find_column(c)).collect();
+            (&u.table, cols, 1)
+        }
+        S::Delete(d) => (&d.from, Vec::new(), 2),
+        _ => return Ok(()),
+    };
+    let Some(table) = catalog.get_table(name) else {
+        return Ok(());
+    };
+    let dml = match (kind, stmt) {
+        (0, S::Insert(i)) => FkDml::Insert {
+            single_row: matches!(&i.source, InsertSource::Values(rows) if rows.len() == 1)
+                || matches!(i.source, InsertSource::DefaultValues),
+        },
+        (1, _) => FkDml::Update(&dml_cols),
+        _ => FkDml::Delete,
+    };
+    fk_dml_check_catalog(catalog, &table, dml)
+}
+
+fn fk_dml_check_catalog(
+    catalog: &crate::schema::Catalog,
+    table: &Table,
+    dml: FkDml<'_>,
+) -> Result<()> {
     let mismatch = |child: &str, parent: &str| {
         Error::semantic(format!(
             "foreign key mismatch - \"{child}\" referencing \"{parent}\""
@@ -3348,20 +3484,20 @@ pub(crate) fn fk_dml_check(ctx: &ExecContext<'_>, table: &Table, dml: FkDml<'_>)
         if !fk.columns.iter().any(|&c| assigned(c)) {
             continue;
         }
-        let Some(parent) = ctx.catalog().get_table(&fk.ref_table) else {
+        let Some(parent) = catalog.get_table(&fk.ref_table) else {
             return Err(Error::NotFound(format!(
                 "no such table: main.{}",
                 fk.ref_table
             )));
         };
-        if !fk_parent_key_usable(ctx, &parent, fk) {
+        if !fk_parent_key_usable(catalog, &parent, fk) {
             return Err(mismatch(&table.name, &fk.ref_table));
         }
     }
     if matches!(dml, FkDml::Insert { single_row: true }) {
         return Ok(());
     }
-    for (_, child) in ctx.catalog().all_tables() {
+    for (_, child) in catalog.all_tables() {
         for fk in &child.foreign_keys {
             if !fk.ref_table.eq_ignore_ascii_case(&table.name) {
                 continue;
@@ -3383,7 +3519,7 @@ pub(crate) fn fk_dml_check(ctx: &ExecContext<'_>, table: &Table, dml: FkDml<'_>)
                     continue;
                 }
             }
-            if !fk_parent_key_usable(ctx, table, fk) {
+            if !fk_parent_key_usable(catalog, table, fk) {
                 return Err(mismatch(&child.name, &table.name));
             }
         }
@@ -3395,7 +3531,25 @@ fn enforce_child_fks(ctx: &ExecContext<'_>, table: &Table, row: &[Value]) -> Res
     if table.foreign_keys.is_empty() || !ctx.pager.foreign_keys_enabled() {
         return Ok(());
     }
+    let catalog = ctx.catalog();
     for fk in &table.foreign_keys {
+        // The prepare-time key errors come first, NULL keys included
+        // (paths that skip the statement-level `fk_dml_check`).
+        match catalog.get_table(&fk.ref_table) {
+            None => {
+                return Err(Error::NotFound(format!(
+                    "no such table: main.{}",
+                    fk.ref_table
+                )))
+            }
+            Some(p) if !fk_parent_key_usable(catalog, &p, fk) => {
+                return Err(Error::semantic(format!(
+                    "foreign key mismatch - \"{}\" referencing \"{}\"",
+                    table.name, fk.ref_table
+                )))
+            }
+            Some(_) => {}
+        }
         let key_values: Vec<Value> = fk
             .columns
             .iter()
@@ -3408,7 +3562,7 @@ fn enforce_child_fks(ctx: &ExecContext<'_>, table: &Table, row: &[Value]) -> Res
         if !fk_parent_exists(ctx, fk, &key_values)? {
             // SQLite's runtime FK message is exactly this — no table or
             // column detail (see sqlite3.c fkMismatch / sqlite3FkCheck).
-            return Err(Error::constraint("FOREIGN KEY constraint failed"));
+            fk_violation(ctx, fk, false)?;
         }
     }
     Ok(())
@@ -3826,7 +3980,7 @@ fn validate_parent_update_actions(
                 }
                 match fk.on_update {
                     ForeignKeyAction::NoAction | ForeignKeyAction::Restrict => {
-                        return Err(Error::constraint("FOREIGN KEY constraint failed"));
+                        fk_violation(ctx, fk, fk.on_update == ForeignKeyAction::Restrict)?;
                     }
                     ForeignKeyAction::SetNull => {
                         if let Some(a) = child.rowid_alias {
@@ -3862,11 +4016,8 @@ fn validate_parent_update_actions(
                             if added.contains(&serialized) {
                                 continue;
                             }
-                            if removed.contains(&serialized) {
-                                return Err(Error::constraint("FOREIGN KEY constraint failed"));
-                            }
-                            if !fk_parent_exists(ctx, fk, &wkey)? {
-                                return Err(Error::constraint("FOREIGN KEY constraint failed"));
+                            if removed.contains(&serialized) || !fk_parent_exists(ctx, fk, &wkey)? {
+                                fk_violation(ctx, fk, false)?;
                             }
                         }
                     }
@@ -3975,7 +4126,7 @@ fn enforce_parent_delete_fks(
             match fk.on_delete {
                 ForeignKeyAction::NoAction | ForeignKeyAction::Restrict => {
                     // SQLite-exact: no row-count detail.
-                    return Err(Error::constraint("FOREIGN KEY constraint failed"));
+                    fk_violation(ctx, fk, fk.on_delete == ForeignKeyAction::Restrict)?;
                 }
                 ForeignKeyAction::Cascade => {
                     // Recursively delete each child row (children may be
@@ -4187,7 +4338,7 @@ fn enforce_parent_update_fks(
             }
             match fk.on_update {
                 ForeignKeyAction::NoAction | ForeignKeyAction::Restrict => {
-                    return Err(Error::constraint("FOREIGN KEY constraint failed"));
+                    fk_violation(ctx, fk, fk.on_update == ForeignKeyAction::Restrict)?;
                 }
                 ForeignKeyAction::Cascade => {
                     for (rowid, mut crow) in children {

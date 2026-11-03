@@ -915,6 +915,12 @@ pub struct Pager {
     /// PRAGMA count_changes (deprecated): DML through the query surface
     /// returns one `rows inserted|updated|deleted` row.
     count_changes: AtomicBool,
+    /// PRAGMA defer_foreign_keys: every FK acts as DEFERRED (reset at
+    /// the end of each transaction, as in SQLite).
+    defer_foreign_keys: AtomicBool,
+    /// A deferred FK constraint was violated in the open transaction;
+    /// COMMIT re-checks the final state before it may proceed.
+    fk_pending: AtomicBool,
     /// True while a virtual-table content-shadow write is in flight (set
     /// by vtab DML, cleared at statement/transaction boundaries). When a
     /// ROLLBACK happens with this set, the engine marks every
@@ -2530,6 +2536,8 @@ impl Pager {
             memory_wal: AtomicBool::new(false),
             foreign_keys_enabled: AtomicBool::new(false),
             count_changes: AtomicBool::new(false),
+            defer_foreign_keys: AtomicBool::new(false),
+            fk_pending: AtomicBool::new(false),
             vtab_shadow_writes: std::sync::atomic::AtomicBool::new(false),
             locking_mode_exclusive: AtomicBool::new(false),
             recursive_triggers_enabled: AtomicBool::new(false),
@@ -8502,6 +8510,22 @@ impl Pager {
 
     pub fn count_changes(&self) -> bool {
         self.count_changes.load(Ordering::Acquire)
+    }
+
+    pub fn set_defer_foreign_keys(&self, on: bool) {
+        self.defer_foreign_keys.store(on, Ordering::Release);
+    }
+
+    pub fn defer_foreign_keys(&self) -> bool {
+        self.defer_foreign_keys.load(Ordering::Acquire)
+    }
+
+    pub fn set_fk_pending(&self, on: bool) {
+        self.fk_pending.store(on, Ordering::Release);
+    }
+
+    pub fn fk_pending(&self) -> bool {
+        self.fk_pending.load(Ordering::Acquire)
     }
 
     /// Advisory PRAGMA locking_mode toggle — see the field docs.

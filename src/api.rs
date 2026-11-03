@@ -1364,6 +1364,7 @@ fn column_def_to_sql(cd: &crate::sql::ast::ColumnDef) -> String {
                 columns,
                 on_delete,
                 on_update,
+                deferred,
             } => {
                 s.push_str(&format!("REFERENCES {}", table));
                 if !columns.is_empty() {
@@ -1382,6 +1383,9 @@ fn column_def_to_sql(cd: &crate::sql::ast::ColumnDef) -> String {
                 }
                 if !matches!(on_update, NoAction) {
                     s.push_str(&format!(" ON UPDATE {}", act(on_update)));
+                }
+                if *deferred {
+                    s.push_str(" DEFERRABLE INITIALLY DEFERRED");
                 }
             }
             C::GeneratedAs { expr, stored } => {
@@ -1464,6 +1468,7 @@ fn create_table_to_sql(
                 ref_columns,
                 on_delete,
                 on_update,
+                deferred,
             } => {
                 let mut s = format!(
                     "FOREIGN KEY ({}) REFERENCES {}",
@@ -1486,6 +1491,9 @@ fn create_table_to_sql(
                 }
                 if !matches!(on_update, NoAction) {
                     s.push_str(&format!(" ON UPDATE {}", act(on_update)));
+                }
+                if *deferred {
+                    s.push_str(" DEFERRABLE INITIALLY DEFERRED");
                 }
                 s
             }
@@ -2398,6 +2406,20 @@ fn object_sql_references_column(sql: &str, table: &str, name: &str, unqualified:
     // any position changed.
     let probe = rename_column_in_object_sql(sql, table, name, "\u{1}__renamed__\u{1}", unqualified);
     probe != sql
+}
+
+/// Does the final state violate a DEFERRED foreign key (the COMMIT-time
+/// re-check of a transaction that recorded a deferred violation)?
+fn deferred_fk_violated(ctx: &ExecContext<'_>) -> Result<bool> {
+    let tables = ctx.catalog().all_tables();
+    for (_, t) in &tables {
+        if !t.foreign_keys.is_empty()
+            && !crate::executor::fk_check_table(ctx, t, true, true)?.is_empty()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Remove a column definition from a CREATE TABLE statement, returning the
@@ -7168,6 +7190,11 @@ impl Database {
         }
         let t_cache = profile::now();
         let cached = self.get_or_cache_stmt(sql)?;
+        // Foreign key DML errors (mismatched / missing parent key) are
+        // prepare-time in SQLite: they fire before any row is touched.
+        if self.pager.foreign_keys_enabled() {
+            crate::executor::fk_dml_check_stmt(&self.catalog, &cached.stmt)?;
+        }
         profile::span(t_cache, &profile::CACHE_NS);
         // Cross-database trigger firing on LOCAL tables: the thread-db
         // bridge (nested routed bodies reach the parent through it) and
@@ -14504,6 +14531,15 @@ impl Database {
                 if !ctx.in_transaction && !ctx.pager.concurrent_writers_active() {
                     return Err(Error::semantic("cannot commit - no transaction is active"));
                 }
+                // Deferred foreign keys (sqlite3VdbeCheckFk): a violation
+                // recorded in this transaction must be resolved in its final
+                // state, else COMMIT fails and the transaction stays open.
+                if ctx.pager.fk_pending() {
+                    if deferred_fk_violated(ctx)? {
+                        return Err(Error::constraint("FOREIGN KEY constraint failed"));
+                    }
+                    ctx.pager.set_fk_pending(false);
+                }
                 if ctx.pager.has_dirty_pages() && !ctx.pager.peer_commit_may_proceed() {
                     // SQLite: COMMIT returns SQLITE_BUSY and the
                     // transaction stays open for a retry.
@@ -14543,6 +14579,7 @@ impl Database {
                 ctx.pager.clear_savepoints();
                 ctx.pager.flush()?;
                 ctx.pager.note_tx_committed();
+                ctx.pager.set_defer_foreign_keys(false);
                 Ok(())
             }
             Statement::Rollback(_) => {
@@ -14584,6 +14621,8 @@ impl Database {
                 ctx.max_rowids.clear();
                 ctx.rolled_back = true;
                 ctx.pager.note_tx_rolled_back();
+                ctx.pager.set_fk_pending(false);
+                ctx.pager.set_defer_foreign_keys(false);
                 Ok(())
             }
             Statement::Pragma(p) => Self::execute_pragma(p.clone(), ctx),
@@ -16753,6 +16792,15 @@ impl Database {
                         ctx.pager.set_checkpoint_fullfsync(on);
                     }
                 }
+                "defer_foreign_keys" => {
+                    let on = match (&v, value_as_expr(value)) {
+                        (_, crate::sql::ast::Expr::Column { name, .. }) => {
+                            matches!(name.to_ascii_lowercase().as_str(), "on" | "true" | "yes")
+                        }
+                        _ => v.is_truthy(),
+                    };
+                    ctx.pager.set_defer_foreign_keys(on);
+                }
                 "count_changes" => {
                     let on = match (&v, value_as_expr(value)) {
                         (_, crate::sql::ast::Expr::Column { name, .. }) => {
@@ -17682,6 +17730,38 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
             let t = catalog.get_table(&arg)?;
             return Some(pragma_foreign_key_list(&t, catalog));
         }
+        "foreign_key_check" => {
+            // One row per child row whose key has no parent: (table,
+            // rowid, parent, fkid) — all tables, or the named one.
+            let tables: Vec<Arc<Table>> = match p.value.as_ref() {
+                Some(v) => vec![catalog.get_table(&pragma_arg(Some(v))?)?],
+                None => catalog.all_tables().into_iter().map(|(_, t)| t).collect(),
+            };
+            let catalog_ptr: *const crate::schema::Catalog = &*db.catalog;
+            let ctx = ExecContext::new_reader(&db.pager, catalog_ptr, db.read_maps());
+            let mut rows = Vec::new();
+            for t in &tables {
+                for (rowid, parent, id) in
+                    crate::executor::fk_check_table(&ctx, t, false, false).ok()?
+                {
+                    rows.push(vec![
+                        Value::Text(t.name.as_str().into()),
+                        rowid.map_or(Value::Null, Value::Integer),
+                        Value::Text(parent.as_str().into()),
+                        Value::Integer(id as i64),
+                    ]);
+                }
+            }
+            return Some(PragmaRows {
+                columns: vec![
+                    "table".into(),
+                    "rowid".into(),
+                    "parent".into(),
+                    "fkid".into(),
+                ],
+                rows,
+            });
+        }
         _ => {}
     }
     // Every other pragma WITH a value is a plain write form: no result
@@ -17927,6 +18007,7 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
     let v = match name.as_str() {
         "foreign_keys" => Value::Integer(if pager.foreign_keys_enabled() { 1 } else { 0 }),
         "count_changes" => Value::Integer(i64::from(pager.count_changes())),
+        "defer_foreign_keys" => Value::Integer(i64::from(pager.defer_foreign_keys())),
         // The min-rows threshold (0 = parallel scans disabled) — SQLite
         // has no equivalent pragma; the value round-trips the setting.
         "parallel_scan" => Value::Integer(pager.parallel_scan_min_rows()),

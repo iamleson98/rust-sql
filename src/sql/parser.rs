@@ -773,22 +773,15 @@ impl Parser {
                 self.advance();
                 let _ = self.parse_ident_or_keyword()?;
             }
-            if self.peek().is_keyword("DEFERRABLE") || self.peek().is_keyword("NOT") {
-                if self.peek().is_keyword("NOT") {
-                    self.advance();
-                }
-                self.expect_keyword("DEFERRABLE")?;
-                if self.peek().is_keyword("INITIALLY") {
-                    self.advance();
-                    let _ = self.parse_ident_or_keyword()?;
-                }
-            }
+            let mut deferred = self.parse_defer_clause()?;
             let (on_delete, on_update) = self.parse_fk_actions()?;
+            deferred |= self.parse_defer_clause()?;
             Ok(ColumnConstraint::References {
                 table,
                 columns,
                 on_delete,
                 on_update,
+                deferred,
             })
         } else if t.is_keyword("GENERATED")
             || matches!(&t.token, Token::Ident(s) if s.eq_ignore_ascii_case("GENERATED"))
@@ -914,6 +907,26 @@ impl Parser {
     /// SQLite's `onconf`: an optional `ON CONFLICT {ROLLBACK | ABORT | FAIL
     /// | IGNORE | REPLACE}` after a NOT NULL / PRIMARY KEY / UNIQUE
     /// constraint.
+    /// `[NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE]`
+    /// (SQLite's defer_subclause): true only for `DEFERRABLE INITIALLY
+    /// DEFERRED`; false when absent.
+    fn parse_defer_clause(&mut self) -> Result<bool> {
+        if !(self.peek().is_keyword("DEFERRABLE")
+            || (self.peek().is_keyword("NOT") && self.peek_n(1).is_keyword("DEFERRABLE")))
+        {
+            return Ok(false);
+        }
+        let not = self.consume_keyword("NOT");
+        self.expect_keyword("DEFERRABLE")?;
+        let mut deferred = false;
+        if self.consume_keyword("INITIALLY") {
+            deferred = self
+                .parse_ident_or_keyword()?
+                .eq_ignore_ascii_case("DEFERRED");
+        }
+        Ok(deferred && !not)
+    }
+
     fn parse_onconf(&mut self) -> Result<Option<ConflictResolution>> {
         if !(self.peek().is_keyword("ON") && self.peek_n(1).is_keyword("CONFLICT")) {
             return Ok(None);
@@ -989,23 +1002,16 @@ impl Parser {
                 self.advance();
                 let _ = self.parse_ident_or_keyword()?;
             }
-            if self.peek().is_keyword("DEFERRABLE") || self.peek().is_keyword("NOT") {
-                if self.peek().is_keyword("NOT") {
-                    self.advance();
-                }
-                self.expect_keyword("DEFERRABLE")?;
-                if self.peek().is_keyword("INITIALLY") {
-                    self.advance();
-                    let _ = self.parse_ident_or_keyword()?;
-                }
-            }
+            let mut deferred = self.parse_defer_clause()?;
             let (on_delete, on_update) = self.parse_fk_actions()?;
+            deferred |= self.parse_defer_clause()?;
             Ok(TableConstraint::ForeignKey {
                 columns: cols,
                 ref_table,
                 ref_columns,
                 on_delete,
                 on_update,
+                deferred,
             })
         } else {
             let t = self.peek();
