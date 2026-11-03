@@ -919,6 +919,7 @@ pub struct Pager {
     /// to drop plans built under the other setting.
     case_sensitive_like: AtomicBool,
     cs_like_dirty: AtomicBool,
+    writable_schema: AtomicBool,
     /// PRAGMA defer_foreign_keys: every FK acts as DEFERRED (reset at
     /// the end of each transaction, as in SQLite).
     defer_foreign_keys: AtomicBool,
@@ -1773,6 +1774,12 @@ impl Pager {
         Ok(Some(self.savepoint_depth.load(Ordering::Acquire)))
     }
 
+    /// Stack position of the newest savepoint named `name` (0 = bottom).
+    pub fn savepoint_index(&self, name: &str) -> Option<usize> {
+        let lc = name.to_ascii_lowercase();
+        self.savepoints.lock().iter().rposition(|s| s.name == lc)
+    }
+
     /// RELEASE [SAVEPOINT] <name>: discard the savepoint and everything
     /// above it WITHOUT rolling back. Returns the remaining stack depth
     /// (0 = none left), or None when the name is unknown.
@@ -2542,6 +2549,7 @@ impl Pager {
             count_changes: AtomicBool::new(false),
             case_sensitive_like: AtomicBool::new(false),
             cs_like_dirty: AtomicBool::new(false),
+            writable_schema: AtomicBool::new(false),
             defer_foreign_keys: AtomicBool::new(false),
             fk_pending: AtomicBool::new(false),
             vtab_shadow_writes: std::sync::atomic::AtomicBool::new(false),
@@ -8526,6 +8534,22 @@ impl Pager {
 
     pub fn case_sensitive_like(&self) -> bool {
         self.case_sensitive_like.load(Ordering::Relaxed)
+    }
+
+    pub fn set_writable_schema(&self, on: bool) {
+        self.writable_schema.store(on, Ordering::Release);
+    }
+
+    /// The statement-scope connection flags (`crate::plugin::CONN_*`).
+    pub fn conn_flags(&self) -> u8 {
+        let mut f = 0;
+        if self.case_sensitive_like.load(Ordering::Relaxed) {
+            f |= crate::plugin::CONN_CS_LIKE;
+        }
+        if self.writable_schema.load(Ordering::Relaxed) {
+            f |= crate::plugin::CONN_WRITABLE_SCHEMA;
+        }
+        f
     }
 
     /// True once after `case_sensitive_like` changed (cached plans embed

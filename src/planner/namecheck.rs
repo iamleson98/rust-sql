@@ -2269,6 +2269,9 @@ fn validate_expr(ctx: &Ctx<'_>, e: &Expr, scope: &mut Scope, visible: &CteList) 
 /// sqlite3IsReadOnly: the schema tables are read-only (no
 /// writable_schema here).
 pub(crate) fn check_writable(name: &str) -> Result<()> {
+    if crate::plugin::writable_schema() {
+        return Ok(());
+    }
     let bare = name.rsplit('.').next().unwrap_or(name).to_ascii_lowercase();
     let schema_table = match bare.as_str() {
         "sqlite_master" | "sqlite_schema" => "sqlite_master",

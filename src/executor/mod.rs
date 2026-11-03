@@ -1446,6 +1446,19 @@ pub struct ExecContext<'a> {
     /// A trigger program ended in RAISE(IGNORE): the firing site skips
     /// its current row (set by `fire_triggers`, read right after it).
     pub raise_ignore: bool,
+    /// While a REPLACE deletes a parent row: immediate NO ACTION child
+    /// references are queued in `fk_stmt_checks` instead of raised — the
+    /// replacement row may restore the key, and SQLite counts these at
+    /// statement end.
+    pub(crate) fk_defer_noaction: bool,
+    /// Child-side keys whose parent row was missing when the row was
+    /// written: verified when the top-level statement ends (SQLite's
+    /// statement FK counter — a later row may supply the parent).
+    pub(crate) fk_child_pending:
+        std::cell::RefCell<Vec<(crate::schema::ForeignKeyClause, Vec<Value>)>>,
+    /// Queued (child, fk, parent row key) references, verified when the
+    /// INSERT statement completes.
+    pub(crate) fk_stmt_checks: Vec<(Arc<Table>, crate::schema::ForeignKeyClause, Vec<Value>)>,
     /// Rows written by trigger bodies (and their nested triggers) during
     /// this statement: `total_changes()` counts them, `changes()` does not
     /// (`fire_triggers` moves each body's rows here from `changes`).
@@ -1502,6 +1515,9 @@ impl<'a> ExecContext<'a> {
             firing_or: None,
             halt_action: None,
             raise_ignore: false,
+            fk_defer_noaction: false,
+            fk_child_pending: std::cell::RefCell::new(Vec::new()),
+            fk_stmt_checks: Vec::new(),
             trigger_changes: 0,
             autoinc_pending: Vec::new(),
             autoinc_defer: false,
@@ -1557,6 +1573,9 @@ impl<'a> ExecContext<'a> {
             firing_or: None,
             halt_action: None,
             raise_ignore: false,
+            fk_defer_noaction: false,
+            fk_child_pending: std::cell::RefCell::new(Vec::new()),
+            fk_stmt_checks: Vec::new(),
             trigger_changes: 0,
             autoinc_pending: Vec::new(),
             autoinc_defer: false,
@@ -2745,7 +2764,11 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
         } => with_firing_or(ctx, *on_conflict, |ctx| {
             let single_row = matches!(source.as_ref(), Plan::Values { rows } if rows.len() == 1);
             fk_dml_check(ctx, table, FkDml::Insert { single_row })?;
-            exec_insert(
+            let top = ctx.trigger_depth == 0;
+            if top {
+                ctx.fk_child_pending.borrow_mut().clear();
+            }
+            let r = exec_insert(
                 ctx,
                 table.clone(),
                 source,
@@ -2754,7 +2777,11 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
                 *on_conflict,
                 upsert.as_ref(),
                 returning.as_deref(),
-            )
+            )?;
+            if top {
+                fk_verify_child_pending(ctx)?;
+            }
+            Ok(r)
         }),
         Plan::Update {
             table,
@@ -2766,7 +2793,11 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
         } => with_firing_or(ctx, *or_conflict, |ctx| {
             let cols: Vec<usize> = assignments.iter().map(|(i, _)| *i).collect();
             fk_dml_check(ctx, table, FkDml::Update(&cols))?;
-            exec_update(
+            let top = ctx.trigger_depth == 0;
+            if top {
+                ctx.fk_child_pending.borrow_mut().clear();
+            }
+            let r = exec_update(
                 ctx,
                 table.clone(),
                 source,
@@ -2774,7 +2805,11 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
                 returning.as_deref(),
                 *or_conflict,
                 from.as_deref(),
-            )
+            )?;
+            if top {
+                fk_verify_child_pending(ctx)?;
+            }
+            Ok(r)
         }),
         Plan::Delete {
             table,
@@ -2782,7 +2817,15 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             returning,
         } => {
             fk_dml_check(ctx, table, FkDml::Delete)?;
-            exec_delete(ctx, table.clone(), source, returning.as_deref())
+            let top = ctx.trigger_depth == 0;
+            if top {
+                ctx.fk_child_pending.borrow_mut().clear();
+            }
+            let r = exec_delete(ctx, table.clone(), source, returning.as_deref())?;
+            if top {
+                fk_verify_child_pending(ctx)?;
+            }
+            Ok(r)
         }
     }
 }
@@ -3634,10 +3677,99 @@ fn enforce_child_fks(ctx: &ExecContext<'_>, table: &Table, row: &[Value]) -> Res
         if key_values.iter().any(|v| v.is_null()) {
             continue;
         }
-        if !fk_parent_exists(ctx, fk, &key_values)? {
-            // SQLite's runtime FK message is exactly this — no table or
-            // column detail (see sqlite3.c fkMismatch / sqlite3FkCheck).
-            fk_violation(ctx, fk, false)?;
+        if fk_row_satisfies_itself(table, fk, row, &key_values) {
+            continue;
+        }
+        // A self-reference is looked up once the statement's rows are
+        // written (SQLite checks an UPDATE's new values after the write):
+        // the row's own old version must not stand in as its parent.
+        let self_ref = fk.ref_table.eq_ignore_ascii_case(&table.name);
+        if self_ref || !fk_parent_exists(ctx, fk, &key_values)? {
+            if ctx.in_transaction && (fk.deferred || ctx.pager.defer_foreign_keys()) {
+                // Deferred: COMMIT settles it.
+                fk_violation(ctx, fk, false)?;
+            } else {
+                ctx.fk_child_pending
+                    .borrow_mut()
+                    .push((fk.clone(), key_values));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// fkLookupParent's self-reference case: a row whose own parent-key
+/// columns hold the key it references is its own parent.
+fn fk_row_satisfies_itself(
+    table: &Table,
+    fk: &crate::schema::ForeignKeyClause,
+    row: &[Value],
+    key: &[Value],
+) -> bool {
+    if !fk.ref_table.eq_ignore_ascii_case(&table.name) {
+        return false;
+    }
+    let cols: Vec<usize> = if !fk.ref_columns.is_empty() {
+        let v: Vec<usize> = fk
+            .ref_columns
+            .iter()
+            .filter_map(|rc| table.find_column(rc))
+            .collect();
+        if v.len() != fk.ref_columns.len() {
+            return false;
+        }
+        v
+    } else {
+        let pk: Vec<usize> = table
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.primary_key)
+            .map(|(i, _)| i)
+            .collect();
+        if pk.is_empty() {
+            match table.rowid_alias {
+                Some(a) => vec![a],
+                None => return false,
+            }
+        } else {
+            pk
+        }
+    };
+    cols.len() == key.len()
+        && cols
+            .iter()
+            .zip(key.iter())
+            .zip(fk.columns.iter())
+            .all(|((&pc, k), &cc)| {
+                row.get(pc).is_some_and(|pv| {
+                    FkParentCmp::new(table, Some(pc)).eq(pv, k, table.columns.get(cc))
+                })
+            })
+}
+
+/// A top-level DML statement's foreign-key settlement, run before its
+/// autocommit flush (a failure must still be undoable): queued child keys
+/// and the parent rows a REPLACE removed.
+fn fk_stmt_end(ctx: &mut ExecContext<'_>) -> Result<()> {
+    if ctx.trigger_depth > 0 {
+        return Ok(());
+    }
+    fk_verify_child_pending(ctx)?;
+    if !ctx.fk_stmt_checks.is_empty() {
+        let pending = std::mem::take(&mut ctx.fk_stmt_checks);
+        fk_verify_stmt_checks(ctx, pending)?;
+    }
+    Ok(())
+}
+
+/// Statement end for `fk_child_pending`: a key still without a parent
+/// row is the violation.
+fn fk_verify_child_pending(ctx: &ExecContext<'_>) -> Result<()> {
+    let pending = std::mem::take(&mut *ctx.fk_child_pending.borrow_mut());
+    for (fk, key) in pending {
+        if !fk_parent_exists(ctx, &fk, &key)? {
+            fk_violation(ctx, &fk, false)?;
         }
     }
     Ok(())
@@ -3646,14 +3778,106 @@ fn enforce_child_fks(ctx: &ExecContext<'_>, table: &Table, row: &[Value]) -> Res
 /// Find child rows referencing `old_row`'s key through `fk` (a clause of
 /// `child_table` that references `parent_table`). Returns (rowid, key-values)
 /// pairs for each referencing child row.
+/// The parent-key side of an FK child scan (fkScanChildren): the parent
+/// value carries the parent column's affinity and an explicit COLLATE of
+/// the parent column's collation (the rowid when the key is the rowid).
+struct FkParentCmp {
+    aff: Option<crate::types::Affinity>,
+    coll: Option<Arc<dyn crate::plugin::Collation>>,
+    coll_name: String,
+}
+
+impl FkParentCmp {
+    fn new(parent: &Table, col: Option<usize>) -> FkParentCmp {
+        let c = col.and_then(|i| parent.columns.get(i));
+        let name = c.map_or("BINARY", |c| {
+            if c.collation.is_empty() {
+                "BINARY"
+            } else {
+                c.collation.as_str()
+            }
+        });
+        FkParentCmp {
+            aff: Some(c.map_or(crate::types::Affinity::Integer, |c| c.affinity)),
+            coll: crate::plugin::lookup_collation(name),
+            coll_name: name.to_string(),
+        }
+    }
+
+    /// `parent = child` under the comparison affinity and the parent's
+    /// collation. NULL never matches.
+    fn eq(
+        &self,
+        parent_v: &Value,
+        child_v: &Value,
+        child_col: Option<&crate::schema::Column>,
+    ) -> bool {
+        if parent_v.is_null() || child_v.is_null() {
+            return false;
+        }
+        let aff =
+            crate::executor::expr::comparison_affinity(self.aff, child_col.map(|c| c.affinity));
+        let (l, r) = crate::executor::expr::apply_comparison_affinity(
+            aff,
+            parent_v.clone(),
+            child_v.clone(),
+        );
+        match (&self.coll, &l, &r) {
+            (Some(c), Value::Text(_), Value::Text(_)) => {
+                crate::plugin::compare_collated(&l, &r, &**c) == std::cmp::Ordering::Equal
+            }
+            _ => l == r,
+        }
+    }
+}
+
+/// SQLite's action-trigger guard `OLD.k IS NOT NEW.k` under the parent
+/// column's collation: a key that changed only within its collation (case
+/// under NOCASE) neither cascades nor counts as a violation.
+fn fk_parent_key_same(parent: &Table, parent_cols: &[usize], old: &[Value], new: &[Value]) -> bool {
+    old.len() == new.len()
+        && old.iter().zip(new.iter()).enumerate().all(|(k, (a, b))| {
+            if a.is_null() || b.is_null() {
+                return a.is_null() && b.is_null();
+            }
+            let col = parent_cols.get(k).copied();
+            FkParentCmp::new(parent, col).eq(a, b, col.and_then(|i| parent.columns.get(i)))
+        })
+}
+
 fn fk_find_child_rows(
     ctx: &ExecContext<'_>,
     child_table: &Table,
     fk: &crate::schema::ForeignKeyClause,
+    parent: &Table,
     parent_col_idxs: &[usize],
     old_row: &[Value],
     parent_rowid: i64,
 ) -> Result<Vec<(i64, Vec<Value>)>> {
+    let cmps: Vec<FkParentCmp> = if parent_col_idxs.is_empty() {
+        vec![FkParentCmp::new(parent, None)]
+    } else {
+        parent_col_idxs
+            .iter()
+            .map(|&i| FkParentCmp::new(parent, Some(i)))
+            .collect()
+    };
+    // fkScanChildren on a self-referencing table never counts the row
+    // being deleted / updated as its own child.
+    let self_rowid = child_table
+        .name
+        .eq_ignore_ascii_case(&parent.name)
+        .then_some(parent_rowid);
+    let key_matches = |row: &[Value], parent_key: &[Value]| -> bool {
+        fk.columns
+            .iter()
+            .zip(parent_key.iter())
+            .zip(cmps.iter())
+            .all(|((&ci, pv), cmp)| {
+                row.get(ci)
+                    .is_some_and(|v| cmp.eq(pv, v, child_table.columns.get(ci)))
+            })
+    };
     let parent_key: Vec<Value> = if parent_col_idxs.is_empty() {
         vec![Value::Integer(parent_rowid)]
     } else {
@@ -3681,13 +3905,43 @@ fn fk_find_child_rows(
             .find(|idx| {
                 idx.partial_expr.is_none()
                     && idx.columns.len() >= fk.columns.len()
-                    && fk.columns.iter().zip(&idx.columns).all(|(&ci, ic)| {
-                        ic.expr.is_none()
-                            && child_table
-                                .columns
-                                .get(ci)
-                                .is_some_and(|c| c.name.eq_ignore_ascii_case(&ic.name))
-                    })
+                    && fk.columns.iter().zip(&idx.columns).zip(cmps.iter()).all(
+                        |((&ci, ic), cmp)| {
+                            let Some(c) = child_table.columns.get(ci) else {
+                                return false;
+                            };
+                            let icoll = if ic.collation.is_empty() {
+                                "BINARY"
+                            } else {
+                                ic.collation.as_str()
+                            };
+                            // The probe finds what the comparison finds only
+                            // under the same collation, and when the child
+                            // column's own affinity is the comparison's (a
+                            // NUMERIC compare against a no-affinity child
+                            // matches '35.0', stored as text).
+                            let aff = crate::executor::expr::comparison_affinity(
+                                cmp.aff,
+                                Some(c.affinity),
+                            );
+                            let aff_ok = match aff {
+                                crate::executor::expr::CmpAffinity::Numeric => matches!(
+                                    c.affinity,
+                                    crate::types::Affinity::Integer
+                                        | crate::types::Affinity::Real
+                                        | crate::types::Affinity::Numeric
+                                ),
+                                crate::executor::expr::CmpAffinity::Text => {
+                                    c.affinity == crate::types::Affinity::Text
+                                }
+                                crate::executor::expr::CmpAffinity::None => true,
+                            };
+                            ic.expr.is_none()
+                                && c.name.eq_ignore_ascii_case(&ic.name)
+                                && icoll.eq_ignore_ascii_case(&cmp.coll_name)
+                                && aff_ok
+                        },
+                    )
             });
         if let Some(idx) = idx {
             let probe: Vec<Value> = parent_key
@@ -3715,12 +3969,7 @@ fn fk_find_child_rows(
                 if found.is_none() {
                     continue;
                 }
-                let matched = fk
-                    .columns
-                    .iter()
-                    .zip(parent_key.iter())
-                    .all(|(&ci, pv)| buf.get(ci).map(|v| v == pv).unwrap_or(false));
-                if matched {
+                if self_rowid != Some(rowid) && key_matches(&buf, &parent_key) {
                     hits.push((rowid, buf.clone()));
                 }
             }
@@ -3735,12 +3984,7 @@ fn fk_find_child_rows(
             decode_err = Some(e);
             return false;
         }
-        let matched = fk
-            .columns
-            .iter()
-            .zip(parent_key.iter())
-            .all(|(&ci, pv)| buf.get(ci).map(|v| v == pv).unwrap_or(false));
-        if matched {
+        if self_rowid != Some(rowid) && key_matches(&buf, &parent_key) {
             hits.push((rowid, buf.clone()));
         }
         true
@@ -4046,10 +4290,11 @@ fn validate_parent_update_actions(
             for (rowid, old_row, new_row) in write_set {
                 let old_key = key_of(old_row);
                 let new_key = key_of(new_row);
-                if old_key == new_key {
+                if fk_parent_key_same(table, &parent_cols, &old_key, &new_key) {
                     continue;
                 }
-                let children = fk_find_child_rows(ctx, child, fk, &parent_cols, old_row, *rowid)?;
+                let children =
+                    fk_find_child_rows(ctx, child, fk, table, &parent_cols, old_row, *rowid)?;
                 if children.is_empty() {
                     continue;
                 }
@@ -4194,11 +4439,22 @@ fn enforce_parent_delete_fks(
             // when those columns are part of the parent key set — otherwise
             // (FK on a non-key column) it's still a reference we must check.
             let children =
-                fk_find_child_rows(ctx, &child, fk, &parent_cols, old_row, parent_rowid)?;
+                fk_find_child_rows(ctx, &child, fk, parent, &parent_cols, old_row, parent_rowid)?;
             if children.is_empty() {
                 continue;
             }
             match fk.on_delete {
+                ForeignKeyAction::NoAction if ctx.fk_defer_noaction => {
+                    let key: Vec<Value> = if parent_cols.is_empty() {
+                        vec![Value::Integer(parent_rowid)]
+                    } else {
+                        parent_cols
+                            .iter()
+                            .map(|&i| old_row.get(i).cloned().unwrap_or(Value::Null))
+                            .collect()
+                    };
+                    ctx.fk_stmt_checks.push((child.clone(), fk.clone(), key));
+                }
                 ForeignKeyAction::NoAction | ForeignKeyAction::Restrict => {
                     // SQLite-exact: no row-count detail.
                     fk_violation(ctx, fk, fk.on_delete == ForeignKeyAction::Restrict)?;
@@ -4401,13 +4657,11 @@ fn enforce_parent_update_fks(
                     .collect()
             };
             // Key unchanged by this UPDATE → nothing to enforce.
-            if old_key.len() == new_key.len()
-                && old_key.iter().zip(new_key.iter()).all(|(a, b)| a == b)
-            {
+            if fk_parent_key_same(parent, &parent_cols, &old_key, &new_key) {
                 continue;
             }
             let children =
-                fk_find_child_rows(ctx, &child, fk, &parent_cols, old_row, parent_rowid)?;
+                fk_find_child_rows(ctx, &child, fk, parent, &parent_cols, old_row, parent_rowid)?;
             if children.is_empty() {
                 continue;
             }
@@ -25411,7 +25665,57 @@ fn exec_insert(
     );
     ctx.autoinc_defer = false;
     ctx.autoinc_pending.clear();
-    r
+    let pending = std::mem::take(&mut ctx.fk_stmt_checks);
+    let r = r?;
+    fk_verify_stmt_checks(ctx, pending)?;
+    Ok(r)
+}
+
+/// Statement end for references a REPLACE left without their parent row:
+/// a child still holding the key with no parent row for it now is the
+/// immediate violation (deferred keys are recorded for COMMIT).
+fn fk_verify_stmt_checks(
+    ctx: &mut ExecContext<'_>,
+    pending: Vec<(Arc<Table>, crate::schema::ForeignKeyClause, Vec<Value>)>,
+) -> Result<()> {
+    for (child, fk, key) in pending {
+        if fk_parent_exists(ctx, &fk, &key)? {
+            continue;
+        }
+        let Some(parent) = ctx.catalog().get_table(&fk.ref_table) else {
+            continue;
+        };
+        let parent_cols: Vec<usize> = if !fk.ref_columns.is_empty() {
+            fk.ref_columns
+                .iter()
+                .filter_map(|rc| parent.find_column(rc))
+                .collect()
+        } else {
+            parent
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.primary_key)
+                .map(|(i, _)| i)
+                .collect()
+        };
+        // A row image carrying the key at the parent columns.
+        let mut row = vec![Value::Null; parent.n_columns()];
+        let mut rowid = 0;
+        if parent_cols.is_empty() {
+            if let Some(Value::Integer(r)) = key.first() {
+                rowid = *r;
+            }
+        } else {
+            for (&i, v) in parent_cols.iter().zip(key.iter()) {
+                row[i] = v.clone();
+            }
+        }
+        if !fk_find_child_rows(ctx, &child, &fk, &parent, &parent_cols, &row, rowid)?.is_empty() {
+            fk_violation(ctx, &fk, false)?;
+        }
+    }
+    Ok(())
 }
 
 /// SQLite's INSERT width error (insert.c): with a column list "N values
@@ -25900,6 +26204,7 @@ fn exec_insert_inner(
         flush_insert_index_bufs(ctx, &mut index_states)?;
         autoinc_end(ctx)?;
         if !ctx.in_transaction && !ctx.deferred_flush {
+            fk_stmt_end(ctx)?;
             ctx.pager.flush()?;
         }
         // Persist the working set for the next same-shape statement on this
@@ -26146,6 +26451,7 @@ fn exec_insert_inner(
     flush_insert_index_bufs(ctx, &mut index_states)?;
     autoinc_end(ctx)?;
     if !ctx.in_transaction && !ctx.deferred_flush {
+        fk_stmt_end(ctx)?;
         ctx.pager.flush()?;
     }
     // Persist the working set for the next same-shape statement on this
@@ -26249,6 +26555,18 @@ enum InsertOutcome {
 ///
 /// `col_indices` empty = all columns in declared order.
 pub fn fast_insert_literal_rows(
+    ctx: &mut ExecContext<'_>,
+    table: &Arc<Table>,
+    col_indices: &[usize],
+    rows: Vec<Vec<Value>>,
+) -> Result<(i64, u32, i64)> {
+    ctx.fk_child_pending.borrow_mut().clear();
+    let r = fast_insert_literal_rows_inner(ctx, table, col_indices, rows)?;
+    fk_verify_child_pending(ctx)?;
+    Ok(r)
+}
+
+fn fast_insert_literal_rows_inner(
     ctx: &mut ExecContext<'_>,
     table: &Arc<Table>,
     col_indices: &[usize],
@@ -26536,6 +26854,17 @@ fn return_fast_index_states(table: &Arc<Table>, states: Vec<IndexMaintState>) {
 }
 
 pub fn fast_insert_single_row(
+    ctx: &mut ExecContext<'_>,
+    table: &Arc<Table>,
+    supplied: Vec<(usize, Value)>,
+) -> Result<i64> {
+    ctx.fk_child_pending.borrow_mut().clear();
+    let r = fast_insert_single_row_inner(ctx, table, supplied)?;
+    fk_verify_child_pending(ctx)?;
+    Ok(r)
+}
+
+fn fast_insert_single_row_inner(
     ctx: &mut ExecContext<'_>,
     table: &Arc<Table>,
     supplied: Vec<(usize, Value)>,
@@ -27770,12 +28099,27 @@ fn replace_delete_holder(
     if old_payload_opt.is_none() {
         trigger_row = None;
     }
+    // The holder's children (sqlite3FkCheck on the REPLACE delete):
+    // actions run now; NO ACTION is counted at statement end.
+    if ctx.pager.foreign_keys_enabled() {
+        if let Some(p) = old_payload_opt.as_ref() {
+            let old_row = decode_row(p, table.n_columns(), existing_rowid, table.rowid_alias)?;
+            ctx.fk_defer_noaction = true;
+            let r = enforce_parent_delete_fks(ctx, table, &old_row, existing_rowid, 0);
+            ctx.fk_defer_noaction = false;
+            r?;
+            refresh_after_trigger(ctx, table, current_root, index_states, max_rowid)?;
+        }
+    }
     // Preupdate: the conflicting row is about to be deleted (the new
     // row's INSERT event fires at the write, matching SQLite's
     // DELETE-then-INSERT pair for a REPLACE).
     if let Some(p) = old_payload_opt.as_ref() {
         crate::preupdate::fire_delete_payload(table, existing_rowid, p);
     }
+    // Re-opened: an FK action on a self-referencing table may have moved
+    // the root since the lookup above.
+    let mut bt = Btree::new(ctx.pager, *current_root, false);
     bt.delete_table(existing_rowid)?;
     *current_root = bt.root;
     ctx.set_table_root_lc(table_name_lc, *current_root);
@@ -29881,6 +30225,7 @@ fn exec_update(
     if let Some(uf) = from {
         let result = exec_update_from(ctx, &table, source, assignments, returning, stmt_or, uf)?;
         if !ctx.in_transaction && !ctx.deferred_flush {
+            fk_stmt_end(ctx)?;
             ctx.pager.flush()?;
         }
         return Ok(result);
@@ -29919,6 +30264,7 @@ fn exec_update(
         // path's early return skipped it, losing autocommit UPDATEs on
         // disk (in-memory reads stayed correct until eviction/reopen).
         if !ctx.in_transaction && !ctx.deferred_flush {
+            fk_stmt_end(ctx)?;
             ctx.pager.flush()?;
         }
         return Ok(result);
@@ -30294,6 +30640,7 @@ fn exec_update(
         return Err(e);
     }
     if !ctx.in_transaction && !ctx.deferred_flush {
+        fk_stmt_end(ctx)?;
         ctx.pager.flush()?;
     }
     if let Some(ret) = returning {
@@ -32495,6 +32842,7 @@ fn try_streaming_update(
     updated += fused_patched as i64;
     ctx.changes += fused_patched as i64;
     if !ctx.in_transaction && !ctx.deferred_flush {
+        fk_stmt_end(ctx)?;
         ctx.pager.flush()?;
     }
     if let Some(ret) = returning {
@@ -33104,6 +33452,7 @@ fn try_truncate_delete(
     ctx.invalidate_max_rowid_if_deleted(&name_lc, i64::MAX);
     ctx.changes += deleted;
     if !ctx.in_transaction && !ctx.deferred_flush {
+        fk_stmt_end(ctx)?;
         ctx.pager.flush()?;
     }
     Ok(Some(ExecResult {
@@ -33740,6 +34089,7 @@ fn try_streaming_delete(
             let deleted = delete_rowid_range_batched(ctx, &table_name_lc, root, lo, hi, strict_gt)?;
             ctx.changes += deleted as i64;
             if !ctx.in_transaction && !ctx.deferred_flush {
+                fk_stmt_end(ctx)?;
                 ctx.pager.flush()?;
             }
             return Ok(Some(ExecResult {
@@ -33862,6 +34212,7 @@ fn try_streaming_delete(
         deleted = n as i64;
         ctx.changes += n as i64;
         if !ctx.in_transaction && !ctx.deferred_flush {
+            fk_stmt_end(ctx)?;
             ctx.pager.flush()?;
         }
         return Ok(Some(ExecResult {
@@ -33998,6 +34349,7 @@ fn try_streaming_delete(
         }
     }
     if !ctx.in_transaction && !ctx.deferred_flush {
+        fk_stmt_end(ctx)?;
         ctx.pager.flush()?;
     }
     if let Some(ret) = returning {
@@ -34238,6 +34590,7 @@ fn exec_delete(
                 ctx.invalidate_max_rowid_if_deleted(&table_name_lc, rowid_val);
             }
             if !ctx.in_transaction && !ctx.deferred_flush {
+                fk_stmt_end(ctx)?;
                 ctx.pager.flush()?;
             }
             if let Some(ret) = returning {
@@ -34434,6 +34787,7 @@ fn exec_delete(
         ctx.invalidate_max_rowid_if_deleted(&table_name_lc, max_deleted);
     }
     if !ctx.in_transaction && !ctx.deferred_flush {
+        fk_stmt_end(ctx)?;
         ctx.pager.flush()?;
     }
     if let Some(ret) = returning {

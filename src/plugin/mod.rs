@@ -486,27 +486,39 @@ mod scope {
             registry: None,
             depth: 0,
         }) };
-        /// PRAGMA case_sensitive_like of the statement's connection (SQLite
-        /// re-registers like() with the flag; here LIKE reads it).
-        static CS_LIKE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// The statement's connection flags (`CONN_*`): PRAGMA
+        /// case_sensitive_like (SQLite re-registers like() with the flag;
+        /// here LIKE reads it) and PRAGMA writable_schema.
+        static CONN_FLAGS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     }
+
+    pub const CONN_CS_LIKE: u8 = 1;
+    pub const CONN_WRITABLE_SCHEMA: u8 = 2;
 
     pub(crate) fn case_sensitive_like() -> bool {
-        CS_LIKE.with(|c| c.get())
+        CONN_FLAGS.with(|c| c.get() & CONN_CS_LIKE != 0)
     }
 
-    /// Carry the statement's LIKE case rule into a worker thread.
-    pub struct CsLikeGuard(bool);
+    pub(crate) fn writable_schema() -> bool {
+        CONN_FLAGS.with(|c| c.get() & CONN_WRITABLE_SCHEMA != 0)
+    }
+
+    pub(crate) fn conn_flags() -> u8 {
+        CONN_FLAGS.with(|c| c.get())
+    }
+
+    /// Carry the statement's connection flags into a worker thread.
+    pub struct CsLikeGuard(u8);
 
     impl CsLikeGuard {
-        pub fn set(on: bool) -> CsLikeGuard {
-            CsLikeGuard(CS_LIKE.with(|c| c.replace(on)))
+        pub fn set(flags: u8) -> CsLikeGuard {
+            CsLikeGuard(CONN_FLAGS.with(|c| c.replace(flags)))
         }
     }
 
     impl Drop for CsLikeGuard {
         fn drop(&mut self) {
-            CS_LIKE.with(|c| c.set(self.0));
+            CONN_FLAGS.with(|c| c.set(self.0));
         }
     }
 
@@ -516,11 +528,11 @@ mod scope {
     /// function itself runs a subquery — the outer registry must survive).
     pub struct Guard {
         installed: bool,
-        cs_like: bool,
+        flags: u8,
     }
 
     impl Guard {
-        pub fn install(reg: Option<Arc<PluginRegistry>>, cs_like: bool) -> Guard {
+        pub fn install(reg: Option<Arc<PluginRegistry>>, flags: u8) -> Guard {
             let installed = SCOPE.with(|s| {
                 let mut s = s.borrow_mut();
                 s.depth += 1;
@@ -531,10 +543,10 @@ mod scope {
                     false
                 }
             });
-            if installed && cs_like {
-                CS_LIKE.with(|c| c.set(true));
+            if installed && flags != 0 {
+                CONN_FLAGS.with(|c| c.set(flags));
             }
-            Guard { installed, cs_like }
+            Guard { installed, flags }
         }
     }
 
@@ -547,8 +559,8 @@ mod scope {
                 }
                 s.depth = s.depth.saturating_sub(1);
             });
-            if self.installed && self.cs_like {
-                CS_LIKE.with(|c| c.set(false));
+            if self.installed && self.flags != 0 {
+                CONN_FLAGS.with(|c| c.set(0));
             }
         }
     }
@@ -560,9 +572,10 @@ mod scope {
     }
 }
 
-pub(crate) use scope::case_sensitive_like;
 pub use scope::CsLikeGuard;
 pub use scope::Guard as PluginScopeGuard;
+pub(crate) use scope::{case_sensitive_like, conn_flags, writable_schema};
+pub use scope::{CONN_CS_LIKE, CONN_WRITABLE_SCHEMA};
 
 /// Resolve a user scalar function for the current statement scope.
 pub(crate) fn lookup_scalar(name: &str) -> Option<Arc<dyn ScalarFunction>> {

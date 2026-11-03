@@ -348,7 +348,7 @@ pub(crate) fn try_parallel_fused_aggregate(
     // TLS (conn text encoding) does not cross threads: each worker
     // re-installs the tag copied on the spawning thread.
     let conn_enc_tag = super::conn_enc::current();
-    let cs_like = crate::plugin::case_sensitive_like();
+    let cs_like = crate::plugin::conn_flags();
     let partials: Vec<Result<FusedWalk>> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(ranges.len());
         for &(lo, hi) in ranges.iter() {
@@ -560,7 +560,7 @@ pub(crate) fn try_parallel_distinct_aggregate(
     // each range — decode_row_selective into a reused buffer, compiled
     // filter, then update_agg_state with the DISTINCT flags.
     let conn_enc_tag = super::conn_enc::current();
-    let cs_like = crate::plugin::case_sensitive_like();
+    let cs_like = crate::plugin::conn_flags();
     let partials: Vec<Result<(Vec<AggState>, bool)>> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(ranges.len());
         for &(lo, hi) in ranges.iter() {
@@ -780,7 +780,7 @@ pub(crate) fn try_parallel_groupby_selective(
     let pager = ctx.pager;
 
     let conn_enc_tag = super::conn_enc::current();
-    let cs_like = crate::plugin::case_sensitive_like();
+    let cs_like = crate::plugin::conn_flags();
     let partials: Vec<Result<HashGrouper>> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(ranges.len());
         for &(lo, hi) in ranges.iter() {
@@ -1282,7 +1282,7 @@ pub(crate) fn try_parallel_groupby_compiled(
     let pager = ctx.pager;
     let conn_enc_tag = super::conn_enc::current();
 
-    let cs_like = crate::plugin::case_sensitive_like();
+    let cs_like = crate::plugin::conn_flags();
     let partials: Vec<Result<HashGrouper>> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(ranges.len());
         for &(lo, hi) in ranges.iter() {
@@ -1480,7 +1480,7 @@ pub(crate) fn try_parallel_count(
     let ranges = split.ranges;
     let pager = ctx.pager;
     let conn_enc_tag = super::conn_enc::current();
-    let cs_like = crate::plugin::case_sensitive_like();
+    let cs_like = crate::plugin::conn_flags();
     let counts: Vec<Result<u64>> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(ranges.len());
         for &(lo, hi) in ranges.iter() {
@@ -1601,7 +1601,7 @@ pub(crate) fn try_parallel_topn(
     // main-thread merge) uses the same comparator the serial path
     // resolved.
     let conn_enc_tag = super::conn_enc::current();
-    let cs_like = crate::plugin::case_sensitive_like();
+    let cs_like = crate::plugin::conn_flags();
     let partials: Vec<Result<Vec<super::TopnSel>>> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(ranges.len());
         for &(lo, hi) in ranges.iter() {
@@ -1745,7 +1745,7 @@ pub(crate) fn try_parallel_topn_expr(
     // heap discipline — sift-up on insert, root-replace + sift-down when
     // the candidate beats the worst survivor).
     let conn_enc_tag = super::conn_enc::current();
-    let cs_like = crate::plugin::case_sensitive_like();
+    let cs_like = crate::plugin::conn_flags();
     let partials: Vec<Result<Vec<super::TopnSel>>> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(ranges.len());
         for &(lo, hi) in ranges.iter() {
@@ -2022,7 +2022,7 @@ pub(crate) fn try_parallel_sort_expr(
 
     // Workers: wide decode + per-row key materialization + local sort.
     let conn_enc_tag = super::conn_enc::current();
-    let cs_like = crate::plugin::case_sensitive_like();
+    let cs_like = crate::plugin::conn_flags();
     let partials: Vec<Result<ExprSortChunk>> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(ranges.len());
         for &(lo, hi) in ranges.iter() {
@@ -2340,7 +2340,7 @@ pub(crate) fn try_parallel_aggregate_rows(
     // Workers: the serial general-path loop over each chunk —
     // update_agg_state with the compiled argument values.
     let conn_enc_tag = super::conn_enc::current();
-    let cs_like = crate::plugin::case_sensitive_like();
+    let cs_like = crate::plugin::conn_flags();
     let partials: Vec<(Vec<AggState>, bool)> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(chunks.len());
         for (_base, part) in chunks {
@@ -2536,7 +2536,7 @@ pub(crate) fn try_parallel_groupby_rows(
         .collect();
 
     let conn_enc_tag = super::conn_enc::current();
-    let cs_like = crate::plugin::case_sensitive_like();
+    let cs_like = crate::plugin::conn_flags();
     let partials: Vec<HashGrouper> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(bounds.len());
         for (lo, hi) in bounds {
@@ -2833,7 +2833,7 @@ pub(crate) fn try_parallel_sort_rows(
     // and sort the chunk under the strict (keys, global-index) order.
     // Pure compute — no I/O, no fallible step.
     let conn_enc_tag = super::conn_enc::current();
-    let cs_like = crate::plugin::case_sensitive_like();
+    let cs_like = crate::plugin::conn_flags();
     let partials: Vec<ExprSortChunk> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(chunks.len());
         for (base, part) in chunks {
@@ -3015,7 +3015,7 @@ pub(crate) fn try_parallel_sort(
     // during the merge (mem::take), so the chunk Vecs are drained
     // allocation-free on the emit side.
     let conn_enc_tag = super::conn_enc::current();
-    let cs_like = crate::plugin::case_sensitive_like();
+    let cs_like = crate::plugin::conn_flags();
     let partials: Vec<Result<SortChunk>> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(ranges.len());
         for &(lo, hi) in ranges.iter() {
@@ -3253,7 +3253,7 @@ pub(crate) fn try_parallel_join_probe(
     let n_workers = ranges.len();
     let conn_enc_tag = super::conn_enc::current();
     type WorkerOut = (Vec<crate::Row>, Vec<u64>);
-    let cs_like = crate::plugin::case_sensitive_like();
+    let cs_like = crate::plugin::conn_flags();
     let partials: Vec<Result<WorkerOut>> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(n_workers);
         for &(lo, hi) in ranges.iter() {
@@ -3592,7 +3592,7 @@ pub(crate) fn try_parallel_nested_join(
 
     type WorkerOut = (Vec<Row>, Vec<u64>);
     let conn_enc_tag = super::conn_enc::current();
-    let cs_like = crate::plugin::case_sensitive_like();
+    let cs_like = crate::plugin::conn_flags();
     let partials: Vec<WorkerOut> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(ranges.len());
         for &(lo, hi) in ranges.iter() {

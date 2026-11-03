@@ -5791,7 +5791,9 @@ impl Database {
             // is table-only by construction.
             None => return Ok(None),
         };
-        crate::planner::namecheck::check_writable(&table.name)?;
+        if self.pager.conn_flags() & crate::plugin::CONN_WRITABLE_SCHEMA == 0 {
+            crate::planner::namecheck::check_writable(&table.name)?;
+        }
         // Table-shape bails: fall through to the general path.
         // Virtual tables route through xUpdate — the byte scanner's
         // btree fast path doesn't apply.
@@ -6345,6 +6347,20 @@ impl Database {
     /// `"name"` that resolves to no column is the string 'name' — the
     /// statement re-parses with it as a literal and checks again.
     fn namecheck_dqs(&self, sql: &str, stmt: &mut Statement) -> Result<()> {
+        // `UPDATE t SET rowid = x` on a table with an INTEGER PRIMARY KEY
+        // assigns that column (the rowid IS the alias).
+        if let Statement::Update(u) = stmt {
+            if let Some(t) = self.catalog.get_table(&u.table) {
+                if let Some(alias) = t.rowid_alias {
+                    for (name, _) in u.set.iter_mut() {
+                        if crate::planner::is_rowid_spelling(name) && t.find_column(name).is_none()
+                        {
+                            *name = t.columns[alias].name.clone();
+                        }
+                    }
+                }
+            }
+        }
         let mut literals: Vec<String> = Vec::new();
         loop {
             let err = match self.namecheck(stmt) {
@@ -10112,13 +10128,13 @@ impl Database {
     #[inline]
     pub(crate) fn plugin_scope(&self) -> Option<crate::plugin::PluginScopeGuard> {
         let plugins = self.has_plugins.load(Ordering::Relaxed);
-        let cs_like = self.pager.case_sensitive_like();
-        if !plugins && !cs_like {
+        let flags = self.pager.conn_flags();
+        if !plugins && flags == 0 {
             return None;
         }
         Some(crate::plugin::PluginScopeGuard::install(
             plugins.then(|| self.plugins.read().clone()),
-            cs_like,
+            flags,
         ))
     }
 
@@ -10968,6 +10984,20 @@ impl Database {
     /// above it without rolling back. Releasing the outermost savepoint of
     /// a savepoint-started transaction COMMITS.
     fn exec_release_savepoint(&mut self, name: &str) -> Result<()> {
+        // Releasing the savepoint that opened the transaction commits it:
+        // deferred foreign keys must hold first, else RELEASE fails and
+        // the transaction (and every savepoint) stays open, like COMMIT.
+        if self.savepoint_txn.load(Ordering::Acquire)
+            && self.pager.fk_pending()
+            && self.pager.savepoint_index(name) == Some(0)
+        {
+            let (ctx, _maps) = self.view_reader_ctx(&[]);
+            if deferred_fk_violated(&ctx)? {
+                return Err(Error::constraint("FOREIGN KEY constraint failed"));
+            }
+            drop(ctx);
+            self.pager.set_fk_pending(false);
+        }
         // Savepoint ops can pop the __begin__ undo level (see
         // exec_savepoint): committed-view reconstruction is off until the
         // transaction ends.
@@ -16872,6 +16902,15 @@ impl Database {
                         _ => v.is_truthy(),
                     };
                     ctx.pager.set_count_changes(on);
+                }
+                "writable_schema" => {
+                    let on = match (&v, value_as_expr(value)) {
+                        (_, crate::sql::ast::Expr::Column { name, .. }) => {
+                            matches!(name.to_ascii_lowercase().as_str(), "on" | "true" | "yes")
+                        }
+                        _ => v.is_truthy(),
+                    };
+                    ctx.pager.set_writable_schema(on);
                 }
                 "case_sensitive_like" => {
                     let on = match (&v, value_as_expr(value)) {

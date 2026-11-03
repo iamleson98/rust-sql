@@ -1598,7 +1598,8 @@ fn main() {
 
     // BENCH_ONLY=<substring> runs only the rows whose function name matches.
     let only = std::env::var("BENCH_ONLY").ok();
-    let all: &[(&str, fn() -> BenchResult)] = &[
+    type Row = (&'static str, fn() -> BenchResult);
+    let all: &[Row] = &[
         ("bench_insert_autocommit", bench_insert_autocommit),
         ("bench_insert_transaction", bench_insert_transaction),
         ("bench_insert_multi_values", bench_insert_multi_values),
