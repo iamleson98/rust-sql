@@ -623,6 +623,8 @@ pub struct UpdateStatement {
     /// `UPDATE ... LIMIT <expr>` — applied to the MATCHED rows, after
     /// WHERE and before the SET rewrite.
     pub limit: Option<Expr>,
+    /// `INDEXED BY idx` / `NOT INDEXED` on the target table.
+    pub indexed: Option<IndexedHint>,
 }
 
 #[derive(Clone, Debug)]
@@ -636,6 +638,8 @@ pub struct DeleteStatement {
     pub returning: Option<Vec<ResultColumn>>,
     pub limit: Option<Expr>,
     pub order_by: Vec<OrderTerm>,
+    /// `INDEXED BY idx` / `NOT INDEXED` on the target table.
+    pub indexed: Option<IndexedHint>,
 }
 
 #[derive(Clone, Debug)]

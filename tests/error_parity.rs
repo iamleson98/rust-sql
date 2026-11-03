@@ -395,3 +395,34 @@ fn attach_detach_round_trip() {
     let err2 = db.execute("DETACH neverwas", []).unwrap_err();
     assert_eq!(err2.to_string(), "no such database: neverwas");
 }
+
+/// Statements whose SQLite error is produced by the parser or resolver
+/// and must match byte-for-byte through `sqlite_message` (no engine
+/// prefix): syntax errors, compound-shape rules, trigger-step rules,
+/// DML index hints, GROUP BY aggregates.
+#[test]
+fn err_parser_and_resolver_messages() {
+    let cases = [
+        "SELECT * FROM t WHERE",
+        "SELECT x FROM t ORDER BY x UNION SELECT k FROM u",
+        "SELECT x FROM t LIMIT 1 UNION ALL SELECT k FROM u",
+        "SELECT x, y FROM t INTERSECT SELECT k FROM u",
+        "SELECT x FROM t GROUP BY count(*)",
+        "CREATE TRIGGER q1 AFTER INSERT ON u BEGIN INSERT INTO main.t VALUES(1,2,3); END",
+        "CREATE TRIGGER q2 AFTER INSERT ON u BEGIN UPDATE t INDEXED BY idx_t_x SET x=1; END",
+        "CREATE TRIGGER q3 AFTER INSERT ON u BEGIN DELETE FROM t NOT INDEXED; END",
+        "CREATE TRIGGER q4 BEFORE INSERT ON v BEGIN SELECT 1; END",
+        "CREATE TRIGGER q5 INSTEAD OF INSERT ON t BEGIN SELECT 1; END",
+        "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END",
+        "UPDATE t INDEXED BY nosuch SET x = 1",
+        "DELETE FROM t INDEXED BY idx_t_x WHERE x = 1",
+        "UPDATE t NOT INDEXED SET x = 1",
+    ];
+    for sql in cases {
+        let mut db = eng();
+        let con = lite();
+        let ours = db.execute(sql, []).map_err(|e| e.sqlite_message());
+        let theirs = con.execute_batch(sql).map_err(|e| raw_sqlite_msg(&e));
+        assert_eq!(ours, theirs, "{sql}");
+    }
+}

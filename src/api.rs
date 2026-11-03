@@ -5826,7 +5826,7 @@ impl Database {
         } else {
             if n_values_per_row != columns.len() {
                 return Err(Error::semantic(format!(
-                    "{} VALUES for {} columns",
+                    "{} values for {} columns",
                     n_values_per_row,
                     columns.len()
                 )));
@@ -11066,12 +11066,12 @@ impl Database {
             let mut row = vec![Value::Null; n];
             if let Some(cols) = &ins.columns {
                 if cols.len() != src.len() {
-                    return Err(Error::semantic(format!(
-                        "table {} has {} columns but {} values were supplied",
-                        view.name,
+                    return Err(crate::executor::insert_arity_error(
+                        &view.name,
+                        true,
                         cols.len(),
-                        src.len()
-                    )));
+                        src.len(),
+                    ));
                 }
                 for (v, name) in <Vec<Value> as IntoIterator>::into_iter(src).zip(cols.iter()) {
                     let pos = view_cols
@@ -14702,6 +14702,14 @@ impl Database {
                     return Err(Error::AlreadyExists(format!(
                         "{} {} already exists",
                         what, name.name
+                    )));
+                }
+                // sqlite3StartTable: an index of that name blocks the
+                // table even under IF NOT EXISTS.
+                if catalog.get_index(&name.name).is_some() {
+                    return Err(Error::semantic(format!(
+                        "there is already an index named {}",
+                        name.name
                     )));
                 }
                 // (The reserved-`sqlite_%`-name guard lives at the

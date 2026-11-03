@@ -25190,6 +25190,24 @@ fn exec_insert(
     r
 }
 
+/// SQLite's INSERT width error (insert.c): with a column list "N values
+/// for M columns", else "table T has M columns but N values were
+/// supplied".
+pub(crate) fn insert_arity_error(
+    table: &str,
+    column_list: bool,
+    n_cols: usize,
+    n_vals: usize,
+) -> Error {
+    if column_list {
+        Error::semantic(format!("{n_vals} values for {n_cols} columns"))
+    } else {
+        Error::semantic(format!(
+            "table {table} has {n_cols} columns but {n_vals} values were supplied"
+        ))
+    }
+}
+
 fn exec_insert_inner(
     ctx: &mut ExecContext<'_>,
     table: Arc<Table>,
@@ -25409,12 +25427,12 @@ fn exec_insert_inner(
             // target_indices.len()`), and short lists silently NULL-filled
             // — both diverged from SQLite.
             if !exprs.is_empty() && exprs.len() != target_indices.len() {
-                return Err(Error::semantic(format!(
-                    "table {} has {} columns but {} values were supplied",
-                    table.name,
+                return Err(insert_arity_error(
+                    &table.name,
+                    columns.is_some(),
                     target_indices.len(),
-                    exprs.len()
-                )));
+                    exprs.len(),
+                ));
             }
             // Reset the row buffer to all-NULLs without releasing capacity.
             for v in full_row.iter_mut() {
@@ -25680,12 +25698,12 @@ fn exec_insert_inner(
     // Arity check (SQLite errors at prepare time — even with zero source
     // rows, `INSERT INTO t SELECT x, x FROM empty` is a width mismatch).
     if !source_res.columns.is_empty() && source_res.columns.len() != target_indices.len() {
-        return Err(Error::semantic(format!(
-            "table {} has {} columns but {} values were supplied",
-            table.name,
+        return Err(insert_arity_error(
+            &table.name,
+            columns.is_some(),
             target_indices.len(),
-            source_res.columns.len()
-        )));
+            source_res.columns.len(),
+        ));
     }
     // SORTED-BATCH arm for INSERT ... SELECT: the source rows are fully
     // materialized above (a self-referencing INSERT sees the pre-statement
@@ -25720,12 +25738,12 @@ fn exec_insert_inner(
         // Arity check (SQLite) for INSERT ... SELECT: one value per target
         // column (a short/long SELECT was silently accepted before).
         if !row.is_empty() && row.len() != target_indices.len() {
-            return Err(Error::semantic(format!(
-                "table {} has {} columns but {} values were supplied",
-                table.name,
+            return Err(insert_arity_error(
+                &table.name,
+                columns.is_some(),
                 target_indices.len(),
-                row.len()
-            )));
+                row.len(),
+            ));
         }
         for (i, val) in row.iter().enumerate() {
             if i < target_indices.len() {

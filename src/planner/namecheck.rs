@@ -2336,6 +2336,7 @@ fn validate_update(ctx: &Ctx<'_>, upd: &UpdateStatement, scope: &mut Scope) -> R
     let ctes = validate_cte_bodies(ctx, &upd.with, scope)?;
 
     let target = dml_target_source(ctx, &upd.table, upd.alias.as_ref())?;
+    check_dml_index_hint(ctx, &upd.table, &upd.indexed)?;
 
     // SQLite's UPDATE-FROM resolution order: the TARGET table is a
     // separate, inner scope level — a bare name resolves to the target
@@ -2434,10 +2435,27 @@ fn validate_update(ctx: &Ctx<'_>, upd: &UpdateStatement, scope: &mut Scope) -> R
     Ok(())
 }
 
+/// `UPDATE / DELETE ... INDEXED BY idx`: the index must exist on the
+/// target (SQLite's "no such index"). The hint itself only steers the
+/// plan, so a valid one changes nothing observable here.
+fn check_dml_index_hint(ctx: &Ctx<'_>, table: &str, hint: &Option<IndexedHint>) -> Result<()> {
+    if let Some(IndexedHint::Indexed(idx)) = hint {
+        let owns = ctx
+            .catalog
+            .get_index(idx)
+            .is_some_and(|i| i.table.eq_ignore_ascii_case(table));
+        if !owns {
+            return Err(Error::NotFound(format!("no such index: {}", idx)));
+        }
+    }
+    Ok(())
+}
+
 fn validate_delete(ctx: &Ctx<'_>, del: &DeleteStatement, scope: &mut Scope) -> Result<()> {
     let ctes = validate_cte_bodies(ctx, &del.with, scope)?;
 
     let target = dml_target_source(ctx, &del.from, del.alias.as_ref())?;
+    check_dml_index_hint(ctx, &del.from, &del.indexed)?;
     scope.push_level();
     scope.cur().sources.push(target.clone());
     if let Some(w) = &del.where_clause {

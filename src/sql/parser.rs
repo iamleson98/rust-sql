@@ -24,6 +24,9 @@ pub struct Parser {
     /// sit inside a window spec / frame offset, so the only
     /// position-complete hook is the parameter token itself).
     trigger_depth: usize,
+    /// Parsing the body of a CREATE TEMP TRIGGER (its DML may name a
+    /// schema; a persistent trigger's may not).
+    temp_trigger: bool,
     /// Unqualified double-quoted identifiers parsed as expressions (the
     /// candidates of SQLite's double-quoted-string fallback).
     dq_idents: Vec<String>,
@@ -53,6 +56,7 @@ impl Parser {
             pos: 0,
             expr_depth: 0,
             trigger_depth: 0,
+            temp_trigger: false,
             dq_idents: Vec::new(),
             dq_literals: Vec::new(),
         })
@@ -354,7 +358,21 @@ impl Parser {
         } else {
             false
         };
+        let name_tok = self.peek().clone();
         let name = self.parse_table_name()?;
+        // sqlite3StartTable: a TEMP table lives in `temp` only.
+        if temp
+            && name
+                .schema
+                .as_deref()
+                .is_some_and(|s| !s.eq_ignore_ascii_case("temp"))
+        {
+            return Err(Error::parse(
+                name_tok.line,
+                name_tok.col,
+                "temporary table name must be unqualified",
+            ));
+        }
         // CREATE TABLE t AS SELECT — materialize the query's result as a
         // new table (column names/types from the result rows).
         if self.peek().is_keyword("AS") {
@@ -1389,7 +1407,7 @@ impl Parser {
         } else {
             false
         };
-        let (when_clause, body) = self.parse_trigger_when_and_body()?;
+        let (when_clause, body) = self.parse_trigger_when_and_body_for(temp)?;
         Ok(Statement::Create(CreateStatement::Trigger(CreateTrigger {
             schema,
             name,
@@ -1410,6 +1428,16 @@ impl Parser {
     /// (window specs, frame offsets, subqueries included) are rejected
     /// with SQLite's message. The depth is ALWAYS restored — every
     /// error path funnels through the single restore below.
+    fn parse_trigger_when_and_body_for(
+        &mut self,
+        temp: bool,
+    ) -> Result<(Option<crate::sql::ast::Expr>, Vec<Statement>)> {
+        let saved = std::mem::replace(&mut self.temp_trigger, temp);
+        let r = self.parse_trigger_when_and_body();
+        self.temp_trigger = saved;
+        r
+    }
+
     fn parse_trigger_when_and_body(
         &mut self,
     ) -> Result<(Option<crate::sql::ast::Expr>, Vec<Statement>)> {
@@ -1829,6 +1857,7 @@ impl Parser {
         } else {
             None
         };
+        let indexed = self.parse_dml_indexed_hint()?;
         self.expect_keyword("SET")?;
         let set = self.parse_set_clause()?;
         let from = if self.peek().is_keyword("FROM") {
@@ -1877,6 +1906,7 @@ impl Parser {
             returning,
             order_by,
             limit,
+            indexed,
         }))
     }
 
@@ -1902,6 +1932,7 @@ impl Parser {
         } else {
             None
         };
+        let indexed = self.parse_dml_indexed_hint()?;
         let where_clause = if self.peek().is_keyword("WHERE") {
             self.advance();
             Some(self.parse_expr()?)
@@ -1936,6 +1967,7 @@ impl Parser {
             returning,
             limit,
             order_by,
+            indexed,
         }))
     }
 
@@ -4174,6 +4206,17 @@ impl Parser {
     fn parse_dml_table_name(&mut self) -> Result<(Option<String>, String)> {
         let first = self.parse_nm()?;
         if self.peek().is_punct('.') {
+            // sqlite3TriggerInsertStep & co: a persistent trigger's steps
+            // name their tables bare.
+            if self.trigger_depth > 0 && !self.temp_trigger {
+                let t = self.peek();
+                return Err(Error::parse(
+                    t.line,
+                    t.col,
+                    "qualified table names are not allowed on INSERT, UPDATE, and DELETE \
+                     statements within triggers",
+                ));
+            }
             self.advance();
             let second = self.parse_nm()?;
             let schema_lc = first.to_ascii_lowercase();
@@ -4184,6 +4227,39 @@ impl Parser {
         } else {
             Ok((None, first))
         }
+    }
+
+    /// `INDEXED BY nm` / `NOT INDEXED` after an UPDATE / DELETE target
+    /// (SQLite's qualified-table-name); neither may appear in a trigger
+    /// step (parse.y tridxby).
+    fn parse_dml_indexed_hint(&mut self) -> Result<Option<IndexedHint>> {
+        let t = self.peek().clone();
+        let hint = if self.peek().is_keyword("INDEXED") && self.peek_n(1).is_keyword("BY") {
+            self.advance();
+            self.advance();
+            IndexedHint::Indexed(self.parse_nm()?)
+        } else if self.peek().is_keyword("NOT") && self.peek_n(1).is_keyword("INDEXED") {
+            self.advance();
+            self.advance();
+            IndexedHint::NotIndexed
+        } else {
+            return Ok(None);
+        };
+        if self.trigger_depth > 0 {
+            let which = match hint {
+                IndexedHint::Indexed(_) => "INDEXED BY",
+                IndexedHint::NotIndexed => "NOT INDEXED",
+            };
+            return Err(Error::parse(
+                t.line,
+                t.col,
+                format!(
+                    "the {which} clause is not allowed on UPDATE or DELETE statements within \
+                     triggers"
+                ),
+            ));
+        }
+        Ok(Some(hint))
     }
 
     fn expect_keyword(&mut self, kw: &str) -> Result<()> {

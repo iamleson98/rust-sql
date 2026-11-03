@@ -900,6 +900,7 @@ fn driver_body(
                     returning: ret,
                     order_by: Vec::new(),
                     limit: None,
+                    indexed: None,
                 });
                 let (cols, rows) = exec_on_target(&localized, &bind)?;
                 if returning_cols.is_empty() {
@@ -930,6 +931,7 @@ fn driver_body(
                 returning: None,
                 order_by: Vec::new(),
                 limit: None,
+                indexed: None,
             };
             let (_, cand_rows) = candidates(db, params, schema_lc, aux_table, &pk_cols, &upd_like)?;
             let n_key = key_width(aux_table, &pk_cols);
@@ -952,6 +954,7 @@ fn driver_body(
                     returning: user_returning.clone(),
                     limit: None,
                     order_by: Vec::new(),
+                    indexed: None,
                 });
                 let (cols, rows) = exec_on_target(&localized, &key)?;
                 if returning_cols.is_empty() {

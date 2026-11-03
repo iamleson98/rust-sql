@@ -350,7 +350,7 @@ fn cross_schema_view_and_trigger_rules() {
     // Trigger bodies may not carry qualified DML targets (SQLite).
     assert_eq!(
         err_of(&mut db, "CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO aux.x VALUES (new.a); END"),
-        "semantic error: qualified table names are not allowed on INSERT, UPDATE, and DELETE statements within triggers"
+        "parse error at 1:58: qualified table names are not allowed on INSERT, UPDATE, and DELETE statements within triggers"
     );
 }
 
