@@ -528,3 +528,193 @@ fn replace_skips_rows_an_earlier_replace_deleted() {
         run(&["t1", "t2"], &refs);
     }
 }
+
+/// insert.test 16.x / 17.x, conflict3 13.x: with recursive_triggers ON, a
+/// REPLACE deletion fires the table's DELETE triggers (INSERT and UPDATE
+/// OR REPLACE alike), and once any ran every constraint is re-checked as
+/// ABORT — a trigger that re-inserts the conflict fails the statement,
+/// one that removes the UPDATE's own row fails it too.
+#[test]
+fn replace_fires_delete_triggers_and_rechecks() {
+    run(
+        &["t", "log"],
+        &[
+            "PRAGMA recursive_triggers = 1",
+            "CREATE TABLE t(a INTEGER PRIMARY KEY, b UNIQUE)",
+            "CREATE TABLE log(x)",
+            "CREATE TRIGGER d AFTER DELETE ON t BEGIN INSERT INTO log VALUES(old.a); END",
+            "CREATE TRIGGER bd BEFORE DELETE ON t BEGIN INSERT INTO log VALUES(-old.a); END",
+            "INSERT INTO t VALUES(1,1),(2,2),(5,5)",
+            "REPLACE INTO t VALUES(3,1)",
+            "INSERT INTO t VALUES(4,4)",
+            "UPDATE OR REPLACE t SET a=4 WHERE a=2",
+            "UPDATE OR REPLACE t SET b=5 WHERE a=3",
+        ],
+    );
+    // Without recursive_triggers the deletions fire nothing.
+    run(
+        &["t", "log"],
+        &[
+            "CREATE TABLE t(a INTEGER PRIMARY KEY, b UNIQUE)",
+            "CREATE TABLE log(x)",
+            "CREATE TRIGGER d AFTER DELETE ON t BEGIN INSERT INTO log VALUES(old.a); END",
+            "INSERT INTO t VALUES(1,1),(2,2)",
+            "REPLACE INTO t VALUES(3,1)",
+            "UPDATE OR REPLACE t SET b=3 WHERE a=2",
+        ],
+    );
+    run(
+        &["t0"],
+        &[
+            "PRAGMA recursive_triggers = true",
+            "CREATE TABLE t0(c0,c1)",
+            "CREATE UNIQUE INDEX i0 ON t0(c0)",
+            "INSERT INTO t0(c0,c1) VALUES(123,1)",
+            "CREATE TRIGGER tr0 AFTER DELETE ON t0 BEGIN INSERT INTO t0 VALUES(123,2); END",
+            "REPLACE INTO t0(c0,c1) VALUES(123,3)",
+        ],
+    );
+    run(
+        &["t1"],
+        &[
+            "PRAGMA recursive_triggers = true",
+            "CREATE TABLE t1(a INTEGER PRIMARY KEY, b)",
+            "CREATE INDEX t1b ON t1(b)",
+            "INSERT INTO t1 VALUES(1, 'one')",
+            "CREATE TRIGGER tr3 AFTER DELETE ON t1 BEGIN INSERT INTO t1 VALUES(1, 'three'); END",
+            "REPLACE INTO t1 VALUES(1, 'two')",
+        ],
+    );
+    run(
+        &["t0"],
+        &[
+            "PRAGMA recursive_triggers = true",
+            "CREATE TABLE t0(aa, bb)",
+            "CREATE UNIQUE INDEX t0bb ON t0(bb)",
+            "CREATE TRIGGER r BEFORE DELETE ON t0 BEGIN INSERT INTO t0(aa,bb) VALUES(99,1); END",
+            "INSERT INTO t0(aa,bb) VALUES(10,20)",
+            "REPLACE INTO t0(aa,bb) VALUES(30,20)",
+        ],
+    );
+    // Two conflicts, a no-op trigger: both holders go, no error.
+    run(
+        &["t3"],
+        &[
+            "PRAGMA recursive_triggers = true",
+            "CREATE TABLE t3(a INTEGER PRIMARY KEY, b INT, c INT, d INT)",
+            "CREATE UNIQUE INDEX t3bpi ON t3(b) WHERE c<=d",
+            "CREATE UNIQUE INDEX t3d ON t3(d)",
+            "INSERT INTO t3(a,b,c,d) VALUES(1,1,1,1),(2,1,3,2),(3,4,5,6)",
+            "CREATE TRIGGER t3r1 AFTER DELETE ON t3 BEGIN SELECT 'hi'; END",
+            "REPLACE INTO t3(a,b,c,d) VALUES(4,4,8,9)",
+            "REPLACE INTO t3(a,b,c,d) VALUES(5,1,11,2)",
+        ],
+    );
+    // The trigger empties the table under an UPDATE OR REPLACE.
+    for setup in [
+        "CREATE TABLE t0 (c0 UNIQUE, c1 UNIQUE)",
+        "CREATE TABLE t0 (a PRIMARY KEY, c0 UNIQUE, c1 UNIQUE) WITHOUT ROWID",
+    ] {
+        let ins = if setup.contains("WITHOUT") {
+            [
+                "INSERT INTO t0 VALUES(1, 1, NULL)",
+                "INSERT INTO t0 VALUES(2, 0, NULL)",
+            ]
+        } else {
+            [
+                "INSERT INTO t0 VALUES(1, NULL)",
+                "INSERT INTO t0 VALUES(0, NULL)",
+            ]
+        };
+        run(
+            &["t0"],
+            &[
+                "PRAGMA recursive_triggers = true",
+                setup,
+                "CREATE TRIGGER tr0 AFTER DELETE ON t0 BEGIN DELETE FROM t0; END",
+                ins[0],
+                ins[1],
+                "UPDATE OR REPLACE t0 SET c1 = 1",
+            ],
+        );
+        let mut db = Database::open_in_memory().unwrap();
+        for s in [
+            "PRAGMA recursive_triggers = true",
+            setup,
+            "CREATE TRIGGER tr0 AFTER DELETE ON t0 BEGIN DELETE FROM t0; END",
+            ins[0],
+            ins[1],
+        ] {
+            db.execute(s, []).unwrap();
+        }
+        let _ = db.execute("UPDATE OR REPLACE t0 SET c1 = 1", []);
+        assert_eq!(
+            db.query("PRAGMA integrity_check", []).unwrap()[0][0],
+            Value::Text("ok".into())
+        );
+    }
+}
+
+/// RAISE() in trigger programs (lang_createtrigger.html#raise): ABORT
+/// undoes the statement, FAIL keeps its earlier rows, ROLLBACK ends the
+/// transaction — each failing with the (expression) message; IGNORE
+/// silently skips the firing row and keeps everything else. Outside a
+/// trigger RAISE is an error.
+#[test]
+fn raise_in_trigger_programs() {
+    for action in ["ABORT", "FAIL", "ROLLBACK", "IGNORE"] {
+        let msg = if action == "IGNORE" {
+            "RAISE(IGNORE)".to_string()
+        } else {
+            format!("RAISE({action}, format('bad %d', new.a))")
+        };
+        let before_ins = format!(
+            "CREATE TRIGGER bi BEFORE INSERT ON t WHEN new.a % 2 = 0 BEGIN SELECT {msg}; END"
+        );
+        let before_upd =
+            format!("CREATE TRIGGER bu BEFORE UPDATE ON t WHEN new.a > 10 BEGIN SELECT {msg}; END");
+        let old_msg = msg.replace("new.a", "old.a");
+        let before_del = format!(
+            "CREATE TRIGGER bd BEFORE DELETE ON t WHEN old.a = 3 BEGIN SELECT {old_msg}; END"
+        );
+        let after_ins = format!(
+            "CREATE TRIGGER ai AFTER INSERT ON u WHEN new.a = 2 BEGIN INSERT INTO log VALUES(new.a); SELECT {msg}; INSERT INTO log VALUES(-new.a); END"
+        );
+        for txn in [false, true] {
+            let mut script: Vec<String> = vec![
+                "CREATE TABLE t(a)".into(),
+                "CREATE TABLE u(a)".into(),
+                "CREATE TABLE log(x)".into(),
+                before_ins.clone(),
+                before_upd.clone(),
+                before_del.clone(),
+                after_ins.clone(),
+            ];
+            if txn {
+                script.push("BEGIN".into());
+            }
+            script.extend(
+                [
+                    "INSERT INTO t VALUES(1),(2),(3),(5)",
+                    "INSERT INTO t SELECT a + 6 FROM t",
+                    "UPDATE t SET a = a + 8",
+                    "DELETE FROM t WHERE a < 4",
+                    "DELETE FROM t",
+                    "INSERT INTO u VALUES(1),(2),(3)",
+                ]
+                .map(String::from),
+            );
+            if txn {
+                script.push("COMMIT".into());
+            }
+            let refs: Vec<&str> = script.iter().map(|s| s.as_str()).collect();
+            run(&["t", "u", "log"], &refs);
+        }
+    }
+    let db = Database::open_in_memory().unwrap();
+    let e = db.query("SELECT raise(abort, 'message')", []).unwrap_err();
+    assert_eq!(
+        e.sqlite_message(),
+        "RAISE() may only be used within a trigger-program"
+    );
+}

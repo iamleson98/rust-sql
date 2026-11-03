@@ -5791,6 +5791,7 @@ impl Database {
             // is table-only by construction.
             None => return Ok(None),
         };
+        crate::planner::namecheck::check_writable(&table.name)?;
         // Table-shape bails: fall through to the general path.
         // Virtual tables route through xUpdate — the byte scanner's
         // btree fast path doesn't apply.
@@ -5882,6 +5883,10 @@ impl Database {
 
     fn exec_fast_insert(&mut self, fi: FastInsert<'_>) -> Result<bool> {
         let n_values_per_row = fi.values.first().map(|r| r.len()).unwrap_or(0);
+        // A ragged VALUES list is the general path's parse error.
+        if fi.values.iter().any(|r| r.len() != n_values_per_row) {
+            return Ok(false);
+        }
         let Some((table, col_indices)) =
             self.fast_insert_target(fi.table, &fi.columns, n_values_per_row)?
         else {
@@ -5959,15 +5964,28 @@ impl Database {
         // the general path's hook): a FAILED fast-path INSERT leaves no
         // partial rows. Must run BEFORE the map-merge epilogue so the
         // undo's root moves flow into the same write-back. ──
-        if result.is_err() && !ctx.stmt_undo.is_empty() {
+        // A constraint / RAISE resolved as FAIL keeps the rows written
+        // before it (sqlite3VdbeHalt's OE_Fail), as on the general path.
+        let keep_partial = result.is_err()
+            && ctx.halt_action == Some(ConflictResolution::Fail)
+            && !ctx.rolled_back;
+        if result.is_err() && !keep_partial && !ctx.stmt_undo.is_empty() {
             let entries = std::mem::take(&mut ctx.stmt_undo);
             if let Err(undo_err) = crate::executor::replay_stmt_undo(&mut ctx, entries) {
                 eprintln!("stmt-undo replay failed after fast-insert error: {undo_err}");
             }
         }
-        if result.is_err() {
+        if result.is_err() && !keep_partial {
             ctx.forget_max_rowids();
         }
+        if keep_partial && !ctx.in_transaction && !ctx.deferred_flush {
+            if let Err(e) = self.pager.flush() {
+                eprintln!("commit of a FAIL statement's changes failed: {e}");
+            }
+        }
+        *self.halt_rollback.get_mut() = result.is_err()
+            && ctx.halt_action == Some(ConflictResolution::Rollback)
+            && ctx.in_transaction;
 
         // ── AUTO-COMMIT FAILURE RESTORE (page level) — MUST run BEFORE the
         // map-merge epilogue below. The merge keeps a failed statement's
@@ -5986,6 +6004,7 @@ impl Database {
         // written through to shared, exactly as the general path keeps
         // them). Mirrors the general path's epilogue block.
         if result.is_err()
+            && !keep_partial
             && !ctx.in_transaction
             && !ctx.deferred_flush
             && self.pager.dirty_set_marked() != fast_dirty_at_start
@@ -6020,7 +6039,12 @@ impl Database {
             self.clear_vtab_shadow_flight();
         }
         if result.is_err() {
-            crate::executor::change_counters::record_outcome(&self.change_counts, false, 0, 0);
+            crate::executor::change_counters::record_outcome(
+                &self.change_counts,
+                keep_partial,
+                ctx.changes,
+                ctx.trigger_changes,
+            );
         }
         if let Ok(n) = result {
             crate::executor::change_counters::record(&self.change_counts, n);
@@ -6113,6 +6137,9 @@ impl Database {
         // Planning must see the plugin registry (user aggregates change
         // how expressions are planned — see is_aggregate_call). One
         // read-lock + refcount bump + thread-local install.
+        if self.pager.take_cs_like_dirty() {
+            self.invalidate_stmt_cache_and_epoch();
+        }
         let _plugin_guard = self.plugin_scope();
         // Planning is also encoding-aware: IndexRange planning is gated on
         // the file's text encoding (the in-memory index byte order is
@@ -10084,11 +10111,14 @@ impl Database {
     /// Keeps the zero-plugin hot path at one relaxed atomic load.
     #[inline]
     pub(crate) fn plugin_scope(&self) -> Option<crate::plugin::PluginScopeGuard> {
-        if !self.has_plugins.load(Ordering::Relaxed) {
+        let plugins = self.has_plugins.load(Ordering::Relaxed);
+        let cs_like = self.pager.case_sensitive_like();
+        if !plugins && !cs_like {
             return None;
         }
         Some(crate::plugin::PluginScopeGuard::install(
-            self.plugins.read().clone(),
+            plugins.then(|| self.plugins.read().clone()),
+            cs_like,
         ))
     }
 
@@ -11473,11 +11503,12 @@ impl Database {
                         let table = self.catalog.get_table(&ins.table).ok_or_else(|| {
                             Error::NotFound(format!("no such table: {}", ins.table))
                         })?;
-                        let columns = Self::insert_columns(&table, ins.columns.as_ref())?;
+                        let columns = Self::insert_columns(&table, ins)?;
                         crate::planner::plan::Plan::Insert {
                             table,
                             source: Box::new(source_plan),
                             columns,
+                            column_list: ins.columns.is_some(),
                             on_conflict: ins.or,
                             upsert: ins.upsert.clone(),
                             returning: ins.returning.clone(),
@@ -11825,11 +11856,12 @@ impl Database {
                         let table = self.catalog.get_table(&ins.table).ok_or_else(|| {
                             Error::NotFound(format!("no such table: {}", ins.table))
                         })?;
-                        let columns = Self::insert_columns(&table, ins.columns.as_ref())?;
+                        let columns = Self::insert_columns(&table, ins)?;
                         Ok(Some(crate::planner::plan::Plan::Insert {
                             table,
                             source: Box::new(source_plan),
                             columns,
+                            column_list: ins.columns.is_some(),
                             on_conflict: ins.or,
                             upsert: ins.upsert.clone(),
                             returning: ins.returning.clone(),
@@ -11881,11 +11913,12 @@ impl Database {
                         let table = catalog.get_table(&ins.table).ok_or_else(|| {
                             Error::NotFound(format!("no such table: {}", ins.table))
                         })?;
-                        let columns = Self::insert_columns(&table, ins.columns.as_ref())?;
+                        let columns = Self::insert_columns(&table, ins)?;
                         Ok(crate::planner::plan::Plan::Insert {
                             table,
                             source: Box::new(source_plan),
                             columns,
+                            column_list: ins.columns.is_some(),
                             on_conflict: ins.or,
                             upsert: ins.upsert.clone(),
                             returning: ins.returning.clone(),
@@ -11924,7 +11957,7 @@ impl Database {
     ) -> Result<()> {
         crate::executor::change_counters::record_outcome(
             &self.change_counts,
-            ok,
+            ok || (ctx.halt_action == Some(ConflictResolution::Fail) && !ctx.rolled_back),
             ctx.changes,
             ctx.trigger_changes,
         );
@@ -12740,6 +12773,9 @@ impl Database {
     /// `EXPLAIN QUERY PLAN WITH c AS (…) SELECT * FROM c` failed with
     /// "no such table: c" (the static planner has no CTE scope).
     fn explain_plan_for_statement(&self, inner: &Statement) -> Result<Option<Plan>> {
+        // The plan must be the one the statement would run (user
+        // functions, PRAGMA case_sensitive_like).
+        let _plugin_guard = self.plugin_scope();
         if let Statement::Select(sel) = inner {
             if let Some(with) = &sel.with {
                 let in_txn = self.in_transaction.load(Ordering::Acquire);
@@ -13578,12 +13614,13 @@ impl Database {
                 crate::planner::plan::Plan::Values { rows: vec![vec![]] }
             }
         };
-        let columns = Self::insert_columns(&table, ins.columns.as_ref())?;
+        let columns = Self::insert_columns(&table, ins)?;
         let on_conflict = ins.or;
         Ok(crate::planner::plan::Plan::Insert {
             table,
             source: Box::new(source_plan),
             columns,
+            column_list: ins.columns.is_some(),
             on_conflict,
             upsert: ins.upsert.clone(),
             returning: ins.returning.clone(),
@@ -13594,9 +13631,10 @@ impl Database {
     /// and the WITH-DML path, which plans the source with CTE scope).
     fn insert_columns(
         table: &Arc<crate::schema::Table>,
-        cols: Option<&Vec<String>>,
+        ins: &crate::sql::ast::InsertStatement,
     ) -> Result<Option<Vec<usize>>> {
-        if let Some(cols) = cols {
+        crate::planner::namecheck::check_writable(&table.name)?;
+        if let Some(cols) = ins.columns.as_ref() {
             let mut v = Vec::with_capacity(cols.len());
             for c in cols {
                 let idx = resolve_insert_column(table, c).ok_or_else(|| {
@@ -13617,15 +13655,27 @@ impl Database {
             }
             return Ok(Some(v));
         }
-        Ok(Some(
-            table
-                .columns
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| c.generated.is_none())
-                .map(|(i, _)| i)
-                .collect(),
-        ))
+        let v: Vec<usize> = table
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.generated.is_none())
+            .map(|(i, _)| i)
+            .collect();
+        // The synthesized list hides that no column list was written, so
+        // the executor would word a width mismatch as "N values for M
+        // columns"; SQLite reports the table form at prepare time.
+        if let InsertSource::Values(rows) = &ins.source {
+            if let Some(r) = rows.iter().find(|r| r.len() != v.len()) {
+                return Err(crate::executor::insert_arity_error(
+                    &table.name,
+                    false,
+                    v.len(),
+                    r.len(),
+                ));
+            }
+        }
+        Ok(Some(v))
     }
 
     pub(crate) fn plan_update(
@@ -15052,6 +15102,7 @@ impl Database {
                         table: table_arc,
                         source: Box::new(crate::planner::plan::Plan::Values { rows: values }),
                         columns: None,
+                        column_list: false,
                         on_conflict: None,
                         upsert: None,
                         returning: None,
@@ -16821,6 +16872,15 @@ impl Database {
                         _ => v.is_truthy(),
                     };
                     ctx.pager.set_count_changes(on);
+                }
+                "case_sensitive_like" => {
+                    let on = match (&v, value_as_expr(value)) {
+                        (_, crate::sql::ast::Expr::Column { name, .. }) => {
+                            matches!(name.to_ascii_lowercase().as_str(), "on" | "true" | "yes")
+                        }
+                        _ => v.is_truthy(),
+                    };
+                    ctx.pager.set_case_sensitive_like(on);
                 }
                 "foreign_keys" | "recursive_triggers" => {
                     // Accept booleans, numbers, and ON/OFF bare words.

@@ -122,6 +122,24 @@ pub(crate) fn trigger_dqs(
     }
 }
 
+std::thread_local! {
+    /// Trigger programs running on this thread (RAISE is legal only
+    /// inside one).
+    static PROGRAM_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// The RAISE that produced the error now unwinding, for the program
+    /// that catches it.
+    static RAISED: std::cell::Cell<Option<crate::sql::ast::RaiseAction>> =
+        const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn in_trigger_program() -> bool {
+    PROGRAM_DEPTH.with(|d| d.get() > 0)
+}
+
+pub(crate) fn note_raise(action: crate::sql::ast::RaiseAction) {
+    RAISED.with(|r| r.set(Some(action)));
+}
+
 pub(crate) fn fire_triggers(
     ctx: &mut ExecContext<'_>,
     table: &crate::schema::Table,
@@ -137,6 +155,7 @@ pub(crate) fn fire_triggers(
             MAX_TRIGGER_DEPTH, table.name
         )));
     }
+    ctx.raise_ignore = false;
     // Any trigger body can execute arbitrary DML (including against
     // tables the OUTER statement is inserting into), so the insert
     // loops' per-row max-rowid overlay consults must become LIVE from
@@ -261,6 +280,8 @@ pub(crate) fn fire_triggers(
         // would abort); a DELETE step fires its own programs with the
         // default policy.
         let firing_or = ctx.firing_or;
+        PROGRAM_DEPTH.with(|d| d.set(d.get() + 1));
+        RAISED.with(|r| r.set(None));
         let result = (|| {
             for (step_idx, stmt) in trig.body.iter().enumerate() {
                 // Compiled program: plan the step ONCE per statement with
@@ -386,6 +407,7 @@ pub(crate) fn fire_triggers(
             }
             Ok(())
         })();
+        PROGRAM_DEPTH.with(|d| d.set(d.get() - 1));
         if armed_channel {
             ctx.foreign = None;
         }
@@ -395,6 +417,25 @@ pub(crate) fn fire_triggers(
         crate::executor::change_counters::note_conn_rowid(saved_last_insert_rowid);
         ctx.trigger_changes += ctx.changes - saved_changes;
         ctx.changes = saved_changes;
+        // A RAISE in this program (an inner program catches its own):
+        // IGNORE abandons this program, the rest of this event's programs
+        // and the firing row's operation, keeping every change; FAIL /
+        // ROLLBACK halt the statement like a constraint with that policy.
+        if result.is_err() {
+            match RAISED.with(|r| r.take()) {
+                Some(crate::sql::ast::RaiseAction::Ignore) => {
+                    ctx.raise_ignore = true;
+                    return Ok(());
+                }
+                Some(crate::sql::ast::RaiseAction::Fail) => {
+                    ctx.halt_action = Some(crate::sql::ast::ConflictResolution::Fail);
+                }
+                Some(crate::sql::ast::RaiseAction::Rollback) => {
+                    ctx.halt_action = Some(crate::sql::ast::ConflictResolution::Rollback);
+                }
+                _ => {}
+            }
+        }
         result?;
     }
     Ok(())
@@ -615,6 +656,9 @@ fn rewrite_new_old(
                 }
                 Ok(())
             }
+            Expr::Raise {
+                message: Some(m), ..
+            } => walk_expr(m, lookup),
             _ => Ok(()),
         }
     }

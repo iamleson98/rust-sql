@@ -426,3 +426,53 @@ fn err_parser_and_resolver_messages() {
         assert_eq!(ours, theirs, "{sql}");
     }
 }
+
+/// insert.test 1.2 / 1.3 / 10.2: schema tables are read-only, INSERT
+/// width errors name the table only without a column list (generated
+/// columns don't count), a ragged VALUES list is its own error.
+#[test]
+fn insert_width_and_readonly_schema_messages() {
+    let cases = [
+        "INSERT INTO sqlite_master VALUES(1,2,3,4)",
+        "INSERT INTO sqlite_schema VALUES('table','x','x',0,'')",
+        "UPDATE sqlite_master SET name = 'x'",
+        "DELETE FROM sqlite_master",
+        "INSERT INTO t VALUES(1,2)",
+        "INSERT INTO t(x) VALUES(1,2)",
+        "INSERT INTO t SELECT k FROM u",
+        "INSERT INTO t(x, y) SELECT k FROM u",
+        "INSERT INTO t VALUES(1,2,3), (4,5), (6,7,8)",
+        "INSERT INTO t(x) VALUES(1), (2, 3)",
+        "CREATE TABLE g(a, b AS (a*2), c); INSERT INTO g VALUES(1,2,3)",
+        "CREATE TABLE g(a, b AS (a*2), c); INSERT INTO g VALUES(1)",
+    ];
+    for sql in cases {
+        let mut db = eng();
+        let con = lite();
+        let ours = db.execute(sql, []).map_err(|e| e.sqlite_message());
+        let theirs = con.execute_batch(sql).map_err(|e| raw_sqlite_msg(&e));
+        assert_eq!(ours, theirs, "{sql}");
+    }
+}
+
+/// `DEFAULT id`: SQLite's grammar stores a bare name as a string, except
+/// TRUE / FALSE (booleans); a quoted "true" stays text.
+#[test]
+fn bare_identifier_defaults_are_strings() {
+    let setup = "CREATE TABLE d(a INT, b TEXT DEFAULT hi, c DEFAULT true, \
+                 e DEFAULT false, f DEFAULT \"true\", g DEFAULT [x y]); \
+                 INSERT INTO d(a) VALUES(1)";
+    let mut db = eng();
+    let con = lite();
+    db.execute(setup, []).unwrap();
+    con.execute_batch(setup).unwrap();
+    let q = "SELECT quote(b), quote(c), quote(e), quote(f), quote(g) FROM d";
+    let ours: Vec<String> = db.query(q, []).unwrap()[0]
+        .iter()
+        .map(|v| v.as_text().to_string())
+        .collect();
+    let theirs: Vec<String> = con
+        .query_row(q, [], |r| (0..5).map(|i| r.get::<_, String>(i)).collect())
+        .unwrap();
+    assert_eq!(ours, theirs);
+}

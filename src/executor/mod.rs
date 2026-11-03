@@ -1443,6 +1443,9 @@ pub struct ExecContext<'a> {
     /// made before the violation, `Rollback` ends the whole transaction;
     /// `None` = ABORT (undo the statement). Set by [`halt_constraint`].
     pub halt_action: Option<ConflictResolution>,
+    /// A trigger program ended in RAISE(IGNORE): the firing site skips
+    /// its current row (set by `fire_triggers`, read right after it).
+    pub raise_ignore: bool,
     /// Rows written by trigger bodies (and their nested triggers) during
     /// this statement: `total_changes()` counts them, `changes()` does not
     /// (`fire_triggers` moves each body's rows here from `changes`).
@@ -1498,6 +1501,7 @@ impl<'a> ExecContext<'a> {
             trigger_plans: HashMap::new(),
             firing_or: None,
             halt_action: None,
+            raise_ignore: false,
             trigger_changes: 0,
             autoinc_pending: Vec::new(),
             autoinc_defer: false,
@@ -1552,6 +1556,7 @@ impl<'a> ExecContext<'a> {
             trigger_plans: HashMap::new(),
             firing_or: None,
             halt_action: None,
+            raise_ignore: false,
             trigger_changes: 0,
             autoinc_pending: Vec::new(),
             autoinc_defer: false,
@@ -2733,6 +2738,7 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             table,
             source,
             columns,
+            column_list,
             on_conflict,
             upsert,
             returning,
@@ -2744,6 +2750,7 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
                 table.clone(),
                 source,
                 columns,
+                *column_list,
                 *on_conflict,
                 upsert.as_ref(),
                 returning.as_deref(),
@@ -13988,7 +13995,7 @@ fn try_text_count(
             pattern,
             escape: None,
             negated: false,
-        } => {
+        } if !crate::plugin::case_sensitive_like() => {
             let Expr::Column { table: ref_t, name } = expr.as_ref() else {
                 return Ok(None);
             };
@@ -25365,23 +25372,43 @@ fn with_firing_or(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn exec_insert(
     ctx: &mut ExecContext<'_>,
     table: Arc<Table>,
     source: &Plan,
     columns: &Option<Vec<usize>>,
+    column_list: bool,
     on_conflict: Option<ConflictResolution>,
     upsert: Option<&crate::sql::ast::UpsertClause>,
     returning: Option<&[crate::sql::ast::ResultColumn]>,
 ) -> Result<ExecResult> {
     if ctx.trigger_depth > 0 || ctx.autoinc_defer {
-        return exec_insert_inner(ctx, table, source, columns, on_conflict, upsert, returning);
+        return exec_insert_inner(
+            ctx,
+            table,
+            source,
+            columns,
+            column_list,
+            on_conflict,
+            upsert,
+            returning,
+        );
     }
     // A top-level INSERT owns the AUTOINCREMENT registers: its own raises
     // and its trigger programs' stay pending until it completes (see
     // `autoinc_end`); a halted statement drops them.
     ctx.autoinc_defer = true;
-    let r = exec_insert_inner(ctx, table, source, columns, on_conflict, upsert, returning);
+    let r = exec_insert_inner(
+        ctx,
+        table,
+        source,
+        columns,
+        column_list,
+        on_conflict,
+        upsert,
+        returning,
+    );
     ctx.autoinc_defer = false;
     ctx.autoinc_pending.clear();
     r
@@ -25405,11 +25432,13 @@ pub(crate) fn insert_arity_error(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn exec_insert_inner(
     ctx: &mut ExecContext<'_>,
     table: Arc<Table>,
     source: &Plan,
     columns: &Option<Vec<usize>>,
+    column_list: bool,
     stmt_or: Option<ConflictResolution>,
     upsert: Option<&crate::sql::ast::UpsertClause>,
     returning: Option<&[crate::sql::ast::ResultColumn]>,
@@ -25626,7 +25655,7 @@ fn exec_insert_inner(
             if !exprs.is_empty() && exprs.len() != target_indices.len() {
                 return Err(insert_arity_error(
                     &table.name,
-                    columns.is_some(),
+                    column_list,
                     target_indices.len(),
                     exprs.len(),
                 ));
@@ -25773,6 +25802,9 @@ fn exec_insert_inner(
                     &mut index_states,
                     &mut current_root,
                 )?;
+                if std::mem::take(&mut ctx.raise_ignore) {
+                    continue;
+                }
             }
             let (outcome, landed_rowid) = exec_insert_one_row(
                 ctx,
@@ -25897,7 +25929,7 @@ fn exec_insert_inner(
     if !source_res.columns.is_empty() && source_res.columns.len() != target_indices.len() {
         return Err(insert_arity_error(
             &table.name,
-            columns.is_some(),
+            column_list,
             target_indices.len(),
             source_res.columns.len(),
         ));
@@ -25937,7 +25969,7 @@ fn exec_insert_inner(
         if !row.is_empty() && row.len() != target_indices.len() {
             return Err(insert_arity_error(
                 &table.name,
-                columns.is_some(),
+                column_list,
                 target_indices.len(),
                 row.len(),
             ));
@@ -26049,6 +26081,9 @@ fn exec_insert_inner(
                 &mut index_states,
                 &mut current_root,
             )?;
+            if std::mem::take(&mut ctx.raise_ignore) {
+                continue;
+            }
         }
 
         let (outcome, landed_rowid) = exec_insert_one_row(
@@ -26372,6 +26407,9 @@ pub fn fast_insert_literal_rows(
             current_root = ctx.table_root(table);
             for st in index_states.iter_mut() {
                 st.root = ctx.index_root(&st.idx);
+            }
+            if std::mem::take(&mut ctx.raise_ignore) {
+                continue;
             }
         }
 
@@ -26916,7 +26954,19 @@ fn exec_insert_one_row(
     };
     let rowid_checkable =
         !table.without_rowid && !rowid_was_autogenerated && !rowid_is_fresh_beyond_max;
-    let early_rowid = rowid_checkable && (!unique_order.is_empty() || clause_for_rowid().is_some());
+    // REPLACE deletions that fire DELETE triggers (recursive_triggers):
+    // the rowid conflict must resolve in this loop (the write below
+    // replaces in place, firing nothing), and every constraint is
+    // re-checked as ABORT once the triggers ran (sqlite3GenerateConstraint
+    // Checks' regTrigCnt recheck — a trigger can re-insert a conflict).
+    let replace_triggers = ctx.pager.recursive_triggers_enabled()
+        && crate::executor::triggers::has_triggers_for(
+            ctx,
+            table,
+            &crate::sql::ast::TriggerEvent::Delete,
+        );
+    let early_rowid = rowid_checkable
+        && (!unique_order.is_empty() || clause_for_rowid().is_some() || replace_triggers);
     #[derive(Clone, Copy, PartialEq)]
     enum Check {
         Rowid,
@@ -26963,6 +27013,8 @@ fn exec_insert_one_row(
         }
     }
     let mut replaced_holders: Vec<i64> = Vec::new();
+    let mut trig_fired = false;
+    let mut recheck = false;
     'checks: loop {
         for &check in &checks {
             match check {
@@ -26970,6 +27022,10 @@ fn exec_insert_one_row(
                     let mut bt = Btree::new(ctx.pager, *current_root, false);
                     if bt.lookup_table_with(rowid, |_| Ok(()))?.is_none() {
                         continue;
+                    }
+                    if recheck {
+                        let msg = rowid_conflict_message(table);
+                        return Err(halt_constraint(ctx, ConflictResolution::Abort, msg));
                     }
                     // UPSERT applies when the target is empty (any
                     // constraint) or the rowid PK itself.
@@ -26989,7 +27045,7 @@ fn exec_insert_one_row(
                     match rowid_policy {
                         ConflictResolution::Ignore => return Ok((InsertOutcome::Skipped, rowid)),
                         ConflictResolution::Replace => {
-                            replace_delete_holder(
+                            if replace_delete_holder(
                                 ctx,
                                 table,
                                 table_name_lc,
@@ -26999,7 +27055,10 @@ fn exec_insert_one_row(
                                 rowid,
                                 rowid,
                                 &mut replaced_holders,
-                            )?;
+                            )? {
+                                trig_fired = true;
+                                continue;
+                            }
                             continue 'checks;
                         }
                         p => return Err(halt_constraint(ctx, p, rowid_conflict_message(table))),
@@ -27040,6 +27099,10 @@ fn exec_insert_one_row(
                         }
                         continue;
                     };
+                    if recheck {
+                        let msg = unique_conflict_message(table, &index_states[i].idx);
+                        return Err(halt_constraint(ctx, ConflictResolution::Abort, msg));
+                    }
                     // Any REPLACE/UPSERT path below mutates the index trees,
                     // so the append hint may go stale — drop it. (Only on a
                     // conflict: clearing it before every probe sent each
@@ -27098,7 +27161,7 @@ fn exec_insert_one_row(
                                 ctx.changes += 1;
                                 return Ok((InsertOutcome::Inserted, existing_rowid));
                             }
-                            replace_delete_holder(
+                            if replace_delete_holder(
                                 ctx,
                                 table,
                                 table_name_lc,
@@ -27108,11 +27171,14 @@ fn exec_insert_one_row(
                                 rowid,
                                 existing_rowid,
                                 &mut replaced_holders,
-                            )?;
+                            )? {
+                                trig_fired = true;
+                                continue;
+                            }
                             continue 'checks;
                         }
                         ConflictResolution::Replace => {
-                            replace_delete_holder(
+                            if replace_delete_holder(
                                 ctx,
                                 table,
                                 table_name_lc,
@@ -27122,7 +27188,10 @@ fn exec_insert_one_row(
                                 rowid,
                                 existing_rowid,
                                 &mut replaced_holders,
-                            )?;
+                            )? {
+                                trig_fired = true;
+                                continue;
+                            }
                             continue 'checks;
                         }
                         p => {
@@ -27132,6 +27201,15 @@ fn exec_insert_one_row(
                     }
                 }
             }
+        }
+        if trig_fired && !recheck {
+            recheck = true;
+            checks.clear();
+            if !table.without_rowid {
+                checks.push(Check::Rowid);
+            }
+            checks.extend(unique_order.iter().map(|&i| Check::Index(i)));
+            continue 'checks;
         }
         break;
     }
@@ -27639,7 +27717,7 @@ fn replace_delete_holder(
     rowid: i64,
     existing_rowid: i64,
     replaced_holders: &mut Vec<i64>,
-) -> Result<()> {
+) -> Result<bool> {
     if replaced_holders.contains(&existing_rowid) {
         return Err(Error::corruption(format!(
             "REPLACE could not remove row {} holding a UNIQUE key of {}",
@@ -27654,11 +27732,44 @@ fn replace_delete_holder(
     if rowid_buffered(index_states, existing_rowid) {
         flush_insert_index_bufs(ctx, index_states)?;
     }
+    // With recursive_triggers ON, a REPLACE deletion fires the table's
+    // DELETE triggers (sqlite3GenerateRowDelete): BEFORE, the delete,
+    // AFTER. Their bodies write through the generic path, so the
+    // statement-local roots and hints are re-read after each.
+    let fire = ctx.pager.recursive_triggers_enabled()
+        && crate::executor::triggers::has_triggers_for(
+            ctx,
+            table,
+            &crate::sql::ast::TriggerEvent::Delete,
+        );
+    let mut trigger_row: Option<Vec<Value>> = None;
+    if fire {
+        let mut bt = Btree::new(ctx.pager, *current_root, false);
+        if let LookupResult::Found(p) = bt.lookup_table(existing_rowid)? {
+            let old_row = decode_row(&p, table.n_columns(), existing_rowid, table.rowid_alias)?;
+            crate::executor::triggers::fire_triggers(
+                ctx,
+                table,
+                &crate::sql::ast::TriggerEvent::Delete,
+                crate::sql::ast::TriggerWhen::Before,
+                None,
+                Some(&old_row),
+                &table.col_names,
+            )?;
+            refresh_after_trigger(ctx, table, current_root, index_states, max_rowid)?;
+            trigger_row = Some(old_row);
+        }
+    }
     let mut bt = Btree::new(ctx.pager, *current_root, false);
     let old_payload_opt = match bt.lookup_table(existing_rowid)? {
         LookupResult::Found(p) => Some(p),
         LookupResult::NotFound => None,
     };
+    // A BEFORE trigger that removed the row skips the delete and the
+    // AFTER triggers (GenerateRowDelete's re-seek).
+    if old_payload_opt.is_none() {
+        trigger_row = None;
+    }
     // Preupdate: the conflicting row is about to be deleted (the new
     // row's INSERT event fires at the write, matching SQLite's
     // DELETE-then-INSERT pair for a REPLACE).
@@ -27706,6 +27817,43 @@ fn replace_delete_holder(
     if max_rowid.is_some_and(|m| existing_rowid >= m) {
         let tree_max = find_max_rowid_opt(ctx.pager, *current_root)?;
         *max_rowid = Some(tree_max.map_or(rowid, |m| m.max(rowid)));
+    }
+    if let Some(old_row) = trigger_row {
+        crate::executor::triggers::fire_triggers(
+            ctx,
+            table,
+            &crate::sql::ast::TriggerEvent::Delete,
+            crate::sql::ast::TriggerWhen::After,
+            None,
+            Some(&old_row),
+            &table.col_names,
+        )?;
+        refresh_after_trigger(ctx, table, current_root, index_states, max_rowid)?;
+        let tree_max = find_max_rowid_opt(ctx.pager, *current_root)?;
+        *max_rowid = Some(tree_max.map_or(rowid, |m| m.max(rowid)));
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// After a trigger body ran mid-row: its writes went through the generic
+/// path and may have split this table's / its indexes' roots and
+/// invalidated every append hint.
+fn refresh_after_trigger(
+    ctx: &mut ExecContext<'_>,
+    table: &Arc<Table>,
+    current_root: &mut u32,
+    index_states: &mut [IndexMaintState],
+    max_rowid: &mut Option<i64>,
+) -> Result<()> {
+    for st in index_states.iter_mut() {
+        st.clear_hints();
+        st.root = ctx.index_root(&st.idx);
+    }
+    ctx.table_append_hint = None;
+    *current_root = ctx.table_root(table);
+    if max_rowid.is_some() {
+        *max_rowid = find_max_rowid_opt(ctx.pager, *current_root)?;
     }
     Ok(())
 }
@@ -28341,8 +28489,79 @@ pub(crate) fn delete_rows_by_rowid(
     ctx: &mut ExecContext<'_>,
     table: &Table,
     rowids: &[i64],
-) -> Result<()> {
-    delete_rows_by_rowid_inner(ctx, table, rowids, true)
+) -> Result<bool> {
+    // With recursive_triggers ON, each REPLACE deletion fires the table's
+    // DELETE triggers around it (sqlite3GenerateRowDelete). Returns
+    // whether any could have run: their bodies may have changed the
+    // caller's rows.
+    if !ctx.pager.recursive_triggers_enabled()
+        || !crate::executor::triggers::has_triggers_for(
+            ctx,
+            table,
+            &crate::sql::ast::TriggerEvent::Delete,
+        )
+    {
+        delete_rows_by_rowid_inner(ctx, table, rowids, true)?;
+        return Ok(false);
+    }
+    let lookup = |ctx: &mut ExecContext<'_>, rowid: i64| -> Result<Option<Row>> {
+        let mut bt = Btree::new(ctx.pager, ctx.table_root(table), false);
+        match bt.lookup_table(rowid)? {
+            LookupResult::Found(p) => Ok(Some(decode_row(
+                &p,
+                table.n_columns(),
+                rowid,
+                table.rowid_alias,
+            )?)),
+            LookupResult::NotFound => Ok(None),
+        }
+    };
+    for &rowid in rowids {
+        let Some(old_row) = lookup(ctx, rowid)? else {
+            continue;
+        };
+        crate::executor::triggers::fire_triggers(
+            ctx,
+            table,
+            &crate::sql::ast::TriggerEvent::Delete,
+            crate::sql::ast::TriggerWhen::Before,
+            None,
+            Some(&old_row),
+            &table.col_names,
+        )?;
+        if std::mem::take(&mut ctx.raise_ignore) {
+            continue;
+        }
+        // A BEFORE trigger that removed the row skips the rest.
+        let Some(old_row) = lookup(ctx, rowid)? else {
+            continue;
+        };
+        delete_rows_by_rowid_inner(ctx, table, &[rowid], true)?;
+        ctx.table_append_hint = None;
+        crate::executor::triggers::fire_triggers(
+            ctx,
+            table,
+            &crate::sql::ast::TriggerEvent::Delete,
+            crate::sql::ast::TriggerWhen::After,
+            None,
+            Some(&old_row),
+            &table.col_names,
+        )?;
+    }
+    Ok(true)
+}
+
+/// After REPLACE deletions ran DELETE triggers: an UPDATE whose own rows a
+/// trigger body removed cannot apply (SQLite's recheck halts the
+/// statement with a plain "constraint failed").
+fn update_rows_survived(ctx: &mut ExecContext<'_>, table: &Table, rowids: &[i64]) -> Result<()> {
+    let mut bt = Btree::new(ctx.pager, ctx.table_root(table), false);
+    for &r in rowids {
+        if bt.lookup_table_with(r, |_| Ok(()))?.is_none() {
+            return Err(Error::constraint("constraint failed"));
+        }
+    }
+    Ok(())
 }
 
 /// `fire_hook = false` skips the preupdate events — for INTERNAL moves
@@ -28471,7 +28690,10 @@ fn apply_rowid_alias_move(
             match policy {
                 ConflictResolution::Ignore => return Ok(false),
                 ConflictResolution::Replace => {
-                    delete_rows_by_rowid(ctx, table, &[target])?;
+                    drop(bt);
+                    if delete_rows_by_rowid(ctx, table, &[target])? {
+                        update_rows_survived(ctx, table, &[rowid])?;
+                    }
                 }
                 p => {
                     return Err(halt_constraint(
@@ -29848,8 +30070,9 @@ fn exec_update(
 
     // OR REPLACE: delete the conflicting holder rows (table + all index
     // entries) before applying the write set.
-    if !plan.delete_rowids.is_empty() {
-        delete_rows_by_rowid(ctx, &table, &plan.delete_rowids)?;
+    if !plan.delete_rowids.is_empty() && delete_rows_by_rowid(ctx, &table, &plan.delete_rowids)? {
+        let ids: Vec<i64> = write_set.iter().map(|(r, _, _)| *r).collect();
+        update_rows_survived(ctx, &table, &ids)?;
     }
 
     // FK-action pre-validation (statement atomicity): every failure mode
@@ -29883,6 +30106,9 @@ fn exec_update(
                 Some(&row),
                 &table.col_names,
             )?;
+        }
+        if std::mem::take(&mut ctx.raise_ignore) {
+            continue;
         }
         // Preupdate: one UPDATE event per applied row (the alias-move
         // below is an internal delete+insert — SQLite reports the whole
@@ -30250,8 +30476,9 @@ fn exec_update_from(
         }
         None => pass1_fail,
     };
-    if !plan.delete_rowids.is_empty() {
-        delete_rows_by_rowid(ctx, table, &plan.delete_rowids)?;
+    if !plan.delete_rowids.is_empty() && delete_rows_by_rowid(ctx, table, &plan.delete_rowids)? {
+        let ids: Vec<i64> = write_set.iter().map(|(r, _, _)| *r).collect();
+        update_rows_survived(ctx, table, &ids)?;
     }
 
     // FK-action pre-validation (statement atomicity) — see the main
@@ -30283,6 +30510,9 @@ fn exec_update_from(
                 Some(&row),
                 &table.col_names,
             )?;
+        }
+        if std::mem::take(&mut ctx.raise_ignore) {
+            continue;
         }
         // Preupdate: one UPDATE event per applied row (the alias-move
         // below is an internal delete+insert — SQLite reports the whole
@@ -31839,8 +32069,9 @@ fn try_streaming_update(
     };
     // OR REPLACE: delete the conflicting holder rows (table + all index
     // entries) before the write set applies.
-    if !plan.delete_rowids.is_empty() {
-        delete_rows_by_rowid(ctx, table, &plan.delete_rowids)?;
+    if !plan.delete_rowids.is_empty() && delete_rows_by_rowid(ctx, table, &plan.delete_rowids)? {
+        let ids: Vec<i64> = updates.iter().map(|(r, _, _)| *r).collect();
+        update_rows_survived(ctx, table, &ids)?;
     }
     // OR IGNORE: drop the skipped rows' RETURNING output. Phase 1 pushed
     // RETURNING rows in lockstep with `updates` (one per pushed update),
@@ -32042,6 +32273,9 @@ fn try_streaming_update(
                     &mut index_roots,
                     &mut index_bts,
                 );
+                if std::mem::take(&mut ctx.raise_ignore) {
+                    continue;
+                }
             }
         }
         let new_root;
@@ -33678,6 +33912,9 @@ fn try_streaming_delete(
                 // The body may have written this very table (split
                 // trees move their root): continue from the live root.
                 new_root = ctx.table_root(table);
+                if std::mem::take(&mut ctx.raise_ignore) {
+                    continue;
+                }
             }
         }
         // FOREIGN KEY (parent side): reject / cascade / set-null BEFORE the
@@ -33893,6 +34130,20 @@ fn exec_delete(
                         )?;
                     }
                 }
+            }
+            if std::mem::take(&mut ctx.raise_ignore) {
+                let columns: Arc<[String]> = match returning {
+                    Some(ret) => {
+                        returning_column_names(ret, col_names_fast.as_deref().unwrap_or(&[])).into()
+                    }
+                    None => Arc::from(vec!["deleted".to_string()]),
+                };
+                let rows = if returning.is_some() {
+                    Vec::new()
+                } else {
+                    vec![vec![Value::Integer(0)]]
+                };
+                return Ok(ExecResult { columns, rows });
             }
             // FOREIGN KEY (parent side): check BEFORE deleting — the row's
             // key values are needed for the child-reference scan and for
@@ -34114,6 +34365,12 @@ fn exec_delete(
                 Some(row),
                 &table.col_names,
             )?;
+        }
+        if std::mem::take(&mut ctx.raise_ignore) {
+            if returning.is_some() {
+                returning_rows.pop();
+            }
+            continue;
         }
         // FOREIGN KEY (parent side): reject / cascade / set-null before the
         // row goes away (only when the pragma is on and some table

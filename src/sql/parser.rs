@@ -761,7 +761,23 @@ impl Parser {
                     }
                 }
             } else {
-                self.parse_primary_expr()?
+                // `DEFAULT id`: SQLite's grammar makes the bare name a
+                // string (TRUE/FALSE stay booleans) — `DEFAULT hi` is 'hi'.
+                match self.parse_primary_expr()? {
+                    Expr::Column { table: None, name } => {
+                        let quoted = self.dq_idents.iter().any(|n| n == &name);
+                        if quoted {
+                            Expr::Literal(Value::Text(name.as_str().into()))
+                        } else if name.eq_ignore_ascii_case("true") {
+                            Expr::Literal(Value::Integer(1))
+                        } else if name.eq_ignore_ascii_case("false") {
+                            Expr::Literal(Value::Integer(0))
+                        } else {
+                            Expr::Literal(Value::Text(name.as_str().into()))
+                        }
+                    }
+                    e => e,
+                }
             };
             Ok(ColumnConstraint::Default(e))
         } else if t.is_keyword("COLLATE") {
@@ -1617,6 +1633,14 @@ impl Parser {
                 self.pos = values_start;
                 InsertSource::Select(Box::new(self.parse_select()?))
             } else {
+                if rows.iter().any(|r| r.len() != rows[0].len()) {
+                    let t = self.peek();
+                    return Err(Error::parse(
+                        t.line,
+                        t.col,
+                        "all VALUES must have the same number of terms".to_string(),
+                    ));
+                }
                 InsertSource::Values(rows)
             }
         } else if self.peek().is_keyword("SELECT") {

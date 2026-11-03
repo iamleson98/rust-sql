@@ -486,6 +486,28 @@ mod scope {
             registry: None,
             depth: 0,
         }) };
+        /// PRAGMA case_sensitive_like of the statement's connection (SQLite
+        /// re-registers like() with the flag; here LIKE reads it).
+        static CS_LIKE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub(crate) fn case_sensitive_like() -> bool {
+        CS_LIKE.with(|c| c.get())
+    }
+
+    /// Carry the statement's LIKE case rule into a worker thread.
+    pub struct CsLikeGuard(bool);
+
+    impl CsLikeGuard {
+        pub fn set(on: bool) -> CsLikeGuard {
+            CsLikeGuard(CS_LIKE.with(|c| c.replace(on)))
+        }
+    }
+
+    impl Drop for CsLikeGuard {
+        fn drop(&mut self) {
+            CS_LIKE.with(|c| c.set(self.0));
+        }
     }
 
     /// RAII guard installing a plugin-registry snapshot for the current
@@ -494,21 +516,25 @@ mod scope {
     /// function itself runs a subquery — the outer registry must survive).
     pub struct Guard {
         installed: bool,
+        cs_like: bool,
     }
 
     impl Guard {
-        pub fn install(reg: Arc<PluginRegistry>) -> Guard {
+        pub fn install(reg: Option<Arc<PluginRegistry>>, cs_like: bool) -> Guard {
             let installed = SCOPE.with(|s| {
                 let mut s = s.borrow_mut();
                 s.depth += 1;
                 if s.depth == 1 {
-                    s.registry = Some(reg);
+                    s.registry = reg;
                     true
                 } else {
                     false
                 }
             });
-            Guard { installed }
+            if installed && cs_like {
+                CS_LIKE.with(|c| c.set(true));
+            }
+            Guard { installed, cs_like }
         }
     }
 
@@ -521,6 +547,9 @@ mod scope {
                 }
                 s.depth = s.depth.saturating_sub(1);
             });
+            if self.installed && self.cs_like {
+                CS_LIKE.with(|c| c.set(false));
+            }
         }
     }
 
@@ -531,6 +560,8 @@ mod scope {
     }
 }
 
+pub(crate) use scope::case_sensitive_like;
+pub use scope::CsLikeGuard;
 pub use scope::Guard as PluginScopeGuard;
 
 /// Resolve a user scalar function for the current statement scope.

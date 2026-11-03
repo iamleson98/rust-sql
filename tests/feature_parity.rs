@@ -1092,7 +1092,11 @@ fn generated_columns_virtual_and_stored() {
     let e = db
         .execute("INSERT INTO m VALUES (1, 2, 3)", [])
         .unwrap_err();
-    assert!(e.to_string().contains("values were supplied"), "got: {e}");
+    assert!(
+        e.to_string()
+            .contains("table m has 2 columns but 3 values were supplied"),
+        "got: {e}"
+    );
 }
 
 #[test]
@@ -1234,22 +1238,17 @@ fn insert_arity_mismatch_errors() {
     let mut db = mem();
     db.execute("CREATE TABLE t (a INT, b INT)", ()).unwrap();
     // Column list + extra values: SQLite errors (values silently dropped
-    // before — the fast path's `if i < target_indices.len()` guard). The
-    // planner's own arity check fires first ("N VALUES for M columns").
+    // before — the fast path's `if i < target_indices.len()` guard).
     let e = db
         .execute("INSERT INTO t (a) VALUES (1, 2)", [])
         .unwrap_err();
-    let msg = e.to_string();
-    assert!(
-        msg.contains("values were supplied") || msg.contains("VALUES for"),
-        "got: {msg}"
-    );
+    assert!(e.to_string().contains("2 values for 1 columns"), "got: {e}");
     // No column list + short VALUES.
     let e = db.execute("INSERT INTO t VALUES (1)", []).unwrap_err();
-    let msg = e.to_string();
     assert!(
-        msg.contains("values were supplied") || msg.contains("VALUES for"),
-        "got: {msg}"
+        e.to_string()
+            .contains("table t has 2 columns but 1 values were supplied"),
+        "got: {e}"
     );
     // INSERT ... SELECT with wrong width (2 values for a 1-column
     // target list) — errors even when the source is EMPTY (SQLite
@@ -1258,10 +1257,15 @@ fn insert_arity_mismatch_errors() {
     let e = db
         .execute("INSERT INTO t (a) SELECT x, x FROM src", [])
         .unwrap_err();
-    let msg = e.to_string();
+    assert!(e.to_string().contains("2 values for 1 columns"), "got: {e}");
+    // No column list + SELECT of the wrong width: the table form.
+    let e = db
+        .execute("INSERT INTO t SELECT x FROM src", [])
+        .unwrap_err();
     assert!(
-        msg.contains("values were supplied") || msg.contains("VALUES for"),
-        "got: {msg}"
+        e.to_string()
+            .contains("table t has 2 columns but 1 values were supplied"),
+        "got: {e}"
     );
     // Matching width with a full-column target is fine.
     db.execute("INSERT INTO src VALUES (1)", []).unwrap();

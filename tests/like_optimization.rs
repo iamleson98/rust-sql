@@ -117,3 +117,105 @@ fn like_escape_prefix_matches_sqlite() {
         assert_eq!(ours, theirs, "{sql}");
     }
 }
+
+/// PRAGMA case_sensitive_like: LIKE turns case-sensitive (operator and
+/// like() function forms, every fast path), the index range follows the
+/// BINARY rule, and turning it off restores the default — against SQLite.
+#[test]
+fn case_sensitive_like_matches_sqlite() {
+    let setup = [
+        "CREATE TABLE t1(x TEXT UNIQUE)",
+        "CREATE TABLE t2(x TEXT UNIQUE COLLATE nocase)",
+        "CREATE TABLE t3(x TEXT, y INT)",
+    ];
+    let values = [
+        "'a'",
+        "'ab'",
+        "'abc'",
+        "'abcd'",
+        "'ABC'",
+        "'ABC abc xyz'",
+        "'Abd'",
+        "'bcd'",
+        "'xyz'",
+        "'aBc'",
+        "x'616263'",
+        "1",
+        "'12'",
+        "'ZZ-uu'",
+        "'zZ-lu'",
+        "'Zz-ul'",
+        "'zz-ll'",
+    ];
+    let queries = [
+        "SELECT x FROM t1 WHERE x LIKE 'abc' ORDER BY 1",
+        "SELECT x FROM t1 WHERE x LIKE 'abc%' ORDER BY 1",
+        "SELECT x FROM t1 WHERE x LIKE 'a%' ORDER BY 1",
+        "SELECT x FROM t1 WHERE x LIKE 'A%' ORDER BY 1",
+        "SELECT x FROM t2 WHERE x LIKE 'abc%' ORDER BY 1",
+        "SELECT x FROM t2 WHERE x LIKE 'ABC%' ORDER BY 1",
+        "SELECT x FROM t2 WHERE x LIKE 'zZ%' ORDER BY 1",
+        "SELECT x FROM t2 WHERE x LIKE 'ZZ%' ORDER BY 1",
+        "SELECT x FROM t2 WHERE x GLOB 'zZ*' ORDER BY 1",
+        "SELECT x FROM t1 WHERE x LIKE 'zZ%' ORDER BY 1",
+        "SELECT x FROM t1 WHERE x GLOB 'Zz*' ORDER BY 1",
+        "SELECT x FROM t3 WHERE x LIKE '%bc%' ORDER BY 1",
+        "SELECT x FROM t3 WHERE x LIKE '%BC%' ORDER BY 1",
+        "SELECT x FROM t3 WHERE x NOT LIKE 'a%' ORDER BY 1",
+        "SELECT x FROM t3 WHERE x LIKE 'a_c' ESCAPE '\\' ORDER BY 1",
+        "SELECT x FROM t3 WHERE like('%B%', x) ORDER BY 1",
+        "SELECT 'ABC' LIKE 'abc', 'abc' LIKE 'abc', like('A%', 'abc')",
+    ];
+    let mut db = Database::open_in_memory().unwrap();
+    let con = rusqlite::Connection::open_in_memory().unwrap();
+    for s in setup {
+        db.execute(s, []).unwrap();
+        con.execute_batch(s).unwrap();
+    }
+    for t in ["t1", "t2", "t3"] {
+        for v in values {
+            let sql = if t == "t3" {
+                format!("INSERT INTO {t} VALUES({v}, 1)")
+            } else {
+                format!("INSERT OR IGNORE INTO {t} VALUES({v})")
+            };
+            db.execute(&sql, []).unwrap();
+            con.execute_batch(&sql).unwrap();
+        }
+    }
+    for mode in ["on", "off", "1", "0"] {
+        let pragma = format!("PRAGMA case_sensitive_like = {mode}");
+        db.execute(&pragma, []).unwrap();
+        con.execute_batch(&pragma).unwrap();
+        for q in queries {
+            let ours: Vec<String> = db
+                .query(q, [])
+                .unwrap()
+                .iter()
+                .map(|r| r.iter().map(render).collect::<Vec<_>>().join("|"))
+                .collect();
+            let mut stmt = con.prepare(q).unwrap();
+            let n = stmt.column_count();
+            let theirs: Vec<String> = stmt
+                .query_map([], |r| {
+                    Ok((0..n)
+                        .map(|i| {
+                            let v: rusqlite::types::Value = r.get(i).unwrap();
+                            render(&match v {
+                                rusqlite::types::Value::Null => Value::Null,
+                                rusqlite::types::Value::Integer(i) => Value::Integer(i),
+                                rusqlite::types::Value::Real(f) => Value::Real(f),
+                                rusqlite::types::Value::Text(t) => Value::Text(t.as_str().into()),
+                                rusqlite::types::Value::Blob(b) => Value::Blob(b),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .join("|"))
+                })
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            assert_eq!(ours, theirs, "case_sensitive_like={mode}: {q}");
+        }
+    }
+}

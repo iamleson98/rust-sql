@@ -1990,9 +1990,31 @@ fn subquery_source(
 /// Validate a view's SELECT body (at use time). Depth-guarded: circular
 /// views stop validating (names then resolve permissively).
 fn validate_view_body(ctx: &Ctx<'_>, v: &crate::schema::View, scope: &mut Scope) -> Result<()> {
+    // A view met again while its own body is being expanded is a cycle
+    // (sqlite3ViewGetColumnNames' nCol<0 check) — reported before any
+    // column-count mismatch the recursion would otherwise surface.
+    thread_local! {
+        static EXPANDING: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    if EXPANDING.with(|e| e.borrow().iter().any(|n| n.eq_ignore_ascii_case(&v.name))) {
+        return Err(Error::semantic(format!(
+            "view {} is circularly defined",
+            v.name
+        )));
+    }
     if ctx.view_depth > 16 {
         return Ok(());
     }
+    struct Pop;
+    impl Drop for Pop {
+        fn drop(&mut self) {
+            EXPANDING.with(|e| {
+                e.borrow_mut().pop();
+            });
+        }
+    }
+    EXPANDING.with(|e| e.borrow_mut().push(v.name.clone()));
+    let _pop = Pop;
     // The view body resolves against an EMPTY outer scope (views are not
     // correlated with their use site) and no CTEs.
     let _ = scope;
@@ -2244,7 +2266,22 @@ fn validate_expr(ctx: &Ctx<'_>, e: &Expr, scope: &mut Scope, visible: &CteList) 
 
 /// Target of a DML statement as a resolver source. For a VIEW target,
 /// returns the view's columns (view DML through INSTEAD OF triggers).
+/// sqlite3IsReadOnly: the schema tables are read-only (no
+/// writable_schema here).
+pub(crate) fn check_writable(name: &str) -> Result<()> {
+    let bare = name.rsplit('.').next().unwrap_or(name).to_ascii_lowercase();
+    let schema_table = match bare.as_str() {
+        "sqlite_master" | "sqlite_schema" => "sqlite_master",
+        "sqlite_temp_master" | "sqlite_temp_schema" => "sqlite_temp_master",
+        _ => return Ok(()),
+    };
+    Err(Error::semantic(format!(
+        "table {schema_table} may not be modified"
+    )))
+}
+
 fn dml_target_source(ctx: &Ctx<'_>, name: &str, alias: Option<&String>) -> Result<Source> {
+    check_writable(name)?;
     if let Some(t) = ctx.catalog.get_table(name) {
         let pending = t.vtab.as_ref().map(|vt| vt.is_pending()).unwrap_or(false);
         let aux = t

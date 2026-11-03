@@ -3365,7 +3365,9 @@ fn evaluate_uncompiled(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
                 }
             }
             let result = match op {
-                LikeOp::Like => like_match(&v, &p, esc.as_ref(), false),
+                LikeOp::Like => {
+                    like_match(&v, &p, esc.as_ref(), crate::plugin::case_sensitive_like())
+                }
                 LikeOp::Glob => glob_match(&v, &p),
                 // REGEXP: POSIX ERE via the engine's own NFA (regex.rs),
                 // leftmost-longest, linear-time. NULL handling is the
@@ -3496,7 +3498,26 @@ fn evaluate_uncompiled(expr: &Expr, ctx: &EvalContext<'_>) -> Result<Value> {
         // by comparison operators and ORDER BY — see the Binary arm and
         // exec_sort).
         Expr::Collate { expr, .. } => evaluate(expr, ctx),
-        Expr::Raise { action, .. } => Err(Error::runtime(format!("RAISE {:?}", action))),
+        Expr::Raise { action, message } => {
+            if !crate::executor::triggers::in_trigger_program() {
+                return Err(Error::semantic(
+                    "RAISE() may only be used within a trigger-program",
+                ));
+            }
+            let msg = match message {
+                Some(m) => {
+                    let v = evaluate(m, ctx)?;
+                    if v.is_null() {
+                        String::new()
+                    } else {
+                        v.as_text()
+                    }
+                }
+                None => String::new(),
+            };
+            crate::executor::triggers::note_raise(*action);
+            Err(Error::constraint(msg))
+        }
     }
 }
 
@@ -4898,7 +4919,12 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
                     Some(_) => return Ok(Value::Null),
                     None => None,
                 };
-                Value::Integer(i64::from(like_match(v, p, esc_val.as_ref(), false)))
+                Value::Integer(i64::from(like_match(
+                    v,
+                    p,
+                    esc_val.as_ref(),
+                    crate::plugin::case_sensitive_like(),
+                )))
             }
             _ => Value::Null,
         },

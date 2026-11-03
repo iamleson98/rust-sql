@@ -915,6 +915,10 @@ pub struct Pager {
     /// PRAGMA count_changes (deprecated): DML through the query surface
     /// returns one `rows inserted|updated|deleted` row.
     count_changes: AtomicBool,
+    /// PRAGMA case_sensitive_like; `cs_like_dirty` asks the next prepare
+    /// to drop plans built under the other setting.
+    case_sensitive_like: AtomicBool,
+    cs_like_dirty: AtomicBool,
     /// PRAGMA defer_foreign_keys: every FK acts as DEFERRED (reset at
     /// the end of each transaction, as in SQLite).
     defer_foreign_keys: AtomicBool,
@@ -2536,6 +2540,8 @@ impl Pager {
             memory_wal: AtomicBool::new(false),
             foreign_keys_enabled: AtomicBool::new(false),
             count_changes: AtomicBool::new(false),
+            case_sensitive_like: AtomicBool::new(false),
+            cs_like_dirty: AtomicBool::new(false),
             defer_foreign_keys: AtomicBool::new(false),
             fk_pending: AtomicBool::new(false),
             vtab_shadow_writes: std::sync::atomic::AtomicBool::new(false),
@@ -8510,6 +8516,23 @@ impl Pager {
 
     pub fn count_changes(&self) -> bool {
         self.count_changes.load(Ordering::Acquire)
+    }
+
+    pub fn set_case_sensitive_like(&self, on: bool) {
+        if self.case_sensitive_like.swap(on, Ordering::AcqRel) != on {
+            self.cs_like_dirty.store(true, Ordering::Release);
+        }
+    }
+
+    pub fn case_sensitive_like(&self) -> bool {
+        self.case_sensitive_like.load(Ordering::Relaxed)
+    }
+
+    /// True once after `case_sensitive_like` changed (cached plans embed
+    /// the LIKE optimization's choice).
+    pub fn take_cs_like_dirty(&self) -> bool {
+        self.cs_like_dirty.load(Ordering::Relaxed)
+            && self.cs_like_dirty.swap(false, Ordering::AcqRel)
     }
 
     pub fn set_defer_foreign_keys(&self, on: bool) {

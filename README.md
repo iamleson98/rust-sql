@@ -14,7 +14,7 @@ An embedded SQL database written from scratch in Rust, built to match SQLite's b
 - **Memory**: peak memory is 1–4 MB higher on most torture sections, and 15 MB higher on `GROUP BY` over 100k groups (57 vs 42 MB). The default page cache is 8 MB against SQLite's 2 MB (`PRAGMA cache_size` lowers it): file-backed workloads larger than 2 MB can use up to 6 MB more. The binary is about 1.5x larger (mimalloc and extra features).
 - **Speed**:
   - mass `UPDATE` of an indexed column on macOS: about 1.4x slower at 2M rows, up to 1.95x at 100M rows on the CI Mac machines;
-  - 4 readers + 1 writer on the CI Mac machines: 0.58–0.67x (it wins on x86);
+  - 4 readers + 1 writer on the CI Mac machines: 0.58–0.67x as of October 2026. It wins on x86, and a 10-core Apple Silicon dev machine measures 2.4–3.0x, so the loss looks specific to the 4-core CI runners;
   - `GROUP BY` over 100k groups at the nightly scale-matrix size on Windows: 213 vs 140 ms;
   - loading a table with five secondary indexes one row per statement (torture S12): about 0.8x on macOS (300 vs 240 ms for 100k rows). Integer index keys take 11 bytes against SQLite's 1–4, so the indexes split and rebalance more often.
 
@@ -63,8 +63,6 @@ python3 tests/tcl/run.py <sqlite>/test window3.test -j 1 -o out.json
   - `UNION ALL` push-down can apply column affinity differently;
   - the same unaliased table joined to itself with `NATURAL` behaves differently;
   - after `ROLLBACK TO` inside `BEGIN CONCURRENT`, rowids aren't reused (by design: the allocator is shared).
-- **Concurrency**:
-  - two connections in one process can't take turns writing: the first writer keeps the writer role until it closes, while SQLite lets them alternate;
-  - a two-connection open / read / update / close cycle takes 6 ms, against 1.3 ms for SQLite.
+- **Concurrency**: separate processes can't take turns writing a rollback-journal file (WAL files work). Within one process, separate connections follow SQLite's locking rules and alternate as writers, and a two-connection open / read / update / close cycle beats SQLite (0.43 vs 0.80 ms with a rollback journal, 1.17 vs 1.21 ms in WAL mode; `examples/probe_open_cycle.rs`).
 
 License: MIT OR Apache-2.0.

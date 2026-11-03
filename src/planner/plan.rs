@@ -304,6 +304,9 @@ pub enum Plan {
         table: Arc<Table>,
         source: Box<Plan>,
         columns: Option<Vec<usize>>,
+        /// Whether the statement wrote a column list (`columns` is filled
+        /// in either way); it picks SQLite's width-error wording.
+        column_list: bool,
         /// The statement's OR clause; `None` = none given (each constraint
         /// then resolves by its own ON CONFLICT clause, else ABORT).
         on_conflict: Option<crate::sql::ast::ConflictResolution>,

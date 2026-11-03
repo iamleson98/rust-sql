@@ -1596,26 +1596,33 @@ fn main() {
     println!("============================================================");
     println!();
 
-    let results = vec![
-        bench_insert_autocommit(),
-        bench_insert_transaction(),
-        bench_insert_multi_values(),
-        bench_point_lookup(),
-        bench_index_lookup(),
-        bench_range_scan(),
-        bench_full_scan(),
-        bench_aggregate_multi(),
-        bench_count_star(),
-        bench_aggregate_with_where(),
-        bench_group_by(),
-        bench_update_by_id(),
-        bench_delete_insert_cycle(),
-        bench_concurrent_8_readers(),
-        bench_concurrent_16_readers(),
-        bench_mixed_rw(),
-        bench_concurrent_writes(),
-        bench_hash_join(),
+    // BENCH_ONLY=<substring> runs only the rows whose function name matches.
+    let only = std::env::var("BENCH_ONLY").ok();
+    let all: &[(&str, fn() -> BenchResult)] = &[
+        ("bench_insert_autocommit", bench_insert_autocommit),
+        ("bench_insert_transaction", bench_insert_transaction),
+        ("bench_insert_multi_values", bench_insert_multi_values),
+        ("bench_point_lookup", bench_point_lookup),
+        ("bench_index_lookup", bench_index_lookup),
+        ("bench_range_scan", bench_range_scan),
+        ("bench_full_scan", bench_full_scan),
+        ("bench_aggregate_multi", bench_aggregate_multi),
+        ("bench_count_star", bench_count_star),
+        ("bench_aggregate_with_where", bench_aggregate_with_where),
+        ("bench_group_by", bench_group_by),
+        ("bench_update_by_id", bench_update_by_id),
+        ("bench_delete_insert_cycle", bench_delete_insert_cycle),
+        ("bench_concurrent_8_readers", bench_concurrent_8_readers),
+        ("bench_concurrent_16_readers", bench_concurrent_16_readers),
+        ("bench_mixed_rw", bench_mixed_rw),
+        ("bench_concurrent_writes", bench_concurrent_writes),
+        ("bench_hash_join", bench_hash_join),
     ];
+    let results: Vec<BenchResult> = all
+        .iter()
+        .filter(|(n, _)| only.as_deref().map_or(true, |o| n.contains(o)))
+        .map(|(_, f)| f())
+        .collect();
 
     let mut wins_rust = 0;
     let mut wins_sqlite = 0;

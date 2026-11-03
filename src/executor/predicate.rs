@@ -668,7 +668,12 @@ impl CompiledPredicate {
                 let matched = if *glob {
                     crate::executor::expr::glob_match(v, &p)
                 } else {
-                    crate::executor::expr::like_match(v, &p, None, false)
+                    crate::executor::expr::like_match(
+                        v,
+                        &p,
+                        None,
+                        crate::plugin::case_sensitive_like(),
+                    )
                 };
                 matched != *negated
             }
@@ -1251,7 +1256,10 @@ fn bind_params(p: &mut CompiledPredicate, params: &[Value]) {
             negated: false,
             glob: false,
         } => {
-            if let Some(Value::Text(t)) = params.get(*i) {
+            if let Some(Value::Text(t)) = params
+                .get(*i)
+                .filter(|_| !crate::plugin::case_sensitive_like())
+            {
                 if let Some(needle) = classify_contains(t.as_bytes()) {
                     *p = CompiledPredicate::LikeSubstr { col: *col, needle };
                 }
@@ -1610,7 +1618,7 @@ fn compile_predicate_at(
             // literal pattern of the exact shape `%<ascii-needle>%` with
             // no other wildcards. Pre-classified once at plan time; the
             // per-row work is a single byte-substring search.
-            if !glob && !negated {
+            if !glob && !negated && !crate::plugin::case_sensitive_like() {
                 if let PredValue::Literal(Value::Text(t)) = &pat {
                     if let Some(needle) = classify_contains(t.as_bytes()) {
                         return Some(CompiledPredicate::LikeSubstr { col, needle });

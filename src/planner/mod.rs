@@ -5980,6 +5980,9 @@ fn try_index_range(
             // range is a pure accelerator, never the match definition.
             if start.is_none() && end.is_none() {
                 if let Some((col, prefix, exact, glob)) = extract_like_prefix(conjunct) {
+                    // PRAGMA case_sensitive_like: LIKE takes GLOB's case
+                    // rule (exprAnalyze's noCase=0 bounds).
+                    let glob = glob || crate::plugin::case_sensitive_like();
                     if bare_col(&col) == first_name
                         && like_prefix_is_sound(table, first_col, &prefix, glob)
                     {
@@ -6005,7 +6008,17 @@ fn try_index_range(
                         if exact {
                             end = Some((Expr::Literal(Value::Text(prefix.into())), true));
                         } else {
-                            end = prefix_successor(&prefix)
+                            // NOCASE compares folded to lower case: bump the
+                            // folded prefix, or 'zZ%' ends at 'z[' < 'zz'
+                            // and the range is empty (SQLite's bound is the
+                            // lower-cased prefix too).
+                            let hi = if !glob || first_col.collation.eq_ignore_ascii_case("NOCASE")
+                            {
+                                prefix.to_ascii_lowercase()
+                            } else {
+                                prefix
+                            };
+                            end = prefix_successor(&hi)
                                 .map(|s| (Expr::Literal(Value::Text(s.into())), false));
                         }
                         // no `continue`: the conjunct falls through to the
