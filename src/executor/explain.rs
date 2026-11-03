@@ -859,3 +859,70 @@ fn covering_index_detail(
         _ => None,
     }
 }
+
+/// Column names of `EXPLAIN QUERY PLAN`.
+pub const EQP_COLUMNS: [&str; 4] = ["id", "parent", "notused", "detail"];
+
+/// Column names of plain `EXPLAIN` (SQLite's bytecode listing).
+pub const BYTECODE_COLUMNS: [&str; 8] = ["addr", "opcode", "p1", "p2", "p3", "p4", "p5", "comment"];
+
+/// Plain `EXPLAIN` output in SQLite's bytecode-listing shape, built from
+/// the plan rows. There is no VDBE program to list; SQLite's own listing
+/// carries one `Explain` opcode per query-plan line (p1 = id, p2 = parent,
+/// p4 = the plan text), framed by `Init` and `Halt` — that is what is
+/// emitted, so tools reading `opcode`/`p4` see SQLite's columns and the
+/// plan text is preserved.
+pub fn bytecode_rows(plan_rows: Vec<Row>) -> Vec<Row> {
+    let n = plan_rows.len() as i64;
+    let mut out = Vec::with_capacity(plan_rows.len() + 2);
+    let op = |addr: i64, name: &str, p1: Value, p2: Value, p4: Value| -> Row {
+        vec![
+            Value::Integer(addr),
+            Value::Text(name.into()),
+            p1,
+            p2,
+            Value::Integer(0),
+            p4,
+            Value::Integer(0),
+            Value::Null,
+        ]
+    };
+    out.push(op(
+        0,
+        "Init",
+        Value::Integer(0),
+        Value::Integer(1),
+        Value::Null,
+    ));
+    for (i, r) in plan_rows.into_iter().enumerate() {
+        let mut it = r.into_iter();
+        let id = it.next().unwrap_or(Value::Null);
+        let parent = it.next().unwrap_or(Value::Null);
+        let _notused = it.next();
+        let detail = it.next().unwrap_or(Value::Null);
+        out.push(op(i as i64 + 1, "Explain", id, parent, detail));
+    }
+    out.push(op(
+        n + 1,
+        "Halt",
+        Value::Integer(0),
+        Value::Integer(0),
+        Value::Null,
+    ));
+    out
+}
+
+/// Rows and column names for a static (non-ANALYZE) EXPLAIN.
+pub fn static_explain(plan_rows: Vec<Row>, query_plan: bool) -> (Vec<String>, Vec<Row>) {
+    if query_plan {
+        (
+            EQP_COLUMNS.iter().map(|c| c.to_string()).collect(),
+            plan_rows,
+        )
+    } else {
+        (
+            BYTECODE_COLUMNS.iter().map(|c| c.to_string()).collect(),
+            bytecode_rows(plan_rows),
+        )
+    }
+}

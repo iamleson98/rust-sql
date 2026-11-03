@@ -239,3 +239,65 @@ fn json_type_false_is_false() {
         ]]
     );
 }
+
+/// SQLite's JSON5 extensions beyond the basics (json501.test): bare keys
+/// with `$` / non-ASCII bytes, comments and Unicode whitespace, raw
+/// control characters and U+2028/U+2029 line continuations in strings,
+/// and `4.e0` floats.
+#[test]
+fn json5_keys_whitespace_strings_and_floats() {
+    let db = Database::open_in_memory().unwrap();
+    let one = |sql: &str| q(&db, sql).remove(0).remove(0);
+    let text = |s: &str| Value::Text(s.into());
+    assert_eq!(
+        one("SELECT '{ $123 : 789 }'->>'$.\"$123\"'"),
+        Value::Integer(789)
+    );
+    assert_eq!(
+        one("SELECT json('{ MNO_123$xyz : 789 }')"),
+        text("{\"MNO_123$xyz\":789}")
+    );
+    assert_eq!(
+        one("SELECT '{ MNO_123æxyz : 789 }'->>'MNO_123æxyz'"),
+        Value::Integer(789)
+    );
+    assert_eq!(
+        one("SELECT ' /* abc */ { /*def*/ aaa /* xyz */ : // eol\n 123 /* xyz */ , /* 123 */ }'->>'aaa'"),
+        Value::Integer(123)
+    );
+    assert_eq!(
+        one("SELECT (char(0x0b,0x0c,0xa0,0x1680,0x2000,0x200a,0x2028,0x2029,0x3000,0xfeff) || '{a: \"xyz\"}')->>'a'"),
+        text("xyz")
+    );
+    for cont in ["0x0d", "0x0d,0x0a", "0x2028", "0x2029"] {
+        assert_eq!(
+            one(&format!(
+                "SELECT ('{{a: \"abc'||char(0x5c,{cont})||'xyz\"}}')->>'a'"
+            )),
+            text("abcxyz"),
+            "continuation {cont}"
+        );
+    }
+    assert_eq!(one("SELECT json('{x: 4.e0}')"), text("{\"x\":4.0e0}"));
+    assert_eq!(one("SELECT '{x: -4.e2}'->>'x'"), Value::Real(-400.0));
+    // Raw control characters: JSON5 only, rendered escaped.
+    assert_eq!(
+        one("SELECT json_valid('\"abc' || char(1) || 'xyz\"')"),
+        Value::Integer(0)
+    );
+    assert_eq!(
+        one("SELECT json_valid('\"abc' || char(1) || 'xyz\"', 2)"),
+        Value::Integer(1)
+    );
+    assert_eq!(
+        one("SELECT json('{label:\"abc' || char(9) || char(1) || 'xyz\"}')"),
+        text("{\"label\":\"abc\\t\\u0001xyz\"}")
+    );
+    assert_eq!(
+        one("SELECT jsonb('{label:\"abc' || char(12) || 'xyz\"}') -> '$'"),
+        text("{\"label\":\"abc\\fxyz\"}")
+    );
+    // Strict RFC 8259 still rejects the JSON5 whitespace.
+    assert_eq!(one("SELECT json_valid('/* c */ 1', 1)"), Value::Integer(0));
+    assert_eq!(one("SELECT json_valid('/* c */ 1', 2)"), Value::Integer(1));
+}

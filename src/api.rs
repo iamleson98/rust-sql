@@ -8919,7 +8919,12 @@ impl Database {
         // EXPLAIN [QUERY PLAN | ANALYZE]: ANALYZE executes the inner SELECT
         // with instrumentation; QUERY PLAN / plain EXPLAIN plan the inner
         // statement and render rows — never executes it.
-        if let Statement::Explain { inner, analyze } = cached.stmt.as_ref() {
+        if let Statement::Explain {
+            inner,
+            analyze,
+            query_plan,
+        } = cached.stmt.as_ref()
+        {
             if *analyze {
                 let (cols, rows) = self.explain_analyze_select(inner, params)?;
                 return Ok((cols, rows));
@@ -8929,7 +8934,7 @@ impl Database {
                 Some(p) => crate::executor::explain::explain_plan_rows(&p, &self.catalog),
                 None => Vec::new(),
             };
-            return Ok((Vec::new(), rows));
+            return Ok(crate::executor::explain::static_explain(rows, *query_plan));
         }
         // CONCURRENT OWNER: arm the page-shadow scope for this whole
         // query — a transaction must see its own writes. get_page then
@@ -9230,6 +9235,12 @@ impl Database {
         self.change_counts.changes()
     }
 
+    /// PRAGMA count_changes is on: DML through `query*` answers one
+    /// change-count row.
+    pub fn count_changes(&self) -> bool {
+        self.pager.count_changes()
+    }
+
     /// Output names for a SELECT, seeing through compound bodies (the
     /// leftmost arm names the columns — SQLite's set-op rule).
     fn select_output_names_fallback(sel: &SelectStatement) -> Option<Vec<String>> {
@@ -9340,6 +9351,33 @@ impl Database {
         params: P,
     ) -> Result<(Vec<String>, Vec<Row>)> {
         let params_vec: Vec<Value> = params.into_iter().collect();
+        if !self.pager.count_changes() {
+            return self.query_with_columns_impl(sql, params_vec);
+        }
+        // PRAGMA count_changes: a DML statement without RETURNING
+        // answers one row holding its change count (SQLite's
+        // sqlite3CodeChangeCount).
+        let label = match self.get_or_cache_stmt(sql)?.stmt.as_ref() {
+            Statement::Insert(i) if i.returning.is_none() => Some("rows inserted"),
+            Statement::Update(u) if u.returning.is_none() => Some("rows updated"),
+            Statement::Delete(d) if d.returning.is_none() => Some("rows deleted"),
+            _ => None,
+        };
+        let res = self.query_with_columns_impl(sql, params_vec)?;
+        match label {
+            Some(l) => Ok((
+                vec![l.to_string()],
+                vec![vec![Value::Integer(self.changes())]],
+            )),
+            None => Ok(res),
+        }
+    }
+
+    fn query_with_columns_impl(
+        &self,
+        sql: &str,
+        params_vec: Vec<Value>,
+    ) -> Result<(Vec<String>, Vec<Row>)> {
         // Per-connection snapshot for `last_insert_rowid()` (the SQL
         // function reads the thread-local; every statement entry must
         // refresh it from THIS connection's atomic — a routed ATTACH
@@ -9459,7 +9497,12 @@ impl Database {
         } else {
             None
         };
-        if let Statement::Explain { inner, analyze } = cached.stmt.as_ref() {
+        if let Statement::Explain {
+            inner,
+            analyze,
+            query_plan,
+        } = cached.stmt.as_ref()
+        {
             if *analyze {
                 return self.explain_analyze_select(inner, params_vec.as_slice());
             }
@@ -9468,15 +9511,7 @@ impl Database {
                 Some(p) => crate::executor::explain::explain_plan_rows(&p, &self.catalog),
                 None => Vec::new(),
             };
-            return Ok((
-                vec![
-                    "id".into(),
-                    "parent".into(),
-                    "notused".into(),
-                    "detail".into(),
-                ],
-                rows,
-            ));
+            return Ok(crate::executor::explain::static_explain(rows, *query_plan));
         }
         // CONCURRENT OWNER: arm the page-shadow scope (see query()).
         let _wsg = self
@@ -11533,7 +11568,8 @@ impl Database {
             }
             return Err(Error::AlreadyExists(format!(
                 "trigger {} already exists",
-                ct.name
+                crate::sql::parser::trigger_name_as_written(original_sql)
+                    .unwrap_or_else(|| ct.name.clone())
             )));
         }
         // Where the ON table binds: the as-written qualifier, or the
@@ -11705,7 +11741,11 @@ impl Database {
                 self.exec_foreign_select_with_cols(stmt, params)
             }
             Statement::Insert(_) => self.exec_foreign_select_with_cols(stmt, params),
-            Statement::Explain { inner, analyze } => {
+            Statement::Explain {
+                inner,
+                analyze,
+                query_plan,
+            } => {
                 if *analyze {
                     // EXPLAIN ANALYZE executes the inner statement.
                     let (cols, rows) = self.explain_analyze_foreign(inner, params)?;
@@ -11713,13 +11753,11 @@ impl Database {
                     return Ok((Vec::new(), rows));
                 }
                 let plan = self.foreign_plan_for(inner, params)?;
-                Ok(match plan {
-                    Some(p) => (
-                        Vec::new(),
-                        crate::executor::explain::explain_plan_rows(&p, &self.catalog),
-                    ),
-                    None => (Vec::new(), Vec::new()),
-                })
+                let rows = match plan {
+                    Some(p) => crate::executor::explain::explain_plan_rows(&p, &self.catalog),
+                    None => Vec::new(),
+                };
+                Ok(crate::executor::explain::static_explain(rows, *query_plan))
             }
             _ => Err(Error::Unsupported(
                 "this cross-database statement form is not supported",
@@ -15485,7 +15523,8 @@ impl Database {
                     }
                     return Err(Error::AlreadyExists(format!(
                         "trigger {} already exists",
-                        t.name
+                        crate::sql::parser::trigger_name_as_written(original_sql)
+                            .unwrap_or_else(|| t.name.clone())
                     )));
                 }
                 // SQLite (3.53.4): NON-TEMP trigger bodies may not carry
@@ -16316,6 +16355,98 @@ impl Database {
                 }
                 Ok(())
             }
+            AlterAction::DropConstraint { .. }
+            | AlterAction::DropNotNull { .. }
+            | AlterAction::SetNotNull { .. }
+            | AlterAction::AddCheck { .. } => {
+                use crate::sql::constraint_edit::{self as ce, DropTarget};
+                let table = catalog
+                    .get_table(&a.table)
+                    .ok_or_else(|| Error::NotFound(format!("no such table: {}", a.table)))?;
+                let col_of = |name: &str| {
+                    table
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(name))
+                        .ok_or_else(|| Error::NotFound(format!("no such column: {name}")))
+                };
+                let sql = table.create_sql.as_str();
+                let corrupt = || Error::corruption("schema row is not a CREATE TABLE statement");
+                // The schema text is edited in place (SQLite's
+                // sqlite_drop_constraint / sqlite_add_constraint), after
+                // the existing rows are checked against an added rule.
+                let new_sql = match &a.action {
+                    AlterAction::DropConstraint { name } => {
+                        ce::drop_constraint(sql, DropTarget::Name(name)).map_err(Error::semantic)?
+                    }
+                    AlterAction::DropNotNull { column } => {
+                        ce::drop_constraint(sql, DropTarget::NotNull(col_of(column)?))
+                            .map_err(Error::semantic)?
+                    }
+                    AlterAction::SetNotNull { column, text } => {
+                        let i = col_of(column)?;
+                        if crate::executor::any_row_violates(ctx, &table, Some(i), None)? {
+                            return Err(Error::constraint("constraint failed"));
+                        }
+                        let dropped = ce::drop_constraint(sql, DropTarget::NotNull(i))
+                            .map_err(Error::semantic)?;
+                        ce::add_constraint(&dropped, text, Some(i)).ok_or_else(corrupt)?
+                    }
+                    AlterAction::AddCheck { name, expr, text } => {
+                        if let Some(n) = name {
+                            if ce::has_constraint(sql, n) {
+                                return Err(Error::semantic(format!(
+                                    "constraint {n} already exists"
+                                )));
+                            }
+                        }
+                        if crate::executor::any_row_violates(ctx, &table, None, Some(expr))? {
+                            return Err(Error::constraint("constraint failed"));
+                        }
+                        ce::add_constraint(sql, text, None).ok_or_else(corrupt)?
+                    }
+                    _ => unreachable!("outer match arm"),
+                };
+                let Ok(crate::sql::ast::Statement::Create(
+                    crate::sql::ast::CreateStatement::Table {
+                        columns,
+                        constraints,
+                        without_rowid,
+                        strict,
+                        ..
+                    },
+                )) = crate::sql::parser::parse(&new_sql)
+                else {
+                    return Err(corrupt());
+                };
+                let root = ctx.table_root(&table);
+                let rebuilt = build_table(
+                    &table.name,
+                    &columns,
+                    &constraints,
+                    root,
+                    without_rowid,
+                    strict,
+                    &new_sql,
+                )?;
+                let table_name = table.name.clone();
+                catalog.replace_table(&table_name, rebuilt);
+                if !catalog.is_temp(&table_name) {
+                    delete_schema_row(ctx.pager, "table", &table_name)?;
+                    let schema_row = crate::schema::encode_schema_row(
+                        "table",
+                        &table_name,
+                        &table_name,
+                        root,
+                        &new_sql,
+                    );
+                    insert_schema_row(ctx.pager, &schema_row)?;
+                }
+                if !ctx.in_transaction {
+                    ctx.pager.flush()?;
+                }
+                Ok(())
+            }
             AlterAction::DropColumn { name } => {
                 let table = catalog
                     .get_table(&a.table)
@@ -16622,6 +16753,15 @@ impl Database {
                         ctx.pager.set_checkpoint_fullfsync(on);
                     }
                 }
+                "count_changes" => {
+                    let on = match (&v, value_as_expr(value)) {
+                        (_, crate::sql::ast::Expr::Column { name, .. }) => {
+                            matches!(name.to_ascii_lowercase().as_str(), "on" | "true" | "yes")
+                        }
+                        _ => v.is_truthy(),
+                    };
+                    ctx.pager.set_count_changes(on);
+                }
                 "foreign_keys" | "recursive_triggers" => {
                     // Accept booleans, numbers, and ON/OFF bare words.
                     let on = match (&v, value_as_expr(value)) {
@@ -16800,6 +16940,16 @@ impl Database {
                         _ => String::new(),
                     };
                     ctx.pager.checkpoint_wal_now(mode == "truncate")?;
+                }
+                "default_cache_size" => {
+                    // Deprecated but standard: persists |N| in the header
+                    // and applies it as this connection's cache size.
+                    if let Value::Integer(k) = &v {
+                        let size = (*k as i32).unsigned_abs();
+                        ctx.pager.set_default_cache_size(size)?;
+                        ctx.pager.set_cache_capacity(size.max(1) as usize);
+                        ctx.pager.set_cache_size_setting(i64::from(size));
+                    }
                 }
                 "cache_size" => {
                     // SQLite semantics: positive N = N pages, negative N =
@@ -17776,6 +17926,7 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
     let pager = &db.pager;
     let v = match name.as_str() {
         "foreign_keys" => Value::Integer(if pager.foreign_keys_enabled() { 1 } else { 0 }),
+        "count_changes" => Value::Integer(i64::from(pager.count_changes())),
         // The min-rows threshold (0 = parallel scans disabled) — SQLite
         // has no equivalent pragma; the value round-trips the setting.
         "parallel_scan" => Value::Integer(pager.parallel_scan_min_rows()),
@@ -17787,6 +17938,12 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
         // = KiB, positive = pages; fresh default -2000), not the
         // derived page capacity.
         "cache_size" => Value::Integer(pager.cache_size_setting()),
+        // SQLite: the stored value's magnitude, else the compiled-in
+        // default (-2000).
+        "default_cache_size" => Value::Integer(match pager.default_cache_size().ok()? as i32 {
+            0 => -2000,
+            v => i64::from(v).abs(),
+        }),
         "max_page_count" => Value::Integer(4294967294),
         "busy_timeout" => Value::Integer(pager.busy_timeout_ms()),
         "data_version" => {

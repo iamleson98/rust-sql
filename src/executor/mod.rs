@@ -2716,6 +2716,8 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             upsert,
             returning,
         } => with_firing_or(ctx, *on_conflict, |ctx| {
+            let single_row = matches!(source.as_ref(), Plan::Values { rows } if rows.len() == 1);
+            fk_dml_check(ctx, table, FkDml::Insert { single_row })?;
             exec_insert(
                 ctx,
                 table.clone(),
@@ -2734,6 +2736,8 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             or_conflict,
             from,
         } => with_firing_or(ctx, *or_conflict, |ctx| {
+            let cols: Vec<usize> = assignments.iter().map(|(i, _)| *i).collect();
+            fk_dml_check(ctx, table, FkDml::Update(&cols))?;
             exec_update(
                 ctx,
                 table.clone(),
@@ -2748,7 +2752,10 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             table,
             source,
             returning,
-        } => exec_delete(ctx, table.clone(), source, returning.as_deref()),
+        } => {
+            fk_dml_check(ctx, table, FkDml::Delete)?;
+            exec_delete(ctx, table.clone(), source, returning.as_deref())
+        }
     }
 }
 
@@ -3041,6 +3048,60 @@ pub(crate) fn apply_generated_columns(
     Ok(())
 }
 
+/// `ALTER TABLE ... SET NOT NULL` / `ADD CHECK` pre-check (SQLite probes
+/// with `sqlite_fail('constraint failed')`): does a stored row have
+/// column `not_null` NULL, or make `check` FALSE (a NULL result passes)?
+/// Generated columns are computed first, so both see them.
+pub(crate) fn any_row_violates(
+    ctx: &mut ExecContext<'_>,
+    table: &Table,
+    not_null: Option<usize>,
+    check: Option<&Expr>,
+) -> Result<bool> {
+    let root = ctx.table_root(table);
+    if root == 0 {
+        return Ok(false);
+    }
+    let n_cols = table.n_columns();
+    let mut rows: Vec<Row> = Vec::new();
+    let mut decode_err: Option<Error> = None;
+    Btree::new(ctx.pager, root, false).scan_table(|rowid, payload| {
+        match decode_row(payload, n_cols, rowid, table.rowid_alias) {
+            Ok(r) => {
+                rows.push(r);
+                true
+            }
+            Err(e) => {
+                decode_err = Some(e);
+                false
+            }
+        }
+    })?;
+    if let Some(e) = decode_err {
+        return Err(e);
+    }
+    for mut row in rows {
+        apply_generated_columns(
+            table,
+            &mut row,
+            &table.col_names,
+            &ctx.params,
+            &ctx.named_params,
+        )?;
+        if not_null.is_some_and(|i| row.get(i).map_or(true, Value::is_null)) {
+            return Ok(true);
+        }
+        if let Some(e) = check {
+            let ectx = EvalContext::new(&row, &table.col_names, &ctx.params, &ctx.named_params)
+                .with_affinities(Some(&table.col_affinities));
+            if !evaluate_check(e, &ectx)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// True when the table declares any GENERATED column (drives the
 /// col_names-always-materialized rule on the INSERT scratch and the
 /// payload-patch fast-path opt-out).
@@ -3125,6 +3186,42 @@ fn fk_parent_exists(
         return Ok(bt.lookup_table_with(rowid, |_| Ok(()))?.is_some());
     }
 
+    // Index path: SQLite requires the parent key to be the PRIMARY KEY or
+    // a UNIQUE index, so an index over exactly the key columns normally
+    // exists — one probe instead of a full scan per checked row (the
+    // scan made every FK insert/update O(parent rows)). The probe uses
+    // the parent column's affinity and the index's collations, which is
+    // also SQLite's comparison for the parent lookup.
+    if !parent_cols.contains(&usize::MAX) {
+        for idx in catalog.indexes_on_table(&parent.name) {
+            if idx.partial_expr.is_some()
+                || idx.columns.len() != parent_cols.len()
+                || idx.columns.iter().any(|ic| ic.expr.is_some())
+                || !idx
+                    .columns
+                    .iter()
+                    .zip(&parent_cols)
+                    .all(|(ic, &pc)| parent.columns[pc].name.eq_ignore_ascii_case(&ic.name))
+            {
+                continue;
+            }
+            let probe: Vec<Value> = key_values
+                .iter()
+                .enumerate()
+                .map(|(i, v)| probe_affinity_value(&parent, &idx, i, &Expr::Literal(v.clone()), v))
+                .collect();
+            if probe.iter().any(|v| v.is_null()) {
+                return Ok(false);
+            }
+            let mut key = Vec::new();
+            crate::plugin::encode_collated_index_key_into(&idx.columns, &probe, &mut key);
+            let mut rowids: Vec<i64> = Vec::new();
+            Btree::new(ctx.pager, ctx.index_root(&idx), true)
+                .lookup_index_into(&key, &mut rowids)?;
+            return Ok(!rowids.is_empty());
+        }
+    }
+
     // General path: scan the parent, comparing the key columns.
     let rowid_marker = parent_cols.len() == 1 && parent_cols[0] == usize::MAX;
     let mut found = false;
@@ -3161,6 +3258,139 @@ fn fk_parent_exists(
 /// Child-side enforcement: every FK of `table` must reference an existing
 /// parent row (NULL child keys pass — SQL MATCH SIMPLE semantics, same as
 /// SQLite's default). Called from INSERT and UPDATE before the write lands.
+/// sqlite3FkLocateIndex: can `parent` serve `fk`'s parent key — its
+/// INTEGER PRIMARY KEY, its PRIMARY KEY (implicit form), or a full,
+/// non-partial UNIQUE index on exactly those columns, each with the
+/// column's own collation?
+fn fk_parent_key_usable(
+    ctx: &ExecContext<'_>,
+    parent: &Table,
+    fk: &crate::schema::ForeignKeyClause,
+) -> bool {
+    let n = fk.columns.len();
+    let ipk = parent.rowid_alias.map(|a| parent.columns[a].name.as_str());
+    if n == 1 {
+        if let Some(ipk) = ipk {
+            match fk.ref_columns.first() {
+                None => return true,
+                Some(k) if k.eq_ignore_ascii_case(ipk) => return true,
+                _ => {}
+            }
+        }
+    }
+    if fk.ref_columns.is_empty() {
+        // The implicit form names the PRIMARY KEY, column count and all.
+        let pk = parent.columns.iter().filter(|c| c.primary_key).count();
+        return pk == n && ipk.is_none();
+    }
+    fn binary(c: &str) -> &str {
+        if c.is_empty() {
+            "BINARY"
+        } else {
+            c
+        }
+    }
+    ctx.catalog()
+        .indexes_on_table(&parent.name)
+        .iter()
+        .any(|idx| {
+            idx.unique
+                && idx.partial_expr.is_none()
+                && idx.columns.len() == n
+                && idx.columns.iter().all(|ic| {
+                    ic.expr.is_none()
+                        && parent
+                            .columns
+                            .iter()
+                            .find(|c| c.name.eq_ignore_ascii_case(&ic.name))
+                            .is_some_and(|c| {
+                                binary(&ic.collation).eq_ignore_ascii_case(binary(&c.collation))
+                            })
+                        && fk
+                            .ref_columns
+                            .iter()
+                            .any(|r| r.eq_ignore_ascii_case(&ic.name))
+                })
+        })
+}
+
+/// Which side of its foreign keys a DML statement touches.
+pub(crate) enum FkDml<'a> {
+    /// `single_row`: a one-row VALUES insert, which cannot break an
+    /// immediate constraint on the parent side.
+    Insert {
+        single_row: bool,
+    },
+    /// The assigned column indexes.
+    Update(&'a [usize]),
+    Delete,
+}
+
+/// SQLite's prepare-time foreign key DML errors (sqlite3FkCheck): with
+/// enforcement on, a statement that touches a foreign key whose parent
+/// table is missing (`no such table: main.p`) or has no usable key
+/// (`foreign key mismatch - "c" referencing "p"`) fails before any row
+/// is read — on the child side and on the parent side alike.
+pub(crate) fn fk_dml_check(ctx: &ExecContext<'_>, table: &Table, dml: FkDml<'_>) -> Result<()> {
+    if !ctx.pager.foreign_keys_enabled() {
+        return Ok(());
+    }
+    let mismatch = |child: &str, parent: &str| {
+        Error::semantic(format!(
+            "foreign key mismatch - \"{child}\" referencing \"{parent}\""
+        ))
+    };
+    let assigned = |i: usize| match &dml {
+        FkDml::Update(cols) => cols.contains(&i),
+        _ => true,
+    };
+    for fk in &table.foreign_keys {
+        if !fk.columns.iter().any(|&c| assigned(c)) {
+            continue;
+        }
+        let Some(parent) = ctx.catalog().get_table(&fk.ref_table) else {
+            return Err(Error::NotFound(format!(
+                "no such table: main.{}",
+                fk.ref_table
+            )));
+        };
+        if !fk_parent_key_usable(ctx, &parent, fk) {
+            return Err(mismatch(&table.name, &fk.ref_table));
+        }
+    }
+    if matches!(dml, FkDml::Insert { single_row: true }) {
+        return Ok(());
+    }
+    for (_, child) in ctx.catalog().all_tables() {
+        for fk in &child.foreign_keys {
+            if !fk.ref_table.eq_ignore_ascii_case(&table.name) {
+                continue;
+            }
+            // fkParentIsModified: an UPDATE touches the parent side only
+            // through an assigned parent-key column.
+            if let FkDml::Update(cols) = &dml {
+                let touches = cols.iter().any(|&i| {
+                    let c = &table.columns[i];
+                    if fk.ref_columns.is_empty() {
+                        c.primary_key
+                    } else {
+                        fk.ref_columns
+                            .iter()
+                            .any(|r| r.eq_ignore_ascii_case(&c.name))
+                    }
+                });
+                if !touches {
+                    continue;
+                }
+            }
+            if !fk_parent_key_usable(ctx, table, fk) {
+                return Err(mismatch(&child.name, &table.name));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn enforce_child_fks(ctx: &ExecContext<'_>, table: &Table, row: &[Value]) -> Result<()> {
     if table.foreign_keys.is_empty() || !ctx.pager.foreign_keys_enabled() {
         return Ok(());
@@ -3209,6 +3439,66 @@ fn fk_find_child_rows(
     let mut hits: Vec<(i64, Vec<Value>)> = Vec::new();
     let mut buf: Vec<Value> = Vec::with_capacity(n_cols);
     let mut decode_err: Option<Error> = None;
+    // Index path (SQLite's advice for every child key): an index whose
+    // leading columns are exactly the FK columns finds the referencing
+    // rows with one probe instead of scanning the child table per parent
+    // row deleted / updated. Candidates are re-checked with the same
+    // equality the scan uses, so the result set is identical.
+    if parent_key.iter().all(|v| !v.is_null()) {
+        let idx = ctx
+            .catalog()
+            .indexes_on_table(&child_table.name)
+            .into_iter()
+            .find(|idx| {
+                idx.partial_expr.is_none()
+                    && idx.columns.len() >= fk.columns.len()
+                    && fk.columns.iter().zip(&idx.columns).all(|(&ci, ic)| {
+                        ic.expr.is_none()
+                            && child_table
+                                .columns
+                                .get(ci)
+                                .is_some_and(|c| c.name.eq_ignore_ascii_case(&ic.name))
+                    })
+            });
+        if let Some(idx) = idx {
+            let probe: Vec<Value> = parent_key
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    probe_affinity_value(child_table, &idx, i, &Expr::Literal(v.clone()), v)
+                })
+                .collect();
+            let mut key = Vec::new();
+            crate::plugin::encode_collated_index_key_into(
+                &idx.columns[..fk.columns.len()],
+                &probe,
+                &mut key,
+            );
+            let mut rowids: Vec<i64> = Vec::new();
+            Btree::new(ctx.pager, ctx.index_root(&idx), true)
+                .lookup_index_into(&key, &mut rowids)?;
+            let mut bt = Btree::new(ctx.pager, root, false);
+            for rowid in rowids {
+                let found = bt.lookup_table_with(rowid, |payload| {
+                    buf.clear();
+                    decode_row_into(payload, n_cols, rowid, alias, &mut buf)
+                })?;
+                if found.is_none() {
+                    continue;
+                }
+                let matched = fk
+                    .columns
+                    .iter()
+                    .zip(parent_key.iter())
+                    .all(|(&ci, pv)| buf.get(ci).map(|v| v == pv).unwrap_or(false));
+                if matched {
+                    hits.push((rowid, buf.clone()));
+                }
+            }
+            hits.sort_by_key(|h| h.0);
+            return Ok(hits);
+        }
+    }
     let mut bt = Btree::new(ctx.pager, root, false);
     bt.scan_table_borrowed(|rowid, payload| {
         buf.clear();
@@ -27578,6 +27868,12 @@ pub(crate) fn simulate_update_unique(
     let mut probe: Vec<i64> = Vec::new();
     for pos in 0..write_set.len() {
         let rowid = write_set[pos].0;
+        if deleted.contains(&rowid) {
+            // An earlier row's REPLACE deleted this one: SQLite's update
+            // loop finds it gone (OP_NotExists) and moves on — it must
+            // neither claim keys nor condemn further holders.
+            continue;
+        }
         let mut claims: Vec<(usize, Vec<u8>)> = Vec::new();
         let mut skip_row = false;
         for &ii in &order {
@@ -29960,6 +30256,19 @@ fn try_streaming_update(
         if assignments.iter().any(|(a_idx, _)| *a_idx == alias_idx) {
             return Ok(None);
         }
+    }
+    // Self-referencing FK: the per-row child check (`enforce_child_fks`)
+    // would scan THIS table from inside the streaming scan's callback,
+    // which holds the leaf page lock — a self-deadlock on the
+    // non-reentrant page mutex (fkey2-14.2.2.5 hung forever). The
+    // general path checks rows outside any scan.
+    if ctx.pager.foreign_keys_enabled()
+        && table
+            .foreign_keys
+            .iter()
+            .any(|fk| fk.ref_table.eq_ignore_ascii_case(&table.name))
+    {
+        return Ok(None);
     }
     // Parent-side FK (ON UPDATE): when the UPDATE assigns any column of
     // a referenced parent key, children must cascade / null / reject.

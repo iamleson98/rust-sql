@@ -63,6 +63,9 @@ pub(crate) fn exec_table_function(
             },
             _ => (TABLE_XINFO_COLS.to_vec(), Vec::new()),
         },
+        "sqlite_temp_master" | "sqlite_temp_schema" => {
+            (SCHEMA_TABLE_COLS.to_vec(), temp_schema_rows(ctx.catalog()))
+        }
         "pragma_table_list" => {
             let filter = match vals.first() {
                 Some(Value::Text(t)) => Some(t.to_string()),
@@ -425,7 +428,101 @@ fn pragma_collation_list() -> (Vec<&'static str>, Vec<Vec<Value>>) {
 /// `FROM pragma_table_list`) — SQLite's eponymous virtual tables. A
 /// real table of the same name shadows them.
 pub(crate) fn is_eponymous(name: &str) -> bool {
-    name.eq_ignore_ascii_case("dbstat") || name.eq_ignore_ascii_case("pragma_table_list")
+    name.eq_ignore_ascii_case("dbstat")
+        || name.eq_ignore_ascii_case("pragma_table_list")
+        || is_temp_schema_table(name)
+}
+
+/// `sqlite_temp_master` / `sqlite_temp_schema`: the TEMP schema's table.
+pub(crate) fn is_temp_schema_table(name: &str) -> bool {
+    name.eq_ignore_ascii_case("sqlite_temp_master")
+        || name.eq_ignore_ascii_case("sqlite_temp_schema")
+}
+
+/// Columns of the schema tables.
+pub(crate) const SCHEMA_TABLE_COLS: [&str; 5] = ["type", "name", "tbl_name", "rootpage", "sql"];
+
+/// The TEMP schema's rows. TEMP objects live only in the catalog (never
+/// in the schema b-tree), so `sqlite_temp_master` is served from it:
+/// tables first, then indexes, views and triggers (SQLite lists in
+/// creation order; the catalog keeps table order).
+/// SQLite records a TEMP object's text without the TEMP / TEMPORARY
+/// keyword (`CREATE TEMP TABLE t(x)` is stored as `CREATE TABLE t(x)`).
+fn strip_temp_keyword(sql: &str) -> String {
+    let trimmed = sql.trim_start();
+    let lead = sql.len() - trimmed.len();
+    let mut words = trimmed.splitn(3, char::is_whitespace);
+    if let (Some(create), Some(kw), Some(rest)) = (words.next(), words.next(), words.next()) {
+        if create.eq_ignore_ascii_case("CREATE")
+            && (kw.eq_ignore_ascii_case("TEMP") || kw.eq_ignore_ascii_case("TEMPORARY"))
+        {
+            return format!("{}{} {}", &sql[..lead], create, rest.trim_start());
+        }
+    }
+    sql.to_string()
+}
+
+pub(crate) fn temp_schema_rows(catalog: &crate::schema::Catalog) -> Vec<Vec<Value>> {
+    let mut tables: Vec<(u64, Vec<Value>)> = Vec::new();
+    for (key, t) in catalog.all_tables() {
+        if !catalog.is_temp(&t.name) {
+            continue;
+        }
+        tables.push((
+            catalog.table_creation_seq(&key),
+            vec![
+                Value::Text("table".into()),
+                Value::Text(t.name.clone().into()),
+                Value::Text(t.name.clone().into()),
+                Value::Integer(t.root_page as i64),
+                Value::Text(strip_temp_keyword(&t.create_sql).into()),
+            ],
+        ));
+    }
+    tables.sort_by_key(|r| r.0);
+    let mut rows: Vec<Vec<Value>> = tables.into_iter().map(|r| r.1).collect();
+    let mut rest: Vec<Vec<Value>> = Vec::new();
+    for (_, i) in catalog.all_indexes() {
+        if catalog.is_temp(&i.name) {
+            let sql = if i.create_sql.is_empty() {
+                Value::Null
+            } else {
+                Value::Text(i.create_sql.clone().into())
+            };
+            rest.push(vec![
+                Value::Text("index".into()),
+                Value::Text(i.name.clone().into()),
+                Value::Text(i.table.clone().into()),
+                Value::Integer(i.root_page as i64),
+                sql,
+            ]);
+        }
+    }
+    for (_, v) in catalog.all_views() {
+        if catalog.is_temp(&v.name) {
+            rest.push(vec![
+                Value::Text("view".into()),
+                Value::Text(v.name.clone().into()),
+                Value::Text(v.name.clone().into()),
+                Value::Integer(0),
+                Value::Text(strip_temp_keyword(&v.create_sql).into()),
+            ]);
+        }
+    }
+    for (_, t) in catalog.all_triggers() {
+        if catalog.is_temp(&t.name) {
+            rest.push(vec![
+                Value::Text("trigger".into()),
+                Value::Text(t.name.clone().into()),
+                Value::Text(t.table.clone().into()),
+                Value::Integer(0),
+                Value::Text(strip_temp_keyword(&t.create_sql).into()),
+            ]);
+        }
+    }
+    rest.sort_by(|a, b| format!("{:?}", a[1]).cmp(&format!("{:?}", b[1])));
+    rows.extend(rest);
+    rows
 }
 
 /// `pragma_table_xinfo` columns (`table_info` plus `hidden`).

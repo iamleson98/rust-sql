@@ -223,6 +223,9 @@ pub(crate) fn tvf_columns(name: &str) -> Option<Vec<&'static str>> {
         "pragma_table_info" => Some(vec!["cid", "name", "type", "notnull", "dflt_value", "pk"]),
         "pragma_table_xinfo" => Some(crate::executor::tableval::TABLE_XINFO_COLS.to_vec()),
         "pragma_table_list" => Some(crate::executor::tableval::TABLE_LIST_COLS.to_vec()),
+        "sqlite_temp_master" | "sqlite_temp_schema" => {
+            Some(crate::executor::tableval::SCHEMA_TABLE_COLS.to_vec())
+        }
         "pragma_index_list" => Some(vec!["seq", "name", "unique", "origin", "partial"]),
         "pragma_index_info" | "pragma_index_xinfo" => {
             Some(vec!["seqno", "cid", "name", "desc", "coll", "key"])
@@ -442,6 +445,88 @@ fn simple_names(ctx: &Ctx<'_>, s: &SimpleSelect, ctes: &CteList) -> Option<Vec<S
         }
     }
     Some(names)
+}
+
+/// multiSelect's prepare-time arity rule: every compound operator's two
+/// sides return the same number of columns. Checked here, before any
+/// arm runs — the executor's own check never sees an INTERSECT / EXCEPT
+/// whose empty left arm ends the merge early. Arms whose width is not
+/// computable statically (star over a USING join, ...) are left to it.
+fn check_compound_widths(ctx: &Ctx<'_>, body: &SelectBody, ctes: &CteList) -> Result<()> {
+    let SelectBody::Binary { op, left, right } = body else {
+        return Ok(());
+    };
+    check_compound_widths(ctx, left, ctes)?;
+    check_compound_widths(ctx, right, ctes)?;
+    if let (Some(l), Some(r)) = (body_width(ctx, left, ctes), body_width(ctx, right, ctes)) {
+        if l != r {
+            let op = match op {
+                SetOp::Union => "UNION",
+                SetOp::UnionAll => "UNION ALL",
+                SetOp::Intersect => "INTERSECT",
+                SetOp::Except => "EXCEPT",
+            };
+            return Err(Error::semantic(format!(
+                "SELECTs to the left and right of {op} do not have the same number of result columns"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Result-column count of a SELECT body (a compound: its leftmost arm).
+fn body_width(ctx: &Ctx<'_>, body: &SelectBody, ctes: &CteList) -> Option<usize> {
+    match body {
+        SelectBody::Binary { left, .. } => body_width(ctx, left, ctes),
+        SelectBody::Simple(s) => {
+            let mut n = 0;
+            for c in &s.columns {
+                n += match c {
+                    ResultColumn::Expr { .. } => 1,
+                    ResultColumn::Star => source_width(ctx, s.from.as_ref()?, ctes)?,
+                    ResultColumn::TableStar(_) => return None,
+                };
+            }
+            Some(n)
+        }
+    }
+}
+
+/// Columns a FROM term contributes to `SELECT *` (`None`: not static —
+/// USING / NATURAL joins merge columns).
+fn source_width(ctx: &Ctx<'_>, te: &TableExpression, ctes: &CteList) -> Option<usize> {
+    match te {
+        TableExpression::Table { name, .. } => {
+            // A CTE of unknown shape, or a virtual table (hidden columns
+            // stay out of `*`): not static.
+            if let Some((_, cols)) = ctes.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
+                return cols.as_ref().map(Vec::len);
+            }
+            if ctx
+                .catalog
+                .get_table(name)
+                .is_some_and(|t| t.vtab.is_some())
+            {
+                return None;
+            }
+            let (cols, _, wildcard) = table_source(ctx, name, ctes)?;
+            (!wildcard).then_some(cols.len())
+        }
+        TableExpression::Function { .. } => None,
+        TableExpression::Subquery { select, .. } => {
+            let own = collect_cte_list(ctx, &select.with);
+            let mut all = own;
+            all.extend(ctes.iter().cloned());
+            body_width(ctx, &select.body, &all)
+        }
+        TableExpression::Join {
+            left,
+            right,
+            constraint: JoinConstraint::On(_) | JoinConstraint::None,
+            ..
+        } => Some(source_width(ctx, left, ctes)? + source_width(ctx, right, ctes)?),
+        _ => None,
+    }
 }
 
 /// CTE list of a WITH clause: (name, declared-or-derived columns).
@@ -839,6 +924,7 @@ fn validate_select(
             // Compound arms are scope-isolated; ORDER BY at the compound
             // level resolves against OUTPUT NAMES ONLY (SQLite's compound
             // rule — source columns are not visible across arms).
+            check_compound_widths(ctx, &stmt.body, &full)?;
             validate_select_body(ctx, &stmt.body, &full, scope)?;
             scope.push_level();
             scope.cur().aliases = output_aliases_of(&stmt.body);
@@ -1057,6 +1143,13 @@ fn validate_simple_select(
         }
     }
     for g in &s.group_by {
+        // resolveOrderGroupBy: a GROUP BY term may not aggregate.
+        if crate::planner::expr_has_aggregate(g) {
+            scope.pop_level();
+            return Err(Error::semantic(
+                "aggregate functions are not allowed in the GROUP BY clause",
+            ));
+        }
         if let Err(e) = validate_expr(ctx, g, scope, ctes) {
             scope.pop_level();
             return Err(e);
@@ -2439,17 +2532,19 @@ fn no_subquery(e: &Expr, what: &str) -> Result<()> {
 fn validate_create(ctx: &Ctx<'_>, c: &CreateStatement, scope: &mut Scope) -> Result<()> {
     match c {
         CreateStatement::Table {
+            name,
             columns,
             constraints,
             as_select,
             ..
         } => {
             // CHECK / generated expressions resolve against THIS table's
-            // full column set (SQLite: forward references are legal).
+            // full column set (SQLite: forward references are legal), bare
+            // or qualified by the table's own name (`CHECK(t1.a != t1.b)`).
             let mut col_scope = Scope::default();
             col_scope.push_level();
             col_scope.cur().sources.push(Source {
-                qualifier: None,
+                qualifier: Some(name.name.clone()),
                 columns: columns.iter().map(|c| c.name.clone()).collect(),
                 rowid_table: true,
                 qualified_only: false,
@@ -2612,7 +2707,33 @@ fn validate_create(ctx: &Ctx<'_>, c: &CreateStatement, scope: &mut Scope) -> Res
             {
                 return Err(Error::NotFound(format!("no such table: main.{}", tr.table)));
             }
-            Ok(())
+            // sqlite3BeginTrigger's order: a duplicate name reports first
+            // (the executor), then the target's kind.
+            if ctx.catalog.get_trigger(&tr.name).is_some() {
+                return Ok(());
+            }
+            if tr.table.len() >= 7 && tr.table[..7].eq_ignore_ascii_case("sqlite_") {
+                return Err(Error::semantic("cannot create trigger on system table"));
+            }
+            let target = match &tr.table_schema {
+                Some(s) => format!("{s}.{}", tr.table),
+                None => tr.table.clone(),
+            };
+            let is_view = ctx.catalog.get_table(&tr.table).is_none();
+            match (is_view, &tr.when) {
+                (true, TriggerWhen::Before | TriggerWhen::After) => Err(Error::semantic(format!(
+                    "cannot create {} trigger on view: {target}",
+                    if tr.when == TriggerWhen::Before {
+                        "BEFORE"
+                    } else {
+                        "AFTER"
+                    }
+                ))),
+                (false, TriggerWhen::InsteadOf) => Err(Error::semantic(format!(
+                    "cannot create INSTEAD OF trigger on table: {target}"
+                ))),
+                _ => Ok(()),
+            }
         }
         CreateStatement::VirtualTable { .. } => Ok(()),
     }
@@ -2657,9 +2778,45 @@ fn validate_drop(ctx: &Ctx<'_>, d: &DropStatement) -> Result<()> {
 }
 
 fn validate_alter(ctx: &Ctx<'_>, a: &AlterStatement) -> Result<()> {
+    let edits_constraints = matches!(
+        a.action,
+        AlterAction::DropConstraint { .. }
+            | AlterAction::DropNotNull { .. }
+            | AlterAction::SetNotNull { .. }
+            | AlterAction::AddCheck { .. }
+    );
     let Some(t) = ctx.catalog.get_table(&a.table) else {
+        if let Some(v) = ctx.catalog.get_view(&a.table) {
+            // isRealTable's wording per operation.
+            let op = match a.action {
+                AlterAction::RenameColumn { .. } => Some("rename columns of"),
+                AlterAction::DropColumn { .. } => Some("drop column from"),
+                _ if edits_constraints => Some("edit constraints of"),
+                _ => None,
+            };
+            if let Some(op) = op {
+                return Err(Error::semantic(format!("cannot {op} view \"{}\"", v.name)));
+            }
+        }
         return Err(Error::NotFound(format!("no such table: {}", a.table)));
     };
+    // A schema qualifier must name the table's own database.
+    if let Some(sc) = &a.schema {
+        let lc = sc.to_ascii_lowercase();
+        let temp = ctx.catalog.is_temp(&t.name);
+        if (lc == "temp" && !temp) || (lc == "main" && temp) {
+            return Err(Error::NotFound(format!(
+                "no such table: {}.{}",
+                sc, a.table
+            )));
+        }
+    }
+    if edits_constraints && t.vtab.is_some() {
+        return Err(Error::semantic(format!(
+            "cannot edit constraints of virtual table \"{}\"",
+            t.name
+        )));
+    }
     // isAlterableTable: system tables may not be altered.
     if t.name.len() >= 7 && t.name[..7].eq_ignore_ascii_case("sqlite_") {
         return Err(Error::semantic(format!(
@@ -2674,7 +2831,32 @@ fn validate_alter(ctx: &Ctx<'_>, a: &AlterStatement) -> Result<()> {
             }
             Ok(())
         }
-        AlterAction::RenameTable { .. } => Ok(()),
+        AlterAction::RenameTable { .. } | AlterAction::DropConstraint { .. } => Ok(()),
+        AlterAction::DropNotNull { column } | AlterAction::SetNotNull { column, .. } => {
+            if !t
+                .columns
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(column))
+            {
+                return Err(Error::NotFound(format!("no such column: {}", column)));
+            }
+            Ok(())
+        }
+        AlterAction::AddCheck { expr, .. } => {
+            let mut s = Scope::default();
+            s.push_level();
+            s.cur().sources.push(Source {
+                qualifier: Some(t.name.clone()),
+                columns: t.columns.iter().map(|c| c.name.clone()).collect(),
+                rowid_table: !t.without_rowid,
+                qualified_only: false,
+                bare_hidden: Vec::new(),
+                pending_vtab: false,
+                aux_columns: Vec::new(),
+                vtable: false,
+            });
+            validate_expr(ctx, expr, &mut s, &EMPTY_CTES)
+        }
         AlterAction::AddColumn { column } => {
             // CHECK / generated expressions of the NEW column resolve
             // against the table's columns plus the new one.

@@ -486,3 +486,25 @@ fn synchronous_pragma_round_trip() {
     diff_query(&["PRAGMA synchronous = OFF"], "PRAGMA synchronous");
     diff_query(&["PRAGMA synchronous = 1"], "PRAGMA synchronous");
 }
+
+/// A header pragma on a brand-new (still 0-byte) file must materialize
+/// page 0, not patch four bytes into an empty file (which then failed to
+/// open as "database disk image is malformed"). pragma.test 1.9.
+#[test]
+fn header_pragmas_on_a_fresh_file_survive_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fresh.db");
+    {
+        let mut db = Database::open(&path).unwrap();
+        db.execute("PRAGMA default_cache_size = -123", []).unwrap();
+        db.execute("PRAGMA user_version = 7", []).unwrap();
+    }
+    let db = Database::open(&path).unwrap();
+    let one = |sql: &str| db.query(sql, []).unwrap()[0][0].clone();
+    assert_eq!(
+        one("PRAGMA default_cache_size"),
+        rustqlite::Value::Integer(123)
+    );
+    assert_eq!(one("PRAGMA cache_size"), rustqlite::Value::Integer(123));
+    assert_eq!(one("PRAGMA user_version"), rustqlite::Value::Integer(7));
+}

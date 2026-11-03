@@ -60,6 +60,35 @@ impl Parser {
     }
 
     pub fn parse(&mut self) -> Result<Statement> {
+        self.parse_one().map_err(|e| self.sqlite_syntax_error(e))
+    }
+
+    /// SQLite's wording for a generic grammar failure: `near "TOKEN":
+    /// syntax error` naming the offending token as written, or
+    /// `incomplete input` at the end of the text. Specific messages
+    /// (arity, VALUES shape, depth limits, ...) pass through.
+    fn sqlite_syntax_error(&self, e: Error) -> Error {
+        let Error::Parse { line, col, msg } = &e else {
+            return e;
+        };
+        if !(msg.starts_with("expected ") || msg.starts_with("unexpected ")) {
+            return e;
+        }
+        let Some(t) = self.toks.iter().find(|t| t.line == *line && t.col == *col) else {
+            return e;
+        };
+        let msg = if matches!(t.token, Token::Eof) {
+            "incomplete input".to_string()
+        } else {
+            match self.src.get(t.start..t.end) {
+                Some(text) => format!("near \"{text}\": syntax error"),
+                None => return e,
+            }
+        };
+        Error::parse(*line, *col, msg)
+    }
+
+    fn parse_one(&mut self) -> Result<Statement> {
         let stmt = self.parse_statement()?;
         // Allow trailing semicolon.
         if self.peek().is_punct(';') {
@@ -101,6 +130,7 @@ impl Parser {
             return Ok(Statement::Explain {
                 inner: Box::new(inner),
                 analyze,
+                query_plan,
             });
         }
         if t.is_keyword("WITH") {
@@ -349,11 +379,17 @@ impl Parser {
             let mut dangling = false;
             while self.peek().is_keyword("CONSTRAINT") && !self.constraint_body_at(2, true) {
                 self.advance();
-                self.parse_ident()?;
+                self.parse_nm()?;
                 dangling = true;
             }
             if dangling && self.peek().is_punct(')') {
                 break;
+            }
+            // `CONSTRAINT abc, CHECK(...)`: the bare name is a whole
+            // (empty) table constraint.
+            if dangling && self.peek().is_punct(',') {
+                self.advance();
+                continue;
             }
             let table_constraint = self.peek().is_keyword("PRIMARY")
                 || self.peek().is_keyword("UNIQUE")
@@ -481,7 +517,7 @@ impl Parser {
             // one`, `x CONSTRAINT a CONSTRAINT b CHECK(...)`.
             if self.peek().is_keyword("CONSTRAINT") && !self.constraint_body_at(2, false) {
                 self.advance();
-                self.parse_ident()?;
+                self.parse_nm()?;
                 continue;
             }
             constraints.push(self.parse_column_constraint()?);
@@ -628,10 +664,10 @@ impl Parser {
     }
 
     fn parse_column_constraint(&mut self) -> Result<ColumnConstraint> {
-        // Skip optional CONSTRAINT name
+        // Skip optional CONSTRAINT name (`nm`: identifier or string).
         if self.peek().is_keyword("CONSTRAINT") {
             self.advance();
-            let _ = self.parse_ident()?;
+            let _ = self.parse_nm()?;
         }
         let t = self.peek();
         if t.is_keyword("PRIMARY") {
@@ -906,7 +942,7 @@ impl Parser {
     fn parse_table_constraint(&mut self) -> Result<TableConstraint> {
         if self.peek().is_keyword("CONSTRAINT") {
             self.advance();
-            let _ = self.parse_ident()?;
+            let _ = self.parse_nm()?;
         }
         if self.peek().is_keyword("PRIMARY") {
             self.advance();
@@ -2035,6 +2071,60 @@ impl Parser {
                 table: table.clone(),
                 action: AlterAction::RenameColumn { old, new },
             }))
+        } else if self.peek().is_keyword("ADD")
+            && (self.peek_n(1).is_keyword("CONSTRAINT") || self.peek_n(1).is_keyword("CHECK"))
+        {
+            // `ADD [CONSTRAINT nm] CHECK (expr) onconf` (SQLite 3.52).
+            self.advance();
+            let first = self.peek().start;
+            let name = if self.consume_keyword("CONSTRAINT") {
+                Some(self.parse_nm()?)
+            } else {
+                None
+            };
+            self.expect_keyword("CHECK")?;
+            self.expect_punct('(')?;
+            let expr = self.parse_expr()?;
+            self.expect_punct(')')?;
+            self.parse_onconf()?;
+            let text = self.constraint_text(first);
+            Ok(Statement::Alter(AlterStatement {
+                schema: alter_schema,
+                table,
+                action: AlterAction::AddCheck { name, expr, text },
+            }))
+        } else if self.peek().is_keyword("ALTER") {
+            // `ALTER [COLUMN] nm DROP NOT NULL` | `... SET NOT NULL onconf`.
+            self.advance();
+            self.consume_keyword("COLUMN");
+            let column = self.parse_nm()?;
+            let action = if self.consume_keyword("DROP") {
+                self.expect_keyword("NOT")?;
+                self.expect_keyword("NULL")?;
+                AlterAction::DropNotNull { column }
+            } else {
+                self.expect_keyword("SET")?;
+                let first = self.peek().start;
+                self.expect_keyword("NOT")?;
+                self.expect_keyword("NULL")?;
+                self.parse_onconf()?;
+                let text = self.constraint_text(first);
+                AlterAction::SetNotNull { column, text }
+            };
+            Ok(Statement::Alter(AlterStatement {
+                schema: alter_schema,
+                table,
+                action,
+            }))
+        } else if self.peek().is_keyword("DROP") && self.peek_n(1).is_keyword("CONSTRAINT") {
+            self.advance();
+            self.advance();
+            let name = self.parse_nm()?;
+            Ok(Statement::Alter(AlterStatement {
+                schema: alter_schema,
+                table,
+                action: AlterAction::DropConstraint { name },
+            }))
         } else if self.peek().is_keyword("ADD") {
             self.advance();
             if self.peek().is_keyword("COLUMN") {
@@ -2064,6 +2154,15 @@ impl Parser {
                 "expected RENAME, ADD, or DROP after table name",
             ))
         }
+    }
+
+    /// Source text of a constraint clause from byte `first` up to the next
+    /// token (the statement's end), without trailing space / `--`
+    /// comments — the text SQLite splices into the CREATE TABLE.
+    fn constraint_text(&self, first: usize) -> String {
+        let end = self.peek().start.max(first);
+        let raw = self.src.get(first..end).unwrap_or("");
+        crate::sql::constraint_edit::rtrim_constraint(raw).to_string()
     }
 
     fn parse_attach(&mut self) -> Result<Statement> {
@@ -2201,6 +2300,36 @@ impl Parser {
         } else {
             (None, None)
         };
+        // A compound operator after ORDER BY / LIMIT: SQLite's
+        // parserDoubleLinkSelect names both clauses.
+        if !order_by.is_empty() || limit.is_some() {
+            let t = self.peek();
+            let op = if t.is_keyword("UNION") {
+                Some(if self.peek_n(1).is_keyword("ALL") {
+                    "UNION ALL"
+                } else {
+                    "UNION"
+                })
+            } else if t.is_keyword("INTERSECT") {
+                Some("INTERSECT")
+            } else if t.is_keyword("EXCEPT") {
+                Some("EXCEPT")
+            } else {
+                None
+            };
+            if let Some(op) = op {
+                let clause = if order_by.is_empty() {
+                    "LIMIT"
+                } else {
+                    "ORDER BY"
+                };
+                return Err(Error::parse(
+                    t.line,
+                    t.col,
+                    format!("{clause} clause should come after {op} not before"),
+                ));
+            }
+        }
         Ok(SelectStatement {
             with,
             body,
@@ -2747,6 +2876,20 @@ impl Parser {
         } else {
             None
         };
+        // `temp.sqlite_master` / `temp.sqlite_schema` name the TEMP
+        // schema's table (served from the catalog as sqlite_temp_master);
+        // the written name stays the alias for qualified columns.
+        let (name, schema, alias) = match schema.as_deref() {
+            Some(s)
+                if s.eq_ignore_ascii_case("temp")
+                    && (name.eq_ignore_ascii_case("sqlite_master")
+                        || name.eq_ignore_ascii_case("sqlite_schema")) =>
+            {
+                let alias = alias.or_else(|| Some(name.clone()));
+                ("sqlite_temp_master".to_string(), None, alias)
+            }
+            _ => (name, schema, alias),
+        };
         Ok(TableExpression::Table {
             name,
             schema,
@@ -2965,8 +3108,11 @@ impl Parser {
     fn parse_binary_body(&mut self, min_prec: u8) -> Result<Expr> {
         // Prefix NOT is right-associative at its own level (SQLite's
         // `%right NOT.`): looser than comparisons/IS, tighter than AND —
-        // `NOT 1 = 2` is `NOT (1 = 2)`, not `(NOT 1) = 2`.
-        let mut left = if self.peek().is_keyword("NOT") && PREC_NOT >= min_prec {
+        // `NOT 1 = 2` is `NOT (1 = 2)`, not `(NOT 1) = 2`. In a tighter
+        // operand position (`21 % NOT (x)`) it is still the prefix
+        // operator — the grammar has no other reading — and its operand
+        // still extends over everything tighter than NOT.
+        let mut left = if self.peek().is_keyword("NOT") {
             self.advance();
             let operand = self.parse_binary(PREC_NOT)?;
             Expr::Unary {
@@ -3984,16 +4130,28 @@ impl Parser {
         }
     }
 
+    /// SQLite's `nm` (an object name): an identifier, or a single-quoted
+    /// string — `DELETE FROM 'a1'` names table a1 (a long-standing
+    /// SQLite quirk the Tcl suite and real scripts rely on).
+    fn parse_nm(&mut self) -> Result<String> {
+        if let Token::String(v) = &self.peek().token {
+            let v = v.clone();
+            self.advance();
+            return Ok(v);
+        }
+        self.parse_ident()
+    }
+
     fn parse_table_name(&mut self) -> Result<TableName> {
         let (schema, name) = self.parse_qualified_name()?;
         Ok(TableName { schema, name })
     }
 
     fn parse_qualified_name(&mut self) -> Result<(Option<String>, String)> {
-        let first = self.parse_ident()?;
+        let first = self.parse_nm()?;
         if self.peek().is_punct('.') {
             self.advance();
-            let second = self.parse_ident()?;
+            let second = self.parse_nm()?;
             Ok((Some(first), second))
         } else {
             Ok((None, first))
@@ -4008,10 +4166,10 @@ impl Parser {
     /// no such database is attached: `UPDATE nosuch.t ...` -> "no such
     /// table: nosuch.t").
     fn parse_dml_table_name(&mut self) -> Result<(Option<String>, String)> {
-        let first = self.parse_ident()?;
+        let first = self.parse_nm()?;
         if self.peek().is_punct('.') {
             self.advance();
-            let second = self.parse_ident()?;
+            let second = self.parse_nm()?;
             let schema_lc = first.to_ascii_lowercase();
             if schema_lc == "main" || schema_lc == "temp" {
                 return Ok((None, second));
@@ -4189,6 +4347,22 @@ fn is_constraint_keyword(s: &str) -> bool {
     )
 }
 
+/// The trigger name of a CREATE TRIGGER as written, quotes included —
+/// SQLite's `trigger %T already exists` echoes the token (`"tr1"`,
+/// `[tr1]`).
+pub fn trigger_name_as_written(sql: &str) -> Option<String> {
+    let toks = Lexer::new(sql).tokenize().ok()?;
+    let mut i = toks.iter().position(|t| t.is_keyword("TRIGGER"))? + 1;
+    if toks.get(i)?.is_keyword("IF") {
+        i += 3; // IF NOT EXISTS
+    }
+    if toks.get(i + 1).is_some_and(|t| t.is_punct('.')) {
+        i += 2;
+    }
+    let t = toks.get(i)?;
+    sql.get(t.start..t.end).map(str::to_string)
+}
+
 /// Parse a single SQL statement from a string.
 pub fn parse(src: &str) -> Result<Statement> {
     Parser::new(src)?.parse()
@@ -4239,7 +4413,13 @@ pub fn split_script(src: &str) -> Vec<String> {
         let end = pos + statement_end(&src[pos..]);
         let part = &src[pos..end];
         let part = part.strip_suffix(';').unwrap_or(part).trim();
-        if !part.is_empty() {
+        // A comment-only part (`...; -- note`) is an empty statement, as
+        // in sqlite3_exec; only a part that starts with a comment can be.
+        let comment_only = (part.starts_with("--") || part.starts_with("/*"))
+            && Lexer::new(part)
+                .tokenize()
+                .is_ok_and(|t| t.len() == 1 && matches!(t[0].token, Token::Eof));
+        if !part.is_empty() && !comment_only {
             out.push(part.to_string());
         }
         pos = end;

@@ -1475,6 +1475,20 @@ pub(crate) fn validate_schemas(db: &Database, stmt: &Statement) -> Result<()> {
                     schema, s.name
                 )));
             }
+            // sqlite_temp_master is main/temp-only (SQLite: attached
+            // schemas have no temp catalog); a routed statement would
+            // otherwise resolve it as the attached engine's own.
+            let name_lc = s.name.to_ascii_lowercase();
+            if lc != "main"
+                && lc != "temp"
+                && !s.pragma
+                && (name_lc == "sqlite_temp_master" || name_lc == "sqlite_temp_schema")
+            {
+                return Err(Error::NotFound(format!(
+                    "no such table: {}.{}",
+                    schema, s.name
+                )));
+            }
         }
     }
     Ok(())

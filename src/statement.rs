@@ -910,7 +910,12 @@ impl<'a> Statement<'a> {
         // ANALYZE executes the inner SELECT with instrumentation
         // (PostgreSQL semantics — result rows are replaced by the
         // analysis output).
-        if let AstStatement::Explain { inner, analyze } = self.stmt.as_ref() {
+        if let AstStatement::Explain {
+            inner,
+            analyze,
+            query_plan,
+        } = self.stmt.as_ref()
+        {
             if *analyze {
                 let (cols, rows) = self
                     .db
@@ -924,11 +929,8 @@ impl<'a> Statement<'a> {
                 Some(p) => crate::executor::explain::explain_plan_rows(&p, &self.db.catalog),
                 None => Vec::new(),
             };
-            self.columns = Some(Arc::from(vec![
-                "opcode".to_string(),
-                "detail".to_string(),
-                "extra".to_string(),
-            ]));
+            let (cols, rows) = crate::executor::explain::static_explain(rows, *query_plan);
+            self.columns = Some(Arc::from(cols));
             self.stream = StreamState::Materialized(rows.into_iter());
             return Ok(());
         }

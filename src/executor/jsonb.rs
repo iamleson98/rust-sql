@@ -497,10 +497,62 @@ struct JParser<'a> {
     strict: bool,
 }
 
+/// Length of the JSON5-only whitespace item at the start of `b` (SQLite's
+/// json5Whitespace): `\v`, `\f`, `/* */` and `//` comments, and the
+/// Unicode space separators, BOM and line/paragraph separators. 0 when
+/// `b` does not start with one (an unterminated `/*` is not whitespace).
+fn json5_ws_len(b: &[u8]) -> usize {
+    match b {
+        [0x0b | 0x0c, ..] => 1,
+        [b'/', b'*', rest @ ..] => rest
+            .windows(2)
+            .position(|w| w == b"*/")
+            .map_or(0, |p| p + 4),
+        [b'/', b'/', rest @ ..] => {
+            let mut j = 0;
+            while j < rest.len() {
+                match rest[j] {
+                    b'\n' | b'\r' => return j + 3,
+                    0xe2 if rest.get(j + 1) == Some(&0x80)
+                        && matches!(rest.get(j + 2), Some(0xa8 | 0xa9)) =>
+                    {
+                        return j + 5
+                    }
+                    _ => j += 1,
+                }
+            }
+            rest.len() + 2
+        }
+        [0xc2, 0xa0, ..] => 2,
+        [0xe1, 0x9a, 0x80, ..]
+        | [0xe2, 0x80, 0x80..=0x8a | 0xa8 | 0xa9 | 0xaf, ..]
+        | [0xe2, 0x81, 0x9f, ..]
+        | [0xe3, 0x80, 0x80, ..]
+        | [0xef, 0xbb, 0xbf, ..] => 3,
+        _ => 0,
+    }
+}
+
+/// Four hex digits at the start of `b`.
+fn is_4hex(b: &[u8]) -> bool {
+    b.len() >= 4 && b[..4].iter().all(u8::is_ascii_hexdigit)
+}
+
 impl<'a> JParser<'a> {
     fn skip_ws(&mut self) {
-        while self.pos < self.b.len() && matches!(self.b[self.pos], b' ' | b'\t' | b'\n' | b'\r') {
-            self.pos += 1;
+        loop {
+            while self.pos < self.b.len()
+                && matches!(self.b[self.pos], b' ' | b'\t' | b'\n' | b'\r')
+            {
+                self.pos += 1;
+            }
+            if self.strict {
+                return;
+            }
+            match json5_ws_len(&self.b[self.pos..]) {
+                0 => return,
+                n => self.pos += n,
+            }
         }
     }
 
@@ -753,6 +805,14 @@ impl<'a> JParser<'a> {
                                 }
                             }
                         }
+                        // `\` U+2028 / U+2029: a JSON5 line continuation.
+                        0xe2 if !self.strict
+                            && self.b.get(self.pos + 1) == Some(&0x80)
+                            && matches!(self.b.get(self.pos + 2), Some(0xa8 | 0xa9)) =>
+                        {
+                            json5 = true;
+                            self.pos += 3;
+                        }
                         // JSON5-only escapes (SQLite's set): `\x`HH, `\v`, `\'`,
                         // `\0` not followed by a digit, and line
                         // continuations; none of them under strict rules.
@@ -782,28 +842,46 @@ impl<'a> JParser<'a> {
                         _ => return Err(self.pos + 1),
                     }
                 }
-                // A control byte (< 0x20).
-                _ => return Err(self.pos + 1),
+                // A control byte (< 0x20): JSON5 allows all but NUL.
+                0 => return Err(self.pos + 1),
+                _ if self.strict => return Err(self.pos + 1),
+                _ => {
+                    json5 = true;
+                    self.pos += 1;
+                }
             }
         }
     }
 
-    /// Unquoted JSON5 object key over bytes (idents are ASCII):
-    /// `{a:1}`.
-    fn parse_ident_key_bytes(&mut self) -> Result<Vec<u8>, usize> {
+    /// Unquoted JSON5 object key (SQLite's sqlite3JsonId1/Id2 rules): it
+    /// starts with a letter, `_`, `$`, any byte >= 0x80 or a `\uXXXX`
+    /// escape, and continues with those or digits up to JSON5
+    /// whitespace. Returns (JSONB type, payload span): TEXTJ when the key
+    /// holds an escape.
+    fn scan_ident_key(&mut self) -> Result<(u8, usize, usize), usize> {
+        let id1 = |c: u8| c.is_ascii_alphabetic() || c == b'_' || c == b'$' || c >= 0x80;
         let start = self.pos;
-        if self.peek() == Some(b'_') || self.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
-            self.pos += 1;
-            while matches!(
-                self.peek(),
-                Some(b'_') | Some(b'0'..=b'9') | Some(b'a'..=b'z') | Some(b'A'..=b'Z')
-            ) {
-                self.pos += 1;
+        let mut typ = T_TEXT;
+        loop {
+            let rest = &self.b[self.pos..];
+            match rest.first() {
+                Some(&c)
+                    if (id1(c) || (c.is_ascii_digit() && self.pos > start))
+                        && json5_ws_len(rest) == 0 =>
+                {
+                    self.pos += 1
+                }
+                Some(b'\\') if rest.get(1) == Some(&b'u') && is_4hex(&rest[2..]) => {
+                    typ = T_TEXTJ;
+                    self.pos += 6;
+                }
+                _ => break,
             }
-            Ok(self.b[start..self.pos].to_vec())
-        } else {
-            Err(self.err())
         }
+        if self.pos == start {
+            return Err(self.err());
+        }
+        Ok((typ, start, self.pos))
     }
 
     fn parse_array(&mut self) -> Result<Jb, usize> {
@@ -854,8 +932,13 @@ impl<'a> JParser<'a> {
                 if self.peek() == Some(b'\'') {
                     self.parse_string_q(b'\'')?.0
                 } else {
-                    let kb = self.parse_ident_key_bytes()?;
-                    Jb::Text(crate::types::Text::from_utf8(&kb).map_err(|_| self.err())?)
+                    let (typ, s, e) = self.scan_ident_key()?;
+                    let text = crate::types::Text::from_bytes(&self.b[s..e]);
+                    if typ == T_TEXTJ {
+                        Jb::TextJ(text)
+                    } else {
+                        Jb::Text(text)
+                    }
                 }
             } else {
                 return Err(self.err());
@@ -1022,9 +1105,9 @@ impl JParser<'_> {
                     push_header(out, typ, e - s);
                     out.extend_from_slice(&self.b[s..e]);
                 } else {
-                    let kb = self.parse_ident_key_bytes()?;
-                    push_header(out, T_TEXT, kb.len());
-                    out.extend_from_slice(&kb);
+                    let (typ, s, e) = self.scan_ident_key()?;
+                    push_header(out, typ, e - s);
+                    out.extend_from_slice(&self.b[s..e]);
                 }
             } else {
                 return Err(self.err());
@@ -1144,6 +1227,18 @@ pub fn decode_escapes(b: &[u8], json5: bool) -> Vec<u8> {
                             i += 2;
                         }
                     }
+                    // Line continuations: `\` CR [LF], `\` U+2028 / U+2029.
+                    b'\r' if json5 => {
+                        if b.get(i + 1) == Some(&b'\n') {
+                            i += 1;
+                        }
+                    }
+                    0xe2 if json5
+                        && b.get(i + 1) == Some(&0x80)
+                        && matches!(b.get(i + 2), Some(0xa8 | 0xa9)) =>
+                    {
+                        i += 2;
+                    }
                     _ => {
                         // Line continuation (backslash newline) or unknown:
                         if b[i] != b'\n' {
@@ -1190,6 +1285,9 @@ fn write_json5_as_json(b: &[u8], out: &mut Vec<u8>) {
                     if b.get(i) == Some(&b'\n') {
                         i += 1;
                     }
+                }
+                0xe2 if b.get(i) == Some(&0x80) && matches!(b.get(i + 1), Some(0xa8 | 0xa9)) => {
+                    i += 2;
                 }
                 _ => {
                     out.push(b'\\');
@@ -1283,13 +1381,12 @@ fn canonical_float5(s: &str) -> String {
         out.push('.');
         out.push_str(frac);
     } else if let Some(pos) = rest.find('.') {
-        if rest[pos + 1..].is_empty() {
-            // "1." → "1.0"
-            out.push_str(rest);
+        // "1." → "1.0", "4.e0" → "4.0e0".
+        out.push_str(&rest[..=pos]);
+        if !rest[pos + 1..].starts_with(|c: char| c.is_ascii_digit()) {
             out.push('0');
-        } else {
-            out.push_str(rest);
         }
+        out.push_str(&rest[pos + 1..]);
     } else {
         out.push_str(rest);
     }

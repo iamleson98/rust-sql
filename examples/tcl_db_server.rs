@@ -197,6 +197,16 @@ fn is_dml_returning(sql: &str) -> bool {
     }
 }
 
+fn count_changes_label(sql: &str) -> Option<&'static str> {
+    use rustqlite::sql::ast::Statement as S;
+    match rustqlite::sql::parser::parse(sql) {
+        Ok(S::Insert(_)) => Some("rows inserted"),
+        Ok(S::Update(_)) => Some("rows updated"),
+        Ok(S::Delete(_)) => Some("rows deleted"),
+        _ => None,
+    }
+}
+
 fn returns_rows(sql: &str) -> bool {
     use rustqlite::sql::ast::Statement as S;
     match rustqlite::sql::parser::parse(sql) {
@@ -395,8 +405,17 @@ fn eval(c: &mut Conn, script: &str, vars: &HashMap<String, Value>) -> Result<Vec
                             other => other,
                         }
                     } else {
-                        db.execute(&sql, params.clone())
-                            .map(|_| (Vec::new(), Vec::new()))
+                        db.execute(&sql, params.clone()).map(|_| {
+                            // PRAGMA count_changes: SQLite's one-row
+                            // change count for plain DML.
+                            match count_changes_label(&sql) {
+                                Some(l) if db.count_changes() => (
+                                    vec![l.to_string()],
+                                    vec![vec![rustqlite::Value::Integer(db.changes())]],
+                                ),
+                                _ => (Vec::new(), Vec::new()),
+                            }
+                        })
                     }
                 }));
                 match r {

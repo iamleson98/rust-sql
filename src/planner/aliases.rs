@@ -241,13 +241,22 @@ impl Planner<'_> {
     ) -> Result<Option<Vec<OrderTerm>>> {
         let mut arms = Vec::new();
         flatten_arms(body, &mut arms);
+        // Arms whose columns are not statically known (a star over a
+        // derived table, ...) are skipped: a term still resolves through
+        // the others (`SELECT * FROM (..) EXCEPT SELECT c FROM t ORDER BY
+        // c`), and only a term no known arm matches is left alone.
         let mut expanded = Vec::with_capacity(arms.len());
+        let mut some_unknown = false;
         for a in &arms {
-            let Some(cols) = self.arm_columns(a) else {
-                return Ok(None);
-            };
-            expanded.push((cols, self.arm_qualifiers(a)));
+            match self.arm_columns(a) {
+                Some(cols) => expanded.push((cols, self.arm_qualifiers(a))),
+                None => some_unknown = true,
+            }
         }
+        if expanded.is_empty() {
+            return Ok(None);
+        }
+        let leftmost_known = !self.arm_columns_unknown(arms[0]);
         let width = expanded[0].0.len();
         let mut out = Vec::with_capacity(terms.len());
         for (i, t) in terms.iter().enumerate() {
@@ -282,6 +291,7 @@ impl Planner<'_> {
                 });
                 match hit {
                     Some(p) => p + 1,
+                    None if some_unknown => return Ok(None),
                     None => {
                         return Err(Error::semantic(format!(
                             "{} ORDER BY term does not match any column in the result set",
@@ -296,6 +306,9 @@ impl Planner<'_> {
             // column has no plain name).
             let mut expr = if collations.is_empty() {
                 Expr::Literal(crate::types::Value::Integer(k as i64))
+            } else if !leftmost_known {
+                out.push(t.clone());
+                continue;
             } else {
                 match &expanded[0].0[k - 1] {
                     ArmColumn { alias: Some(a), .. } => Expr::Column {
@@ -329,6 +342,10 @@ impl Planner<'_> {
             });
         }
         Ok(Some(out))
+    }
+
+    fn arm_columns_unknown(&self, s: &SimpleSelect) -> bool {
+        self.arm_columns(s).is_none()
     }
 
     fn arm_columns(&self, s: &SimpleSelect) -> Option<Vec<ArmColumn>> {

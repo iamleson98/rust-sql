@@ -434,3 +434,106 @@ fn alter_add_column_plain_table_still_appends_at_end() {
     let rows = db.query("SELECT c FROM t", []).unwrap();
     assert_eq!(rows[0][0], Value::Integer(3));
 }
+
+fn sql_of(db: &Database, t: &str) -> String {
+    match &db
+        .query(
+            &format!("SELECT sql FROM sqlite_schema WHERE name = '{t}'"),
+            [],
+        )
+        .unwrap()[0][0]
+    {
+        Value::Text(s) => s.to_string(),
+        v => panic!("{v:?}"),
+    }
+}
+
+fn err(db: &mut Database, sql: &str) -> String {
+    let e = db.execute(sql, []).unwrap_err();
+    e.sqlite_message()
+}
+
+/// SQLite 3.52's constraint editing (altercons.test): the stored CREATE
+/// TABLE text is edited in place, existing rows are checked first, and
+/// the rebuilt table enforces the new rules.
+#[test]
+fn alter_constraint_edits() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute(
+        "CREATE TABLE t1(a, b CONSTRAINT abc CHECK(t1.a != t1.b) NOT NULL)",
+        [],
+    )
+    .unwrap();
+    assert!(db.execute("INSERT INTO t1 VALUES (1, 1)", []).is_err());
+    db.execute("ALTER TABLE t1 DROP CONSTRAINT abc", [])
+        .unwrap();
+    assert_eq!(sql_of(&db, "t1"), "CREATE TABLE t1(a, b NOT NULL)");
+    db.execute("INSERT INTO t1 VALUES (1, 1)", []).unwrap();
+    db.execute("ALTER TABLE t1 ALTER COLUMN b DROP NOT NULL", [])
+        .unwrap();
+    assert_eq!(sql_of(&db, "t1"), "CREATE TABLE t1(a, b)");
+    db.execute("INSERT INTO t1 VALUES (2, NULL)", []).unwrap();
+    // SET NOT NULL checks the stored rows first.
+    assert_eq!(
+        err(&mut db, "ALTER TABLE t1 ALTER b SET NOT NULL"),
+        "constraint failed"
+    );
+    db.execute("DELETE FROM t1 WHERE b IS NULL", []).unwrap();
+    db.execute(
+        "ALTER TABLE t1 ALTER b SET NOT   NULL ON CONFLICT IGNORE ;",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        sql_of(&db, "t1"),
+        "CREATE TABLE t1(a, b NOT   NULL ON CONFLICT IGNORE)"
+    );
+    db.execute("INSERT INTO t1 VALUES (3, NULL)", []).unwrap(); // ignored
+    assert_eq!(
+        db.query("SELECT count(*) FROM t1", []).unwrap()[0][0],
+        Value::Integer(1)
+    );
+    // ADD CHECK: existing rows first (NULL passes), then enforced by name.
+    assert_eq!(
+        err(&mut db, "ALTER TABLE t1 ADD CONSTRAINT nn CHECK (a != 1)"),
+        "constraint failed"
+    );
+    db.execute("ALTER TABLE t1 ADD CONSTRAINT nn CHECK (a > 0)", [])
+        .unwrap();
+    assert_eq!(
+        sql_of(&db, "t1"),
+        "CREATE TABLE t1(a, b NOT   NULL ON CONFLICT IGNORE, CONSTRAINT nn CHECK (a > 0))"
+    );
+    assert_eq!(
+        err(&mut db, "INSERT INTO t1 VALUES (-1, 5)"),
+        "CHECK constraint failed: nn"
+    );
+    assert_eq!(
+        err(&mut db, "ALTER TABLE t1 ADD CONSTRAINT nn CHECK (a < 9)"),
+        "constraint nn already exists"
+    );
+    assert_eq!(
+        err(&mut db, "ALTER TABLE t1 ADD CHECK (z >= 0)"),
+        "no such column: z"
+    );
+    assert_eq!(
+        err(&mut db, "ALTER TABLE t1 ALTER z SET NOT NULL"),
+        "no such column: z"
+    );
+    assert_eq!(
+        err(&mut db, "ALTER TABLE t1 DROP CONSTRAINT zz"),
+        "no such constraint: zz"
+    );
+    db.execute("CREATE TABLE t2(x, y CONSTRAINT ccc UNIQUE)", [])
+        .unwrap();
+    assert_eq!(
+        err(&mut db, "ALTER TABLE t2 DROP CONSTRAINT ccc"),
+        "constraint may not be dropped: ccc"
+    );
+    db.execute("CREATE VIEW v1 AS SELECT a FROM t1", [])
+        .unwrap();
+    assert_eq!(
+        err(&mut db, "ALTER TABLE v1 ALTER a SET NOT NULL"),
+        "cannot edit constraints of view \"v1\""
+    );
+}

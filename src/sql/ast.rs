@@ -29,6 +29,9 @@ pub enum Statement {
     Explain {
         inner: Box<Statement>,
         analyze: bool,
+        /// `EXPLAIN QUERY PLAN` (plan rows) rather than plain `EXPLAIN`
+        /// (SQLite's bytecode-listing shape).
+        query_plan: bool,
     },
     Pragma(PragmaStatement),
     Attach(AttachStatement),
@@ -302,6 +305,21 @@ pub enum AlterAction {
     RenameColumn { old: String, new: String },
     /// `DROP COLUMN <name>`
     DropColumn { name: String },
+    /// `DROP CONSTRAINT <name>`: removes a named CHECK / NOT NULL /
+    /// REFERENCES constraint from the stored CREATE TABLE text.
+    DropConstraint { name: String },
+    /// `ALTER [COLUMN] <column> DROP NOT NULL`.
+    DropNotNull { column: String },
+    /// `ALTER [COLUMN] <column> SET NOT NULL [ON CONFLICT ...]`; `text` is
+    /// the constraint as written (from NOT), spliced into the CREATE text.
+    SetNotNull { column: String, text: String },
+    /// `ADD [CONSTRAINT <name>] CHECK (<expr>) [ON CONFLICT ...]`; `text`
+    /// is the constraint as written.
+    AddCheck {
+        name: Option<String>,
+        expr: Expr,
+        text: String,
+    },
 }
 
 /// A qualified table name: `main.users` or just `users`.

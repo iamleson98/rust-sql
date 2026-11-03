@@ -507,7 +507,8 @@ impl Page {
 ///         18/19 (a reopen of a WAL-mode file comes up in WAL mode);
 ///         every other journal mode reverts to delete on reopen, also
 ///         like SQLite.
-/// 76..92  reserved (zeros)
+/// 76..80  PRAGMA default_cache_size (u32 LE, 0 = unset)
+/// 80..92  reserved (zeros)
 /// 92..96  version-valid-for (u32 LE)
 /// 96..100  SQLite version magic (we use our own version, e.g. 1)
 /// ```

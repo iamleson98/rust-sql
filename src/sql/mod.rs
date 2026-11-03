@@ -1,6 +1,7 @@
 //! SQL layer: lexer, parser, AST.
 
 pub mod ast;
+pub mod constraint_edit;
 pub mod lexer;
 pub mod parser;
 

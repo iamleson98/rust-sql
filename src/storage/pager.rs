@@ -912,6 +912,9 @@ pub struct Pager {
     /// Lives on the pager so both Database (api.rs) and the executor's
     /// static statement dispatcher can reach it through a shared &Pager.
     foreign_keys_enabled: AtomicBool,
+    /// PRAGMA count_changes (deprecated): DML through the query surface
+    /// returns one `rows inserted|updated|deleted` row.
+    count_changes: AtomicBool,
     /// True while a virtual-table content-shadow write is in flight (set
     /// by vtab DML, cleared at statement/transaction boundaries). When a
     /// ROLLBACK happens with this set, the engine marks every
@@ -2526,6 +2529,7 @@ impl Pager {
             skip_fsync: AtomicBool::new(skip_sync),
             memory_wal: AtomicBool::new(false),
             foreign_keys_enabled: AtomicBool::new(false),
+            count_changes: AtomicBool::new(false),
             vtab_shadow_writes: std::sync::atomic::AtomicBool::new(false),
             locking_mode_exclusive: AtomicBool::new(false),
             recursive_triggers_enabled: AtomicBool::new(false),
@@ -2982,6 +2986,15 @@ impl Pager {
             .store(FileHeader::user_version(&header), Ordering::Release);
         self.application_id
             .store(FileHeader::application_id(&header), Ordering::Release);
+        // A stored PRAGMA default_cache_size seeds the connection's cache
+        // size (sqlite3InitOne); an explicit PRAGMA cache_size wins.
+        let dflt_cache = u32::from_le_bytes(header[76..80].try_into().unwrap());
+        if dflt_cache != 0 && !self.cache_size_pinned.load(Ordering::Acquire) {
+            self.cache_capacity
+                .store(dflt_cache.max(1) as usize, Ordering::Relaxed);
+            self.cache_size_setting
+                .store(dflt_cache as i64, Ordering::Release);
+        }
 
         // Verify file size matches the claimed page count.
         let actual_size = self.store.read().len()?;
@@ -3143,6 +3156,45 @@ impl Pager {
         self.application_id.load(Ordering::Acquire)
     }
 
+    /// PRAGMA default_cache_size — header bytes 76..80 (0 = unset; SQLite
+    /// keeps it in header cookie 3).
+    pub fn default_cache_size(&self) -> Result<u32> {
+        let page = self.get_page(0)?;
+        let p = page.lock();
+        Ok(u32::from_le_bytes(p.data[76..80].try_into().unwrap()))
+    }
+
+    pub fn set_default_cache_size(&self, v: u32) -> Result<()> {
+        self.patch_header_u32(76, v)
+    }
+
+    /// DEFERRED INIT: write the cache-only page 0 of a 0-byte database
+    /// file to the main file in full (header counters refreshed) and
+    /// fsync — a raw header-field patch would instead extend the empty
+    /// file into a fragment that no longer opens.
+    fn materialize_new_page0(&self, page0: &PageRef) -> Result<()> {
+        let data = {
+            let mut p = page0.lock();
+            FileHeader::write(
+                &mut p.data,
+                self.page_size.load(Ordering::Acquire),
+                self.n_pages.load(Ordering::Acquire),
+                self.schema_cookie.load(Ordering::Acquire),
+            );
+            p.data[20..24]
+                .copy_from_slice(&self.freelist_head.load(Ordering::Acquire).to_le_bytes());
+            p.data[24..28]
+                .copy_from_slice(&self.freelist_count.load(Ordering::Acquire).to_le_bytes());
+            p.data.clone()
+        };
+        self.write_file_at(0, &data)?;
+        if !self.skip_fsync.load(Ordering::Acquire) {
+            self.store.read().sync_all(self.fullfsync())?;
+        }
+        self.is_new.store(false, Ordering::Release);
+        Ok(())
+    }
+
     /// Patch a 4-byte little-endian field inside page 0's file header,
     /// marking the page dirty so the next flush persists it. The backing
     /// image is patched with a DIRECT 4-byte write as well (a full flush
@@ -3157,6 +3209,9 @@ impl Pager {
             p.touch();
         }
         self.note_dirty(0);
+        if self.is_new.load(Ordering::Acquire) && !self.store.read().is_memory() {
+            return self.materialize_new_page0(&page);
+        }
         let bytes = v.to_le_bytes();
         self.write_file_at(offset as u64, &bytes)?;
         Ok(())
@@ -6053,26 +6108,7 @@ impl Pager {
         // would leave a recoverable-only-through-the-wal database that
         // the stale-sidecar delete on the next open would destroy.
         if self.is_new.load(Ordering::Acquire) {
-            let data = {
-                let mut p = page0.lock();
-                FileHeader::write(
-                    &mut p.data,
-                    self.page_size.load(Ordering::Acquire),
-                    self.n_pages.load(Ordering::Acquire),
-                    self.schema_cookie.load(Ordering::Acquire),
-                );
-                p.data[20..24]
-                    .copy_from_slice(&self.freelist_head.load(Ordering::Acquire).to_le_bytes());
-                p.data[24..28]
-                    .copy_from_slice(&self.freelist_count.load(Ordering::Acquire).to_le_bytes());
-                p.data.clone()
-            };
-            self.write_file_at(0, &data)?;
-            if !self.skip_fsync.load(Ordering::Acquire) {
-                self.store.read().sync_all(self.fullfsync())?;
-            }
-            self.is_new.store(false, Ordering::Release);
-            return Ok(());
+            return self.materialize_new_page0(&page0);
         }
         let mut raw = [0u8; 4];
         raw.copy_from_slice(&mode.to_le_bytes());
@@ -8458,6 +8494,14 @@ impl Pager {
     pub fn foreign_keys_enabled(&self) -> bool {
         self.foreign_keys_enabled
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn set_count_changes(&self, on: bool) {
+        self.count_changes.store(on, Ordering::Release);
+    }
+
+    pub fn count_changes(&self) -> bool {
+        self.count_changes.load(Ordering::Acquire)
     }
 
     /// Advisory PRAGMA locking_mode toggle — see the field docs.

@@ -129,11 +129,17 @@ fn static_explain_unchanged() {
         "detail: {}",
         detail
     );
-    // Plain EXPLAIN behaves the same as QUERY PLAN (SQLite parses both).
+    // Plain EXPLAIN: SQLite's bytecode-listing shape — Init, one Explain
+    // opcode per plan line (plan text in p4), Halt.
     let rows2 = db
         .query("EXPLAIN SELECT a FROM t WHERE b = 'x'", [])
         .unwrap();
-    assert_eq!(rows2.len(), rows.len());
+    assert_eq!(rows2.len(), rows.len() + 2);
+    assert_eq!(rows2[0].len(), 8);
+    assert_eq!(rows2[0][1].as_text(), "Init");
+    assert_eq!(rows2[1][1].as_text(), "Explain");
+    assert_eq!(rows2[1][5].as_text(), detail);
+    assert_eq!(rows2[rows2.len() - 1][1].as_text(), "Halt");
 }
 
 #[test]

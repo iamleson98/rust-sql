@@ -507,3 +507,24 @@ fn change_counters_are_per_connection() {
     assert_eq!((a.changes(), a.total_changes()), (3, 8));
     assert_eq!((b.changes(), b.total_changes()), (1, 1));
 }
+
+/// sidedelete.test 3.x: `UPDATE OR REPLACE t SET a=a+1` over a UNIQUE
+/// column. Row 1 -> 2 deletes row 2; the deleted row must not then move
+/// to 3 and delete row 3 (SQLite's loop finds it gone and skips it).
+#[test]
+fn replace_skips_rows_an_earlier_replace_deleted() {
+    for n in [3, 4, 7] {
+        let mut script = vec![
+            "CREATE TABLE t1(a PRIMARY KEY)".to_string(),
+            "CREATE TABLE t2(a UNIQUE, b)".to_string(),
+        ];
+        for i in 1..=n {
+            script.push(format!("INSERT INTO t1 VALUES ({i})"));
+            script.push(format!("INSERT INTO t2 VALUES ({i}, {i})"));
+        }
+        script.push("UPDATE OR REPLACE t1 SET a = a + 1".to_string());
+        script.push("UPDATE OR REPLACE t2 SET a = a + 1 WHERE b > 0".to_string());
+        let refs: Vec<&str> = script.iter().map(|s| s.as_str()).collect();
+        run(&["t1", "t2"], &refs);
+    }
+}
