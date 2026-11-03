@@ -49,9 +49,16 @@ fn run(tag: &str, script: &[&str]) {
     let c = rusqlite::Connection::open(dir.join("theirs.db")).unwrap();
     for sql in std::iter::once(&"PRAGMA foreign_keys = 1").chain(script) {
         let a = db.execute(sql, []).map_err(|e| e.sqlite_message());
-        let b = c.execute_batch(sql).map_err(|e| match e {
-            rusqlite::Error::SqliteFailure(_, Some(m)) => m,
-            e => e.to_string(),
+        let b = c.execute_batch(sql).map_err(|e| {
+            let m = match e {
+                rusqlite::Error::SqliteFailure(_, Some(m)) => m,
+                e => e.to_string(),
+            };
+            // Newer SQLite appends the statement and error offset.
+            match m.find(" in CREATE ") {
+                Some(i) => m[..i].to_string(),
+                None => m,
+            }
         });
         assert_eq!(a, b, "{tag}: outcome of {sql}");
         assert_eq!(
@@ -208,6 +215,104 @@ fn release_of_a_transaction_savepoint_checks_deferred_keys() {
             "COMMIT",
             "INSERT INTO node VALUES(4, NULL)",
             "RELEASE outer",
+        ],
+    );
+}
+
+/// VACUUM rebuilds the store; PRAGMA foreign_keys (a connection setting)
+/// must survive it — enforcement silently stopped after a VACUUM.
+#[test]
+fn foreign_keys_survive_vacuum() {
+    run(
+        "vacuum",
+        &[
+            "CREATE TABLE t1(a REFERENCES t2(c), b)",
+            "CREATE TABLE t2(c UNIQUE, b)",
+            "INSERT INTO t2 VALUES(1, 2)",
+            "INSERT INTO t1 VALUES(1, 2)",
+            "VACUUM",
+            "INSERT INTO t1 VALUES(9, 9)",
+            "DELETE FROM t2",
+        ],
+    );
+}
+
+/// A trigger WHEN clause may hold a subquery (e_fkey-31: the trigger
+/// supplies the missing parent before the statement's FK check).
+#[test]
+fn trigger_when_subquery_supplies_parent() {
+    run(
+        "when",
+        &[
+            "CREATE TABLE king(a, b, PRIMARY KEY(a))",
+            "CREATE TABLE prince(c REFERENCES king, d)",
+            "INSERT INTO prince VALUES(1, 2)",
+            "CREATE TRIGGER kt AFTER INSERT ON prince WHEN NOT EXISTS (SELECT a FROM king WHERE a = new.c) BEGIN INSERT INTO king VALUES(new.c, NULL); END",
+            "INSERT INTO prince VALUES(1, 2)",
+            "INSERT INTO prince VALUES(1, 3)",
+            "BEGIN",
+            "INSERT INTO prince VALUES(2, 3)",
+            "DROP TRIGGER kt",
+            "INSERT INTO prince VALUES(3, 4)",
+            "COMMIT",
+        ],
+    );
+}
+
+/// sqlite3CreateForeignKey's definition errors (regardless of the
+/// pragma) and ADD COLUMN's REFERENCES-with-default rule.
+#[test]
+fn foreign_key_definition_errors() {
+    run(
+        "defs",
+        &[
+            "CREATE TABLE p(x, y, PRIMARY KEY(x, y))",
+            "CREATE TABLE child1(a, b, FOREIGN KEY(a, b) REFERENCES p(c))",
+            "CREATE TABLE child2(a, b, FOREIGN KEY(a, c) REFERENCES p(c, d))",
+            "CREATE TABLE child3(a, b, FOREIGN KEY(c, b) REFERENCES t2(d))",
+            "CREATE TABLE c(jj REFERENCES p(x, y))",
+            "CREATE TABLE c2(a, b, FOREIGN KEY(a,b) REFERENCES p)",
+            "CREATE TABLE t1(a PRIMARY KEY)",
+            "CREATE TABLE t2(a, b)",
+            "ALTER TABLE t2 ADD COLUMN c REFERENCES t1",
+            "ALTER TABLE t2 ADD COLUMN d DEFAULT NULL REFERENCES t1",
+            "ALTER TABLE t2 ADD COLUMN e REFERENCES t1 DEFAULT 1",
+            "INSERT INTO t2(a, b) VALUES(1, 2)",
+            "ALTER TABLE t2 ADD COLUMN f REFERENCES t1 DEFAULT 1",
+            "ALTER TABLE t2 ADD COLUMN g DEFAULT NULL REFERENCES t1",
+            "PRAGMA foreign_keys = 0",
+            "ALTER TABLE t2 ADD COLUMN h REFERENCES t1 DEFAULT 2",
+        ],
+    );
+}
+
+/// NEW / OLD inside a trigger body's subqueries (scalar, EXISTS, IN,
+/// FROM-subquery, JOIN ON) bind to the trigger row — they were left
+/// unbound, so the subquery saw NULL.
+#[test]
+fn trigger_new_old_inside_subqueries() {
+    run(
+        "subq",
+        &[
+            "CREATE TABLE src(k, v)",
+            "CREATE TABLE log(a, b, c, d, e)",
+            "INSERT INTO src VALUES(1, 'one'), (2, 'two'), (3, 'three')",
+            "CREATE TABLE t(x, y)",
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN \
+               INSERT INTO log VALUES( \
+                 (SELECT v FROM src WHERE k = new.x), \
+                 EXISTS (SELECT 1 FROM src WHERE k = new.y), \
+                 new.x IN (SELECT k FROM src WHERE k <> new.y), \
+                 (SELECT count(*) FROM (SELECT * FROM src WHERE k <= new.x)), \
+                 (SELECT s2.v FROM src s1 JOIN src s2 ON s2.k = s1.k + new.y WHERE s1.k = new.x)); \
+             END",
+            "CREATE TRIGGER td AFTER DELETE ON t BEGIN \
+               UPDATE src SET v = (SELECT v || '!' FROM src WHERE k = old.x) WHERE k = old.y; \
+             END",
+            "INSERT INTO t VALUES(1, 1)",
+            "INSERT INTO t VALUES(2, 9)",
+            "INSERT INTO t VALUES(3, 1)",
+            "DELETE FROM t WHERE x = 1",
         ],
     );
 }

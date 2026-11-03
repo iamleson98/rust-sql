@@ -239,7 +239,11 @@ pub(crate) fn fire_triggers(
         // WHEN guard: evaluate with NEW/OLD bound as a combined row
         // (with the channel armed — the guard may read attached tables).
         if let Some(w) = &trig.when_clause {
-            let fires = eval_with_new_old(w, new_row, old_row, col_names, ctx)?;
+            let fires = if crate::executor::expr::contains_subquery(w) {
+                eval_when_with_subqueries(w, new_row, old_row, col_names, ctx)?
+            } else {
+                eval_with_new_old(w, new_row, old_row, col_names, ctx)?
+            };
             if !fires {
                 if armed_channel {
                     ctx.foreign = None;
@@ -476,6 +480,48 @@ fn eval_with_new_old(
     crate::executor::eval_row_where(expr, &combined, &names, &ctx.params, &ctx.named_params)
 }
 
+/// A WHEN guard holding a subquery (`WHEN NOT EXISTS (SELECT ...)`): run
+/// as `SELECT <guard>` with NEW / OLD bound, through the planner — the
+/// row evaluator cannot run subqueries. NULL / false = does not fire.
+fn eval_when_with_subqueries(
+    expr: &Expr,
+    new_row: Option<&Row>,
+    old_row: Option<&Row>,
+    col_names: &[String],
+    ctx: &mut ExecContext<'_>,
+) -> crate::error::Result<bool> {
+    let select = crate::sql::ast::SelectStatement {
+        with: None,
+        body: crate::sql::ast::SelectBody::Simple(crate::sql::ast::SimpleSelect {
+            distinct: false,
+            columns: vec![crate::sql::ast::ResultColumn::Expr {
+                expr: expr.clone(),
+                alias: None,
+            }],
+            from: None,
+            where_clause: None,
+            group_by: Vec::new(),
+            having: None,
+            window: Vec::new(),
+        }),
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+    };
+    let mut stmt = Statement::Select(select);
+    substitute_new_old(&mut stmt, new_row, old_row, col_names)?;
+    let Statement::Select(sel) = &stmt else {
+        unreachable!()
+    };
+    let _corr = crate::executor::CorrGuard::install(ctx as *mut _);
+    let res = crate::executor::exec_select_statement(sel, ctx, None, false)?;
+    Ok(res
+        .rows
+        .first()
+        .and_then(|r| r.first())
+        .is_some_and(|v| v.is_truthy()))
+}
+
 /// True when the table has at least one trigger for this event (lets hot
 /// DML paths skip all trigger work with a single catalog lookup).
 #[inline]
@@ -597,13 +643,20 @@ fn rewrite_new_old(
             }
             Expr::In { expr, source, .. } => {
                 walk_expr(expr, lookup)?;
-                if let crate::sql::ast::InSource::List(list) = source {
-                    for item in std::sync::Arc::make_mut(list).iter_mut() {
-                        walk_expr(item, lookup)?;
+                match source {
+                    crate::sql::ast::InSource::List(list) => {
+                        for item in std::sync::Arc::make_mut(list).iter_mut() {
+                            walk_expr(item, lookup)?;
+                        }
                     }
+                    crate::sql::ast::InSource::Subquery(sel) => walk_select(sel, lookup)?,
+                    _ => {}
                 }
                 Ok(())
             }
+            // NEW / OLD are visible inside subqueries too (a correlated
+            // reference to the trigger row).
+            Expr::Subquery(sel) | Expr::Exists(sel) => walk_select(sel, lookup),
             Expr::Like {
                 expr,
                 pattern,
@@ -673,6 +726,9 @@ fn rewrite_new_old(
                         walk_expr(expr, lookup)?;
                     }
                 }
+                if let Some(f) = s.from.as_mut() {
+                    walk_from(f, lookup)?;
+                }
                 if let Some(w) = s.where_clause.as_mut() {
                     walk_expr(w, lookup)?;
                 }
@@ -691,13 +747,54 @@ fn rewrite_new_old(
         }
     }
 
+    fn walk_from(
+        te: &mut crate::sql::ast::TableExpression,
+        lookup: &dyn Fn(&str, &str) -> Option<Expr>,
+    ) -> crate::error::Result<()> {
+        use crate::sql::ast::{JoinConstraint, TableExpression as T};
+        match te {
+            T::Subquery { select, .. } => walk_select(select, lookup),
+            T::Join {
+                left,
+                right,
+                constraint,
+                ..
+            } => {
+                walk_from(left, lookup)?;
+                walk_from(right, lookup)?;
+                if let JoinConstraint::On(e) = constraint {
+                    walk_expr(e, lookup)?;
+                }
+                Ok(())
+            }
+            T::Function { args, .. } => {
+                for a in args {
+                    walk_expr(a, lookup)?;
+                }
+                Ok(())
+            }
+            T::Table { .. } => Ok(()),
+        }
+    }
+
     fn walk_select(
         sel: &mut crate::sql::ast::SelectStatement,
         lookup: &dyn Fn(&str, &str) -> Option<Expr>,
     ) -> crate::error::Result<()> {
+        if let Some(w) = sel.with.as_mut() {
+            for cte in w.ctes.iter_mut() {
+                walk_select(&mut cte.select, lookup)?;
+            }
+        }
         walk_body(&mut sel.body, lookup)?;
         for t in sel.order_by.iter_mut() {
             walk_expr(&mut t.expr, lookup)?;
+        }
+        if let Some(l) = sel.limit.as_mut() {
+            walk_expr(l, lookup)?;
+        }
+        if let Some(o) = sel.offset.as_mut() {
+            walk_expr(o, lookup)?;
         }
         Ok(())
     }

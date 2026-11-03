@@ -369,6 +369,20 @@ pub(crate) struct XReadScope {
 /// pragmas do not; `BEGIN IMMEDIATE/EXCLUSIVE` and every write do. The
 /// empty string is the stepped / RETURNING DML callers (always writes).
 fn stmt_takes_write_role(sql: &str) -> bool {
+    // The leading keyword decides almost every statement; DML (the hot
+    // per-statement case) answers from it without the word iterator.
+    let head = sql.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == ';');
+    let kw_len = head
+        .bytes()
+        .position(|b| !b.is_ascii_alphabetic())
+        .unwrap_or(head.len());
+    let kw = &head.as_bytes()[..kw_len];
+    if ["INSERT", "UPDATE", "DELETE", "REPLACE"]
+        .iter()
+        .any(|k| kw.eq_ignore_ascii_case(k.as_bytes()))
+    {
+        return true;
+    }
     let mut words = sql
         .split(|c: char| c.is_whitespace() || c == ';' || c == '(' || c == '=')
         .filter(|w| !w.is_empty());
@@ -4550,6 +4564,7 @@ impl Database {
         // the rebuild published. Idempotent with the file arm's earlier
         // retire; a memory pager's close-out is empty anyway.
         self.pager.retire();
+        new.pager.adopt_connection_flags(&self.pager);
         std::mem::swap(&mut self.pager, &mut new.pager);
         std::mem::swap(&mut self.path, &mut new.path);
         let catalog = std::mem::replace(&mut *new.catalog, Catalog::new());
@@ -5935,32 +5950,35 @@ impl Database {
         // Pre-statement dirty-set mark for the autocommit failure restore
         // below (the same DELTA gate the general path uses).
         let fast_dirty_at_start = self.pager.dirty_set_marked();
+        // Trigger programs (and their WHEN guards) may run subqueries:
+        // the correlated-subquery bridge needs this statement's context.
+        let corr_guard = crate::executor::CorrGuard::install(&mut ctx as *mut _);
         let result =
-            crate::executor::fast_insert_literal_rows(&mut ctx, &table, &col_indices, values).map(
-                |(inserted, root, max_rowid)| {
-                    // Seed the cross-statement INSERT chain (eligibility
-                    // is checked inside; plain tables only). The chain
-                    // serves the NEXT same-shape statement; this one paid
-                    // the cold-path setup.
-                    if explicit_rowid {
-                        return inserted;
-                    }
-                    let table_key = Arc::as_ptr(&table) as usize;
-                    let leaf_hint = ctx
-                        .table_append_hint
-                        .filter(|(k, _)| *k == table_key)
-                        .map(|(_, leaf)| leaf);
-                    self.try_build_insert_chain(
-                        &stmt_columns,
-                        &table,
-                        &col_indices,
-                        root,
-                        max_rowid,
-                        leaf_hint,
-                    );
-                    inserted
-                },
+            crate::executor::fast_insert_literal_rows(&mut ctx, &table, &col_indices, values);
+        drop(corr_guard);
+        let result = result.map(|(inserted, root, max_rowid)| {
+            // Seed the cross-statement INSERT chain (eligibility
+            // is checked inside; plain tables only). The chain
+            // serves the NEXT same-shape statement; this one paid
+            // the cold-path setup.
+            if explicit_rowid {
+                return inserted;
+            }
+            let table_key = Arc::as_ptr(&table) as usize;
+            let leaf_hint = ctx
+                .table_append_hint
+                .filter(|(k, _)| *k == table_key)
+                .map(|(_, leaf)| leaf);
+            self.try_build_insert_chain(
+                &stmt_columns,
+                &table,
+                &col_indices,
+                root,
+                max_rowid,
+                leaf_hint,
             );
+            inserted
+        });
 
         // ── Statement journal (row-granularity statement atomicity — see
         // the general path's hook): a FAILED fast-path INSERT leaves no
@@ -6805,15 +6823,16 @@ impl Database {
                 self.refresh_foreign_roots_and_schema()?;
             }
         }
-        let mut words = sql.split_whitespace();
-        if words
-            .next()
-            .is_some_and(|w| w.eq_ignore_ascii_case("BEGIN"))
-            && words
+        let head = sql.trim_start().as_bytes();
+        if head.len() >= 5 && head[..5].eq_ignore_ascii_case(b"BEGIN") {
+            let mut words = sql.split_whitespace();
+            words.next();
+            if words
                 .next()
                 .is_some_and(|w| w.eq_ignore_ascii_case("EXCLUSIVE"))
-        {
-            self.pager.peer_take_exclusive()?;
+            {
+                self.pager.peer_take_exclusive()?;
+            }
         }
         Ok(())
     }
@@ -16126,6 +16145,28 @@ impl Database {
                 } else {
                     Value::Null
                 };
+                // sqlite3AlterFinishAddColumn: with foreign keys on, a
+                // REFERENCES column may only default to a literal NULL
+                // (checked only when the table holds rows).
+                let references = column
+                    .constraints
+                    .iter()
+                    .any(|c| matches!(c, crate::sql::ast::ColumnConstraint::References { .. }));
+                let literal_null_default = column.constraints.iter().all(|c| match c {
+                    crate::sql::ast::ColumnConstraint::Default(e) => {
+                        matches!(e, crate::sql::ast::Expr::Literal(Value::Null))
+                    }
+                    _ => true,
+                });
+                if references
+                    && !literal_null_default
+                    && ctx.pager.foreign_keys_enabled()
+                    && Btree::new(ctx.pager, ctx.table_root(&table), false).count_rows()? > 0
+                {
+                    return Err(Error::semantic(
+                        "Cannot add a REFERENCES column with non-NULL default value",
+                    ));
+                }
 
                 // Rewrite the CREATE TABLE SQL to include the new column.
                 let new_sql = rewrite_create_table_add_column(&table.create_sql, &column);
@@ -18203,6 +18244,7 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
     let v = match name.as_str() {
         "foreign_keys" => Value::Integer(if pager.foreign_keys_enabled() { 1 } else { 0 }),
         "count_changes" => Value::Integer(i64::from(pager.count_changes())),
+        "recursive_triggers" => Value::Integer(i64::from(pager.recursive_triggers_enabled())),
         "defer_foreign_keys" => Value::Integer(i64::from(pager.defer_foreign_keys())),
         // The min-rows threshold (0 = parallel scans disabled) — SQLite
         // has no equivalent pragma; the value round-trips the setting.

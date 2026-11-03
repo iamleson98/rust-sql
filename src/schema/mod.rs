@@ -1820,6 +1820,13 @@ pub fn build_table(
                 deferred,
             } = constraint
             {
+                // sqlite3CreateForeignKey on a column-level REFERENCES.
+                if rc.len() > 1 {
+                    return Err(Error::semantic(format!(
+                        "foreign key on {} should reference only one column of table {}",
+                        col.name, rt
+                    )));
+                }
                 foreign_keys.push(ForeignKeyClause {
                     columns: vec![i],
                     ref_table: rt.clone(),
@@ -1841,6 +1848,12 @@ pub fn build_table(
             deferred,
         } = c
         {
+            if !ref_columns.is_empty() && ref_columns.len() != cols.len() {
+                return Err(Error::semantic(
+                    "number of columns in foreign key does not match the number of \
+                     columns in the referenced table",
+                ));
+            }
             let mut child_idx = Vec::with_capacity(cols.len());
             for cn in cols {
                 match table_columns
@@ -1850,7 +1863,7 @@ pub fn build_table(
                     Some(idx) => child_idx.push(idx),
                     None => {
                         return Err(Error::semantic(format!(
-                            "unknown column {} in FOREIGN KEY definition",
+                            "unknown column \"{}\" in foreign key definition",
                             cn
                         )))
                     }

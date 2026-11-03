@@ -8536,6 +8536,27 @@ impl Pager {
         self.case_sensitive_like.load(Ordering::Relaxed)
     }
 
+    /// Carry the connection-level PRAGMA flags over to a rebuilt store
+    /// (VACUUM swaps the pager; foreign_keys and friends belong to the
+    /// connection, not the file).
+    pub fn adopt_connection_flags(&self, from: &Pager) {
+        let copy = |dst: &AtomicBool, src: &AtomicBool| {
+            dst.store(src.load(Ordering::Acquire), Ordering::Release);
+        };
+        copy(&self.foreign_keys_enabled, &from.foreign_keys_enabled);
+        copy(&self.count_changes, &from.count_changes);
+        copy(&self.case_sensitive_like, &from.case_sensitive_like);
+        copy(&self.writable_schema, &from.writable_schema);
+        copy(&self.defer_foreign_keys, &from.defer_foreign_keys);
+        copy(&self.locking_mode_exclusive, &from.locking_mode_exclusive);
+        copy(
+            &self.recursive_triggers_enabled,
+            &from.recursive_triggers_enabled,
+        );
+        copy(&self.fullfsync, &from.fullfsync);
+        copy(&self.checkpoint_fullfsync, &from.checkpoint_fullfsync);
+    }
+
     pub fn set_writable_schema(&self, on: bool) {
         self.writable_schema.store(on, Ordering::Release);
     }
