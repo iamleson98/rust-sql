@@ -1580,10 +1580,14 @@ pub fn build_table(
                 "INT" | "INTEGER" | "TEXT" | "REAL" | "BLOB" | "ANY"
             );
             if !ok {
-                return Err(Error::semantic(format!(
-                    "unknown datatype for {}.{}: \"{}\"",
-                    name, col.name, col.type_name
-                )));
+                return Err(Error::semantic(if t.is_empty() {
+                    format!("missing datatype for {}.{}", name, col.name)
+                } else {
+                    format!(
+                        "unknown datatype for {}.{}: \"{}\"",
+                        name, col.name, col.type_name
+                    )
+                }));
             }
         }
         let affinity = if col.type_name.is_empty() {

@@ -237,11 +237,17 @@ fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64, cat: &
             } else {
                 ""
             };
+            // A WITHOUT ROWID table's key is its PRIMARY KEY b-tree.
+            let using = if index.origin == crate::schema::IndexOrigin::WithoutRowidPk {
+                "PRIMARY KEY".to_string()
+            } else {
+                format!("INDEX {}", index.name)
+            };
             push_row(
                 parent,
                 rows,
                 next_id,
-                format!("SEARCH {a} USING INDEX {} ({lo}{join}{hi})", index.name),
+                format!("SEARCH {a} USING {using} ({lo}{join}{hi})"),
             );
         }
         Plan::Values { .. } => {
@@ -459,6 +465,11 @@ fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64, cat: &
         Plan::NestedSelect { .. } => {
             // Planned at run time (its CTEs materialize first).
             push_row(parent, rows, next_id, "SCAN SUBQUERY WITH CTE".to_string());
+        }
+        // The LIKE optimization's BLOB twin is SQLite's second pass of
+        // ONE loop (iLikeRepCntr): one SEARCH line.
+        Plan::Union { left, right, .. } if is_like_blob_twin(left, right) => {
+            walk(left, parent, rows, next_id, cat);
         }
         Plan::Union { left, right, .. } => {
             walk(left, parent, rows, next_id, cat);
@@ -793,6 +804,22 @@ fn covering_projection(
                     .iter()
                     .all(|i| *i == crate::storage::row_codec::ROWID_PROJ)
         }
+        _ => false,
+    }
+}
+
+/// `IndexRange ∪ IndexRange` over one index whose right side starts at
+/// a BLOB bound: the planner's LIKE / GLOB text+blob range pair.
+fn is_like_blob_twin(left: &Plan, right: &Plan) -> bool {
+    match (left, right) {
+        (
+            Plan::IndexRange { index: li, .. },
+            Plan::IndexRange {
+                index: ri,
+                start: Some((Expr::Literal(Value::Blob(_)), _)),
+                ..
+            },
+        ) => li.name == ri.name,
         _ => false,
     }
 }

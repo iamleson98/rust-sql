@@ -4727,6 +4727,10 @@ fn keyword_is_fallback_ident(k: &str) -> bool {
             | "MATERIALIZED"
             | "REINDEX"
             | "RENAME"
+            // Plain identifiers in SQLite's grammar, recognized only by
+            // position (`) STRICT`, `AS (..) STORED`).
+            | "STRICT"
+            | "STORED"
             // parse.y's %fallback ID list also has CAST, COLUMNKW,
             // LIKE_KW (LIKE / GLOB / REGEXP), PRAGMA, RAISE, CURRENT,
             // CTIME_KW (CURRENT_DATE / _TIME / _TIMESTAMP), IF and TEMP

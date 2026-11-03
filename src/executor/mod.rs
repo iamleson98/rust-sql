@@ -26412,7 +26412,7 @@ pub(crate) fn validate_strict_row(table: &Table, row: &mut [Value]) -> Result<()
         };
         if !allowed {
             return Err(Error::semantic(format!(
-                "cannot store {} value in {} column {}.{} (type mismatch)",
+                "cannot store {} value in {} column {}.{}",
                 kind, declared, table.name, col.name
             )));
         }

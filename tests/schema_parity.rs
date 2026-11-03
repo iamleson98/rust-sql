@@ -627,7 +627,7 @@ fn pragma_compile_options_shape() {
         assert!(matches!(r[0], Value::Text(_)));
     }
     // The same list backs sqlite_compileoption_get.
-    let first = db.query("SELECT sqlite_compileoption_get(1)", []).unwrap();
+    let first = db.query("SELECT sqlite_compileoption_get(0)", []).unwrap();
     let opts_first = rows.first().cloned();
     assert_eq!(Some(first.into_iter().next().unwrap()), opts_first);
 }

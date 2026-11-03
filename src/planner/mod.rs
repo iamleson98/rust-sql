@@ -6147,13 +6147,13 @@ fn extract_range(expr: &Expr) -> Option<(String, String, Expr)> {
 /// `col LIKE 'lit%'`, `col GLOB 'lit*'`, or the wildcard-free exact forms
 /// `col LIKE 'lit'` / `col GLOB 'lit'`. Returns
 /// (column_name, prefix, is_exact, is_glob) — `None` for anything else
-/// (negated, ESCAPE clause, non-literal pattern, embedded wildcards,
-/// LIKE with a case-sensitive escape... conservative by design).
+/// (negated, non-literal pattern, embedded wildcards — conservative by
+/// design).
 ///
 /// Only the TRAILING wildcard is allowed: an embedded `%` / `_` (LIKE) or
-/// `*` / `?` (GLOB) makes the prefix non-constant. LIKE additionally
-/// treats backslash as a plain character (no escape unless ESCAPE is
-/// given, and an ESCAPE clause disqualifies the conjunct here).
+/// `*` / `?` (GLOB) makes the prefix non-constant. A LIKE ESCAPE
+/// character turns the next pattern character into a literal of the
+/// prefix (backslash is plain unless it is the ESCAPE).
 fn extract_like_prefix(expr: &Expr) -> Option<(String, String, bool, bool)> {
     let Expr::Like {
         op,
@@ -6165,40 +6165,58 @@ fn extract_like_prefix(expr: &Expr) -> Option<(String, String, bool, bool)> {
     else {
         return None;
     };
-    if escape.is_some() {
-        return None; // escaped metacharacters: the prefix isn't literal
-    }
     let glob = matches!(op, LikeOp::Glob);
     if !matches!(op, LikeOp::Like | LikeOp::Glob) {
         return None;
     }
+    // An ESCAPE character makes the next pattern character literal
+    // (isLikeOrGlob honors it); it must be a one-character literal.
+    let esc: Option<char> = match escape.as_deref() {
+        None => None,
+        Some(_) if glob => return None,
+        Some(Expr::Literal(Value::Text(t))) => {
+            let mut it = t.as_str().chars();
+            match (it.next(), it.next()) {
+                (Some(c), None) => Some(c),
+                _ => return None,
+            }
+        }
+        Some(_) => return None,
+    };
     let col = column_name_of(expr.as_ref())?;
     let Expr::Literal(Value::Text(pat)) = pattern.as_ref() else {
         return None;
     };
-    let p = pat.as_str();
     let (wc_any, wc_one) = if glob { ('*', '?') } else { ('%', '_') };
-    let body = if let Some(rest) = p.strip_suffix(wc_any) {
-        rest
-    } else {
-        p
-    };
-    let exact = !p.ends_with(wc_any);
-    // GLOB's `[...]` character class is a wildcard too (`[a-c]*` was taken
-    // as the LITERAL prefix "[a-c" — the range found nothing), and a NUL
-    // ends the C-string pattern early: neither has a literal prefix.
-    // An EMPTY prefix (`LIKE '%'`, `LIKE ''`) has no range to seek:
-    // SQLite's isLikeOrGlob requires at least one literal character.
-    if body.is_empty()
-        || body.contains(wc_any)
-        || body.contains(wc_one)
-        || (glob && body.contains('['))
-        || body.contains('\0')
-    {
+    // The literal prefix, then nothing or ONE trailing `%` / `*`. GLOB's
+    // `[...]` class is a wildcard too, and a NUL ends the C-string
+    // pattern early: neither has a literal prefix. An EMPTY prefix has
+    // no range to seek (isLikeOrGlob wants one literal character).
+    let chars: Vec<char> = pat.as_str().chars().collect();
+    let mut prefix = String::new();
+    let mut exact = true;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if Some(c) == esc {
+            prefix.push(*chars.get(i + 1)?);
+            i += 2;
+            continue;
+        }
+        if c == wc_any && i + 1 == chars.len() {
+            exact = false;
+            break;
+        }
+        if c == wc_any || c == wc_one || (glob && c == '[') || c == '\0' {
+            return None;
+        }
+        prefix.push(c);
+        i += 1;
+    }
+    if prefix.is_empty() || prefix.contains('\0') {
         return None;
     }
-    // A GLOB/LIKE with no trailing wildcard is an exact-match form.
-    Some((col.to_string(), body.to_string(), exact, glob))
+    Some((col.to_string(), prefix, exact, glob))
 }
 
 /// Soundness gate for the LIKE/GLOB prefix range (see try_index_range):
@@ -6215,10 +6233,14 @@ fn like_prefix_is_sound(
     let Some(col_idx) = table.find_column(&index_first_col.name) else {
         return false;
     };
-    // TEXT affinity only: numeric values coerce to text for LIKE, but
-    // their NUMERIC index keys order differently than their text forms —
-    // the range would under-select (SQLite's own rule).
-    if table.columns[col_idx].affinity != crate::types::Affinity::Text {
+    // Numeric values coerce to text for LIKE, but their NUMERIC index
+    // keys order apart from text: on a non-TEXT column the range is sound
+    // only while no number's text could start with the prefix — SQLite's
+    // isLikeOrGlob test: neither the prefix nor the prefix with its last
+    // character bumped may read as a number (a lone `-` counts).
+    if table.columns[col_idx].affinity != crate::types::Affinity::Text
+        && like_prefix_may_be_numeric(prefix)
+    {
         return false;
     }
     if glob {
@@ -6235,6 +6257,52 @@ fn like_prefix_is_sound(
         return true;
     }
     index_first_col.collation.eq_ignore_ascii_case("NOCASE")
+}
+
+/// isLikeOrGlob's numeric guard for a non-TEXT column (see
+/// `like_prefix_is_sound`).
+fn like_prefix_may_be_numeric(prefix: &str) -> bool {
+    if prefix == "-" || sqlite_atof_complete(prefix) {
+        return true;
+    }
+    prefix_successor(prefix).is_some_and(|s| sqlite_atof_complete(&s))
+}
+
+/// sqlite3AtoF's "the whole text is a number" (result > 0): optional
+/// spaces, a sign, digits with an optional fraction (at least one digit
+/// in all), an optional exponent, optional trailing spaces.
+fn sqlite_atof_complete(s: &str) -> bool {
+    let b = s.trim_matches(|c: char| c.is_ascii_whitespace()).as_bytes();
+    let mut i = 0;
+    if matches!(b.first(), Some(b'+' | b'-')) {
+        i += 1;
+    }
+    let digits = |i: &mut usize| {
+        let st = *i;
+        while *i < b.len() && b[*i].is_ascii_digit() {
+            *i += 1;
+        }
+        *i - st
+    };
+    let mut n = digits(&mut i);
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        n += digits(&mut i);
+    }
+    if n == 0 {
+        return false;
+    }
+    if matches!(b.get(i), Some(b'e' | b'E')) {
+        let mut j = i + 1;
+        if matches!(b.get(j), Some(b'+' | b'-')) {
+            j += 1;
+        }
+        if digits(&mut j) == 0 {
+            return false;
+        }
+        i = j;
+    }
+    i == b.len()
 }
 
 /// Smallest string strictly greater than every string starting with

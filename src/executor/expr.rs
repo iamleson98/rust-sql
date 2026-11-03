@@ -4825,33 +4825,36 @@ pub fn call_scalar(name: &str, args: &[Value]) -> Result<Value> {
             Some(v) => Value::Text(soundex(&v.as_text()).into()),
         },
         "sqlite_compileoption_get" => {
-            // 1-BASED index (SQLite: N=1 returns the first option), so
-            // PRAGMA compile_options' row order and get() agree.
-            let n = args.first().map(|v| v.as_integer()).unwrap_or(0);
-            Value::Text(
-                compile_options()
-                    .get((n - 1).max(0) as usize)
-                    .map(|s| (*s).into())
-                    .unwrap_or_default(),
-            )
+            // 0-based; past either end is NULL (sqlite3_compileoption_get).
+            let n = args.first().map(|v| v.as_integer()).unwrap_or(-1);
+            usize::try_from(n)
+                .ok()
+                .and_then(|i| compile_options().get(i))
+                .map_or(Value::Null, |s| Value::Text((*s).into()))
         }
         "sqlite_compileoption_used" => {
-            let name = args.first().map(|v| v.as_text());
-            let name =
-                match name {
-                    Some(n) if !n.is_empty() => n,
-                    _ => return Err(Error::Runtime(
-                        "argument to sqlite_compileoption_used() must be a positive length string"
-                            .to_string(),
-                    )),
-                };
-            let hit = compile_options().iter().any(|o| {
-                o.split_once('=')
-                    .map(|(k, _)| k)
-                    .unwrap_or(o)
-                    .eq_ignore_ascii_case(&name)
-            });
-            Value::Integer(if hit { 1 } else { 0 })
+            // sqlite3_compileoption_used: an optional SQLITE_ prefix,
+            // then a case-insensitive prefix of an option that ends where
+            // the option's identifier does (`THREADSAFE`, `THREADSAFE=1`).
+            match args.first() {
+                None | Some(Value::Null) => Value::Null,
+                Some(v) => {
+                    let t = v.as_text();
+                    let name = match t.get(..7) {
+                        Some(p) if p.eq_ignore_ascii_case("SQLITE_") => &t[7..],
+                        _ => &t[..],
+                    };
+                    let n = name.len();
+                    let hit = compile_options().iter().any(|o| {
+                        o.len() >= n
+                            && o.as_bytes()[..n].eq_ignore_ascii_case(name.as_bytes())
+                            && !o.as_bytes().get(n).is_some_and(|&c| {
+                                c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80
+                            })
+                    });
+                    Value::Integer(i64::from(hit))
+                }
+            }
         }
         // TRUE() / FALSE() — SQLite 3.23+ boolean literals.
         "true" => Value::Integer(1),
