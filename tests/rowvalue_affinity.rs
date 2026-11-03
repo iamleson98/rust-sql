@@ -21,7 +21,17 @@ fn run_both(setup: &[&str], queries: &[&str]) {
             .query(q, [])
             .unwrap()
             .iter()
-            .map(|r| format!("{:?}", r.iter().map(|v| v.to_string()).collect::<Vec<_>>()))
+            .map(|r| {
+                format!(
+                    "{:?}",
+                    r.iter()
+                        .map(|v| match v {
+                            rustqlite::Value::Null => "NULL".to_string(),
+                            v => v.to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                )
+            })
             .collect();
         let mut stmt = con.prepare(q).unwrap();
         let n = stmt.column_count();
@@ -78,4 +88,23 @@ fn correlated_rowid_and_blob_affinity_match_sqlite() {
         "SELECT rowid FROM d1",
     ];
     run_both(&setup, &queries);
+}
+
+/// A compound's ORDER BY sorts under the result column's collation —
+/// the leftmost arm's declared NOCASE here (selectA.test 2.x).
+#[test]
+fn compound_order_by_uses_column_collation() {
+    run_both(
+        &[
+            "CREATE TABLE t1(a, b, c COLLATE NOCASE)",
+            "CREATE TABLE t2(x, y, z COLLATE NOCASE)",
+            "INSERT INTO t1 VALUES(1,'a','a'),(9.9,'b','B'),(NULL,'C','c'),('hello','d','D')",
+            "INSERT INTO t2 VALUES(NULL,'U','u'),('mad','Z','z'),(-23,'Y','y')",
+        ],
+        &[
+            "SELECT a, b, c FROM t1 UNION ALL SELECT x, y, z FROM t2 ORDER BY c, b, a",
+            "SELECT a, b, c FROM t1 UNION SELECT x, y, z FROM t2 ORDER BY 3 DESC",
+            "SELECT c FROM t1 EXCEPT SELECT z FROM t2 ORDER BY c",
+        ],
+    );
 }

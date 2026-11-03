@@ -8611,6 +8611,27 @@ fn exec_sort(ctx: &mut ExecContext<'_>, input: &Plan, terms: &[OrderTerm]) -> Re
         }
     }
 
+    // A compound's ORDER BY ordinal sorts under that result column's
+    // collation (multiSelectOrderByKeyInfo: the leftmost arm's, else a
+    // later arm's — `ORDER BY c` over NOCASE columns is case-blind).
+    let compound_colls: Vec<Option<String>> = if matches!(
+        input,
+        Plan::Union { .. } | Plan::Intersect { .. } | Plan::Except { .. }
+    ) {
+        plan_output_collations(input)
+    } else {
+        Vec::new()
+    };
+    let ordinal_coll = |e: &Expr| -> Option<String> {
+        match e {
+            Expr::Literal(Value::Integer(k)) if *k >= 1 => {
+                compound_colls.get(*k as usize - 1).cloned().flatten()
+            }
+            _ => None,
+        }
+    };
+    let any_ordinal_coll = terms.iter().any(|t| ordinal_coll(&t.expr).is_some());
+
     // ---- MATERIALIZED-ROW parallel split ---------------------------------
     // The sort's input is not a bare scan (a compound body, a subquery,
     // a join, ...) but it IS materialized now: when every term compiles
@@ -8618,7 +8639,7 @@ fn exec_sort(ctx: &mut ExecContext<'_>, input: &Plan, terms: &[OrderTerm]) -> Re
     // strict (keys, input-index) order reproduces the serial stable
     // sort bit-for-bit (see parallel.rs for the proof) — with the key
     // values evaluated ONCE per row instead of twice per comparison.
-    if inner.rows.len() >= 2 {
+    if inner.rows.len() >= 2 && !any_ordinal_coll {
         if let Some(mterms) =
             crate::executor::parallel::materialized_sort_terms(terms, &columns, ctx.params.len())
         {
@@ -8646,7 +8667,7 @@ fn exec_sort(ctx: &mut ExecContext<'_>, input: &Plan, terms: &[OrderTerm]) -> Re
         .iter()
         .map(|t| match &t.expr {
             Expr::Collate { collation, .. } => crate::plugin::lookup_collation(collation),
-            _ => None,
+            e => ordinal_coll(e).and_then(|c| crate::plugin::lookup_collation(&c)),
         })
         .collect();
     let mut order: Vec<usize> = (0..inner.rows.len()).collect();
