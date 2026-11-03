@@ -1497,7 +1497,16 @@ fn compile_predicate_at(
             // converted too (`int_col IN (text_col)` compares numerically,
             // `text_col IN (int_col)` as text), unlike `=` where a column
             // operand keeps its own affinity.
-            if let Some(a) = table.columns.get(col).map(|c| c.affinity) {
+            // A subquery column's own affinity joins in (exprINAffinity's
+            // sqlite3CompareAffinity): TEXT against a BLOB-affinity column
+            // compares raw — no member conversion at all.
+            let raw = rhs_aff.is_some_and(|ra| {
+                crate::executor::expr::comparison_affinity(
+                    table.columns.get(col).map(|c| c.affinity),
+                    Some(ra),
+                ) == crate::executor::expr::CmpAffinity::None
+            });
+            if let Some(a) = table.columns.get(col).map(|c| c.affinity).filter(|_| !raw) {
                 for b in bound.iter_mut() {
                     *b = match b {
                         PredValue::Col(_) => PredValue::Coerce {

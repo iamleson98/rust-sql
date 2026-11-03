@@ -229,7 +229,26 @@ mod corr {
                 }
             }
         }
+        // `q.rowid` / `oid` / `_rowid_` of a table without a rowid alias:
+        // the frame carries it as the hidden slot (`q.\0rowid`).
+        if crate::planner::is_rowid_spelling(name) {
+            for (f, frame) in c.outer.iter().enumerate().rev() {
+                if let Some(i) = frame
+                    .names()
+                    .iter()
+                    .position(|n| super::rowid_slot_matches(n, table))
+                {
+                    return Some((f, i));
+                }
+            }
+        }
         None
+    }
+
+    /// The statement context installed for correlated evaluation (null
+    /// outside one).
+    pub(crate) fn current_ctx() -> *mut ExecContext<'static> {
+        CORR.with(|c| c.borrow().ctx)
     }
 
     pub(crate) fn lookup_outer(table: Option<&str>, name: &str) -> Option<Value> {
@@ -771,9 +790,11 @@ fn rewrite_outer_refs(
     // then suffix — the runtime outer-scope resolver's passes)?
     let resolves_in_frame = |qual: &Option<String>, name: &str| -> bool {
         match qual {
-            Some(q) => outer_names
-                .iter()
-                .any(|n| n.eq_ignore_ascii_case(&format!("{}.{}", q, name))),
+            Some(q) => outer_names.iter().any(|n| {
+                n.eq_ignore_ascii_case(&format!("{}.{}", q, name))
+                    || (crate::planner::is_rowid_spelling(name)
+                        && rowid_slot_matches(n, Some(q.as_str())))
+            }),
             None => outer_names.iter().any(|n| {
                 n.eq_ignore_ascii_case(name)
                     || n.rsplit('.')
@@ -5272,10 +5293,36 @@ fn select_result_affinity(
     sel: &SelectStatement,
     catalog: &crate::schema::Catalog,
 ) -> Option<crate::types::Affinity> {
+    select_column_affinity(sel, catalog, 0)
+}
+
+/// [`select_column_affinity`] against the running statement's catalog
+/// (the evaluator's correlated row-value paths; `None` outside one).
+pub(crate) fn select_column_affinity_pub(
+    sel: &SelectStatement,
+    i: usize,
+) -> Option<crate::types::Affinity> {
+    let ctx = corr::current_ctx();
+    if ctx.is_null() {
+        return None;
+    }
+    // SAFETY: the installed statement context outlives its evaluation.
+    let catalog = unsafe { (*ctx).catalog() };
+    select_column_affinity(sel, catalog, i)
+}
+
+/// The `i`-th result column's affinity of a simple SELECT (a column's
+/// declared one, a CAST's target; `None` for other expressions or when
+/// unknown).
+fn select_column_affinity(
+    sel: &SelectStatement,
+    catalog: &crate::schema::Catalog,
+    i: usize,
+) -> Option<crate::types::Affinity> {
     let SelectBody::Simple(s) = &sel.body else {
         return None;
     };
-    let ResultColumn::Expr { expr, .. } = s.columns.first()? else {
+    let ResultColumn::Expr { expr, .. } = s.columns.get(i)? else {
         return None;
     };
     let mut sides: Vec<(String, Option<String>)> = Vec::new();
@@ -5306,6 +5353,28 @@ fn select_result_affinity(
         None
     };
     crate::executor::expr::expr_affinity_with(expr, &resolve)
+}
+
+/// A materialized subquery row as row-value items: each value carries
+/// its column's affinity (`\0aff:` identity carrier) so a row comparison
+/// combines it with the other side's like sqlite3CompareAffinity — a
+/// TEXT operand against a BLOB-affinity column compares raw.
+fn affinity_row(sel: &SelectStatement, catalog: &crate::schema::Catalog, row: Vec<Value>) -> Expr {
+    Expr::Row(
+        row.into_iter()
+            .enumerate()
+            .map(|(i, v)| match select_column_affinity(sel, catalog, i) {
+                Some(a) if a != crate::types::Affinity::None => Expr::Cast {
+                    expr: Box::new(Expr::Literal(v)),
+                    type_name: crate::executor::expr::affinity_marker(
+                        crate::executor::expr::AFF_MARKER,
+                        a,
+                    ),
+                },
+                _ => Expr::Literal(v),
+            })
+            .collect(),
+    )
 }
 
 /// Bottom-up rewrite of subquery nodes in an expression.
@@ -5351,7 +5420,7 @@ fn materialize_row_subquery(
         .into_iter()
         .next()
         .unwrap_or_else(|| vec![Value::Null; width]);
-    Ok(Expr::Row(row.into_iter().map(Expr::Literal).collect()))
+    Ok(affinity_row(&sel, ctx.catalog(), row))
 }
 
 /// Row-value contexts of the subquery rewrite (see
@@ -5366,7 +5435,59 @@ fn rewrite_row_context(e: &Expr, ctx: &mut ExecContext<'_>) -> Result<Option<Exp
                 .collect::<Result<_>>()?,
         ))
     };
+    // `(SELECT a, b) = (SELECT c, d)`: both sides are rows when the
+    // subqueries are multi-column (a one-column pair stays scalar).
+    let pair_width = |a: &SelectStatement| match &a.body {
+        SelectBody::Simple(s)
+            if s.columns.len() > 1
+                && s.columns
+                    .iter()
+                    .all(|c| matches!(c, ResultColumn::Expr { .. })) =>
+        {
+            Some(s.columns.len())
+        }
+        _ => None,
+    };
     match e {
+        Expr::Binary { op, left, right }
+            if matches!(
+                (left.as_ref(), right.as_ref()),
+                (Expr::Subquery(_), Expr::Subquery(_))
+            ) =>
+        {
+            let (Expr::Subquery(a), Expr::Subquery(b)) = (left.as_ref(), right.as_ref()) else {
+                unreachable!()
+            };
+            let Some(w) = pair_width(a) else {
+                return Ok(None);
+            };
+            Ok(Some(Expr::Binary {
+                op: *op,
+                left: Box::new(materialize_row_subquery(a, w, ctx)?),
+                right: Box::new(materialize_row_subquery(b, w, ctx)?),
+            }))
+        }
+        Expr::Is {
+            left,
+            right,
+            negated,
+        } if matches!(
+            (left.as_ref(), right.as_ref()),
+            (Expr::Subquery(_), Expr::Subquery(_))
+        ) =>
+        {
+            let (Expr::Subquery(a), Expr::Subquery(b)) = (left.as_ref(), right.as_ref()) else {
+                unreachable!()
+            };
+            let Some(w) = pair_width(a) else {
+                return Ok(None);
+            };
+            Ok(Some(Expr::Is {
+                left: Box::new(materialize_row_subquery(a, w, ctx)?),
+                right: Box::new(materialize_row_subquery(b, w, ctx)?),
+                negated: *negated,
+            }))
+        }
         Expr::Binary { op, left, right } => match (left.as_ref(), right.as_ref()) {
             (Expr::Row(items), Expr::Subquery(sel)) => Ok(Some(Expr::Binary {
                 op: *op,
@@ -5539,10 +5660,11 @@ fn rewrite_subqueries_rec(e: &Expr, ctx: &mut ExecContext<'_>) -> Result<Expr> {
                                     width
                                 )));
                             }
+                            let catalog = ctx.catalog();
                             let list: Vec<Expr> = res
                                 .rows
                                 .into_iter()
-                                .map(|r| Expr::Row(r.into_iter().map(Expr::Literal).collect()))
+                                .map(|r| affinity_row(&sel, catalog, r))
                                 .collect();
                             InSource::List(list.into())
                         }
@@ -5573,21 +5695,16 @@ fn rewrite_subqueries_rec(e: &Expr, ctx: &mut ExecContext<'_>) -> Result<Expr> {
             // intcol …)` compares NUMERICALLY ('+7' matches 7). The carrier
             // rides on the operand; the compiled IN path unwraps it
             // whenever the column's own affinity already decides.
+            // A BLOB-affinity column is a real affinity (only an
+            // expression's is none): TEXT against it compares raw.
             let expr = match rhs_aff {
-                Some(a)
-                    if !matches!(
+                Some(a) if a != crate::types::Affinity::None => Box::new(Expr::Cast {
+                    expr,
+                    type_name: crate::executor::expr::affinity_marker(
+                        crate::executor::expr::IN_RHS_MARKER,
                         a,
-                        crate::types::Affinity::Blob | crate::types::Affinity::None
-                    ) =>
-                {
-                    Box::new(Expr::Cast {
-                        expr,
-                        type_name: crate::executor::expr::affinity_marker(
-                            crate::executor::expr::IN_RHS_MARKER,
-                            a,
-                        ),
-                    })
-                }
+                    ),
+                }),
                 _ => expr,
             };
             Ok(Expr::In {
@@ -6009,7 +6126,19 @@ fn lookup_outer_frame_value(
     if let Some(i) = crate::executor::expr::suffix_column_index(names, name) {
         return row.get(i).cloned().unwrap_or(Value::Null);
     }
+    if crate::planner::is_rowid_spelling(name) {
+        if let Some(i) = names.iter().position(|n| rowid_slot_matches(n, qual)) {
+            return row.get(i).cloned().unwrap_or(Value::Null);
+        }
+    }
     Value::Null
+}
+
+/// Is frame name `n` the hidden rowid slot a rowid spelling qualified by
+/// `qual` (or bare) binds to?
+pub(crate) fn rowid_slot_matches(n: &str, qual: Option<&str>) -> bool {
+    let hidden = crate::planner::HIDDEN_ROWID;
+    n == hidden || qual.is_some_and(|q| qualified_name_eq(n, q, hidden))
 }
 
 /// `n` equals `"{q}.{name}"`, ASCII case-insensitively — without building
@@ -29502,6 +29631,20 @@ fn exec_update(
             .columns
             .last()
             .is_some_and(|c| crate::planner::is_hidden_rowid(c));
+    // SET expressions (correlated subqueries reading `t.rowid`) see the
+    // trailing hidden slot under its name.
+    let set_names: Vec<String> = if hidden_rowid_slot {
+        let mut v = col_names.clone();
+        v.push(crate::planner::HIDDEN_ROWID.to_string());
+        v
+    } else {
+        Vec::new()
+    };
+    let set_names: &[String] = if hidden_rowid_slot {
+        &set_names
+    } else {
+        &col_names
+    };
     let n_cols = table.n_columns();
 
     let indexes = ctx.catalog().indexes_on_table(&table.name);
@@ -29554,7 +29697,7 @@ fn exec_update(
         // values.
         let mut new_row: Vec<Value> = row[..n_cols].to_vec();
         for (col_idx, expr) in assignments {
-            new_row[*col_idx] = eval_row(expr, row, &col_names, &ctx.params, &ctx.named_params)?;
+            new_row[*col_idx] = eval_row(expr, row, set_names, &ctx.params, &ctx.named_params)?;
             new_row[*col_idx] = table.columns[*col_idx].coerce(new_row[*col_idx].clone());
         }
         // GENERATED columns recompute when a referenced column changes
@@ -30213,6 +30356,21 @@ fn try_streaming_update(
         None => !table_conflict_clauses(table),
     };
     if !plain_abort {
+        return Ok(None);
+    }
+    // A subquery of a table WITHOUT a rowid alias may read the row's
+    // rowid (`... WHERE d2.rowid = t.rowid`): this path decodes rows
+    // without the hidden rowid slot, the general path carries it.
+    if table.rowid_alias.is_none()
+        && !table.without_rowid
+        && (plan_has_subqueries(source)
+            || assignments.iter().any(|(_, e)| expr_has_subquery(e))
+            || returning.is_some_and(|r| {
+                r.iter().any(|c| {
+                    matches!(c, crate::sql::ast::ResultColumn::Expr { expr, .. } if expr_has_subquery(expr))
+                })
+            }))
+    {
         return Ok(None);
     }
     let or_conflict = ConflictResolution::Abort;
@@ -32650,6 +32808,28 @@ fn delete_rowid_range_batched(
     Ok(total)
 }
 
+/// A streaming DELETE residual over one decoded row: when `names` ends
+/// in the hidden rowid slot, the row's rowid rides along for the call.
+fn eval_delete_pred(
+    pred: &Expr,
+    row: &mut Vec<Value>,
+    rowid: i64,
+    names: &[String],
+    affinities: &[crate::types::Affinity],
+    params: &[Value],
+    named_params: &HashMap<String, Value>,
+) -> Result<bool> {
+    let with_slot = names.len() > row.len();
+    if with_slot {
+        row.push(Value::Integer(rowid));
+    }
+    let r = eval_row_aff_where(pred, row, names, affinities, params, named_params);
+    if with_slot {
+        row.pop();
+    }
+    r
+}
+
 fn try_streaming_delete(
     ctx: &mut ExecContext<'_>,
     table: &Arc<Table>,
@@ -32906,6 +33086,17 @@ fn try_streaming_delete(
     let params = ctx.params.clone();
     let named_params = ctx.named_params.clone();
     let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
+    // The residual sees the rowid of a table without a rowid alias as
+    // the hidden slot (`... WHERE (SELECT .. WHERE d2.rowid = t.rowid)`):
+    // `eval_delete_pred` appends it to the decoded row.
+    let hidden_rowid = table.rowid_alias.is_none() && !table.without_rowid;
+    let pred_names: Vec<String> = if hidden_rowid {
+        let mut v = col_names.clone();
+        v.push(crate::planner::HIDDEN_ROWID.to_string());
+        v
+    } else {
+        col_names.clone()
+    };
     let n_cols = table.n_columns();
     let indexes = ctx.catalog().indexes_on_table(&table.name);
     let has_delete_triggers = crate::executor::triggers::has_triggers_for(
@@ -33031,10 +33222,11 @@ fn try_streaming_delete(
                             continue;
                         }
                         if let Some(pred) = residual_pred {
-                            match eval_row_aff_where(
+                            match eval_delete_pred(
                                 pred,
-                                &row_buf,
-                                &col_names,
+                                &mut row_buf,
+                                rid,
+                                &pred_names,
                                 table.col_affinities.as_ref(),
                                 &params,
                                 &named_params,
@@ -33090,10 +33282,11 @@ fn try_streaming_delete(
                             continue;
                         }
                         if let Some(pred) = residual_pred {
-                            match eval_row_aff_where(
+                            match eval_delete_pred(
                                 pred,
-                                &row_buf,
-                                &col_names,
+                                &mut row_buf,
+                                rid,
+                                &pred_names,
                                 table.col_affinities.as_ref(),
                                 &params,
                                 &named_params,
@@ -33221,10 +33414,11 @@ fn try_streaming_delete(
                             first_error = Some(e);
                             return false;
                         }
-                        match eval_row_aff_where(
+                        match eval_delete_pred(
                             pred,
-                            &row_buf,
-                            &col_names,
+                            &mut row_buf,
+                            rowid,
+                            &pred_names,
                             table.col_affinities.as_ref(),
                             &params,
                             &named_params,
@@ -33256,10 +33450,11 @@ fn try_streaming_delete(
                     first_error = Some(e);
                     return false;
                 }
-                match eval_row_aff_where(
+                match eval_delete_pred(
                     pred,
-                    &row_buf,
-                    &col_names,
+                    &mut row_buf,
+                    rowid,
+                    &pred_names,
                     table.col_affinities.as_ref(),
                     &params,
                     &named_params,

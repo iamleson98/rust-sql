@@ -2787,13 +2787,33 @@ fn is_row(e: &Expr) -> bool {
 enum RowSide<'e> {
     Items(&'e [Expr]),
     Values(Option<&'e [Expr]>, Vec<Value>),
+    /// A subquery row: each value with an affinity-carrier expression for
+    /// its column (so the pair's comparison affinity sees it).
+    Typed(Vec<Expr>, Vec<Value>),
+}
+
+/// A (correlated) subquery's row as a row side whose items carry the
+/// subquery columns' affinities.
+fn subquery_row_side<'e>(sel: &SelectStatement, row: Vec<Value>) -> RowSide<'e> {
+    let exprs = (0..row.len())
+        .map(
+            |i| match crate::executor::select_column_affinity_pub(sel, i) {
+                Some(a) if a != crate::types::Affinity::None => Expr::Cast {
+                    expr: Box::new(Expr::Literal(Value::Null)),
+                    type_name: affinity_marker(AFF_MARKER, a),
+                },
+                _ => Expr::Literal(Value::Null),
+            },
+        )
+        .collect();
+    RowSide::Typed(exprs, row)
 }
 
 impl RowSide<'_> {
     fn len(&self) -> usize {
         match self {
             RowSide::Items(items) => items.len(),
-            RowSide::Values(_, vals) => vals.len(),
+            RowSide::Values(_, vals) | RowSide::Typed(_, vals) => vals.len(),
         }
     }
 
@@ -2803,6 +2823,7 @@ impl RowSide<'_> {
         match self {
             RowSide::Items(items) => Ok((Some(&items[i]), evaluate(&items[i], ctx)?)),
             RowSide::Values(exprs, vals) => Ok((exprs.map(|e| &e[i]), vals[i].clone())),
+            RowSide::Typed(exprs, vals) => Ok((Some(&exprs[i]), vals[i].clone())),
         }
     }
 }
@@ -2827,7 +2848,7 @@ fn row_side<'e>(e: &'e Expr, width: usize, ctx: &EvalContext<'_>) -> Result<Opti
                 .into_iter()
                 .next()
                 .unwrap_or_else(|| vec![Value::Null; width]);
-            Ok(Some(RowSide::Values(None, row)))
+            Ok(Some(subquery_row_side(sel, row)))
         }
         _ => Ok(None),
     }
@@ -3013,7 +3034,7 @@ fn evaluate_in_row(
             }
             let mut found = false;
             for row in res.rows {
-                if probe(RowSide::Values(None, row))? {
+                if probe(subquery_row_side(sel, row))? {
                     found = true;
                     break;
                 }
@@ -3803,7 +3824,7 @@ fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext<'_>) -> Result
         if let [Expr::Literal(Value::Integer(k)), Expr::Literal(Value::Integer(n)), sub] = args {
             let width = *n as usize;
             return match row_side(sub, width, ctx)? {
-                Some(RowSide::Values(_, row)) => {
+                Some(RowSide::Values(_, row) | RowSide::Typed(_, row)) => {
                     Ok(row.get(*k as usize).cloned().unwrap_or(Value::Null))
                 }
                 Some(RowSide::Items(items)) => evaluate(&items[*k as usize], ctx),
