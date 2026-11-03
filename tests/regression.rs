@@ -1632,3 +1632,54 @@ fn generated_columns_dependency_order_and_loops() {
     let e = db.execute("UPDATE t0 SET c0 = NULL", []).unwrap_err();
     assert_eq!(e.sqlite_message(), "generated column loop on \"c2\"");
 }
+
+/// sqlite_sequence rows a user edited (NULL / text / huge values) are
+/// the table's row — rewritten, never duplicated — and PRIMARY KEY(x
+/// AUTOINCREMENT) is the table-level AUTOINCREMENT (autoinc.test 2.2x,
+/// 7.1).
+#[test]
+fn autoincrement_sequence_edits_and_table_level_form() {
+    let mut db = rustqlite::Database::open_in_memory().unwrap();
+    let all = |db: &rustqlite::Database, sql: &str| -> Vec<String> {
+        db.query(sql, [])
+            .unwrap()
+            .iter()
+            .flatten()
+            .map(|v| v.to_string())
+            .collect()
+    };
+    db.execute(
+        "CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y)",
+        [],
+    )
+    .unwrap();
+    db.execute("INSERT INTO t1 VALUES(235, 1)", []).unwrap();
+    for (set, y, want) in [
+        ("NULL", 2, "236"),
+        ("'a-string'", 3, "237"),
+        ("'-12345678901234567890'", 4, "238"),
+    ] {
+        db.execute(
+            &format!("UPDATE sqlite_sequence SET seq = {set} WHERE name = 't1'"),
+            [],
+        )
+        .unwrap();
+        db.execute(&format!("INSERT INTO t1 VALUES(NULL, {y})"), [])
+            .unwrap();
+        assert_eq!(
+            all(&db, "SELECT * FROM sqlite_sequence"),
+            ["t1", want],
+            "{set}"
+        );
+    }
+    db.execute(
+        "CREATE TABLE t7(x INTEGER, y REAL, PRIMARY KEY(x AUTOINCREMENT))",
+        [],
+    )
+    .unwrap();
+    db.execute("INSERT INTO t7(y) VALUES(123), (234)", [])
+        .unwrap();
+    db.execute("DELETE FROM t7", []).unwrap();
+    db.execute("INSERT INTO t7(y) VALUES(345)", []).unwrap();
+    assert_eq!(all(&db, "SELECT x FROM t7"), ["3"]);
+}

@@ -1448,9 +1448,11 @@ fn create_table_to_sql(
             T::PrimaryKey {
                 columns,
                 on_conflict,
+                autoincrement,
             } => format!(
-                "PRIMARY KEY ({}){}",
+                "PRIMARY KEY ({}{}){}",
                 indexed_columns_to_sql(columns),
+                if *autoincrement { " AUTOINCREMENT" } else { "" },
                 onconf_sql(*on_conflict)
             ),
             T::Unique {
@@ -19515,6 +19517,7 @@ fn implicit_constraint_indexes(
             crate::sql::ast::TableConstraint::PrimaryKey {
                 columns: cols,
                 on_conflict,
+                ..
             } => {
                 let is_rowid_alias = !table.without_rowid
                     && cols.len() == 1

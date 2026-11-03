@@ -980,11 +980,13 @@ impl Parser {
             self.expect_keyword("KEY")?;
             self.expect_punct('(')?;
             let cols = self.parse_indexed_columns()?;
+            let autoincrement = self.consume_keyword("AUTOINCREMENT");
             self.expect_punct(')')?;
             let on_conflict = self.parse_onconf()?;
             Ok(TableConstraint::PrimaryKey {
                 columns: cols,
                 on_conflict,
+                autoincrement,
             })
         } else if self.peek().is_keyword("UNIQUE") {
             self.advance();

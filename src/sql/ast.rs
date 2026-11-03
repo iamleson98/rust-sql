@@ -242,6 +242,8 @@ pub enum TableConstraint {
     PrimaryKey {
         columns: Vec<IndexedColumn>,
         on_conflict: Option<ConflictResolution>,
+        /// `PRIMARY KEY(x AUTOINCREMENT)` (SQLite's `sortlist autoinc`).
+        autoincrement: bool,
     },
     /// `UNIQUE (cols) [ON CONFLICT x]`.
     Unique {

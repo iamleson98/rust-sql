@@ -1615,14 +1615,17 @@ pub fn build_table(
     // The PRIMARY KEY's ON CONFLICT clause (SQLite's keyConf when the key
     // is the rowid; the PK index's onError otherwise).
     let mut pk_conflict = None;
+    let mut table_pk_autoinc = false;
     for c in constraints {
         if let TableConstraint::PrimaryKey {
             columns,
             on_conflict,
+            autoincrement,
         } = c
         {
             table_pk = columns.clone();
             pk_conflict = *on_conflict;
+            table_pk_autoinc = *autoincrement;
         }
     }
 
@@ -1764,6 +1767,11 @@ pub fn build_table(
                         .eq_ignore_ascii_case("INTEGER")
                 {
                     rowid_alias = Some(idx);
+                    // `PRIMARY KEY(x AUTOINCREMENT)`: the table-level
+                    // spelling of `x INTEGER PRIMARY KEY AUTOINCREMENT`.
+                    if table_pk_autoinc {
+                        table_columns[idx].autoincrement = true;
+                    }
                 }
             }
         }

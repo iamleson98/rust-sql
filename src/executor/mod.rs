@@ -29240,10 +29240,7 @@ pub(crate) fn read_sqlite_sequence(ctx: &ExecContext, table_name: &str) -> Resul
                 _ => false,
             };
             if matches {
-                out = match &vals[1] {
-                    crate::types::Value::Integer(i) => Some(*i),
-                    _ => None,
-                };
+                out = Some(seq_integer(&vals[1]));
                 return false;
             }
         }
@@ -29253,6 +29250,24 @@ pub(crate) fn read_sqlite_sequence(ctx: &ExecContext, table_name: &str) -> Resul
         return Err(e);
     }
     Ok(out)
+}
+
+/// A `sqlite_sequence.seq` value as the AUTOINCREMENT register reads it
+/// (sqlite3VdbeIntValue): integers as-is, reals truncated, numeric text
+/// converted, anything else 0.
+fn seq_integer(v: &Value) -> i64 {
+    match v {
+        Value::Integer(i) => *i,
+        Value::Real(f) => *f as i64,
+        Value::Text(t) => {
+            let s = t.as_str().trim();
+            s.parse::<i64>()
+                .ok()
+                .or_else(|| s.parse::<f64>().ok().map(|f| f as i64))
+                .unwrap_or(0)
+        }
+        _ => 0,
+    }
 }
 
 /// Fire the table's `when` INSERT triggers for `full_row`, then re-sync
@@ -29367,7 +29382,10 @@ pub(crate) fn bump_sqlite_sequence(
     let root = ctx.table_root(&seq_table);
     let name_lc = table_name.to_ascii_lowercase();
     let mut bt = Btree::new(ctx.pager, root, false);
-    let mut existing: Option<(i64, i64)> = None; // (rowid, seq)
+    // (rowid, seq as an integer, stored as an INTEGER): the row is the
+    // table's whatever a user stored in it (NULL, 'a-string' — SQLite's
+    // OP_MemMax integerifies them to 0); it is rewritten, never doubled.
+    let mut existing: Option<(i64, i64, bool)> = None;
     let mut decode_err: Option<Error> = None;
     bt.scan_table_borrowed(|rowid, payload| {
         if existing.is_some() {
@@ -29386,9 +29404,11 @@ pub(crate) fn bump_sqlite_sequence(
                 _ => false,
             };
             if matches {
-                if let crate::types::Value::Integer(i) = &vals[1] {
-                    existing = Some((rowid, *i));
-                }
+                existing = Some((
+                    rowid,
+                    seq_integer(&vals[1]),
+                    matches!(vals[1], crate::types::Value::Integer(_)),
+                ));
                 return false;
             }
         }
@@ -29400,10 +29420,11 @@ pub(crate) fn bump_sqlite_sequence(
     // Only raise: SQLite never lowers the sequence on re-insert of a
     // smaller explicit rowid (the high-water is monotone until the user
     // edits the table).
-    if let Some((rowid, seq)) = existing {
-        if new_seq <= seq {
+    if let Some((rowid, seq, is_int)) = existing {
+        if new_seq <= seq && is_int {
             return Ok(());
         }
+        let new_seq = new_seq.max(seq);
         let row = vec![
             crate::types::Value::Text(crate::types::text::Text::from(table_name)),
             crate::types::Value::Integer(new_seq),
