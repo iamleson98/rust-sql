@@ -1309,7 +1309,20 @@ impl Parser {
             None
         };
         self.expect_keyword("AS")?;
+        let body_start = self.pos;
         let select = self.parse_select()?;
+        // sqlite3CreateView: a view body may not hold host parameters.
+        if self.toks[body_start..self.pos]
+            .iter()
+            .any(|t| matches!(t.token, Token::Parameter(_)))
+        {
+            let t = &self.toks[body_start];
+            return Err(Error::parse(
+                t.line,
+                t.col,
+                "parameters are not allowed in views",
+            ));
+        }
         Ok(Statement::Create(CreateStatement::View {
             if_not_exists,
             temp,

@@ -1800,6 +1800,20 @@ fn build_from_expr(
             {
                 if let Some(v) = ctx.catalog.get_view(name) {
                     validate_view_body(ctx, &v, scope)?;
+                    // A declared column list must match the body's width
+                    // (sqlite3SelectExpand at each use).
+                    if let Some(list) = &v.columns {
+                        if let Some(w) = body_width(ctx, &v.select.body, &EMPTY_CTES) {
+                            if w != list.len() {
+                                return Err(Error::semantic(format!(
+                                    "expected {} columns for '{}' but got {}",
+                                    list.len(),
+                                    v.name,
+                                    w
+                                )));
+                            }
+                        }
+                    }
                 }
             }
             let qualifier = alias.clone().or_else(|| Some(name.clone()));
@@ -2826,6 +2840,23 @@ fn validate_create(ctx: &Ctx<'_>, c: &CreateStatement, scope: &mut Scope) -> Res
 }
 
 fn validate_drop(ctx: &Ctx<'_>, d: &DropStatement) -> Result<()> {
+    // sqlite3DropTable: the name must be of the kind the statement says
+    // (checked before IF EXISTS, which only covers a missing name).
+    match d.kind {
+        DropKind::View if ctx.catalog.get_table(&d.name).is_some() => {
+            return Err(Error::semantic(format!(
+                "use DROP TABLE to delete table {}",
+                d.name
+            )));
+        }
+        DropKind::Table if ctx.catalog.get_view(&d.name).is_some() => {
+            return Err(Error::semantic(format!(
+                "use DROP VIEW to delete view {}",
+                d.name
+            )));
+        }
+        _ => {}
+    }
     if d.if_exists {
         return Ok(());
     }

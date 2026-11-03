@@ -108,3 +108,24 @@ fn compound_order_by_uses_column_collation() {
         ],
     );
 }
+
+/// Views and derived tables over an AGGREGATE keep their columns'
+/// affinities (view.test 27.x): a TEXT column compared with AVG()'s
+/// affinity-less result compares as text.
+#[test]
+fn aggregate_view_columns_keep_affinity() {
+    run_both(
+        &[
+            "CREATE TABLE t0(c0 TEXT, c1)",
+            "INSERT INTO t0 VALUES (-1, 0)",
+            "CREATE VIEW v0(c0, c1) AS SELECT t0.c0, AVG(t0.c1) FROM t0",
+            "CREATE VIEW v3 AS SELECT c0, count(*) AS n FROM t0 GROUP BY c0",
+        ],
+        &[
+            "SELECT c0 < c1, c1 < c0 FROM v0",
+            "SELECT 1 FROM v0 WHERE c0 < c1",
+            "SELECT c0 < c1 FROM (SELECT t0.c0 AS c0, AVG(t0.c1) AS c1 FROM t0)",
+            "SELECT c0 < 0, n FROM v3",
+        ],
+    );
+}

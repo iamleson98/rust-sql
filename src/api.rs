@@ -17111,6 +17111,88 @@ fn pragma_arg(v: Option<&crate::sql::ast::PragmaValue>) -> Option<String> {
 /// (cid, name, type, notnull, dflt_value, pk[, hidden]).
 /// `table_info` EXCLUDES generated (hidden) columns; `table_xinfo`
 /// includes them with hidden=2 (VIRTUAL) / 3 (STORED).
+/// PRAGMA table_info / table_xinfo of a VIEW: its output columns (a
+/// declared column list wins), each typed with the declared type of the
+/// table column it reads directly (empty for any other expression);
+/// notnull 0, no default, no key.
+fn pragma_view_info(db: &Database, v: &crate::schema::View, xinfo: bool) -> Option<PragmaRows> {
+    use crate::sql::ast::{Expr, ResultColumn, SelectBody};
+    let (names, _) = db
+        .query_with_columns(
+            &format!("SELECT * FROM \"{}\" LIMIT 0", v.name.replace('"', "\"\"")),
+            [],
+        )
+        .ok()?;
+    let mut types: Vec<String> = Vec::new();
+    if let SelectBody::Simple(s) = &v.select.body {
+        let mut sides: Vec<(String, Option<String>)> = Vec::new();
+        if let Some(from) = s.from.as_ref() {
+            if !crate::planner::collect_plain_table_sides(from, &mut sides) {
+                sides.clear();
+            }
+        }
+        let side_table = |q: Option<&str>, col: &str| -> Option<String> {
+            sides.iter().find_map(|(t, alias)| {
+                if let Some(q) = q {
+                    if !q.eq_ignore_ascii_case(alias.as_deref().unwrap_or(t)) {
+                        return None;
+                    }
+                }
+                let tab = db.catalog.get_table(t)?;
+                let i = tab.find_column(col)?;
+                Some(tab.columns[i].declared_type.clone())
+            })
+        };
+        for c in &s.columns {
+            match c {
+                ResultColumn::Expr {
+                    expr: Expr::Column { table, name },
+                    ..
+                } => types.push(side_table(table.as_deref(), name).unwrap_or_default()),
+                ResultColumn::Expr { .. } => types.push(String::new()),
+                ResultColumn::Star | ResultColumn::TableStar(_) => {
+                    for (t, alias) in &sides {
+                        if let ResultColumn::TableStar(q) = c {
+                            if !q.eq_ignore_ascii_case(alias.as_deref().unwrap_or(t)) {
+                                continue;
+                            }
+                        }
+                        if let Some(tab) = db.catalog.get_table(t) {
+                            types.extend(tab.columns.iter().map(|c| c.declared_type.clone()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut columns: Vec<String> = ["cid", "name", "type", "notnull", "dflt_value", "pk"]
+        .iter()
+        .map(|c| c.to_string())
+        .collect();
+    if xinfo {
+        columns.push("hidden".to_string());
+    }
+    let rows = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let mut row = vec![
+                Value::Integer(i as i64),
+                Value::Text(n.as_str().into()),
+                Value::Text(types.get(i).cloned().unwrap_or_default().into()),
+                Value::Integer(0),
+                Value::Null,
+                Value::Integer(0),
+            ];
+            if xinfo {
+                row.push(Value::Integer(0));
+            }
+            row
+        })
+        .collect();
+    Some(PragmaRows { columns, rows })
+}
+
 pub(crate) fn pragma_table_info(t: &Arc<crate::schema::Table>, xinfo: bool) -> PragmaRows {
     let mut columns = vec![
         "cid".to_string(),
@@ -17709,8 +17791,11 @@ fn read_pragma(p: &PragmaStatement, db: &Database) -> Option<PragmaRows> {
     match name.as_str() {
         "table_info" | "table_xinfo" => {
             let arg = pragma_arg(p.value.as_ref())?;
-            let t = catalog.get_table(&arg)?;
-            return Some(pragma_table_info(&t, name == "table_xinfo"));
+            if let Some(t) = catalog.get_table(&arg) {
+                return Some(pragma_table_info(&t, name == "table_xinfo"));
+            }
+            let v = catalog.get_view(&arg)?;
+            return pragma_view_info(db, &v, name == "table_xinfo");
         }
         "table_list" => {
             let arg = pragma_arg(p.value.as_ref());

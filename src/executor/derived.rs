@@ -222,7 +222,37 @@ fn arm_columns(arm: &Plan, positional: &mut bool) -> Option<Vec<ArmCol>> {
         Plan::Project { input, columns } => {
             let mut sources = Vec::new();
             scope_sources(input, &mut sources);
-            let resolve = |e: &Expr| resolve_column(e, &sources);
+            // Over an aggregate the projection reads its OUTPUT slots:
+            // `__agg_N` (an aggregate — no affinity — or a bare column's
+            // representative value, which keeps its column's metadata)
+            // and group keys named after their source (`t.c`).
+            let aggregates = aggregate_below(input);
+            let resolve = |e: &Expr| -> Resolved {
+                if let (Some(aggs), Expr::Column { table: None, name }) = (aggregates, e) {
+                    if let Some(i) = name
+                        .strip_prefix("__agg_")
+                        .and_then(|n| n.parse::<usize>().ok())
+                    {
+                        return match aggs.get(i) {
+                            Some(a) if a.func == "bare" => match &a.arg {
+                                Some(arg) => resolve_column(arg, &sources),
+                                None => (None, None),
+                            },
+                            _ => (None, None),
+                        };
+                    }
+                    if let Some((q, n)) = name.split_once('.') {
+                        return resolve_column(
+                            &Expr::Column {
+                                table: Some(q.to_string()),
+                                name: n.to_string(),
+                            },
+                            &sources,
+                        );
+                    }
+                }
+                resolve_column(e, &sources)
+            };
             let mut out = Vec::with_capacity(columns.len());
             for c in columns {
                 if let Expr::Column { table, name } = &c.expr {
@@ -272,6 +302,18 @@ fn arm_columns(arm: &Plan, positional: &mut bool) -> Option<Vec<ArmCol>> {
                     .map(|c| source_column(&m.table, c))
                     .collect(),
             )
+        }
+        _ => None,
+    }
+}
+
+/// The aggregate list of the `Aggregate` node a projection reads, seen
+/// through row-preserving wrappers (HAVING filter, ORDER BY, LIMIT).
+fn aggregate_below(plan: &Plan) -> Option<&[crate::planner::plan::AggExpr]> {
+    match plan {
+        Plan::Aggregate { aggregates, .. } => Some(aggregates),
+        Plan::Filter { input, .. } | Plan::Sort { input, .. } | Plan::Limit { input, .. } => {
+            aggregate_below(input)
         }
         _ => None,
     }
