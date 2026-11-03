@@ -517,6 +517,8 @@ pub(crate) fn synthetic_table(qualifier: &str, columns: Vec<Column>) -> Arc<Tabl
         col_affinities: affs.into(),
         vtab: None,
         pk_conflict: None,
+        generated_order: std::sync::Arc::from(Vec::new()),
+        generated_loop: None,
         conflict_clauses: false,
     })
 }

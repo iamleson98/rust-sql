@@ -2903,7 +2903,14 @@ pub(crate) fn check_row_constraints(
     stmt_or: Option<ConflictResolution>,
 ) -> Result<RowCheck> {
     let mut replaced = false;
+    // sqlite3GenerateConstraintChecks' two passes: ordinary columns first
+    // (a REPLACE may substitute their DEFAULT), then the generated
+    // columns — recomputed from those final values — are checked.
+    let has_generated = table.columns.iter().any(|c| c.generated.is_some());
     for (i, col) in table.columns.iter().enumerate() {
+        if col.generated.is_some() {
+            continue;
+        }
         if !not_null_enforced(table, i, col) || !row.get(i).map_or(true, |v| v.is_null()) {
             continue;
         }
@@ -2931,11 +2938,45 @@ pub(crate) fn check_row_constraints(
     if replaced {
         // The second pass: REPLACE becomes ABORT (a NULL DEFAULT).
         for (i, col) in table.columns.iter().enumerate() {
-            if not_null_enforced(table, i, col) && row.get(i).map_or(true, |v| v.is_null()) {
+            if col.generated.is_none()
+                && not_null_enforced(table, i, col)
+                && row.get(i).map_or(true, |v| v.is_null())
+            {
                 return Err(Error::constraint(format!(
                     "NOT NULL constraint failed: {}.{}",
                     table.name, col.name
                 )));
+            }
+        }
+        if has_generated {
+            apply_generated_columns(table, row, &table.col_names, &ctx.params, &ctx.named_params)?;
+        }
+    }
+    // Generated columns: their own policy (a REPLACE has no DEFAULT to
+    // take, so it aborts).
+    if has_generated {
+        for (i, col) in table.columns.iter().enumerate() {
+            if col.generated.is_none()
+                || !not_null_enforced(table, i, col)
+                || !row.get(i).map_or(true, |v| v.is_null())
+            {
+                continue;
+            }
+            match conflict_policy(stmt_or, col.not_null_conflict) {
+                ConflictResolution::Ignore => return Ok(RowCheck::Skip),
+                ConflictResolution::Replace => {
+                    return Err(Error::constraint(format!(
+                        "NOT NULL constraint failed: {}.{}",
+                        table.name, col.name
+                    )))
+                }
+                p => {
+                    return Err(halt_constraint(
+                        ctx,
+                        p,
+                        format!("NOT NULL constraint failed: {}.{}", table.name, col.name),
+                    ))
+                }
             }
         }
     }
@@ -3057,7 +3098,13 @@ pub(crate) fn apply_generated_columns(
     params: &[Value],
     named_params: &HashMap<String, Value>,
 ) -> Result<()> {
-    for (i, col) in table.columns.iter().enumerate() {
+    // A generated column may read another one declared after it
+    // (`w AS (m*5), m AS (a*2)`): the table's dependency order.
+    if let Some(c) = &table.generated_loop {
+        return Err(Error::semantic(format!("generated column loop on \"{c}\"")));
+    }
+    for &i in table.generated_order.iter() {
+        let col = &table.columns[i];
         if let Some((expr, _stored)) = &col.generated {
             let v = eval_row(expr, row, col_names, params, named_params)?;
             let coerced = col.coerce(v);
@@ -30044,9 +30091,39 @@ fn exec_update_from(
     // statement abort on any constraint violation).
     let mut write_set: Vec<(i64, Vec<Value>, Vec<Value>)> = Vec::new();
     let mut pass1_fail: Option<Error> = None;
+    // The row's storage rowid, as in exec_update: the alias column, the
+    // scan's trailing hidden rowid slot, or (WITHOUT ROWID) the internal
+    // PK index's mapping.
+    let n_cols = table.n_columns();
+    let hidden_rowid_slot = table.rowid_alias.is_none()
+        && target_res
+            .columns
+            .last()
+            .is_some_and(|c| crate::planner::is_hidden_rowid(c));
+    let wr_pk_index = if table.without_rowid {
+        indexes
+            .iter()
+            .find(|i| i.origin == crate::schema::IndexOrigin::WithoutRowidPk)
+            .cloned()
+    } else {
+        None
+    };
     for row in &target_res.rows {
         let rowid = if let Some(idx) = table.rowid_alias {
             row[idx].as_integer()
+        } else if hidden_rowid_slot {
+            row.last().map(|v| v.as_integer()).unwrap_or(0)
+        } else if let Some(pk) = wr_pk_index.as_ref() {
+            let key = encode_index_key(pk, table, &row[..n_cols])?;
+            let mut ibt = Btree::new(ctx.pager, ctx.index_root(pk), true);
+            match ibt.lookup_index(&key)?.first() {
+                Some(&r) => r,
+                None => {
+                    return Err(Error::corruption(
+                        "WITHOUT ROWID row missing from its PK index",
+                    ))
+                }
+            }
         } else {
             return Err(Error::Unsupported(
                 "UPDATE on a table without INTEGER PRIMARY KEY",
@@ -30070,7 +30147,9 @@ fn exec_update_from(
         }
         let Some(combined) = last_match else { continue };
 
-        let mut new_row = row.clone();
+        // The write-set row has exactly the table's columns (the hidden
+        // slot, if any, stays on `row` for the old-row side).
+        let mut new_row: Vec<Value> = row[..n_cols.min(row.len())].to_vec();
         for (col_idx, expr) in assignments {
             new_row[*col_idx] = eval_row(
                 expr,

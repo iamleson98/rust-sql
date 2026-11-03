@@ -1592,3 +1592,43 @@ fn regression_upsert_then_dup_insert_still_rejects() {
     let n = db.query("SELECT COUNT(*) FROM p", []).unwrap();
     assert_eq!(n[0][0], Value::Integer(1));
 }
+
+/// Generated columns in dependency order (gencol1.test 2.6 / 7.x / 8.20):
+/// a column may read one declared after it, a REPLACE-substituted
+/// DEFAULT feeds the generated columns, and a dependency cycle is
+/// "generated column loop" at prepare time.
+#[test]
+fn generated_columns_dependency_order_and_loops() {
+    let mut db = rustqlite::Database::open_in_memory().unwrap();
+    db.execute(
+        "CREATE TABLE t1(w INT GENERATED ALWAYS AS (m*5), m INT AS (a*2) STORED, a INT, \
+         y TEXT AS (substr(b, m/2, m/2+2)) STORED, b TEXT, PRIMARY KEY(a, b))",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO t1(a, b) VALUES(1, 'abcdef'), (3, 'cantaloupe')",
+        [],
+    )
+    .unwrap();
+    let rows = db.query("SELECT w, m, y FROM t1 ORDER BY a", []).unwrap();
+    let s: Vec<String> = rows.iter().flatten().map(|v| v.to_string()).collect();
+    assert_eq!(s, ["10", "2", "abc", "30", "6", "ntalo"]);
+    db.execute(
+        "CREATE TABLE t2(a NOT NULL DEFAULT 'aaa', b AS (c) NOT NULL, c NOT NULL DEFAULT 'ccc')",
+        [],
+    )
+    .unwrap();
+    db.execute("REPLACE INTO t2(a, c) VALUES(NULL, NULL)", [])
+        .unwrap();
+    let rows = db.query("SELECT * FROM t2", []).unwrap();
+    let s: Vec<String> = rows.iter().flatten().map(|v| v.to_string()).collect();
+    assert_eq!(s, ["aaa", "ccc", "ccc"]);
+    db.execute(
+        "CREATE TABLE t0(c0, c1 AS (c0 + c2), c2 AS (c1) CHECK(c2))",
+        [],
+    )
+    .unwrap();
+    let e = db.execute("UPDATE t0 SET c0 = NULL", []).unwrap_err();
+    assert_eq!(e.sqlite_message(), "generated column loop on \"c2\"");
+}

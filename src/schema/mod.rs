@@ -186,6 +186,68 @@ pub struct Table {
     /// UNIQUE, column or table level) — the hot DML gates' one-load test
     /// for "every constraint resolves as plain ABORT".
     pub conflict_clauses: bool,
+    /// Generated columns in evaluation order (sqlite3ComputeGeneratedColumns:
+    /// a column whose inputs are not yet computed is deferred to a later
+    /// round), and the column a dependency LOOP stops on — an INSERT or
+    /// UPDATE of such a table is `generated column loop on "x"`.
+    pub generated_order: std::sync::Arc<[usize]>,
+    pub generated_loop: Option<String>,
+}
+
+/// Column names an expression reads (lowercased; subqueries included).
+fn expr_column_names(e: &crate::sql::ast::Expr, out: &mut Vec<String>) {
+    if let crate::sql::ast::Expr::Column { name, .. } = e {
+        out.push(name.to_ascii_lowercase());
+    }
+    let _ = crate::executor::map_expr_children(e, &mut |c| {
+        expr_column_names(c, out);
+        Ok(c.clone())
+    });
+}
+
+/// SQLite's generated-column ordering (see `Table::generated_order`).
+fn generated_column_order(columns: &[Column]) -> (Vec<usize>, Option<String>) {
+    let names: Vec<String> = columns
+        .iter()
+        .map(|c| c.name.to_ascii_lowercase())
+        .collect();
+    let deps: Vec<Vec<usize>> = columns
+        .iter()
+        .map(|c| match &c.generated {
+            Some((e, _)) => {
+                let mut refs = Vec::new();
+                expr_column_names(e, &mut refs);
+                refs.iter()
+                    .filter_map(|r| names.iter().position(|n| n == r))
+                    .filter(|&j| columns[j].generated.is_some())
+                    .collect()
+            }
+            None => Vec::new(),
+        })
+        .collect();
+    let mut done: Vec<bool> = columns.iter().map(|c| c.generated.is_none()).collect();
+    let mut order = Vec::new();
+    loop {
+        let mut progress = false;
+        let mut redo = None;
+        for i in 0..columns.len() {
+            if done[i] {
+                continue;
+            }
+            if deps[i].iter().all(|&j| done[j] && j != i) {
+                done[i] = true;
+                order.push(i);
+                progress = true;
+            } else {
+                redo = Some(i);
+            }
+        }
+        match redo {
+            None => return (order, None),
+            Some(i) if !progress => return (order, Some(columns[i].name.clone())),
+            Some(_) => {}
+        }
+    }
 }
 
 impl Table {
@@ -1805,7 +1867,10 @@ pub fn build_table(
         .map(|c| format!("{}.{}", name, c.name))
         .collect();
 
+    let (generated_order, generated_loop) = generated_column_order(&table_columns);
     Ok(Table {
+        generated_order: generated_order.into(),
+        generated_loop,
         name: name.to_string(),
         columns: table_columns,
         root_page,
@@ -2194,6 +2259,8 @@ pub fn sqlite_master_table() -> Table {
         pk_conflict: None,
         check_labels: Vec::new(),
         conflict_clauses: false,
+        generated_order: std::sync::Arc::from(Vec::new()),
+        generated_loop: None,
     }
 }
 

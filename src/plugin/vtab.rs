@@ -621,6 +621,8 @@ pub(crate) fn vtab_columns_to_schema(
         vtab: None,
         pk_conflict: None,
         check_labels: Vec::new(),
+        generated_order: std::sync::Arc::from(Vec::new()),
+        generated_loop: None,
         conflict_clauses: false,
     };
     for (name, ty) in cols {

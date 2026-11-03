@@ -840,3 +840,27 @@ fn update_notnull_message_shape() {
         "UPDATE t SET v = NULL WHERE id = 1",
     );
 }
+
+/// UPDATE ... FROM on targets without an INTEGER PRIMARY KEY (rowid
+/// tables keyed by the hidden rowid, and WITHOUT ROWID tables) —
+/// upfrom2.test; these used to fail "UPDATE on a table without INTEGER
+/// PRIMARY KEY".
+#[test]
+fn update_from_without_rowid_alias() {
+    diff_program(
+        &[
+            "CREATE TABLE t1(a, b, c)",
+            "CREATE TABLE t2(k TEXT PRIMARY KEY, v) WITHOUT ROWID",
+            "CREATE TABLE src(a, b)",
+            "INSERT INTO t1 VALUES(1, 'one', 0), (2, 'two', 0), (3, 'three', 0)",
+            "INSERT INTO t2 VALUES('one', 1), ('two', 2), ('nine', 9)",
+            "INSERT INTO src VALUES(1, 'I'), (3, 'III'), (3, 'iii')",
+        ],
+        &[
+            "UPDATE t1 SET c = src.b FROM src WHERE src.a = t1.a",
+            "UPDATE t2 SET v = t1.a * 10 FROM t1 WHERE t1.b = t2.k",
+            "UPDATE t1 SET b = upper(b) FROM t2 WHERE t2.k = t1.b AND t2.v > 10",
+        ],
+        "SELECT * FROM t1 UNION ALL SELECT k, v, NULL FROM t2 ORDER BY 1, 2",
+    );
+}

@@ -966,6 +966,57 @@ fn validate_select(
     }
 }
 
+/// Width of an operand as a row value: a row constructor's length, a
+/// simple subquery's column count (`None` when a `*` hides it), 1 for any
+/// other expression.
+fn row_value_width(e: &Expr) -> Option<usize> {
+    match e {
+        Expr::Row(items) => Some(items.len()),
+        Expr::Subquery(sel) => match &sel.body {
+            SelectBody::Simple(s)
+                if s.columns
+                    .iter()
+                    .all(|c| matches!(c, ResultColumn::Expr { .. })) =>
+            {
+                Some(s.columns.len())
+            }
+            _ => None,
+        },
+        _ => Some(1),
+    }
+}
+
+/// SQLite's prepare-time "row value misused": a comparison (or IS) whose
+/// sides differ in width with a row value among them, or a row value
+/// under any other binary operator (`(a, b) + 1`) — raised even when no
+/// row is ever evaluated.
+fn check_row_widths(op: Option<BinaryOp>, left: &Expr, right: &Expr) -> Result<()> {
+    let comparison = op.map_or(true, |op| {
+        matches!(
+            op,
+            BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::LtEq
+                | BinaryOp::Gt
+                | BinaryOp::GtEq
+        )
+    });
+    let is_row = |e: &Expr| matches!(e, Expr::Row(items) if items.len() > 1);
+    if !comparison {
+        if is_row(left) || is_row(right) {
+            return Err(Error::semantic("row value misused"));
+        }
+        return Ok(());
+    }
+    if let (Some(l), Some(r)) = (row_value_width(left), row_value_width(right)) {
+        if l != r && (is_row(left) || is_row(right)) {
+            return Err(Error::semantic("row value misused"));
+        }
+    }
+    Ok(())
+}
+
 /// LIMIT / OFFSET resolve against NO table — neither the FROM clause nor
 /// an enclosing query: any column reference outside a subquery fails at
 /// prepare with SQLite's "no such column: <ref as written>".
@@ -1967,7 +2018,8 @@ fn validate_expr(ctx: &Ctx<'_>, e: &Expr, scope: &mut Scope, visible: &CteList) 
             scope.resolve_qualified(q, name)
         }
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Raise { .. } => Ok(()),
-        Expr::Binary { left, right, .. } => {
+        Expr::Binary { op, left, right } => {
+            check_row_widths(Some(*op), left, right)?;
             validate_expr(ctx, left, scope, visible)?;
             validate_expr(ctx, right, scope, visible)
         }
@@ -2016,6 +2068,7 @@ fn validate_expr(ctx: &Ctx<'_>, e: &Expr, scope: &mut Scope, visible: &CteList) 
         }
         Expr::IsNull { expr, .. } => validate_expr(ctx, expr, scope, visible),
         Expr::Is { left, right, .. } => {
+            check_row_widths(None, left, right)?;
             validate_expr(ctx, left, scope, visible)?;
             validate_expr(ctx, right, scope, visible)
         }
@@ -2221,6 +2274,7 @@ fn validate_insert(ctx: &Ctx<'_>, ins: &InsertStatement, scope: &mut Scope) -> R
     let ctes = validate_cte_bodies(ctx, &ins.with, scope)?;
 
     let target = dml_target_source(ctx, &ins.table, ins.alias.as_ref())?;
+    check_generated_loop(ctx, &ins.table)?;
 
     // Column list (the executor's "table X has no column named Y" stays
     // authoritative for real tables; here we catch VIEW targets, where
@@ -2337,6 +2391,7 @@ fn validate_update(ctx: &Ctx<'_>, upd: &UpdateStatement, scope: &mut Scope) -> R
 
     let target = dml_target_source(ctx, &upd.table, upd.alias.as_ref())?;
     check_dml_index_hint(ctx, &upd.table, &upd.indexed)?;
+    check_generated_loop(ctx, &upd.table)?;
 
     // SQLite's UPDATE-FROM resolution order: the TARGET table is a
     // separate, inner scope level — a bare name resolves to the target
@@ -2433,6 +2488,19 @@ fn validate_update(ctx: &Ctx<'_>, upd: &UpdateStatement, scope: &mut Scope) -> R
     }
     scope.pop_level();
     Ok(())
+}
+
+/// A write to a table whose generated columns depend on each other in a
+/// cycle: SQLite's prepare-time `generated column loop on "x"`.
+fn check_generated_loop(ctx: &Ctx<'_>, table: &str) -> Result<()> {
+    match ctx
+        .catalog
+        .get_table(table)
+        .and_then(|t| t.generated_loop.clone())
+    {
+        Some(c) => Err(Error::semantic(format!("generated column loop on \"{c}\""))),
+        None => Ok(()),
+    }
 }
 
 /// `UPDATE / DELETE ... INDEXED BY idx`: the index must exist on the
