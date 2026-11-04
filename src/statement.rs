@@ -1176,6 +1176,12 @@ impl<'a> Statement<'a> {
                 {
                     self.db.pager.note_tx_autocommit();
                 }
+                // The tree surgery is done: let plain readers back in
+                // before the commit's WAL append (the plain-DML slot is
+                // still held through it).
+                if let Some(g) = plain_dml_gate.as_mut() {
+                    g.release_reader_exclusion();
+                }
                 // Foreign (SQLite-format) durability: `Database::execute`
                 // dumps at every autocommit boundary
                 // (`note_pending_write`); the streaming-statement path —
@@ -1860,7 +1866,10 @@ impl CellPlan {
 /// arena by a gated pull) does NOT take it — that per-row probe was the
 /// S06 step-path residual the macOS-ARM fleet amplified.
 #[inline]
-fn pull_gate_for(db: &Database, is_dml: bool) -> Option<parking_lot::RwLockReadGuard<'_, ()>> {
+fn pull_gate_for(
+    db: &Database,
+    is_dml: bool,
+) -> Option<crate::storage::concurrent::PlainReadGate<'_>> {
     if !is_dml && db.concurrent_txn_for_caller().is_none() {
         db.pager.plain_reader_gate()
     } else {

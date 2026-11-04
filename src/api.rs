@@ -275,6 +275,23 @@ thread_local! {
 /// [`Database::enter_plain_dml`]).
 pub(crate) struct PlainDmlGuard<'a> {
     db: &'a Database,
+    /// Install-gate write side held by the OUTERMOST plain DML level on a
+    /// regime-capable (WAL) engine: excludes gated plain readers for the
+    /// statement's in-place tree surgery (see
+    /// [`Pager::plain_writer_gate`](crate::storage::pager::Pager::plain_writer_gate)).
+    _write_gate: Option<crate::storage::concurrent::PlainWriteGate<'a>>,
+}
+
+impl PlainDmlGuard<'_> {
+    /// Drop the reader exclusion (the install-gate write side) while
+    /// KEEPING the plain-DML slot: called once the statement's in-place
+    /// tree surgery is finished, so the WAL append / flush of the
+    /// autocommit that follows does not hold plain readers out. The
+    /// pages are complete and consistent at this point; later readers
+    /// simply see the statement's (about to be committed) state.
+    pub(crate) fn release_reader_exclusion(&mut self) {
+        self._write_gate = None;
+    }
 }
 
 impl Drop for PlainDmlGuard<'_> {
@@ -10273,8 +10290,19 @@ impl Database {
                     ));
                 }
             }
+            // Outermost level only: nested levels (triggers, hooks) run
+            // under the outer statement's exclusion. Taken AFTER the
+            // tripwire claim so at most one thread ever queues here.
+            let write_gate = if d.get() == 0 {
+                self.pager.plain_writer_gate()
+            } else {
+                None
+            };
             d.set(d.get() + 1);
-            Ok(PlainDmlGuard { db: self })
+            Ok(PlainDmlGuard {
+                db: self,
+                _write_gate: write_gate,
+            })
         })
     }
 

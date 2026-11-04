@@ -347,6 +347,7 @@ pub(crate) fn try_parallel_fused_aggregate(
     // immutably; the main thread is quiescent until the scope joins.
     // TLS (conn text encoding) does not cross threads: each worker
     // re-installs the tag copied on the spawning thread.
+    let parent_owns_write_gate = pager.plain_gate_write_owned();
     let conn_enc_tag = super::conn_enc::current();
     let cs_like = crate::plugin::conn_flags();
     let partials: Vec<Result<FusedWalk>> = std::thread::scope(|scope| {
@@ -367,7 +368,7 @@ pub(crate) fn try_parallel_fused_aggregate(
                 // parallel COUNT). plain_reader_gate() is None unless the
                 // engine is regime-capable (WAL attached) or the regime is
                 // active — single-writer/DELETE-mode engines pay nothing.
-                let _worker_reader_gate = pager.plain_reader_gate();
+                let _worker_reader_gate = pager.plain_reader_gate_child(parent_owns_write_gate);
                 let mut bt = Btree::new(pager, root, false);
                 let mut walk = FusedWalk::new(
                     col_slot.clone(),
@@ -559,6 +560,7 @@ pub(crate) fn try_parallel_distinct_aggregate(
     // Workers: an exact replica of the serial compiled-path loop over
     // each range — decode_row_selective into a reused buffer, compiled
     // filter, then update_agg_state with the DISTINCT flags.
+    let parent_owns_write_gate = pager.plain_gate_write_owned();
     let conn_enc_tag = super::conn_enc::current();
     let cs_like = crate::plugin::conn_flags();
     let partials: Vec<Result<(Vec<AggState>, bool)>> = std::thread::scope(|scope| {
@@ -584,7 +586,7 @@ pub(crate) fn try_parallel_distinct_aggregate(
                 // parallel COUNT). plain_reader_gate() is None unless the
                 // engine is regime-capable (WAL attached) or the regime is
                 // active — single-writer/DELETE-mode engines pay nothing.
-                let _worker_reader_gate = pager.plain_reader_gate();
+                let _worker_reader_gate = pager.plain_reader_gate_child(parent_owns_write_gate);
                 let mut bt = Btree::new(pager, root, false);
                 let mut states: Vec<AggState> = (0..n_aggs).map(|_| AggState::default()).collect();
                 let mut saw_any_row = false;
@@ -779,6 +781,7 @@ pub(crate) fn try_parallel_groupby_selective(
     let ranges = split.ranges;
     let pager = ctx.pager;
 
+    let parent_owns_write_gate = pager.plain_gate_write_owned();
     let conn_enc_tag = super::conn_enc::current();
     let cs_like = crate::plugin::conn_flags();
     let partials: Vec<Result<HashGrouper>> = std::thread::scope(|scope| {
@@ -810,7 +813,7 @@ pub(crate) fn try_parallel_groupby_selective(
                 // parallel COUNT). plain_reader_gate() is None unless the
                 // engine is regime-capable (WAL attached) or the regime is
                 // active — single-writer/DELETE-mode engines pay nothing.
-                let _worker_reader_gate = pager.plain_reader_gate();
+                let _worker_reader_gate = pager.plain_reader_gate_child(parent_owns_write_gate);
                 let mut bt = Btree::new(pager, root, false);
                 let mut grouper = if spill_ok {
                     HashGrouper::with_spill_for(
@@ -1280,6 +1283,7 @@ pub(crate) fn try_parallel_groupby_compiled(
 
     let ranges = split.ranges;
     let pager = ctx.pager;
+    let parent_owns_write_gate = pager.plain_gate_write_owned();
     let conn_enc_tag = super::conn_enc::current();
 
     let cs_like = crate::plugin::conn_flags();
@@ -1307,7 +1311,7 @@ pub(crate) fn try_parallel_groupby_compiled(
                 // parallel COUNT). plain_reader_gate() is None unless the
                 // engine is regime-capable (WAL attached) or the regime is
                 // active — single-writer/DELETE-mode engines pay nothing.
-                let _worker_reader_gate = pager.plain_reader_gate();
+                let _worker_reader_gate = pager.plain_reader_gate_child(parent_owns_write_gate);
                 let mut bt = Btree::new(pager, root, false);
                 let mut grouper = if spill_ok {
                     HashGrouper::with_spill_for(
@@ -1479,6 +1483,7 @@ pub(crate) fn try_parallel_count(
     };
     let ranges = split.ranges;
     let pager = ctx.pager;
+    let parent_owns_write_gate = pager.plain_gate_write_owned();
     let conn_enc_tag = super::conn_enc::current();
     let cs_like = crate::plugin::conn_flags();
     let counts: Vec<Result<u64>> = std::thread::scope(|scope| {
@@ -1495,7 +1500,7 @@ pub(crate) fn try_parallel_count(
                 // parallel COUNT). plain_reader_gate() is None unless the
                 // engine is regime-capable (WAL attached) or the regime is
                 // active — single-writer/DELETE-mode engines pay nothing.
-                let _worker_reader_gate = pager.plain_reader_gate();
+                let _worker_reader_gate = pager.plain_reader_gate_child(parent_owns_write_gate);
                 let mut bt = Btree::new(pager, root, false);
                 bt.count_rows_range(lo, hi)
             }));
@@ -1600,6 +1605,7 @@ pub(crate) fn try_parallel_topn(
     // the process-global registry, so every comparison (worker heap,
     // main-thread merge) uses the same comparator the serial path
     // resolved.
+    let parent_owns_write_gate = pager.plain_gate_write_owned();
     let conn_enc_tag = super::conn_enc::current();
     let cs_like = crate::plugin::conn_flags();
     let partials: Vec<Result<Vec<super::TopnSel>>> = std::thread::scope(|scope| {
@@ -1618,7 +1624,7 @@ pub(crate) fn try_parallel_topn(
                 // parallel COUNT). plain_reader_gate() is None unless the
                 // engine is regime-capable (WAL attached) or the regime is
                 // active — single-writer/DELETE-mode engines pay nothing.
-                let _worker_reader_gate = pager.plain_reader_gate();
+                let _worker_reader_gate = pager.plain_reader_gate_child(parent_owns_write_gate);
                 let coll_ref = coll.as_deref();
                 let mut bt = Btree::new(pager, root, false);
                 let mut sel: Vec<super::TopnSel> = Vec::with_capacity(keep.min(4096));
@@ -1744,6 +1750,7 @@ pub(crate) fn try_parallel_topn_expr(
     // Workers: the serial expression-key loop over each range (identical
     // heap discipline — sift-up on insert, root-replace + sift-down when
     // the candidate beats the worst survivor).
+    let parent_owns_write_gate = pager.plain_gate_write_owned();
     let conn_enc_tag = super::conn_enc::current();
     let cs_like = crate::plugin::conn_flags();
     let partials: Vec<Result<Vec<super::TopnSel>>> = std::thread::scope(|scope| {
@@ -1763,7 +1770,7 @@ pub(crate) fn try_parallel_topn_expr(
                 // parallel COUNT). plain_reader_gate() is None unless the
                 // engine is regime-capable (WAL attached) or the regime is
                 // active — single-writer/DELETE-mode engines pay nothing.
-                let _worker_reader_gate = pager.plain_reader_gate();
+                let _worker_reader_gate = pager.plain_reader_gate_child(parent_owns_write_gate);
                 let coll_ref = coll.as_deref();
                 let mut bt = Btree::new(pager, root, false);
                 let mut sel: Vec<super::TopnSel> = Vec::with_capacity(keep.min(4096));
@@ -2021,6 +2028,7 @@ pub(crate) fn try_parallel_sort_expr(
     let params: &[Value] = &ctx.params;
 
     // Workers: wide decode + per-row key materialization + local sort.
+    let parent_owns_write_gate = pager.plain_gate_write_owned();
     let conn_enc_tag = super::conn_enc::current();
     let cs_like = crate::plugin::conn_flags();
     let partials: Vec<Result<ExprSortChunk>> = std::thread::scope(|scope| {
@@ -2039,7 +2047,7 @@ pub(crate) fn try_parallel_sort_expr(
                 // parallel COUNT). plain_reader_gate() is None unless the
                 // engine is regime-capable (WAL attached) or the regime is
                 // active — single-writer/DELETE-mode engines pay nothing.
-                let _worker_reader_gate = pager.plain_reader_gate();
+                let _worker_reader_gate = pager.plain_reader_gate_child(parent_owns_write_gate);
                 let mut bt = Btree::new(pager, root, false);
                 let mut wide: Vec<Value> = Vec::with_capacity(n_cols + 1);
                 let mut rows: Vec<(i64, Vec<Value>, Row)> = Vec::new();
@@ -3014,6 +3022,7 @@ pub(crate) fn try_parallel_sort(
     // Workers: range scan + local sort. The rows move out of the chunk
     // during the merge (mem::take), so the chunk Vecs are drained
     // allocation-free on the emit side.
+    let parent_owns_write_gate = pager.plain_gate_write_owned();
     let conn_enc_tag = super::conn_enc::current();
     let cs_like = crate::plugin::conn_flags();
     let partials: Vec<Result<SortChunk>> = std::thread::scope(|scope| {
@@ -3032,7 +3041,7 @@ pub(crate) fn try_parallel_sort(
                 // parallel COUNT). plain_reader_gate() is None unless the
                 // engine is regime-capable (WAL attached) or the regime is
                 // active — single-writer/DELETE-mode engines pay nothing.
-                let _worker_reader_gate = pager.plain_reader_gate();
+                let _worker_reader_gate = pager.plain_reader_gate_child(parent_owns_write_gate);
                 let mut bt = Btree::new(pager, root, false);
                 let mut rows: Vec<(i64, Row)> = Vec::new();
                 bt.scan_table_range_selective(
@@ -3251,6 +3260,7 @@ pub(crate) fn try_parallel_join_probe(
     let built_key_slots: StdArc<Vec<usize>> = StdArc::new(built.key_slots.clone());
     let build_words = built.n_build.div_ceil(64);
     let n_workers = ranges.len();
+    let parent_owns_write_gate = pager.plain_gate_write_owned();
     let conn_enc_tag = super::conn_enc::current();
     type WorkerOut = (Vec<crate::Row>, Vec<u64>);
     let cs_like = crate::plugin::conn_flags();
@@ -3273,7 +3283,7 @@ pub(crate) fn try_parallel_join_probe(
                 // parallel COUNT). plain_reader_gate() is None unless the
                 // engine is regime-capable (WAL attached) or the regime is
                 // active — single-writer/DELETE-mode engines pay nothing.
-                let _worker_reader_gate = pager.plain_reader_gate();
+                let _worker_reader_gate = pager.plain_reader_gate_child(parent_owns_write_gate);
                 let mut out_rows: Vec<crate::Row> = Vec::new();
                 let mut pbuf: Vec<crate::types::Value> = Vec::new();
                 let mut pks: Vec<u64> = vec![0u64; n_keys];

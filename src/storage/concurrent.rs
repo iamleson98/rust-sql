@@ -428,13 +428,19 @@ pub struct ConcurrentManager {
     /// tree. Installers hold the WRITE side across the whole
     /// install+freelist-splice window; plain (no-transaction) readers
     /// hold the READ side for their whole walk (see
-    /// [`Pager::plain_reader_gate`]). Owners are exempt by construction
+    /// [`Pager::plain_reader_gate`]). A PLAIN `&self` DML statement is the
+    /// second kind of writer: it rewrites live pages in place (a split
+    /// re-initializes an interior page and re-adds its cells across
+    /// several page-lock acquisitions), so it takes the WRITE side for its
+    /// tree surgery too (see [`Pager::plain_writer_gate`]) — without it
+    /// readers saw half-rewritten pages and could deadlock against the
+    /// writer's lock order. Owners are exempt by construction
     /// — their fetch-time version-stamp gate fails fast on any page a
     /// sibling commit installed — and the outer-RwLock worlds (the
     /// driver, the C ABI, `execute(&mut self)`) never overlap a reader
     /// with a commit in the first place, so the gate stays uncontended
     /// there.
-    install_gate: RwLock<()>,
+    install_gate: InstallGate,
     /// Sticky "the engine is regime-CAPABLE" marker: set the first time
     /// WAL mode attaches on a file-backed pager. While set, PLAIN reader
     /// walks always hold the install gate's read side — `any_active()`
@@ -475,7 +481,7 @@ impl ConcurrentManager {
             active: AtomicUsize::new(0),
             committing: AtomicUsize::new(0),
             roots_moved: AtomicUsize::new(0),
-            install_gate: RwLock::new(()),
+            install_gate: InstallGate::new(),
             regime_capable: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -755,6 +761,314 @@ fn replace_writer_scope(new: Option<(u64, u64)>) -> Option<(u64, u64)> {
         _ => {}
     }
     old
+}
+
+/// The install gate: a many-readers / one-writer lock tuned for the shape
+/// of its two sides. Readers hold it for ~1-10 us (one page walk); the
+/// writer — a concurrent COMMIT's shadow install, or a plain `&self` DML
+/// statement's in-place tree surgery — holds it for ~5-20 us, thousands
+/// of times a second. Waiters therefore SPIN for a bounded budget before
+/// parking: with a parking lock (`parking_lot::RwLock`) every write made
+/// all N readers park on the futex and wake again (tens of microseconds
+/// of scheduler latency each way), and the barging writer immediately
+/// re-took the free lock — eight readers collapsed from ~940k to ~19k
+/// queries/s behind a 33k-writes/s writer even though the writer held the
+/// lock only a fraction of the time. The park fallback keeps the rare long
+/// holds (a foreign-commit resync reopening the WAL view, an oversubscribed
+/// host) from burning CPU.
+///
+/// Semantics (what the callers rely on):
+/// - readers share; the writer is exclusive;
+/// - a PENDING writer blocks NEW plain readers (no writer starvation under
+///   a steady reader stream) but not [`InstallGate::read_recursive`]
+///   (nested reads and worker threads of an already-admitted reader, which
+///   would otherwise deadlock against the writer waiting for their
+///   parent);
+/// - phase-fair: a writer that just released lets the readers that queued
+///   behind it in before it claims the next round;
+/// - not re-entrant for writers and no read->write upgrade: callers keep
+///   the per-thread `GATES_HELD` ledger to avoid both.
+pub struct InstallGate {
+    /// bits 0..29: reader count (including transient optimistic
+    /// increments of readers that are about to back off); bit 30: a
+    /// writer is waiting for readers to drain; bit 31: a writer holds it.
+    state: std::sync::atomic::AtomicU32,
+    /// Readers currently in the slow path (spinning or parked). A writer
+    /// that just released the gate lets them in before it claims the next
+    /// round — without this a back-to-back writer starves the readers
+    /// outright, because the release -> re-claim gap is shorter than a
+    /// waiter's poll interval.
+    waiting_readers: std::sync::atomic::AtomicU32,
+    /// Threads blocked on `cv` (the park fallback).
+    parked: std::sync::atomic::AtomicU32,
+    lock: Mutex<()>,
+    cv: parking_lot::Condvar,
+}
+
+const GATE_PENDING: u32 = 1 << 30;
+const GATE_ACTIVE: u32 = 1 << 31;
+const GATE_COUNT: u32 = GATE_PENDING - 1;
+/// Longest a releasing writer waits for queued readers to get in before it
+/// claims the next round.
+const GATE_READER_GRACE: std::time::Duration = std::time::Duration::from_micros(30);
+/// How long a waiter spins before parking.
+const GATE_SPIN_BUDGET: std::time::Duration = std::time::Duration::from_micros(60);
+
+/// Read side of [`InstallGate`], released on drop.
+pub struct GateReadGuard<'a>(&'a InstallGate);
+
+impl Drop for GateReadGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.0.release_read();
+    }
+}
+
+/// Write side of [`InstallGate`], released on drop.
+pub struct GateWriteGuard<'a>(&'a InstallGate);
+
+impl Drop for GateWriteGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.0.state.fetch_and(!GATE_ACTIVE, Ordering::SeqCst);
+        self.0.wake_parked();
+    }
+}
+
+impl InstallGate {
+    fn new() -> Self {
+        Self {
+            state: std::sync::atomic::AtomicU32::new(0),
+            waiting_readers: std::sync::atomic::AtomicU32::new(0),
+            parked: std::sync::atomic::AtomicU32::new(0),
+            lock: Mutex::new(()),
+            cv: parking_lot::Condvar::new(),
+        }
+    }
+
+    /// Wake every parked waiter (cheap no-op when nobody is parked).
+    #[inline]
+    fn wake_parked(&self) {
+        // SeqCst on the state change before and on `parked` here pairs
+        // with the waiter's `parked` increment before its state re-check:
+        // either we see the waiter parked (and wake it through the
+        // mutex), or it sees our state change and never sleeps. The
+        // timed wait below is a belt for any residual window.
+        if self.parked.load(Ordering::SeqCst) != 0 {
+            let _g = self.lock.lock();
+            self.cv.notify_all();
+        }
+    }
+
+    /// Give back one reader count (also the optimistic-increment back-out).
+    #[inline]
+    fn release_read(&self) {
+        let prev = self.state.fetch_sub(1, Ordering::SeqCst);
+        // The last reader leaving while a writer waits for the drain.
+        if prev & GATE_PENDING != 0 && prev & GATE_COUNT == 1 {
+            self.wake_parked();
+        }
+    }
+
+    /// Wait until `blocked(state)` is false: spin for a bounded budget,
+    /// then park on the condvar.
+    fn wait_while(&self, blocked: impl Fn(u32) -> bool) {
+        let start = std::time::Instant::now();
+        let mut i = 0u32;
+        loop {
+            if !blocked(self.state.load(Ordering::Acquire)) {
+                return;
+            }
+            i += 1;
+            if i % 64 == 0 && start.elapsed() > GATE_SPIN_BUDGET {
+                break;
+            }
+            std::hint::spin_loop();
+        }
+        let mut g = self.lock.lock();
+        self.parked.fetch_add(1, Ordering::SeqCst);
+        while blocked(self.state.load(Ordering::SeqCst)) {
+            self.cv
+                .wait_for(&mut g, std::time::Duration::from_millis(1));
+        }
+        self.parked.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Shared acquisition that yields to a pending or active writer.
+    #[inline]
+    pub fn read(&self) -> GateReadGuard<'_> {
+        self.read_blocked_by(GATE_PENDING | GATE_ACTIVE)
+    }
+
+    /// Shared acquisition that waits only for an ACTIVE writer — joins
+    /// readers already inside even while a writer is pending.
+    #[inline]
+    pub fn read_recursive(&self) -> GateReadGuard<'_> {
+        self.read_blocked_by(GATE_ACTIVE)
+    }
+
+    #[inline]
+    fn read_blocked_by(&self, mask: u32) -> GateReadGuard<'_> {
+        // Optimistic increment: one RMW on the uncontended path (a CAS
+        // loop would retry under N readers hammering the same word).
+        let prev = self.state.fetch_add(1, Ordering::SeqCst);
+        if prev & mask == 0 {
+            return GateReadGuard(self);
+        }
+        self.read_slow(mask)
+    }
+
+    #[cold]
+    fn read_slow(&self, mask: u32) -> GateReadGuard<'_> {
+        // Back the optimistic increment out, wait for the writer to go
+        // away, retry.
+        self.release_read();
+        self.waiting_readers.fetch_add(1, Ordering::SeqCst);
+        loop {
+            self.wait_while(|s| s & mask != 0);
+            let prev = self.state.fetch_add(1, Ordering::SeqCst);
+            if prev & mask == 0 {
+                self.waiting_readers.fetch_sub(1, Ordering::SeqCst);
+                return GateReadGuard(self);
+            }
+            self.release_read();
+        }
+    }
+
+    /// Exclusive acquisition: claim the writer slot (blocking new plain
+    /// readers), then wait for the admitted readers to drain.
+    pub fn write(&self) -> GateWriteGuard<'_> {
+        // 0. Let the readers that queued behind the previous writer in
+        //    first (bounded: a steady trickle of new waiters must not
+        //    starve this writer).
+        let start = std::time::Instant::now();
+        while self.waiting_readers.load(Ordering::Acquire) != 0
+            && start.elapsed() < GATE_READER_GRACE
+        {
+            std::hint::spin_loop();
+        }
+        // 1. Claim the (single) writer slot.
+        loop {
+            self.wait_while(|s| s & (GATE_PENDING | GATE_ACTIVE) != 0);
+            let s = self.state.load(Ordering::Relaxed);
+            if s & (GATE_PENDING | GATE_ACTIVE) == 0
+                && self
+                    .state
+                    .compare_exchange(s, s | GATE_PENDING, Ordering::SeqCst, Ordering::Relaxed)
+                    .is_ok()
+            {
+                break;
+            }
+        }
+        // 2. Wait for the readers inside to leave, then flip
+        //    pending -> active in one step.
+        loop {
+            self.wait_while(|s| s & GATE_COUNT != 0);
+            let s = self.state.load(Ordering::Relaxed);
+            if s & GATE_COUNT == 0
+                && self
+                    .state
+                    .compare_exchange(
+                        s,
+                        (s & !GATE_PENDING) | GATE_ACTIVE,
+                        Ordering::SeqCst,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
+                return GateWriteGuard(self);
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// Install-gate sides THIS thread currently holds, as
+    /// `(gate address, is_write, depth)`. Lets the gate helpers below be
+    /// re-entrant: a thread that already holds a gate's WRITE side (a
+    /// plain `&self` DML statement) must not take it again or take the
+    /// read side (self-deadlock), and a nested READ on a thread that
+    /// already holds the read side must not queue behind a waiting
+    /// writer (parking_lot's plain `read` blocks behind queued writers).
+    /// Almost always empty; touched only while the engine is regime-capable.
+    static GATES_HELD: std::cell::RefCell<Vec<(usize, bool, u32)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// What this thread currently holds of the gate at `key`:
+/// `Some(true)` = write side, `Some(false)` = read side, `None` = neither.
+fn gate_held_by_me(key: usize) -> Option<bool> {
+    GATES_HELD.with(|h| h.borrow().iter().find(|e| e.0 == key).map(|e| e.1))
+}
+
+fn gate_note_acquired(key: usize, write: bool) {
+    GATES_HELD.with(|h| {
+        let mut h = h.borrow_mut();
+        match h.iter_mut().find(|e| e.0 == key) {
+            Some(e) => e.2 += 1,
+            None => h.push((key, write, 1)),
+        }
+    });
+}
+
+fn gate_note_released(key: usize) {
+    GATES_HELD.with(|h| {
+        let mut h = h.borrow_mut();
+        if let Some(i) = h.iter().position(|e| e.0 == key) {
+            if h[i].2 <= 1 {
+                h.swap_remove(i);
+            } else {
+                h[i].2 -= 1;
+            }
+        }
+    });
+}
+
+/// Reader side of the install gate (see [`Pager::plain_reader_gate`]).
+/// Holds the read lock, or nothing when this thread already owns the
+/// gate's write side (a plain DML statement reading its own state).
+pub struct PlainReadGate<'a> {
+    _guard: Option<GateReadGuard<'a>>,
+    /// Gate address when the acquisition was recorded in `GATES_HELD`.
+    tracked: Option<usize>,
+}
+
+impl Drop for PlainReadGate<'_> {
+    fn drop(&mut self) {
+        if let Some(key) = self.tracked {
+            gate_note_released(key);
+        }
+    }
+}
+
+/// Writer side of the install gate taken by a plain (`&self`,
+/// non-concurrent) DML statement for the duration of its tree surgery
+/// (see [`Pager::plain_writer_gate`]).
+pub struct PlainWriteGate<'a> {
+    _guard: GateWriteGuard<'a>,
+    key: usize,
+}
+
+impl Drop for PlainWriteGate<'_> {
+    fn drop(&mut self) {
+        gate_note_released(self.key);
+    }
+}
+
+/// Install-gate write side taken by freshness resyncs (see
+/// [`Pager::install_gate_write`]); a no-op when this thread already
+/// owns the write side (a resync reached from inside a plain DML).
+pub struct InstallWriteGate<'a> {
+    _guard: Option<GateWriteGuard<'a>>,
+    tracked: Option<usize>,
+}
+
+impl Drop for InstallWriteGate<'_> {
+    fn drop(&mut self) {
+        if let Some(key) = self.tracked {
+            gate_note_released(key);
+        }
+    }
 }
 
 thread_local! {
@@ -1133,26 +1447,24 @@ impl Pager {
         self.concurrent.any_active()
     }
 
-    /// Reader-side half of the concurrent-install gate (see
-    /// [`ConcurrentManager`]'s `install_gate`): a read guard held for
-    /// the duration of a PLAIN (no-transaction) reader's page walks
-    /// while the concurrent regime is active, so a concurrent COMMIT's
-    /// shadow install cannot interleave mid-walk (a torn tree). Returns
-    /// `None` — one atomic load, nothing held — when no concurrent
-    /// transaction is open. Callers that hold a concurrent transaction
-    /// (owners) must NOT take this guard: their fetch-time version-stamp
-    /// validation is the isolation mechanism, and an owner's statement
-    /// may legitimately run while a sibling commits.
-    /// The write side of the install gate — used by cross-process
-    /// freshness resyncs (`Pager::resync_foreign_commits_if_stale`):
-    /// absorbing a foreign process's committed WAL growth changes
-    /// committed pages, exactly like an in-process install, so in-flight
-    /// walker pulls finish before the map/cache swap and new pulls wait.
-    pub(crate) fn install_gate_write(&self) -> parking_lot::RwLockWriteGuard<'_, ()> {
-        self.concurrent.install_gate.write()
-    }
-
-    pub fn plain_reader_gate(&self) -> Option<parking_lot::RwLockReadGuard<'_, ()>> {
+    /// Reader-side half of the install gate (see [`ConcurrentManager`]'s
+    /// `install_gate`): a read guard held for the duration of a PLAIN
+    /// (no-transaction) reader's page walks, so neither a concurrent
+    /// COMMIT's shadow install nor a plain `&self` DML statement's
+    /// in-place tree surgery ([`Self::plain_writer_gate`]) can interleave
+    /// mid-walk (a torn tree). Returns `None` — one atomic load, nothing
+    /// held — for engines that are neither regime-capable nor in the
+    /// regime. Callers that hold a concurrent transaction (owners) must
+    /// NOT take this guard: their fetch-time version-stamp validation is
+    /// the isolation mechanism, and an owner's statement may legitimately
+    /// run while a sibling commits.
+    ///
+    /// Re-entrant: a nested acquisition on a thread that already holds
+    /// the read side is recursive (it must not queue behind a waiting
+    /// writer, which would wait for the outer guard — a deadlock), and
+    /// on a thread that holds the WRITE side (a plain DML statement
+    /// reading its own state) it holds nothing.
+    pub fn plain_reader_gate(&self) -> Option<PlainReadGate<'_>> {
         // Gate condition: the regime is active OR the engine is
         // regime-CAPABLE (WAL attached, sticky). `any_active()` alone is
         // NOT sound: between two concurrent transactions (all writers
@@ -1167,7 +1479,109 @@ impl Pager {
         if !self.concurrent.any_active() && !self.concurrent.regime_capable() {
             return None;
         }
-        Some(self.concurrent.install_gate.read())
+        let gate = &self.concurrent.install_gate;
+        let key = gate as *const InstallGate as usize;
+        Some(match gate_held_by_me(key) {
+            Some(true) => PlainReadGate {
+                _guard: None,
+                tracked: None,
+            },
+            Some(false) => {
+                let g = gate.read_recursive();
+                gate_note_acquired(key, false);
+                PlainReadGate {
+                    _guard: Some(g),
+                    tracked: Some(key),
+                }
+            }
+            None => {
+                let g = gate.read();
+                gate_note_acquired(key, false);
+                PlainReadGate {
+                    _guard: Some(g),
+                    tracked: Some(key),
+                }
+            }
+        })
+    }
+
+    /// Reader gate for a WORKER thread spawned by a gated reader (the
+    /// parallel scan workers): the spawning thread already holds the read
+    /// side for the workers' whole lifetime, so the workers take it
+    /// recursively — queueing behind a waiting writer would deadlock
+    /// (the writer waits for the parent's guard, the parent for the
+    /// worker).
+    ///
+    /// `parent_owns_write` (from [`Self::plain_gate_write_owned`], sampled
+    /// on the spawning thread): the spawner is a plain DML statement
+    /// holding the WRITE side, which already excludes every other thread
+    /// — the workers hold nothing (read-locking would wait for it).
+    pub fn plain_reader_gate_child(&self, parent_owns_write: bool) -> Option<GateReadGuard<'_>> {
+        if parent_owns_write || (!self.concurrent.any_active() && !self.concurrent.regime_capable())
+        {
+            return None;
+        }
+        Some(self.concurrent.install_gate.read_recursive())
+    }
+
+    /// True when the CALLING thread holds the install gate's write side
+    /// (it is running a plain DML statement under [`Self::plain_writer_gate`]).
+    pub fn plain_gate_write_owned(&self) -> bool {
+        let key = &self.concurrent.install_gate as *const InstallGate as usize;
+        gate_held_by_me(key) == Some(true)
+    }
+
+    /// Writer-side gate for a PLAIN (non-concurrent) DML statement stepped
+    /// through `&self` on a shared `Database`. Plain DML rewrites the LIVE
+    /// page cache in place — a B-tree split re-initializes an interior
+    /// page and re-adds its cells across several page-lock acquisitions —
+    /// so a concurrent reader walking the same pages saw torn trees
+    /// ("interior page N has no valid child") and could deadlock against
+    /// the writer's lock order (reader: parent→child; writer: child→
+    /// parent). Taking the install gate's WRITE side for the statement
+    /// excludes the gated readers ([`Self::plain_reader_gate`]) exactly
+    /// like a concurrent COMMIT's shadow install does; it is one
+    /// uncontended lock acquisition for sanctioned single-threaded /
+    /// outer-lock callers.
+    ///
+    /// `None` (nothing held) when the engine is not regime-capable —
+    /// readers don't gate there either — or when this thread already
+    /// holds the gate (a nested DML, or DML re-entered from a reader).
+    pub(crate) fn plain_writer_gate(&self) -> Option<PlainWriteGate<'_>> {
+        if !self.concurrent.regime_capable() {
+            return None;
+        }
+        let gate = &self.concurrent.install_gate;
+        let key = gate as *const InstallGate as usize;
+        if gate_held_by_me(key).is_some() {
+            return None;
+        }
+        let g = gate.write();
+        gate_note_acquired(key, true);
+        Some(PlainWriteGate { _guard: g, key })
+    }
+
+    /// The write side of the install gate — used by cross-process
+    /// freshness resyncs (`Pager::resync_foreign_commits_if_stale`):
+    /// absorbing a foreign process's committed WAL growth changes
+    /// committed pages, exactly like an in-process install, so in-flight
+    /// walker pulls finish before the map/cache swap and new pulls wait.
+    /// Re-entrant on a thread that already owns the write side.
+    pub(crate) fn install_gate_write(&self) -> InstallWriteGate<'_> {
+        let gate = &self.concurrent.install_gate;
+        let key = gate as *const InstallGate as usize;
+        if gate_held_by_me(key) == Some(true) {
+            return InstallWriteGate {
+                _guard: None,
+                tracked: None,
+            };
+        }
+        let g = gate.write();
+        gate_note_acquired(key, true);
+        InstallWriteGate {
+            _guard: Some(g),
+            tracked: Some(key),
+        }
     }
 
     /// True when the transaction has no observable effect (no dirty
