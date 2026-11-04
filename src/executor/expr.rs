@@ -453,8 +453,14 @@ impl<'a> EvalContext<'a> {
     /// one this row's column list resolves a bare name to (so the
     /// registry lookup learns which source it means).
     fn source_qualifier(&self, table: Option<&str>, name: &str) -> Option<String> {
+        self.source_qualifier_raw(table, name)
+            .map(|q| q.to_ascii_lowercase())
+    }
+
+    /// [`source_qualifier`](Self::source_qualifier) before lowercasing.
+    fn source_qualifier_raw<'b>(&'b self, table: Option<&'b str>, name: &str) -> Option<&'b str> {
         match table {
-            Some(t) => Some(t.to_ascii_lowercase()),
+            Some(t) => Some(t),
             None => {
                 for n in self.column_names.iter() {
                     if n.eq_ignore_ascii_case(name) {
@@ -462,7 +468,7 @@ impl<'a> EvalContext<'a> {
                     }
                     if let Some(pos) = n.rfind('.') {
                         if n[pos + 1..].eq_ignore_ascii_case(name) {
-                            return Some(n[..pos].to_ascii_lowercase());
+                            return Some(&n[..pos]);
                         }
                     }
                 }
@@ -816,6 +822,15 @@ fn collation_scope_lookup(qualifier: Option<&str>, name: &str) -> Option<String>
 /// [`collation_scope_lookup`] telling "resolved, no collation" (the
 /// rowid: `Some(None)`) apart from "not resolved in any scope" (`None`).
 fn collation_scope_lookup_ex(qualifier: Option<&str>, name: &str) -> Option<Option<String>> {
+    collation_scope_with(qualifier, name, |r| r.map(|c| c.map(str::to_string)))
+}
+
+/// `collation_scope_lookup_ex` handing the (borrowed) answer to `f`.
+fn collation_scope_with<R>(
+    qualifier: Option<&str>,
+    name: &str,
+    f: impl FnOnce(Option<Option<&str>>) -> R,
+) -> R {
     AFFINITY_SCOPES.with(|s| {
         let s = s.borrow();
         for frame in s.iter().rev() {
@@ -832,25 +847,25 @@ fn collation_scope_lookup_ex(qualifier: Option<&str>, name: &str) -> Option<Opti
                 // compares NOCASE; `id = h` takes h's collation).
                 if let Some(i) = table.find_column(name) {
                     if table.rowid_alias == Some(i) {
-                        return Some(None);
+                        return f(Some(None));
                     }
-                    return Some(table.columns.get(i).map(|c| {
+                    return f(Some(table.columns.get(i).map(|c| {
                         if c.collation.is_empty() {
-                            "BINARY".to_string()
+                            "BINARY"
                         } else {
-                            c.collation.clone()
+                            c.collation.as_str()
                         }
-                    }));
+                    })));
                 }
                 if crate::planner::is_rowid_spelling(name) && !table.without_rowid {
-                    return Some(None);
+                    return f(Some(None));
                 }
                 if qualifier.is_some() {
-                    return None;
+                    return f(None);
                 }
             }
         }
-        None
+        f(None)
     })
 }
 
@@ -1401,6 +1416,109 @@ enum CExpr {
         /// functions there too, so the binding is the same).
         direct: Option<BuiltinFn>,
     },
+    /// A whole OR condition (never evaluated as a value: `compiled_eval`
+    /// skips it, `compiled_cond` finds it).
+    Cond(Box<CCond>),
+}
+
+/// A condition tree in jump form: `cond_if_false` / `cond_if_true`
+/// (sqlite3ExprIfFalse / IfTrue) over compiled leaves, in the walker's
+/// exact evaluation order. Only built for subquery-free scopes, where
+/// `and_or_order` is the identity.
+enum CCond {
+    And(Box<CCond>, Box<CCond>),
+    Or(Box<CCond>, Box<CCond>),
+    Not(Box<CCond>),
+    /// BETWEEN and IS [NOT] TRUE|FALSE keep their jump code in the walker.
+    Walk(*const Expr),
+    Leaf(CExpr),
+}
+
+impl CCond {
+    fn compile(e: &Expr, ctx: &EvalContext<'_>) -> CCond {
+        match e {
+            Expr::Binary {
+                op: op @ (BinaryOp::And | BinaryOp::Or),
+                left,
+                right,
+            } => {
+                let alt = simplified_and_or(e);
+                if !std::ptr::eq(alt, e) {
+                    return CCond::compile(alt, ctx);
+                }
+                let (l, r) = (
+                    Box::new(CCond::compile(left, ctx)),
+                    Box::new(CCond::compile(right, ctx)),
+                );
+                if *op == BinaryOp::And {
+                    CCond::And(l, r)
+                } else {
+                    CCond::Or(l, r)
+                }
+            }
+            Expr::Unary {
+                op: UnaryOp::Not,
+                expr,
+            } => CCond::Not(Box::new(CCond::compile(expr, ctx))),
+            Expr::Unary {
+                op: UnaryOp::Truth { .. },
+                ..
+            }
+            | Expr::Between { .. } => CCond::Walk(e as *const Expr),
+            _ => CCond::Leaf(CExpr::compile(e, ctx)),
+        }
+    }
+
+    /// `cond_if_false`: does the condition take its FALSE exit?
+    fn if_false(&self, ctx: &EvalContext<'_>, jump_if_null: bool) -> Result<bool> {
+        match self {
+            CCond::And(a, b) => {
+                Ok(a.if_false(ctx, jump_if_null)? || b.if_false(ctx, jump_if_null)?)
+            }
+            CCond::Or(a, b) => {
+                if a.if_true(ctx, !jump_if_null)? {
+                    return Ok(false);
+                }
+                b.if_false(ctx, jump_if_null)
+            }
+            CCond::Not(a) => a.if_true(ctx, jump_if_null),
+            // SAFETY: the scope that owns this node borrows the expression
+            // tree for its whole lifetime.
+            CCond::Walk(p) => cond_if_false(unsafe { &**p }, ctx, jump_if_null),
+            CCond::Leaf(c) => {
+                let v = c.eval(ctx)?;
+                Ok(if v.is_null() {
+                    jump_if_null
+                } else {
+                    !v.is_truthy()
+                })
+            }
+        }
+    }
+
+    /// `cond_if_true`: does the condition take its TRUE exit?
+    fn if_true(&self, ctx: &EvalContext<'_>, jump_if_null: bool) -> Result<bool> {
+        match self {
+            CCond::And(a, b) => {
+                if a.if_false(ctx, !jump_if_null)? {
+                    return Ok(false);
+                }
+                b.if_true(ctx, jump_if_null)
+            }
+            CCond::Or(a, b) => Ok(a.if_true(ctx, jump_if_null)? || b.if_true(ctx, jump_if_null)?),
+            CCond::Not(a) => a.if_false(ctx, jump_if_null),
+            // SAFETY: as for `if_false`.
+            CCond::Walk(p) => cond_if_true(unsafe { &**p }, ctx, jump_if_null),
+            CCond::Leaf(c) => {
+                let v = c.eval(ctx)?;
+                Ok(if v.is_null() {
+                    jump_if_null
+                } else {
+                    v.is_truthy()
+                })
+            }
+        }
+    }
 }
 
 /// A builtin scalar's implementation.
@@ -1581,7 +1699,10 @@ impl CExpr {
                 };
                 let converted;
                 let (lv, rv) = match aff {
-                    Some(a) if matches!(lv, Value::Text(_)) || matches!(rv, Value::Text(_)) => {
+                    Some(a)
+                        if !matches!(a, CmpAffinity::None)
+                            && (matches!(lv, Value::Text(_)) || matches!(rv, Value::Text(_))) =>
+                    {
                         converted = apply_comparison_affinity(*a, lv.clone(), rv.clone());
                         (&converted.0, &converted.1)
                     }
@@ -1626,6 +1747,7 @@ impl CExpr {
                     ))),
                 }
             }
+            CExpr::Cond(_) => Err(crate::error::Error::Unsupported("condition as value")),
             CExpr::Func { name, args, direct } => {
                 // Context-resident arguments are passed as SHALLOW copies
                 // that are never dropped (`call_scalar` only reads its
@@ -1786,6 +1908,30 @@ impl Drop for CompiledScope {
 #[derive(Default)]
 struct SigHasher(u64);
 
+impl SigHasher {
+    /// `bytes` (and a caller tag) in one length-framed pass: one chained
+    /// mix per 8 bytes.
+    #[inline]
+    fn bytes(&mut self, bytes: &[u8], tag: u64) {
+        use std::hash::Hasher;
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            self.write_u64(u64::from_le_bytes(c.try_into().unwrap()));
+        }
+        let mut tail = 0u64;
+        for (i, b) in chunks.remainder().iter().enumerate() {
+            tail |= (*b as u64) << (8 * i);
+        }
+        let frame = (bytes.len() as u64).wrapping_mul(0x9e_37_79_b9_7f_4a_7c_15) ^ tag;
+        self.write_u64(tail ^ frame);
+    }
+
+    #[inline]
+    fn str(&mut self, s: &str, tag: u64) {
+        self.bytes(s.as_bytes(), tag);
+    }
+}
+
 impl std::hash::Hasher for SigHasher {
     #[inline]
     fn write(&mut self, bytes: &[u8]) {
@@ -1793,10 +1939,12 @@ impl std::hash::Hasher for SigHasher {
         for c in &mut chunks {
             self.write_u64(u64::from_le_bytes(c.try_into().unwrap()));
         }
-        let mut tail = [0u8; 8];
         let r = chunks.remainder();
-        tail[..r.len()].copy_from_slice(r);
-        self.write_u64(u64::from_le_bytes(tail) ^ ((r.len() as u64) << 56));
+        let mut tail = (r.len() as u64) << 56;
+        for (i, b) in r.iter().enumerate() {
+            tail |= (*b as u64) << (8 * i);
+        }
+        self.write_u64(tail);
     }
     #[inline]
     fn write_u64(&mut self, v: u64) {
@@ -1818,16 +1966,29 @@ impl std::hash::Hasher for SigHasher {
 
 fn sig_node(e: &Expr, h: &mut SigHasher) {
     use std::hash::Hash;
-    (e as *const Expr as usize).hash(h);
-    std::mem::discriminant(e).hash(h);
+    // The address and the node kind share ONE chained mix (the kind is
+    // hashed on its own, off the dependency chain).
+    let kind = |d: u64| d.wrapping_mul(0x9e_37_79_b9_7f_4a_7c_15);
+    let mut k = SigHasher::default();
+    std::mem::discriminant(e).hash(&mut k);
+    let mut x = (e as *const Expr as usize as u64) ^ kind(k.0);
+    if let Expr::Binary { op, .. } = e {
+        let mut k = SigHasher::default();
+        std::mem::discriminant(op).hash(&mut k);
+        x ^= kind(k.0).rotate_left(17);
+    }
+    std::hash::Hasher::write_u64(h, x);
     match e {
         Expr::Literal(v) => value_sig(v, h),
-        Expr::Parameter(p) => p.hash(h),
+        Expr::Parameter(p) => h.str(p, 0),
         Expr::Column { table, name } => {
-            table.hash(h);
-            name.hash(h);
+            match table {
+                Some(t) => h.str(t, 1),
+                None => h.str("", 2),
+            }
+            h.str(name, 0);
         }
-        Expr::Binary { op, .. } => std::mem::discriminant(op).hash(h),
+        Expr::Binary { .. } => {}
         Expr::Unary { op, .. } => {
             std::mem::discriminant(op).hash(h);
             if let UnaryOp::Truth { truth, negated } = op {
@@ -1850,10 +2011,12 @@ fn sig_node(e: &Expr, h: &mut SigHasher) {
             order_by,
             ..
         } => {
-            name.hash(h);
-            distinct.hash(h);
-            over.is_some().hash(h);
-            order_by.len().hash(h);
+            h.str(
+                name,
+                (*distinct as u64)
+                    | ((over.is_some() as u64) << 1)
+                    | ((order_by.len() as u64) << 2),
+            );
         }
         Expr::Cast { type_name, .. } => type_name.hash(h),
         Expr::Collate { collation, .. } => collation.hash(h),
@@ -1863,13 +2026,13 @@ fn sig_node(e: &Expr, h: &mut SigHasher) {
 }
 
 fn value_sig(v: &Value, h: &mut SigHasher) {
-    use std::hash::Hash;
+    use std::hash::Hasher;
     match v {
-        Value::Null => 0u8.hash(h),
-        Value::Integer(i) => (1u8, i).hash(h),
-        Value::Real(f) => (2u8, f.to_bits()).hash(h),
-        Value::Text(t) => (3u8, t.as_bytes()).hash(h),
-        Value::Blob(b) => (4u8, b.as_slice()).hash(h),
+        Value::Null => h.write_u64(0),
+        Value::Integer(i) => h.write_u64((*i as u64).wrapping_mul(0x2545_f491_4f6c_dd1d) ^ 1),
+        Value::Real(f) => h.write_u64(f.to_bits().wrapping_mul(0x2545_f491_4f6c_dd1d) ^ 2),
+        Value::Text(t) => h.bytes(t.as_bytes(), 3),
+        Value::Blob(b) => h.bytes(b.as_slice(), 4),
     }
 }
 
@@ -1963,14 +2126,6 @@ fn sig_walk(e: &Expr, h: &mut SigHasher) {
     }
 }
 
-/// One registry-resolution record: (binding key, comparison affinity,
-/// declared collation) — see [`column_resolutions`].
-type ColRes = (
-    String,
-    Option<crate::types::Affinity>,
-    Option<Option<String>>,
-);
-
 /// Everything an operator scope's construction read, besides the tree.
 #[derive(PartialEq)]
 struct ScopeInputs {
@@ -1979,9 +2134,9 @@ struct ScopeInputs {
     collated_frames: u32,
     collate_seen: bool,
     condition: bool,
-    /// The statement-scoped REGISTRY's answers for every column
-    /// reference in the compiled expressions (deterministic walk
-    /// order): (binding key, comparison affinity, declared collation).
+    /// A hash of the statement-scoped REGISTRY's answers for every
+    /// column reference in the compiled expressions (deterministic walk
+    /// order): (comparison affinity, declared collation).
     /// The compiled `CExpr` bakes these resolutions at compile time
     /// (`CExpr::Bin { aff, coll }`), so a cached scope built under
     /// DIFFERENT registry frames must never serve them — see
@@ -1989,12 +2144,15 @@ struct ScopeInputs {
     /// mechanism: a stale INTEGER-baked comparison for a no-affinity
     /// compound-derived column). Empty when the context carries its
     /// own affinity map (the registry is not consulted then).
-    colres: Vec<ColRes>,
+    colres: u64,
 }
 
 struct CachedScope {
     roots: Vec<usize>,
     sig: u64,
+    /// The plan holding the expression tree (see `OperatorScope::pinned`):
+    /// kept alive by this entry, so the roots' addresses stay theirs.
+    owner: Option<std::sync::Arc<crate::planner::Plan>>,
     inputs: ScopeInputs,
     subq_free: bool,
     coll_free: bool,
@@ -2010,77 +2168,110 @@ thread_local! {
 /// Cap on cached operator scopes per thread (oldest evicted first).
 const SCOPE_CACHE_CAP: usize = 64;
 
+/// (roots, signature, inputs, owning plan) of a scope being used.
+type ScopeKey = (
+    Vec<usize>,
+    u64,
+    ScopeInputs,
+    Option<std::sync::Arc<crate::planner::Plan>>,
+);
+
 /// One operator's evaluation scopes (subquery / COLLATE flags, column
 /// slots, compiled expressions) for its row loop — built once, or taken
 /// from the cache when the same live expression tree runs again under
 /// the same inputs; returned to the cache on drop.
 pub(crate) struct OperatorScope {
-    key: Option<(Vec<usize>, u64, ScopeInputs)>,
+    key: Option<ScopeKey>,
     compiled: Option<CompiledScope>,
     slots: Option<SlotScope>,
     flags: Option<SubqueryScope>,
 }
 
-/// The registry's answers for every column reference in `exprs`, in a
-/// deterministic depth-first walk order (subquery subtrees excluded —
-/// they compile under their own scopes): for each `Expr::Column`, the
-/// binding key (its qualifier, or the one the row layout resolves a
-/// bare name to), the comparison affinity the registry resolves, and
-/// its declared collation. This is the exact input set the compiled
-/// `CExpr` bakes through `comparison_column_affinity` /
+/// A hash of the registry's answers for every column reference in
+/// `exprs`, in a deterministic depth-first walk order (subquery subtrees
+/// excluded — they compile under their own scopes): for each
+/// `Expr::Column`, the comparison affinity the registry resolves and its
+/// declared collation. This is the exact input set the compiled `CExpr`
+/// bakes through `comparison_column_affinity` /
 /// `binary_comparison_collation` — keying the operator scope cache on
 /// it closes the stale-frame hole: a cached scope built under one set
 /// of registry frames can never serve a predicate whose columns
 /// resolve differently (the macOS semantics-battery flake — see
 /// `scope_cache_never_serves_a_foreign_registry_frame`).
 ///
-/// Empty when the context carries its own affinity map: the registry
+/// 0 when the context carries its own affinity map: the registry
 /// is then never consulted (the map answers every probe).
-fn column_resolutions(exprs: &[&Expr], ctx: &EvalContext<'_>) -> Vec<ColRes> {
+fn column_resolutions(exprs: &[&Expr], ctx: &EvalContext<'_>) -> u64 {
     if ctx.column_affinities.is_some() {
-        return Vec::new();
+        return 0;
     }
-    let mut out = Vec::new();
+    let mut h = SigHasher::default();
+    let mut seen: Vec<(Option<&str>, &str)> = Vec::new();
     for e in exprs {
-        collect_column_resolutions(e, ctx, &mut out);
+        collect_column_resolutions(e, ctx, &mut h, &mut seen);
     }
-    out
+    std::hash::Hasher::finish(&h)
 }
 
-fn collect_column_resolutions(e: &Expr, ctx: &EvalContext<'_>, out: &mut Vec<ColRes>) {
+/// `f` over the lowercase of `s` (a stack copy for the usual short name).
+fn with_lowercase<R>(s: &str, f: impl FnOnce(&str) -> R) -> R {
+    let mut buf = [0u8; 64];
+    if s.len() <= buf.len() {
+        let b = &mut buf[..s.len()];
+        b.copy_from_slice(s.as_bytes());
+        b.make_ascii_lowercase();
+        // ASCII case mapping keeps valid UTF-8 valid.
+        f(std::str::from_utf8(b).unwrap_or(""))
+    } else {
+        f(&s.to_ascii_lowercase())
+    }
+}
+
+fn collect_column_resolutions<'e>(
+    e: &'e Expr,
+    ctx: &EvalContext<'_>,
+    out: &mut SigHasher,
+    seen: &mut Vec<(Option<&'e str>, &'e str)>,
+) {
+    use std::hash::Hash;
     match e {
         Expr::Column { table, name } => {
-            let q = ctx.source_qualifier(table.as_deref(), name);
-            let aff = affinity_scope_lookup(q.as_deref(), name);
-            let coll = collation_scope_lookup_ex(q.as_deref(), name);
-            let key = match (table.as_deref(), q.as_deref()) {
-                (Some(t), _) => format!("{}:{}", t.to_ascii_lowercase(), name.to_ascii_lowercase()),
-                (None, Some(q)) => format!("{q}:{}", name.to_ascii_lowercase()),
-                (None, None) => name.to_ascii_lowercase(),
+            // A repeated reference resolves the same way: hashed once.
+            let key = (table.as_deref(), name.as_str());
+            if seen.contains(&key) {
+                return;
+            }
+            seen.push(key);
+            let mut resolve = |q: Option<&str>| {
+                affinity_scope_lookup(q, name).map(|a| a as u8).hash(out);
+                collation_scope_with(q, name, |c| c.hash(out));
             };
-            out.push((key, aff, coll));
+            match ctx.source_qualifier_raw(table.as_deref(), name) {
+                Some(q) => with_lowercase(q, |q| resolve(Some(q))),
+                None => resolve(None),
+            }
         }
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Subquery(_) | Expr::Exists(_) => {}
         Expr::Binary { left, right, .. } | Expr::Is { left, right, .. } => {
-            collect_column_resolutions(left, ctx, out);
-            collect_column_resolutions(right, ctx, out);
+            collect_column_resolutions(left, ctx, out, seen);
+            collect_column_resolutions(right, ctx, out, seen);
         }
         Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } | Expr::Cast { expr, .. } => {
-            collect_column_resolutions(expr, ctx, out);
+            collect_column_resolutions(expr, ctx, out, seen);
         }
-        Expr::Collate { expr, .. } => collect_column_resolutions(expr, ctx, out),
+        Expr::Collate { expr, .. } => collect_column_resolutions(expr, ctx, out, seen),
         Expr::Between {
             expr, low, high, ..
         } => {
-            collect_column_resolutions(expr, ctx, out);
-            collect_column_resolutions(low, ctx, out);
-            collect_column_resolutions(high, ctx, out);
+            collect_column_resolutions(expr, ctx, out, seen);
+            collect_column_resolutions(low, ctx, out, seen);
+            collect_column_resolutions(high, ctx, out, seen);
         }
         Expr::In { expr, source, .. } => {
-            collect_column_resolutions(expr, ctx, out);
+            collect_column_resolutions(expr, ctx, out, seen);
             if let crate::sql::ast::InSource::List(l) = source {
                 for x in l.iter() {
-                    collect_column_resolutions(x, ctx, out);
+                    collect_column_resolutions(x, ctx, out, seen);
                 }
             }
         }
@@ -2090,10 +2281,10 @@ fn collect_column_resolutions(e: &Expr, ctx: &EvalContext<'_>, out: &mut Vec<Col
             escape,
             ..
         } => {
-            collect_column_resolutions(expr, ctx, out);
-            collect_column_resolutions(pattern, ctx, out);
+            collect_column_resolutions(expr, ctx, out, seen);
+            collect_column_resolutions(pattern, ctx, out, seen);
             if let Some(x) = escape {
-                collect_column_resolutions(x, ctx, out);
+                collect_column_resolutions(x, ctx, out, seen);
             }
         }
         Expr::Function {
@@ -2104,26 +2295,26 @@ fn collect_column_resolutions(e: &Expr, ctx: &EvalContext<'_>, out: &mut Vec<Col
             ..
         } => {
             for a in args {
-                collect_column_resolutions(a, ctx, out);
+                collect_column_resolutions(a, ctx, out, seen);
             }
             if let Some(f) = filter {
-                collect_column_resolutions(f, ctx, out);
+                collect_column_resolutions(f, ctx, out, seen);
             }
             if let Some(o) = over {
                 match o.as_ref() {
                     crate::sql::ast::WindowSpec::Named(_) => {}
                     crate::sql::ast::WindowSpec::Inline(w) => {
                         for t in w.partition_by.iter() {
-                            collect_column_resolutions(t, ctx, out);
+                            collect_column_resolutions(t, ctx, out, seen);
                         }
                         for t in w.order_by.iter() {
-                            collect_column_resolutions(&t.expr, ctx, out);
+                            collect_column_resolutions(&t.expr, ctx, out, seen);
                         }
                     }
                 }
             }
             for t in order_by {
-                collect_column_resolutions(&t.expr, ctx, out);
+                collect_column_resolutions(&t.expr, ctx, out, seen);
             }
         }
         Expr::Case {
@@ -2132,19 +2323,19 @@ fn collect_column_resolutions(e: &Expr, ctx: &EvalContext<'_>, out: &mut Vec<Col
             else_,
         } => {
             if let Some(o) = operand {
-                collect_column_resolutions(o, ctx, out);
+                collect_column_resolutions(o, ctx, out, seen);
             }
             for w in whens {
-                collect_column_resolutions(&w.0, ctx, out);
-                collect_column_resolutions(&w.1, ctx, out);
+                collect_column_resolutions(&w.0, ctx, out, seen);
+                collect_column_resolutions(&w.1, ctx, out, seen);
             }
             if let Some(x) = else_ {
-                collect_column_resolutions(x, ctx, out);
+                collect_column_resolutions(x, ctx, out, seen);
             }
         }
         Expr::Row(xs) => {
             for x in xs {
-                collect_column_resolutions(x, ctx, out);
+                collect_column_resolutions(x, ctx, out, seen);
             }
         }
         Expr::Raise { .. } => {}
@@ -2154,20 +2345,41 @@ fn collect_column_resolutions(e: &Expr, ctx: &EvalContext<'_>, out: &mut Vec<Col
 impl OperatorScope {
     /// Scopes for a CONDITION evaluated per row over `ctx`'s layout.
     pub(crate) fn condition(e: &Expr, ctx: &EvalContext<'_>) -> Self {
-        Self::build(&[e], ctx, true)
+        Self::build(&[e], ctx, true, None)
+    }
+
+    /// [`condition`](Self::condition) for a predicate that lives inside
+    /// `owner` (a cached, immutable plan). The cache entry keeps `owner`
+    /// alive, so its tree's identity is the root's address plus the
+    /// owner: no per-run walk of the tree.
+    pub(crate) fn pinned(
+        e: &Expr,
+        ctx: &EvalContext<'_>,
+        owner: &std::sync::Arc<crate::planner::Plan>,
+    ) -> Self {
+        Self::build(&[e], ctx, true, Some(owner))
     }
 
     /// Scopes for VALUE expressions evaluated per row.
     pub(crate) fn values(exprs: &[&Expr], ctx: &EvalContext<'_>) -> Self {
-        Self::build(exprs, ctx, false)
+        Self::build(exprs, ctx, false, None)
     }
 
-    fn build(exprs: &[&Expr], ctx: &EvalContext<'_>, condition: bool) -> Self {
-        let mut h = SigHasher::default();
-        for e in exprs {
-            sig_walk(e, &mut h);
-        }
-        let sig = std::hash::Hasher::finish(&h);
+    fn build(
+        exprs: &[&Expr],
+        ctx: &EvalContext<'_>,
+        condition: bool,
+        owner: Option<&std::sync::Arc<crate::planner::Plan>>,
+    ) -> Self {
+        let sig = if owner.is_some() {
+            0
+        } else {
+            let mut h = SigHasher::default();
+            for e in exprs {
+                sig_walk(e, &mut h);
+            }
+            std::hash::Hasher::finish(&h)
+        };
         let collated_frames = COLLATED_FRAMES.with(|c| c.get());
         let collate_seen =
             crate::sql::lexer::COLLATE_SEEN.load(std::sync::atomic::Ordering::Relaxed);
@@ -2179,6 +2391,11 @@ impl OperatorScope {
         // are made only for a new entry.
         let same = |x: &CachedScope| {
             x.sig == sig
+                && match (&x.owner, owner) {
+                    (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+                    (None, None) => true,
+                    _ => false,
+                }
                 && x.roots.len() == exprs.len()
                 && x.roots
                     .iter()
@@ -2235,7 +2452,7 @@ impl OperatorScope {
         let slots = SlotScope::install(slots, ctx.column_names);
         let compiled = CompiledScope::install(ctx, compiled);
         OperatorScope {
-            key: Some((roots, sig, inputs)),
+            key: Some((roots, sig, inputs, owner.cloned())),
             compiled: Some(compiled),
             slots: Some(slots),
             flags: Some(flags),
@@ -2254,7 +2471,7 @@ impl Drop for OperatorScope {
         self.compiled.take();
         self.slots.take();
         self.flags.take();
-        if let Some((roots, sig, inputs)) = self.key.take() {
+        if let Some((roots, sig, inputs, owner)) = self.key.take() {
             SCOPE_CACHE.with(|c| {
                 let mut c = c.borrow_mut();
                 if c.len() >= SCOPE_CACHE_CAP {
@@ -2263,6 +2480,7 @@ impl Drop for OperatorScope {
                 c.push(CachedScope {
                     roots,
                     sig,
+                    owner,
                     inputs,
                     subq_free,
                     coll_free,
@@ -2277,19 +2495,62 @@ impl Drop for OperatorScope {
 /// Register the compiled leaves of a condition (mirrors cond_if_false /
 /// cond_if_true's structural recursion).
 fn register_condition(e: &Expr, ctx: &EvalContext<'_>, out: &mut Vec<(usize, CExpr)>) {
+    // An OR (the head of a term) also gets its whole jump tree compiled,
+    // unless it is huge.
+    if matches!(
+        e,
+        Expr::Binary {
+            op: BinaryOp::Or,
+            ..
+        }
+    ) && expr_nodes_within(e, 256)
+    {
+        out.push((
+            e as *const Expr as usize,
+            CExpr::Cond(Box::new(CCond::compile(e, ctx))),
+        ));
+    }
+    register_condition_leaves(e, ctx, out);
+}
+
+/// Does `e` have at most `budget` And / Or / Not nodes and leaves?
+fn expr_nodes_within(e: &Expr, budget: usize) -> bool {
+    fn count(e: &Expr, left: &mut usize) -> bool {
+        if *left == 0 {
+            return false;
+        }
+        *left -= 1;
+        match e {
+            Expr::Binary {
+                op: BinaryOp::And | BinaryOp::Or,
+                left: l,
+                right: r,
+            } => count(l, left) && count(r, left),
+            Expr::Unary {
+                op: UnaryOp::Not,
+                expr,
+            } => count(expr, left),
+            _ => true,
+        }
+    }
+    let mut left = budget;
+    count(e, &mut left)
+}
+
+fn register_condition_leaves(e: &Expr, ctx: &EvalContext<'_>, out: &mut Vec<(usize, CExpr)>) {
     match e {
         Expr::Binary {
             op: BinaryOp::And | BinaryOp::Or,
             left,
             right,
         } => {
-            register_condition(left, ctx, out);
-            register_condition(right, ctx, out);
+            register_condition_leaves(left, ctx, out);
+            register_condition_leaves(right, ctx, out);
         }
         Expr::Unary {
             op: UnaryOp::Not | UnaryOp::Truth { .. },
             expr,
-        } => register_condition(expr, ctx, out),
+        } => register_condition_leaves(expr, ctx, out),
         Expr::Between {
             expr, low, high, ..
         } => {
@@ -2379,13 +2640,49 @@ fn compiled_eval(e: &Expr, ctx: &EvalContext<'_>) -> Option<Result<Value>> {
             return None;
         }
         let key = e as *const Expr as usize;
-        let ce = t.entries.iter().find(|x| x.0 == key)?;
+        let ce = t
+            .entries
+            .iter()
+            .find(|x| x.0 == key && !matches!(x.1, CExpr::Cond(_)))?;
         // SAFETY: entries live until the scope drops, and `t` (the borrow)
         // is only needed to find the node; evaluation may install nested
         // scopes, so release the borrow first.
         let ptr: *const CExpr = &ce.1;
         drop(t);
         Some(unsafe { &*ptr }.eval(ctx))
+    })
+}
+
+/// The compiled jump form of the OR condition `e` (see [`CCond`]): does
+/// it take its TRUE exit (`if_true`) or its FALSE exit?
+#[inline]
+fn compiled_cond(
+    e: &Expr,
+    ctx: &EvalContext<'_>,
+    jump_if_null: bool,
+    if_true: bool,
+) -> Option<Result<bool>> {
+    if !COMPILED_ACTIVE.with(|c| c.get()) {
+        return None;
+    }
+    COMPILED.with(|c| {
+        let t = c.borrow();
+        if t.names != (ctx.column_names.as_ptr() as usize, ctx.column_names.len()) {
+            return None;
+        }
+        let key = e as *const Expr as usize;
+        let cond: *const CCond = t.entries.iter().find_map(|x| match &x.1 {
+            CExpr::Cond(c) if x.0 == key => Some(&**c as *const CCond),
+            _ => None,
+        })?;
+        drop(t);
+        // SAFETY: as in `compiled_eval`.
+        let cond = unsafe { &*cond };
+        Some(if if_true {
+            cond.if_true(ctx, jump_if_null)
+        } else {
+            cond.if_false(ctx, jump_if_null)
+        })
     })
 }
 
@@ -2594,6 +2891,11 @@ fn cond_if_false(e: &Expr, ctx: &EvalContext<'_>, jump_if_null: bool) -> Result<
             left,
             right,
         } => {
+            if *op == BinaryOp::Or {
+                if let Some(r) = compiled_cond(e, ctx, jump_if_null, false) {
+                    return r;
+                }
+            }
             let alt = simplified_and_or(e);
             if !std::ptr::eq(alt, e) {
                 return cond_if_false(alt, ctx, jump_if_null);
@@ -2647,6 +2949,11 @@ fn cond_if_true(e: &Expr, ctx: &EvalContext<'_>, jump_if_null: bool) -> Result<b
             left,
             right,
         } => {
+            if *op == BinaryOp::Or {
+                if let Some(r) = compiled_cond(e, ctx, jump_if_null, true) {
+                    return r;
+                }
+            }
             let alt = simplified_and_or(e);
             if !std::ptr::eq(alt, e) {
                 return cond_if_true(alt, ctx, jump_if_null);
@@ -3976,6 +4283,22 @@ fn evaluate_function(name: &str, args: &[Expr], ctx: &EvalContext<'_>) -> Result
     call_scalar(fname, &argvals)
 }
 
+/// Every byte is ASCII and none is NUL (a word at a time).
+#[inline]
+fn ascii_nul_free(b: &[u8]) -> bool {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    let mut chunks = b.chunks_exact(8);
+    for c in &mut chunks {
+        let w = u64::from_le_bytes(c.try_into().unwrap());
+        // A set high bit, or (with the high bits clear) a zero byte.
+        if (w | (w.wrapping_sub(LO) & !w)) & HI != 0 {
+            return false;
+        }
+    }
+    chunks.remainder().iter().all(|&c| c != 0 && c < 0x80)
+}
+
 /// `scalar_substr`'s builtin (shared by `call_scalar` and the compiled
 /// evaluator's direct dispatch).
 fn scalar_substr(args: &[Value]) -> Result<Value> {
@@ -4044,7 +4367,7 @@ fn scalar_substr(args: &[Value]) -> Result<Value> {
                         let begin = ((*p1 - 1) as u64).min(b.len() as u64) as usize;
                         let end = (begin as u64 + z as u64).min(b.len() as u64) as usize;
                         let pre = &b[..end];
-                        if pre.iter().all(|&c| c != 0 && c < 0x80) {
+                        if ascii_nul_free(pre) {
                             return Ok(Value::Text(t.as_str()[begin..end].into()));
                         }
                     }

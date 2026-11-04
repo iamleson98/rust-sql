@@ -1402,6 +1402,9 @@ pub struct ExecContext<'a> {
     /// LOOKUP keyed on the outer row's value instead of a full inner
     /// scan + per-row correlated filter evaluation.
     pub(crate) subquery_plans: HashMap<usize, SubqPlanEntry>,
+    /// The cached correlated-subquery plan being executed, if any (see
+    /// `limit_into_filter`).
+    pub(crate) pin_plan: Option<Arc<Plan>>,
     /// Current trigger-firing depth (guards runaway recursion).
     pub trigger_depth: u32,
     /// EXPLAIN ANALYZE instrumentation: `Some` while the statement runs
@@ -1509,6 +1512,7 @@ impl<'a> ExecContext<'a> {
             table_append_hint: None,
             ctes: None,
             subquery_plans: HashMap::new(),
+            pin_plan: None,
             trigger_depth: 0,
             trigger_stack: Vec::new(),
             trigger_plans: HashMap::new(),
@@ -1567,6 +1571,7 @@ impl<'a> ExecContext<'a> {
             table_append_hint: None,
             ctes: None,
             subquery_plans: HashMap::new(),
+            pin_plan: None,
             trigger_depth: 0,
             trigger_stack: Vec::new(),
             trigger_plans: HashMap::new(),
@@ -6310,14 +6315,17 @@ fn exec_select_statement(
         }
         Some(p)
     };
-    if let Some(p) = bound_params {
+    let saved_pin = ctx.pin_plan.replace(Arc::clone(&entry.plan));
+    let r = if let Some(p) = bound_params {
         let saved = std::mem::replace(&mut ctx.params, p);
         let r = execute(&entry.plan, ctx);
         ctx.params = saved;
         r
     } else {
         execute(&entry.plan, ctx)
-    }
+    };
+    ctx.pin_plan = saved_pin;
+    r
 }
 
 /// `Plan::NestedSelect`: a FROM atom / view body with its own WITH
@@ -7537,6 +7545,20 @@ fn exec_values(ctx: &mut ExecContext<'_>, rows: &[Vec<Expr>]) -> Result<ExecResu
 // ============================================================================
 
 fn exec_filter(ctx: &mut ExecContext<'_>, input: &Plan, predicate: &Expr) -> Result<ExecResult> {
+    exec_filter_stop(ctx, input, predicate, None, None)
+}
+
+/// [`exec_filter`] that may stop once `stop` rows have passed (a LIMIT
+/// above it only wants that many; the rows after are never evaluated).
+///
+/// `pin`: the cached plan that owns `predicate`, if any.
+fn exec_filter_stop(
+    ctx: &mut ExecContext<'_>,
+    input: &Plan,
+    predicate: &Expr,
+    stop: Option<usize>,
+    pin: Option<&Arc<Plan>>,
+) -> Result<ExecResult> {
     if let Some(terms) = crate::planner::const_where_terms(predicate) {
         return exec_const_where(ctx, input, terms);
     }
@@ -7579,9 +7601,41 @@ fn exec_filter(ctx: &mut ExecContext<'_>, input: &Plan, predicate: &Expr) -> Res
     // skips materializing rows that fail it — non-matching rows cost a
     // selective decode and nothing else (no Vec<Value>, no clone, no move).
     if let Plan::Scan { .. } = input {
-        if let Some(res) = scan_filter_limit(ctx, input, Some(predicate), None)? {
+        if let Some(res) = scan_filter_limit(ctx, input, Some(predicate), stop)? {
             return Ok(res);
         }
+    }
+
+    // Shared CTE rows are tested in place: only the rows that pass are copied.
+    if let (
+        Plan::CteRows {
+            rows: shared,
+            columns,
+            ..
+        },
+        true,
+    ) = (input, ctx.explain_stats.is_none())
+    {
+        let compile_ctx = EvalContext::new(&[], columns, &ctx.params, &ctx.named_params);
+        let _scope = match pin {
+            Some(owner) => {
+                crate::executor::expr::OperatorScope::pinned(predicate, &compile_ctx, owner)
+            }
+            None => crate::executor::expr::OperatorScope::condition(predicate, &compile_ctx),
+        };
+        let mut rows = Vec::new();
+        for row in shared.iter() {
+            if eval_row_where(predicate, row, columns, &ctx.params, &ctx.named_params)? {
+                rows.push(row.clone());
+                if stop.is_some_and(|n| rows.len() >= n) {
+                    break;
+                }
+            }
+        }
+        return Ok(ExecResult {
+            columns: columns.clone(),
+            rows,
+        });
     }
 
     let inner = execute(input, ctx)?;
@@ -7603,6 +7657,9 @@ fn exec_filter(ctx: &mut ExecContext<'_>, input: &Plan, predicate: &Expr) -> Res
             for row in inner.rows {
                 if pred.eval(&row, &positions, params) {
                     rows.push(row);
+                    if stop.is_some_and(|n| rows.len() >= n) {
+                        break;
+                    }
                 }
             }
             return Ok(ExecResult {
@@ -7623,7 +7680,10 @@ fn exec_filter(ctx: &mut ExecContext<'_>, input: &Plan, predicate: &Expr) -> Res
     // same affinities) — cached across runs of the same plan.
     let compile_ctx = EvalContext::new(&[], &inner.columns, &ctx.params, &ctx.named_params)
         .with_affinities(scan_affinities);
-    let _scope = crate::executor::expr::OperatorScope::condition(predicate, &compile_ctx);
+    let _scope = match pin {
+        Some(owner) => crate::executor::expr::OperatorScope::pinned(predicate, &compile_ctx, owner),
+        None => crate::executor::expr::OperatorScope::condition(predicate, &compile_ctx),
+    };
     for row in inner.rows {
         let v = match scan_affinities {
             Some(aff) => eval_row_aff_where(
@@ -7644,6 +7704,9 @@ fn exec_filter(ctx: &mut ExecContext<'_>, input: &Plan, predicate: &Expr) -> Res
         };
         if v {
             rows.push(row);
+            if stop.is_some_and(|n| rows.len() >= n) {
+                break;
+            }
         }
     }
     Ok(ExecResult {
@@ -9797,6 +9860,50 @@ fn limit_window(mut res: ExecResult, offset: usize, count: i64) -> ExecResult {
     res
 }
 
+/// `Limit(Filter(x))` / `Limit(Project(Filter(x)))` over any input: the
+/// filter stops once `stop` rows have passed, so the rows after them are
+/// never tested (SQLite's loop ends at the LIMIT too). The projection is
+/// 1:1, so projecting only the survivors yields the same rows. `None` for
+/// any other shape.
+fn limit_into_filter(
+    ctx: &mut ExecContext<'_>,
+    input: &Plan,
+    stop: usize,
+) -> Result<Option<ExecResult>> {
+    let (filter, columns) = match input {
+        Plan::Project {
+            input: inner,
+            columns,
+        } => (inner.as_ref(), Some(columns)),
+        p => (p, None),
+    };
+    let Plan::Filter {
+        input: fin,
+        predicate,
+    } = filter
+    else {
+        return Ok(None);
+    };
+    if ctx.explain_stats.is_some() || crate::planner::const_where_terms(predicate).is_some() {
+        return Ok(None);
+    }
+    // The registry frame of this subtree is the one `execute` of the
+    // enclosing Limit already pushed (Limit and Project add no sources).
+    // The cached correlated-subquery plan whose LIMIT this is: its
+    // predicate lives as long as the plan does.
+    let pin = match &ctx.pin_plan {
+        Some(root) if matches!(&**root, Plan::Limit { input: li, .. } if std::ptr::eq(&**li, input)) => {
+            Some(Arc::clone(root))
+        }
+        _ => None,
+    };
+    let res = exec_filter_stop(ctx, fin, predicate, Some(stop), pin.as_ref())?;
+    match columns {
+        Some(columns) => apply_projection(res, columns, ctx).map(Some),
+        None => Ok(Some(res)),
+    }
+}
+
 /// A LIMIT / OFFSET operand under OP_MustBeInt: an INTEGER, or a REAL /
 /// numeric TEXT that converts losslessly to one (`2.0`, `'1e1'` = 10);
 /// anything else — `1.5`, `'abc'`, NULL, a BLOB — fails with SQLite's
@@ -10797,6 +10904,10 @@ fn exec_limit(
                                 _ => None,
                             },
                             _ => None,
+                        };
+                        let pushed = match pushed {
+                            None if stop >= 1 => limit_into_filter(ctx, input, stop)?,
+                            p => p,
                         };
                         if let Some(mut res) = pushed {
                             let skip = offset_i as usize;
