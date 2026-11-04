@@ -9362,6 +9362,7 @@ pub(crate) fn reorder_inner_joins(catalog: &Catalog, plan: Plan) -> Plan {
             inner_index,
             outer_key_col,
             covering,
+            left_outer,
         } => Plan::IndexNestedLoopJoin {
             outer: Box::new(reorder_inner_joins(catalog, *outer)),
             inner_table,
@@ -9369,6 +9370,7 @@ pub(crate) fn reorder_inner_joins(catalog: &Catalog, plan: Plan) -> Plan {
             inner_index,
             outer_key_col,
             covering,
+            left_outer,
         },
         // Leaves and everything else pass through untouched.
         other => other,
@@ -11443,19 +11445,194 @@ fn inlj_residual(
     }
 }
 
-fn inlj_walk(catalog: &Catalog, plan: Plan, needed: &NeededCols) -> Plan {
-    /// Accumulate this node's own expression refs into a child context.
-    fn with_exprs(exprs: &[&Expr], needed: &NeededCols) -> NeededCols {
-        let mut n = NeededCols {
-            qualified: needed.qualified.clone(),
-            any: needed.any.clone(),
-            star: needed.star,
-        };
-        for e in exprs {
-            collect_col_refs(e, &mut n);
-        }
-        n
+/// Accumulate an expression set's column refs into a copy of `needed`.
+fn with_exprs(exprs: &[&Expr], needed: &NeededCols) -> NeededCols {
+    let mut n = NeededCols {
+        qualified: needed.qualified.clone(),
+        any: needed.any.clone(),
+        star: needed.star,
+    };
+    for e in exprs {
+        collect_col_refs(e, &mut n);
     }
+    n
+}
+
+/// The decision [`inlj_choose`] hands back to the rewrite.
+struct InljChoice {
+    /// `None` = probe the inner table's rowid (INTEGER PRIMARY KEY key).
+    index: Option<Arc<Index>>,
+    outer_key_col: usize,
+    /// ON-clause conjuncts the single-key probe does not enforce.
+    residual: Option<Expr>,
+    covering: bool,
+}
+
+/// The single base table behind an access-path plan (through filters).
+fn single_access_table(plan: &Plan) -> Option<&Arc<Table>> {
+    match plan {
+        Plan::Scan { table, .. }
+        | Plan::RowidLookup { table, .. }
+        | Plan::RowidRange { table, .. }
+        | Plan::RowidIn { table, .. }
+        | Plan::IndexLookup { table, .. }
+        | Plan::IndexRange { table, .. }
+        | Plan::IndexIn { table, .. } => Some(table),
+        Plan::Filter { input, .. } => single_access_table(input),
+        _ => None,
+    }
+}
+
+/// May the INNER side's rowid alias be probed (SQLite's `SEARCH t USING
+/// INTEGER PRIMARY KEY (rowid=?)`) with the outer key? A probe converts
+/// the key through OP_SeekRowid's rules (`rowid_seek_value`), which differ
+/// from the general `=` only at the boundary REAL -2^63 — so the rewrite
+/// must follow the same verdict the hash join's gate follows
+/// (`executor::join_alias_seek_gate`). LEFT joins always seek the right
+/// (inner) side. A multi-table outer is not modeled: SQLite seeks the
+/// alias side there unless the planner's verdict says otherwise.
+#[allow(clippy::too_many_arguments)]
+fn rowid_probe_seek_ok(
+    catalog: &Catalog,
+    outer: &Plan,
+    outer_is_left: bool,
+    outer_col: &str,
+    inner: &Arc<Table>,
+    inner_key: usize,
+    join_type: JoinType,
+    alias_seek: Option<bool>,
+) -> bool {
+    if matches!(join_type, JoinType::Left) {
+        return true;
+    }
+    if let Some(seeks) = alias_seek {
+        return seeks;
+    }
+    if let Some(ot) = single_access_table(outer) {
+        if let Some(ok) = ot.find_column(outer_col) {
+            // An alias column only holds INTEGERs: seek and `=` agree.
+            if ot.rowid_alias == Some(ok) {
+                return true;
+            }
+            return if outer_is_left {
+                crate::executor::join_alias_seek_gate(
+                    catalog, ot, inner, ok, inner_key, join_type, None,
+                )
+            } else {
+                crate::executor::join_alias_seek_gate(
+                    catalog, inner, ot, inner_key, ok, join_type, None,
+                )
+            };
+        }
+    }
+    true
+}
+
+/// Pick the index (or rowid) probe that lets `inner` — a bare base-table
+/// scan — be joined to `outer` by lookups instead of a hash build.
+/// `pairs` are the ON clause's equi keys oriented (outer qualifier,
+/// outer column, inner qualifier, inner column).
+#[allow(clippy::too_many_arguments)]
+fn inlj_choose(
+    catalog: &Catalog,
+    needed: &NeededCols,
+    outer: &Plan,
+    inner: &Plan,
+    outer_is_left: bool,
+    pairs: &[(Option<String>, String, Option<String>, String)],
+    condition: Option<&Expr>,
+    join_type: JoinType,
+    alias_seek: Option<bool>,
+) -> Option<InljChoice> {
+    let Plan::Scan {
+        table,
+        alias,
+        predicate,
+        ..
+    } = inner
+    else {
+        return None;
+    };
+    // A pushed inner predicate (single-table WHERE conjunct) would be
+    // consumed and dropped by the rewrite — decline and keep the Hash
+    // join, which evaluates it.
+    if predicate.is_some()
+        || !outer_is_selective(outer)
+        || inner_rowid_needed_without_alias(needed, table, alias)
+    {
+        return None;
+    }
+    let left_outer = matches!(join_type, JoinType::Left);
+    for (o_qual, o_col, i_qual, i_col) in pairs {
+        let Some(outer_key_col) = resolve_outer_col_index(outer, o_qual.as_deref(), o_col) else {
+            continue;
+        };
+        // LEFT joins keep every ON conjunct inside the probe (a residual
+        // filter above would drop the NULL-extended rows).
+        let residual = inlj_residual(
+            condition,
+            (o_qual.as_deref(), o_col),
+            (i_qual.as_deref(), i_col),
+        );
+        if left_outer && residual.is_some() {
+            continue;
+        }
+        let rowid_key = table.vtab.is_none()
+            && !table.without_rowid
+            && table
+                .rowid_alias
+                .is_some_and(|a| table.columns[a].name.eq_ignore_ascii_case(i_col));
+        if rowid_key {
+            let inner_key = table.find_column(i_col)?;
+            if !rowid_probe_seek_ok(
+                catalog,
+                outer,
+                outer_is_left,
+                o_col,
+                table,
+                inner_key,
+                join_type,
+                alias_seek,
+            ) {
+                continue;
+            }
+            return Some(InljChoice {
+                index: None,
+                outer_key_col,
+                residual,
+                covering: false,
+            });
+        }
+        let Some(idx) = find_index_for_column(catalog, table, i_col).filter(|idx| {
+            inlj_index_affinity_ok(outer, outer_key_col, table, idx)
+                && inlj_index_collation_ok(
+                    condition,
+                    (o_qual.as_deref(), o_col),
+                    (i_qual.as_deref(), i_col),
+                    idx,
+                )
+        }) else {
+            continue;
+        };
+        // COVERING: only when nothing above — the residual included —
+        // reads an inner column beyond the rowid alias. (Never for a LEFT
+        // join: the covering form emits one row per index entry.)
+        let covering = !left_outer
+            && match &residual {
+                Some(r) => inner_covering(&with_exprs(&[r], needed), table, alias, &idx),
+                None => inner_covering(needed, table, alias, &idx),
+            };
+        return Some(InljChoice {
+            index: Some(idx),
+            outer_key_col,
+            residual,
+            covering,
+        });
+    }
+    None
+}
+
+fn inlj_walk(catalog: &Catalog, plan: Plan, needed: &NeededCols) -> Plan {
     match plan {
         Plan::Join {
             left,
@@ -11481,46 +11658,31 @@ fn inlj_walk(catalog: &Catalog, plan: Plan, needed: &NeededCols) -> Plan {
             let left = Box::new(inlj_walk(catalog, *left, &child_needed));
             let right = Box::new(inlj_walk(catalog, *right, &child_needed));
 
-            // Only INNER/CROSS joins qualify — outer joins must preserve all
-            // rows from the preserved side, which forbids index-only access
-            // to the inner side (the join needs to emit NULL-extended rows
-            // when no match exists, which requires materializing the outer).
+            // Index nested-loop candidates: INNER/CROSS joins (either side
+            // may become the inner) and LEFT joins (the right side only —
+            // the preserved side must drive).
             let is_inner = matches!(join_type, JoinType::Inner | JoinType::Cross);
+            let is_left = matches!(join_type, JoinType::Left);
             let is_hash = matches!(algorithm, plan::JoinAlgorithm::Hash);
-            if !is_inner || !is_hash {
-                return Plan::Join {
-                    left,
-                    right,
-                    join_type,
-                    condition,
-                    algorithm,
-                    alias_seek,
-                };
+            let unchanged = |left, right| Plan::Join {
+                left,
+                right,
+                join_type,
+                condition: condition.clone(),
+                algorithm,
+                alias_seek,
+            };
+            if !(is_inner || is_left) || !is_hash {
+                return unchanged(left, right);
             }
 
             // Extract equi-join key pairs from the ON condition.
             let eq_pairs = match condition.as_ref() {
                 Some(c) => extract_equi_join_keys_for_planner(c, &left, &right),
-                None => {
-                    return Plan::Join {
-                        left,
-                        right,
-                        join_type,
-                        condition,
-                        algorithm,
-                        alias_seek,
-                    }
-                }
+                None => return unchanged(left, right),
             };
             if eq_pairs.is_empty() {
-                return Plan::Join {
-                    left,
-                    right,
-                    join_type,
-                    condition,
-                    algorithm,
-                    alias_seek,
-                };
+                return unchanged(left, right);
             }
 
             // Purity gate: the rewrite CONSUMES the condition — any
@@ -11529,173 +11691,127 @@ fn inlj_walk(catalog: &Catalog, plan: Plan, needed: &NeededCols) -> Plan {
             // changing results. Measured bug: `ON a.k = b.k AND a.w > b.w`
             // returned 10 rows where SQLite returns 6.
             if !join_condition_is_pure_equi(condition.as_ref()) {
-                return Plan::Join {
-                    left,
-                    right,
-                    join_type,
-                    condition,
-                    algorithm,
-                    alias_seek,
-                };
+                return unchanged(left, right);
             }
 
-            // Try the right side as inner (the common case: scan right table
-            // via its index). The outer (left) plan is kept verbatim — we
-            // don't unwrap Filter/Project around it, because doing so would
-            // drop the WHERE clause.
+            // Try the right side as inner first (the common case), then
+            // the left side (INNER only). The outer plan is kept verbatim
+            // — we don't unwrap Filter/Project around it, because doing so
+            // would drop the WHERE clause.
             //
-            // Selectivity heuristic: only pick INLJ when the outer is filtered
-            // (has a WHERE clause pushed down, or is a point/range lookup).
-            // When the outer is a bare full-table Scan, Hash join is faster:
-            // 1000 separate index lookups (~3 ms) is more expensive than
-            // decoding the inner table once and hashing it (~1.5 ms). This is
-            // what makes `SELECT u.dept, COUNT(*), SUM(o.total) FROM users
-            // u JOIN orders o ON u.id = o.user_id GROUP BY u.dept` (no WHERE)
-            // ~3× faster than the INLJ path.
-            if let Plan::Scan {
-                table: r_table,
-                alias: r_alias,
-                predicate,
-                ..
-            } = right.as_ref()
-            {
-                // A pushed inner predicate (single-table WHERE conjunct)
-                // would be consumed and dropped by the rewrite — decline
-                // and keep the Hash join, which evaluates it.
-                if predicate.is_none()
-                    && outer_is_selective(&left)
-                    && !inner_rowid_needed_without_alias(needed, r_table, r_alias)
-                {
-                    for (l_qual, l_col, r_qual, r_col) in &eq_pairs {
-                        if let Some(outer_key_col) =
-                            resolve_outer_col_index(&left, l_qual.as_deref(), l_col)
-                        {
-                            if let Some(idx) = find_index_for_column(catalog, r_table, r_col)
-                                .filter(|idx| {
-                                    inlj_index_affinity_ok(&left, outer_key_col, r_table, idx)
-                                        && inlj_index_collation_ok(
-                                            condition.as_ref(),
-                                            (l_qual.as_deref(), l_col),
-                                            (r_qual.as_deref(), r_col),
-                                            idx,
-                                        )
-                                })
-                            {
-                                // The index seek enforces ONE key; every other
-                                // conjunct of the ON clause (a second key of a
-                                // composite join, an expression equality)
-                                // rides as a residual filter — it used to be
-                                // silently DROPPED (`ON a.x = b.x AND a.y =
-                                // b.y` returned rows matching only x).
-                                let residual = inlj_residual(
-                                    condition.as_ref(),
-                                    (l_qual.as_deref(), l_col),
-                                    (r_qual.as_deref(), r_col),
-                                );
-                                // COVERING: only when nothing above — the
-                                // residual included — reads an inner column
-                                // beyond the rowid alias.
-                                let covering = match &residual {
-                                    Some(r) => inner_covering(
-                                        &with_exprs(&[r], needed),
-                                        r_table,
-                                        r_alias,
-                                        &idx,
-                                    ),
-                                    None => inner_covering(needed, r_table, r_alias, &idx),
-                                };
-                                let inlj = Plan::IndexNestedLoopJoin {
-                                    outer: left.clone(),
-                                    inner_table: r_table.clone(),
-                                    inner_alias: r_alias.clone(),
-                                    inner_index: idx,
-                                    outer_key_col,
-                                    covering,
-                                };
-                                return match residual {
-                                    Some(predicate) => Plan::Filter {
-                                        input: Box::new(inlj),
-                                        predicate,
-                                    },
-                                    None => inlj,
-                                };
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Symmetric: try the left side as inner. The outer (right) plan
-            // is kept verbatim.
-            if let Plan::Scan {
-                table: l_table,
-                alias: l_alias,
-                predicate,
-                ..
-            } = left.as_ref()
-            {
-                if predicate.is_none()
-                    && outer_is_selective(&right)
-                    && !inner_rowid_needed_without_alias(needed, l_table, l_alias)
-                {
-                    for (l_qual, l_col, r_qual, r_col) in &eq_pairs {
-                        if let Some(outer_key_col) =
-                            resolve_outer_col_index(&right, r_qual.as_deref(), r_col)
-                        {
-                            if let Some(idx) = find_index_for_column(catalog, l_table, l_col)
-                                .filter(|idx| {
-                                    inlj_index_affinity_ok(&right, outer_key_col, l_table, idx)
-                                        && inlj_index_collation_ok(
-                                            condition.as_ref(),
-                                            (l_qual.as_deref(), l_col),
-                                            (r_qual.as_deref(), r_col),
-                                            idx,
-                                        )
-                                })
-                            {
-                                // Residual conjuncts: see the right-inner arm.
-                                let residual = inlj_residual(
-                                    condition.as_ref(),
-                                    (l_qual.as_deref(), l_col),
-                                    (r_qual.as_deref(), r_col),
-                                );
-                                let covering = match &residual {
-                                    Some(r) => inner_covering(
-                                        &with_exprs(&[r], needed),
-                                        l_table,
-                                        l_alias,
-                                        &idx,
-                                    ),
-                                    None => inner_covering(needed, l_table, l_alias, &idx),
-                                };
-                                let inlj = Plan::IndexNestedLoopJoin {
-                                    outer: right.clone(),
-                                    inner_table: l_table.clone(),
-                                    inner_alias: l_alias.clone(),
-                                    inner_index: idx,
-                                    outer_key_col,
-                                    covering,
-                                };
-                                return match residual {
-                                    Some(predicate) => Plan::Filter {
-                                        input: Box::new(inlj),
-                                        predicate,
-                                    },
-                                    None => inlj,
-                                };
-                            }
-                        }
-                    }
-                }
-            }
-
-            Plan::Join {
-                left,
-                right,
+            // Selectivity heuristic: only pick INLJ when the outer is
+            // filtered (has a WHERE clause pushed down, or is a point/range
+            // lookup). When the outer is a bare full-table Scan, Hash join
+            // is faster: 1000 separate index lookups (~3 ms) is more
+            // expensive than decoding the inner table once and hashing it
+            // (~1.5 ms). This is what makes `SELECT u.dept, COUNT(*),
+            // SUM(o.total) FROM users u JOIN orders o ON u.id = o.user_id
+            // GROUP BY u.dept` (no WHERE) ~3× faster than the INLJ path.
+            let right_inner = inlj_choose(
+                catalog,
+                needed,
+                &left,
+                &right,
+                true,
+                &eq_pairs,
+                condition.as_ref(),
                 join_type,
-                condition,
-                algorithm,
                 alias_seek,
+            );
+            let (inner_is_right, choice) = match right_inner {
+                Some(c) => (true, c),
+                None if is_inner => {
+                    let swapped: Vec<_> = eq_pairs
+                        .iter()
+                        .map(|(lq, lc, rq, rc)| (rq.clone(), rc.clone(), lq.clone(), lc.clone()))
+                        .collect();
+                    match inlj_choose(
+                        catalog,
+                        needed,
+                        &right,
+                        &left,
+                        false,
+                        &swapped,
+                        condition.as_ref(),
+                        join_type,
+                        alias_seek,
+                    ) {
+                        Some(c) => (false, c),
+                        None => return unchanged(left, right),
+                    }
+                }
+                None => return unchanged(left, right),
+            };
+            // A SWAPPED probe (the left table becomes the inner) emits the
+            // right table's columns first. Positional consumers (`SELECT
+            // *`) need the syntactic order back: re-export the columns
+            // left-then-right (the inner side carries no hidden rowid
+            // slot — nothing above reads one, see
+            // `inner_rowid_needed_without_alias`).
+            let restore: Option<Vec<String>> = if inner_is_right || !needed.star {
+                None
+            } else {
+                let (Some(l_cols), Some(r_cols)) = (atom_out_cols(&left), atom_out_cols(&right))
+                else {
+                    return unchanged(left, right);
+                };
+                let mut names: Vec<String> = l_cols
+                    .into_iter()
+                    .filter(|c| !c.ends_with(HIDDEN_ROWID))
+                    .collect();
+                names.extend(r_cols);
+                Some(names)
+            };
+            let (outer, inner) = if inner_is_right {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            let Plan::Scan {
+                table: inner_table,
+                alias: inner_alias,
+                ..
+            } = *inner
+            else {
+                unreachable!("inlj_choose only accepts a base-table Scan as the inner side")
+            };
+            let inlj = Plan::IndexNestedLoopJoin {
+                outer,
+                inner_table,
+                inner_alias,
+                inner_index: choice.index,
+                outer_key_col: choice.outer_key_col,
+                covering: choice.covering,
+                left_outer: is_left,
+            };
+            // The index seek enforces ONE key; every other conjunct of the
+            // ON clause (a second key of a composite join, an expression
+            // equality) rides as a residual filter — it used to be
+            // silently DROPPED (`ON a.x = b.x AND a.y = b.y` returned rows
+            // matching only x). LEFT joins never carry one (see
+            // `inlj_choose`).
+            let joined = match choice.residual {
+                Some(predicate) => Plan::Filter {
+                    input: Box::new(inlj),
+                    predicate,
+                },
+                None => inlj,
+            };
+            match restore {
+                Some(names) => Plan::Project {
+                    input: Box::new(joined),
+                    columns: names
+                        .into_iter()
+                        .map(|name| crate::planner::plan::ProjectExpr {
+                            expr: Expr::Column {
+                                table: None,
+                                name: name.clone(),
+                            },
+                            alias: Some(name),
+                        })
+                        .collect(),
+                },
+                None => joined,
             }
         }
 

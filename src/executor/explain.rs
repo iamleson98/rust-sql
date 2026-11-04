@@ -437,23 +437,31 @@ fn walk(plan: &Plan, parent: i64, rows: &mut Vec<Row>, next_id: &mut i64, cat: &
             inner_alias,
             inner_index,
             covering,
+            left_outer,
             ..
         } => {
             walk(outer, parent, rows, next_id, cat);
             let a = alias_of(inner_alias, &inner_table.name);
-            let cols = index_columns_desc(inner_index, 1);
-            // SQLite's wording distinguishes the index-only form.
-            let kind = if *covering {
-                "USING COVERING INDEX"
-            } else {
-                "USING INDEX"
+            let left = if *left_outer { " LEFT-JOIN" } else { "" };
+            let detail = match inner_index {
+                Some(inner_index) => {
+                    let cols = index_columns_desc(inner_index, 1);
+                    if inner_index.origin == crate::schema::IndexOrigin::WithoutRowidPk {
+                        // A WITHOUT ROWID table's key is its PRIMARY KEY b-tree.
+                        format!("SEARCH {a} USING PRIMARY KEY ({cols}=?){left}")
+                    } else {
+                        // SQLite's wording distinguishes the index-only form.
+                        let kind = if *covering {
+                            "USING COVERING INDEX"
+                        } else {
+                            "USING INDEX"
+                        };
+                        format!("SEARCH {a} {kind} {} ({cols}=?){left}", inner_index.name)
+                    }
+                }
+                None => format!("SEARCH {a} USING INTEGER PRIMARY KEY (rowid=?){left}"),
             };
-            push_row(
-                parent,
-                rows,
-                next_id,
-                format!("SEARCH {a} {kind} {} ({cols}=?)", inner_index.name),
-            );
+            push_row(parent, rows, next_id, detail);
         }
         Plan::Subquery { plan, .. } => {
             // Give the subquery its own top-level id group, like SQLite.
@@ -732,16 +740,18 @@ pub(crate) fn node_detail(plan: &Plan) -> Option<String> {
             ..
         } => {
             let a = alias_of(inner_alias, &inner_table.name);
-            let cols = index_columns_desc(inner_index, 1);
-            let kind = if *covering {
-                "USING COVERING INDEX"
-            } else {
-                "USING INDEX"
-            };
-            Some(format!(
-                "SEARCH {a} {kind} {} ({cols}=?) [INLJ]",
-                inner_index.name
-            ))
+            Some(match inner_index {
+                Some(inner_index) => {
+                    let cols = index_columns_desc(inner_index, 1);
+                    let kind = if *covering {
+                        "USING COVERING INDEX"
+                    } else {
+                        "USING INDEX"
+                    };
+                    format!("SEARCH {a} {kind} {} ({cols}=?) [INLJ]", inner_index.name)
+                }
+                None => format!("SEARCH {a} USING INTEGER PRIMARY KEY (rowid=?) [INLJ]"),
+            })
         }
         Plan::Subquery { .. } => Some("SUBQUERY".to_string()),
         Plan::CteRows { .. } => Some("SCAN CTE".to_string()),

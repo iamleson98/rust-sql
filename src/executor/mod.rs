@@ -2523,6 +2523,7 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
                     inner_index,
                     outer_key_col,
                     covering,
+                    left_outer,
                 } = &**input
                 {
                     return exec_index_nested_loop_join(
@@ -2534,6 +2535,7 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
                         *outer_key_col,
                         Some(columns),
                         *covering,
+                        *left_outer,
                     );
                 }
             }
@@ -2599,6 +2601,7 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             inner_index,
             outer_key_col,
             covering,
+            left_outer,
         } => exec_index_nested_loop_join(
             ctx,
             outer,
@@ -2608,6 +2611,7 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             *outer_key_col,
             None,
             *covering,
+            *left_outer,
         ),
         Plan::Distinct { input } => exec_distinct(ctx, input),
         Plan::Union { left, right, all } => exec_union(ctx, left, right, *all),
@@ -10006,6 +10010,7 @@ pub(crate) fn empty_input_plan(plan: &Plan) -> Option<Plan> {
             inner_index,
             outer_key_col,
             covering,
+            left_outer,
         } => Plan::IndexNestedLoopJoin {
             outer: sub(outer)?,
             inner_table: inner_table.clone(),
@@ -10013,6 +10018,7 @@ pub(crate) fn empty_input_plan(plan: &Plan) -> Option<Plan> {
             inner_index: inner_index.clone(),
             outer_key_col: *outer_key_col,
             covering: *covering,
+            left_outer: *left_outer,
         },
         Plan::Subquery { plan: inner, meta } => Plan::Subquery {
             plan: sub(inner)?,
@@ -16162,9 +16168,10 @@ fn exec_aggregate(
             if let Plan::IndexNestedLoopJoin {
                 outer,
                 inner_table,
-                inner_index,
+                inner_index: Some(inner_index),
                 outer_key_col,
                 covering: true,
+                left_outer: false,
                 ..
             } = input
             {
@@ -20223,11 +20230,15 @@ fn join_keys_match(
 /// column is the column at `col_pos`? (SQLite's "SEARCH t USING INDEX ix
 /// (col=?)" — a unique-equality probe with NUMERIC comparison semantics,
 /// which the planner prefers over a rowid seek whenever it exists.)
-fn unique_index_serves_eq_probe(ctx: &ExecContext<'_>, table: &Arc<Table>, col_pos: usize) -> bool {
+fn unique_index_serves_eq_probe(
+    catalog: &crate::schema::Catalog,
+    table: &Arc<Table>,
+    col_pos: usize,
+) -> bool {
     let Some(col) = table.columns.get(col_pos) else {
         return false;
     };
-    for idx in ctx.catalog().indexes_on_table(&table.name) {
+    for idx in catalog.indexes_on_table(&table.name) {
         if idx.unique
             && idx.partial_expr.is_none()
             && idx.kind == crate::schema::IndexKind::Btree
@@ -20259,8 +20270,8 @@ fn unique_index_serves_eq_probe(ctx: &ExecContext<'_>, table: &Arc<Table>, col_p
 /// one by row estimate (sqlite_stat1, else 2^20; ties keep the syntactic
 /// left outer) — then SQLite scans the alias side and probes that index
 /// (stateful-fuzz seed 777101 case 3).
-fn join_alias_seek_gate(
-    ctx: &ExecContext<'_>,
+pub(crate) fn join_alias_seek_gate(
+    catalog: &crate::schema::Catalog,
     l_table: &Arc<Table>,
     r_table: &Arc<Table>,
     l_key: usize,
@@ -20286,16 +20297,16 @@ fn join_alias_seek_gate(
     // Both directions index-backed? The NON-alias side's key needs the
     // serving unique index (the alias side is seekable by definition).
     let non_alias_indexed = if l_key_is_alias {
-        unique_index_serves_eq_probe(ctx, r_table, r_key)
+        unique_index_serves_eq_probe(catalog, r_table, r_key)
     } else {
-        unique_index_serves_eq_probe(ctx, l_table, l_key)
+        unique_index_serves_eq_probe(catalog, l_table, l_key)
     };
     if !non_alias_indexed {
         return true;
     }
     let outer_is_left = {
-        let l_rows = crate::planner::table_rows_hint(ctx.catalog(), l_table);
-        let r_rows = crate::planner::table_rows_hint(ctx.catalog(), r_table);
+        let l_rows = crate::planner::table_rows_hint(catalog, l_table);
+        let r_rows = crate::planner::table_rows_hint(catalog, r_table);
         if l_rows == r_rows {
             true // tie: syntactic left is outer
         } else {
@@ -20481,7 +20492,13 @@ fn try_fused_scan_hash_join(
     let r_key_is_alias = r_table.rowid_alias == Some(r_keys[0]);
     let rowid_seek_join = n_keys == 1
         && join_alias_seek_gate(
-            ctx, l_table, r_table, l_keys[0], r_keys[0], join_type, alias_seek,
+            ctx.catalog(),
+            l_table,
+            r_table,
+            l_keys[0],
+            r_keys[0],
+            join_type,
+            alias_seek,
         );
     // Cross-affinity equi keys (INTEGER col = TEXT col — needs the
     // NUMERIC fold) must NOT hash: the encoded order keys are
@@ -21378,7 +21395,7 @@ fn exec_hash_join(
         plan_scan_table(right),
     ) {
         ([(li, ri)], Some(lt), Some(rt))
-            if join_alias_seek_gate(ctx, lt, rt, *li, *ri, join_type, alias_seek) =>
+            if join_alias_seek_gate(ctx.catalog(), lt, rt, *li, *ri, join_type, alias_seek) =>
         {
             if lt.rowid_alias == Some(*li) {
                 Some((true, *li, *ri))
@@ -22121,10 +22138,11 @@ fn exec_index_nested_loop_join(
     outer_plan: &Plan,
     inner_table: Arc<Table>,
     inner_alias: Option<String>,
-    inner_index: Arc<crate::schema::Index>,
+    inner_index: Option<Arc<crate::schema::Index>>,
     outer_key_col: usize,
     projection: Option<&[crate::planner::plan::ProjectExpr]>,
     covering: bool,
+    left_outer: bool,
 ) -> Result<ExecResult> {
     let outer_res = execute(outer_plan, ctx)?;
     let n_inner_cols = inner_table.n_columns();
@@ -22190,7 +22208,10 @@ fn exec_index_nested_loop_join(
     // outer row. Index roots only move on B+tree splits; re-read only if
     // something actually changed roots mid-join (an UPDATE source writing
     // the same table).
-    let mut inner_index_root = ctx.index_root(&inner_index);
+    // `inner_index == None` is the ROWID probe (SQLite's `SEARCH t USING
+    // INTEGER PRIMARY KEY (rowid=?)`): each outer key converts through
+    // OP_SeekRowid's rules and descends the table b-tree directly.
+    let mut inner_index_root = inner_index.as_ref().map_or(0, |ix| ctx.index_root(ix));
     let outer_width = outer_res.columns.len();
     let total_width = outer_width + n_inner_cols;
     // Selective inner decode: when the fused projection only needs some
@@ -22229,17 +22250,17 @@ fn exec_index_nested_loop_join(
     // when the encoding is ambiguous for the column (a numeric key under
     // BLOB affinity, a collation-folded text key) that outer row fetches
     // its rows instead.
-    let key_col: Option<usize> = inner_index
-        .columns
-        .first()
+    let first_index_col = inner_index.as_ref().and_then(|ix| ix.columns.first());
+    let key_col: Option<usize> = first_index_col
         .filter(|c| c.expr.is_none())
         .and_then(|c| inner_table.find_column(&c.name))
         .filter(|&k| inner_table.rowid_alias != Some(k));
-    let key_binary = inner_index
-        .columns
-        .first()
+    let key_binary = first_index_col
         .is_some_and(|c| c.collation.is_empty() || c.collation.eq_ignore_ascii_case("BINARY"));
     let key_aff = key_col.map(|k| inner_table.columns[k].affinity);
+    // The covering form emits one row per index ENTRY: neither the rowid
+    // probe (no index) nor the LEFT form (NULL-extension) can use it.
+    let covering = covering && inner_index.is_some() && !left_outer;
     let covering = if covering {
         let alias_pos = inner_table.rowid_alias;
         match &fused_inner_cols {
@@ -22310,7 +22331,9 @@ fn exec_index_nested_loop_join(
     // ONE index + ONE table B+tree handle for the whole join: the pinned
     // root pages and thread-local leaf hints survive across every probe
     // (a fresh `Btree::new` per rowid re-fetched the root page per row).
-    let mut index_bt = Btree::new(ctx.pager, inner_index_root, true);
+    let mut index_bt: Option<Btree> = inner_index
+        .as_ref()
+        .map(|_| Btree::new(ctx.pager, inner_index_root, true));
     let mut table_bt = Btree::new(ctx.pager, inner_root, false);
     // sqlite3IndexAffinityOk: the planner only probes an index whose key
     // column has NUMERIC affinity with a value of any class when the
@@ -22318,9 +22341,7 @@ fn exec_index_nested_loop_join(
     // to the probe value first (OP_Affinity): a TEXT outer key '0' finds
     // the INTEGER entry 0 (`t1 JOIN t2 ON t2.g = t1.b`, b TEXT, g
     // INTEGER, probed t2_g with the raw text and matched nothing).
-    let numeric_probe = inner_index
-        .columns
-        .first()
+    let numeric_probe = first_index_col
         .filter(|ic| ic.expr.is_none())
         .and_then(|ic| inner_table.find_column(&ic.name))
         .is_some_and(|i| {
@@ -22332,14 +22353,42 @@ fn exec_index_nested_loop_join(
             )
         });
 
+    // LEFT form: the NULL-extended row for an outer row with no match.
+    let null_extended = |outer_row: &Row| -> Row {
+        match &fused {
+            Some((indices, _)) => indices
+                .iter()
+                .map(|&i| {
+                    if i < outer_width {
+                        outer_row[i].clone()
+                    } else {
+                        Value::Null
+                    }
+                })
+                .collect(),
+            None => {
+                let mut combined: Row = Vec::with_capacity(total_width);
+                combined.extend_from_slice(outer_row);
+                combined.extend(std::iter::repeat(Value::Null).take(n_inner_cols));
+                combined
+            }
+        }
+    };
+
     for outer_row in &outer_res.rows {
+        let rows_before = out_rows.len();
         // Extract the join key from the outer row (borrowed — no clone;
         // the order-key encoder only reads it).
         // A NULL join key never matches (`NULL = x` is NULL): the index
         // DOES hold NULL-keyed entries, and probing it with the NULL key
         // used to pair NULL outer keys with NULL inner keys.
         let key_value = match outer_row.get(outer_key_col) {
-            Some(Value::Null) | None => continue,
+            Some(Value::Null) | None => {
+                if left_outer {
+                    out_rows.push(null_extended(outer_row));
+                }
+                continue;
+            }
             Some(v) => v,
         };
         let converted: Value;
@@ -22360,25 +22409,38 @@ fn exec_index_nested_loop_join(
             v => v,
         };
 
-        // Encode the key for index lookup (order-preserving form, folded
-        // through the inner index's collation when it is a collated
-        // index), reusing the buffer across rows.
-        key_buf.clear();
-        match inner_index.columns.first() {
-            Some(ic) => crate::plugin::collation_fold_key_ref(&ic.collation, key_value)
-                .encode_order_key_into(&mut key_buf),
-            None => key_value.encode_order_key_into(&mut key_buf),
-        }
+        match index_bt.as_mut() {
+            Some(bt) => {
+                // Encode the key for index lookup (order-preserving form,
+                // folded through the inner index's collation when it is a
+                // collated index), reusing the buffer across rows.
+                key_buf.clear();
+                match first_index_col {
+                    Some(ic) => crate::plugin::collation_fold_key_ref(&ic.collation, key_value)
+                        .encode_order_key_into(&mut key_buf),
+                    None => key_value.encode_order_key_into(&mut key_buf),
+                }
 
-        // Look up matching rowids in the index B+tree (reused handle +
-        // reused output buffer). A mid-join index split moves the root:
-        // re-target the handle when that happens.
-        if index_bt.root != inner_index_root {
-            index_bt = Btree::new(ctx.pager, inner_index_root, true);
-        }
-        index_bt.lookup_index_into(&key_buf, &mut rowids)?;
-        if index_bt.root != inner_index_root {
-            inner_index_root = index_bt.root;
+                // Look up matching rowids in the index B+tree (reused
+                // handle + reused output buffer). A mid-join index split
+                // moves the root: re-target the handle when that happens.
+                if bt.root != inner_index_root {
+                    *bt = Btree::new(ctx.pager, inner_index_root, true);
+                }
+                bt.lookup_index_into(&key_buf, &mut rowids)?;
+                if bt.root != inner_index_root {
+                    inner_index_root = bt.root;
+                }
+            }
+            None => {
+                // Rowid probe: at most one candidate; a key that does not
+                // convert to an integer rowid (a fractional REAL, TEXT
+                // that is not an integer, a BLOB) matches nothing.
+                rowids.clear();
+                if let Some(r) = rowid_seek_value(key_value) {
+                    rowids.push(r);
+                }
+            }
         }
 
         // Fetch each matching row from the inner table, decoding directly
@@ -22514,6 +22576,9 @@ fn exec_index_nested_loop_join(
                     }
                 }
             }
+        }
+        if left_outer && out_rows.len() == rows_before {
+            out_rows.push(null_extended(outer_row));
         }
     }
 
@@ -28932,8 +28997,7 @@ pub(crate) fn simulate_update_unique(
     }
     // New keys claimed by PROCESSED write-set rows, per index (their old
     // entries are vacated; their new entries are live).
-    let mut pending_new: Vec<std::collections::HashMap<Vec<u8>, i64, KeyHashBuild>> =
-        vec![
+    let mut pending_new: Vec<std::collections::HashMap<Vec<u8>, i64, KeyHashBuild>> = vec![
             std::collections::HashMap::with_capacity_and_hasher(write_set.len(), KeyHashBuild);
             unique_indexes.len()
         ];

@@ -61,16 +61,18 @@ fn walk(p: &Plan, s: &mut String, depth: usize) {
             inner_index,
             outer_key_col,
             covering,
+            left_outer,
         } => {
             let mut x = format!(
-                "{}INLJ inner={}{} idx={} outer_key_col={} covering={}\n",
+                "{}INLJ{} inner={}{} idx={} outer_key_col={} covering={}\n",
                 indent,
+                if *left_outer { " LEFT" } else { "" },
                 inner_table.name,
                 inner_alias
                     .as_ref()
                     .map(|a| format!(" AS {a}"))
                     .unwrap_or_default(),
-                inner_index.name,
+                inner_index.as_ref().map_or("<rowid>", |i| i.name.as_str()),
                 outer_key_col,
                 covering
             );

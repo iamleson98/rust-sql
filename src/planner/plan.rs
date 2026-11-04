@@ -227,7 +227,12 @@ pub enum Plan {
         /// Inner alias (for column-name resolution in the output).
         inner_alias: Option<String>,
         /// Index on `inner_table` whose first column is the join key.
-        inner_index: Arc<Index>,
+        /// `None` = probe the table's own rowid: the join key is the
+        /// INTEGER PRIMARY KEY alias (SQLite's "SEARCH t USING INTEGER
+        /// PRIMARY KEY (rowid=?)"); each outer key converts through the
+        /// rowid-seek rules (`rowid_seek_value`) and descends the table
+        /// b-tree directly.
+        inner_index: Option<Arc<Index>>,
         /// Column index in the OUTER row that supplies the join key value.
         /// E.g. for `JOIN orders o ON u.id = o.user_id`, this is the index
         /// of `u.id` in the outer (users) row.
@@ -242,6 +247,11 @@ pub enum Plan {
         /// too. `SELECT COUNT(*) FROM big1 JOIN big2 ON big1.k = big2.k`
         /// shapes stop paying one table descent per matched entry.
         covering: bool,
+        /// LEFT OUTER form: an outer row with no inner match (or a NULL /
+        /// unseekable key) is emitted once, NULL-extended. Only built for
+        /// a pure-equi ON clause (nothing is left to filter the matches)
+        /// and never together with `covering`.
+        left_outer: bool,
     },
     /// Subquery (materialized).
     Subquery {
