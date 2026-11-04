@@ -402,6 +402,52 @@ pub fn rtrim_constraint(text: &str) -> &str {
     &text[..end]
 }
 
+/// `ALTER TABLE old RENAME TO new` in another (or the same) table's
+/// definition: every `REFERENCES old` names the new table, written as the
+/// quoted identifier SQLite's rename emits. `None` when nothing changed.
+pub fn rename_references(sql: &str, old: &str, new_quoted: &str) -> Option<String> {
+    let z = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut last = 0usize;
+    let mut i = 0usize;
+    let mut changed = false;
+    while i < z.len() {
+        let (n, t) = get_token(&z[i..]);
+        if n == 0 {
+            break;
+        }
+        i += n;
+        if t != Tk::References {
+            continue;
+        }
+        let ws = get_whitespace(&z[i..]);
+        let start = i + ws;
+        let (len, kind) = get_token(&z[start..]);
+        if len == 0 || matches!(kind, Tk::Illegal | Tk::Lp | Tk::Rp | Tk::Comma) {
+            continue;
+        }
+        let raw = &sql[start..start + len];
+        let name = match raw.as_bytes()[0] {
+            b'"' | b'`' => raw[1..raw.len() - 1].replace(&raw[..1].repeat(2), &raw[..1]),
+            b'[' => raw[1..raw.len() - 1].to_string(),
+            b'\'' => raw[1..raw.len() - 1].replace("''", "'"),
+            _ => raw.to_string(),
+        };
+        if name.eq_ignore_ascii_case(old) {
+            out.push_str(&sql[last..start]);
+            out.push_str(new_quoted);
+            last = start + len;
+            changed = true;
+        }
+        i = start + len;
+    }
+    if !changed {
+        return None;
+    }
+    out.push_str(&sql[last..]);
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

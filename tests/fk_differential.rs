@@ -78,6 +78,12 @@ fn run(tag: &str, script: &[&str]) {
             b.sort();
             assert_eq!(a, b, "{tag}: {name} after {sql}");
         }
+        let q = "SELECT changes(), total_changes()";
+        assert_eq!(
+            ours(&mut db, q),
+            theirs(&c, q),
+            "{tag}: change counts after {sql}"
+        );
         let q = "PRAGMA foreign_key_check";
         assert_eq!(
             ours(&mut db, q),
@@ -313,6 +319,68 @@ fn trigger_new_old_inside_subqueries() {
             "INSERT INTO t VALUES(2, 9)",
             "INSERT INTO t VALUES(3, 1)",
             "DELETE FROM t WHERE x = 1",
+        ],
+    );
+}
+
+/// FK actions are UPDATE / DELETE programs on the child: the rewritten
+/// row's CHECK / NOT NULL constraints and its own foreign keys apply,
+/// index entries move with it, the statement undoes them on failure, and
+/// their rows count toward total_changes() only.
+#[test]
+fn fk_actions_behave_like_child_statements() {
+    run(
+        "check",
+        &[
+            "CREATE TABLE ab(a PRIMARY KEY, b)",
+            "CREATE TABLE cd(c PRIMARY KEY REFERENCES ab ON UPDATE CASCADE ON DELETE CASCADE, d)",
+            "CREATE TABLE ef(e REFERENCES cd ON UPDATE CASCADE, f, CHECK (e!=5))",
+            "INSERT INTO ab VALUES(1, 'b')",
+            "INSERT INTO cd VALUES(1, 'd')",
+            "INSERT INTO ef VALUES(1, 'e')",
+            "UPDATE ab SET a = 5",
+            "BEGIN",
+            "UPDATE ab SET a = 5",
+            "COMMIT",
+            "BEGIN",
+            "DELETE FROM ab",
+            "COMMIT",
+            "UPDATE ab SET a = 2",
+            "DELETE FROM ef",
+            "DELETE FROM ab",
+        ],
+    );
+    run(
+        "setdefault",
+        &[
+            "CREATE TABLE t1(a INTEGER PRIMARY KEY, b)",
+            "CREATE TABLE t2(c INTEGER PRIMARY KEY, d INTEGER DEFAULT 1 REFERENCES t1 ON DELETE SET DEFAULT)",
+            "CREATE INDEX t2d ON t2(d)",
+            "INSERT INTO t1 VALUES(1, 'one')",
+            "INSERT INTO t1 VALUES(2, 'two')",
+            "INSERT INTO t2 VALUES(1, 2)",
+            "DELETE FROM t1 WHERE a = 2",
+            "INSERT INTO t1 VALUES(2, 'two')",
+            "UPDATE t2 SET d = 2",
+            "DELETE FROM t1 WHERE a = 1",
+            "DELETE FROM t1",
+            "SELECT * FROM t2 WHERE d = 2",
+        ],
+    );
+    run(
+        "setnull",
+        &[
+            "CREATE TABLE p(a PRIMARY KEY)",
+            "CREATE TABLE c(x REFERENCES p ON DELETE SET NULL ON UPDATE SET NULL, y NOT NULL DEFAULT 0)",
+            "CREATE TABLE n(x NOT NULL REFERENCES p ON DELETE SET NULL)",
+            "CREATE INDEX cx ON c(x)",
+            "INSERT INTO p VALUES(1), (2), (3)",
+            "INSERT INTO c VALUES(1, 1), (2, 2), (2, 3)",
+            "INSERT INTO n VALUES(3)",
+            "DELETE FROM p WHERE a = 2",
+            "UPDATE p SET a = 10 WHERE a = 1",
+            "DELETE FROM p WHERE a = 3",
+            "SELECT count(*) FROM c WHERE x IS NULL",
         ],
     );
 }

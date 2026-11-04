@@ -6067,7 +6067,12 @@ impl Database {
             );
         }
         if let Ok(n) = result {
-            crate::executor::change_counters::record(&self.change_counts, n);
+            crate::executor::change_counters::record_outcome(
+                &self.change_counts,
+                true,
+                n,
+                ctx.trigger_changes,
+            );
             self.pager.note_rows_modified(n);
             // Auto-commit bulk INSERT: one implicit transaction.
             if n > 0 && !ctx.in_transaction {
@@ -16024,7 +16029,14 @@ impl Database {
                 // Rewrite the CREATE TABLE statement's table name and the
                 // qualified column names; everything else (columns, FKs,
                 // checks) is unchanged.
-                let new_sql = rewrite_create_table_name(&table.create_sql, &new_name);
+                // SQLite's rename writes the new name as a quoted
+                // identifier, in the table's own definition and in every
+                // REFERENCES clause naming it (its own included).
+                let quoted = format!("\"{}\"", new_name.replace('"', "\"\""));
+                let new_sql = rewrite_create_table_name(&table.create_sql, &quoted);
+                let new_sql =
+                    crate::sql::constraint_edit::rename_references(&new_sql, &table.name, &quoted)
+                        .unwrap_or(new_sql);
                 let mut rebuilt = (*table).clone();
                 rebuilt.name = new_name.clone();
                 rebuilt.create_sql = new_sql.clone();
@@ -16060,11 +16072,10 @@ impl Database {
                 // never had a row — and the temp mark already followed
                 // the rename (rename_table) — so this is catalog-only.
                 if !catalog.is_temp(&new_name) {
-                    delete_schema_row(ctx.pager, "table", &old_name)?;
-                    let schema_row = crate::schema::encode_schema_row(
-                        "table", &new_name, &new_name, root, &new_sql,
-                    );
-                    insert_schema_row(ctx.pager, &schema_row)?;
+                    // In place (same rowids — sqlite_master keeps its
+                    // order): the renamed table's row and every table
+                    // row whose REFERENCES name it.
+                    rewrite_table_rows_for_rename(ctx.pager, &old_name, &new_name, root, &new_sql)?;
 
                     // Index schema rows keep name and SQL but tbl_name follows.
                     rewrite_index_tbl_names(ctx.pager, &old_name, &new_name)?;
@@ -16963,14 +16974,25 @@ impl Database {
                     ctx.pager.set_case_sensitive_like(on);
                 }
                 "foreign_keys" | "recursive_triggers" => {
-                    // Accept booleans, numbers, and ON/OFF bare words.
-                    let on = match (&v, value_as_expr(value)) {
-                        (_, crate::sql::ast::Expr::Column { name, .. }) => {
-                            matches!(name.to_ascii_lowercase().as_str(), "on" | "true" | "1")
+                    // sqlite3GetBoolean: on/yes/true, off/no/false, numbers
+                    // (bare words or strings).
+                    let word = |w: &str| -> bool {
+                        match w.to_ascii_lowercase().as_str() {
+                            "on" | "yes" | "true" => true,
+                            "off" | "no" | "false" => false,
+                            other => other.trim().parse::<i64>().is_ok_and(|n| n != 0),
                         }
+                    };
+                    let on = match (&v, value_as_expr(value)) {
+                        (_, crate::sql::ast::Expr::Column { name, .. }) => word(name),
+                        (Value::Text(t), _) => word(t.as_str()),
                         _ => v.is_truthy(),
                     };
                     if name == "foreign_keys" {
+                        // A no-op inside a transaction (SQLite).
+                        if ctx.in_transaction {
+                            return Ok(());
+                        }
                         ctx.pager.set_foreign_keys_enabled(on);
                     } else {
                         ctx.pager.set_recursive_triggers_enabled(on);
@@ -18922,6 +18944,59 @@ fn rewrite_on_table(sql: &str, old: &str, new: &str) -> String {
     out
 }
 
+/// RENAME TABLE's schema-row rewrite, in place: the table's own row
+/// (name, tbl_name, sql) and the sql of every other table whose
+/// REFERENCES clauses name it.
+fn rewrite_table_rows_for_rename(
+    pager: &Pager,
+    old_table: &str,
+    new_table: &str,
+    root: u32,
+    own_sql: &str,
+) -> Result<()> {
+    let quoted = format!("\"{}\"", new_table.replace('"', "\"\""));
+    let mut bt = Btree::new(pager, 0, false);
+    let mut updates: Vec<(i64, Vec<Value>)> = Vec::new();
+    bt.scan_table(|rowid, payload| {
+        if let Ok(row) = decode_row(payload, 5, 0, None) {
+            if let Some((kind, name, tbl_name, rootpage, sql)) =
+                crate::schema::decode_schema_row(&row)
+            {
+                if kind == "table" && name.eq_ignore_ascii_case(old_table) {
+                    updates.push((
+                        rowid,
+                        crate::schema::encode_schema_row(
+                            "table", new_table, new_table, root, own_sql,
+                        ),
+                    ));
+                } else if kind == "table" {
+                    if let Some(new_sql) =
+                        crate::sql::constraint_edit::rename_references(sql, old_table, &quoted)
+                    {
+                        let internal = crate::schema::rootpage_to_internal(rootpage);
+                        updates.push((
+                            rowid,
+                            crate::schema::encode_schema_row(
+                                "table", name, tbl_name, internal, &new_sql,
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        true
+    })?;
+    drop(bt);
+    schema_tree_mutate(pager, |bt| {
+        for (rowid, row) in updates {
+            let payload = encode_row(&row);
+            bt.delete_table(rowid)?;
+            bt.insert_table(rowid, &payload).map(|_| ())?;
+        }
+        Ok(())
+    })
+}
+
 /// Rewrite the `tbl_name` column of every index schema row that belongs to
 /// `old_table` (used by ALTER TABLE RENAME TO).
 fn rewrite_index_tbl_names(pager: &Pager, old_table: &str, new_table: &str) -> Result<()> {
@@ -20349,18 +20424,64 @@ impl Database {
                     return Ok(());
                 }
             };
+            let n_cols = table.n_columns();
+            // Splice path: with no hook wanting the row images, only the
+            // SET columns are encoded; every other column's bytes are
+            // copied from the old payload (no decode / re-encode / text
+            // allocations of the untouched columns).
+            if !crate::preupdate::events_needed()
+                && sets.iter().all(|&(c, _)| table.rowid_alias != Some(c))
+            {
+                let mut regions: Vec<(u32, u32)> = Vec::new();
+                if crate::storage::row_codec::row_column_regions_into(
+                    &old_payload,
+                    n_cols,
+                    table.rowid_alias,
+                    &mut regions,
+                ) {
+                    let mut repl: Vec<Option<Value>> = vec![None; n_cols];
+                    for &(col_idx, pos) in sets.iter() {
+                        let v = table.columns[col_idx].coerce(params[pos].clone());
+                        if !table.columns[col_idx].nullable && v.is_null() {
+                            return Err(Error::constraint(format!(
+                                "NOT NULL constraint failed: {}.{}",
+                                table.name, table.columns[col_idx].name
+                            )));
+                        }
+                        repl[col_idx] = Some(v);
+                    }
+                    let mut payload = Vec::with_capacity(old_payload.len() + 16);
+                    for (col, &(off, len)) in regions.iter().enumerate() {
+                        match &repl[col] {
+                            Some(v) => v.encode_into(&mut payload),
+                            None => payload.extend_from_slice(
+                                &old_payload[off as usize..(off + len) as usize],
+                            ),
+                        }
+                    }
+                    if !bt.update_table(rowid, &payload)? {
+                        bt.delete_table(rowid)?;
+                        bt.insert_table(rowid, &payload)?;
+                    }
+                    if bt.root != root {
+                        ctx.set_table_root_lc(&table.name.to_ascii_lowercase(), bt.root);
+                    }
+                    changed = 1;
+                    return Ok(());
+                }
+            }
             // Decode the old row, clone it as the new row, apply the SETs
             // with column affinity + NOT NULL on the modified columns.
-            let n_cols = table.n_columns();
-            let mut old_crow: Vec<Value> = Vec::with_capacity(n_cols);
+            let mut new_crow: Vec<Value> = Vec::with_capacity(n_cols);
             crate::storage::row_codec::decode_row_into(
                 &old_payload,
                 n_cols,
                 rowid,
                 table.rowid_alias,
-                &mut old_crow,
+                &mut new_crow,
             )?;
-            let mut new_crow = old_crow.clone();
+            // The old image only feeds the preupdate / session hook.
+            let old_crow = crate::preupdate::events_needed().then(|| new_crow.clone());
             for &(col_idx, pos) in sets.iter() {
                 new_crow[col_idx] = table.columns[col_idx].coerce(params[pos].clone());
                 if !table.columns[col_idx].nullable && new_crow[col_idx].is_null() {
@@ -20373,13 +20494,15 @@ impl Database {
             let payload =
                 crate::storage::row_codec::encode_row_aliased(&new_crow, table.rowid_alias);
             // Preupdate/session hook scope (installed by `execute`).
-            crate::preupdate::fire(
-                crate::preupdate::PreupdateOp::Update,
-                table,
-                rowid,
-                Some(&old_crow),
-                Some(&new_crow),
-            );
+            if let Some(old_crow) = old_crow.as_ref() {
+                crate::preupdate::fire(
+                    crate::preupdate::PreupdateOp::Update,
+                    table,
+                    rowid,
+                    Some(old_crow),
+                    Some(&new_crow),
+                );
+            }
             // In-place replace; delete+insert fallback when the payload
             // size class changed (mirrors try_streaming_update).
             let updated = bt.update_table(rowid, &payload)?;

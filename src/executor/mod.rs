@@ -2122,10 +2122,12 @@ pub mod change_counters {
     /// FAIL conflict) counts them.
     pub fn record_outcome(conn: &ConnCounts, kept: bool, direct: i64, nested: i64) {
         use std::sync::atomic::Ordering::Relaxed;
+        // A failed statement still adds the rows of the trigger / FK
+        // action programs that completed (each program's halt adds them).
         let (last_v, add) = if kept {
             (direct, direct + nested)
         } else {
-            (0, 0)
+            (0, nested)
         };
         conn.v[0].store(last_v, Relaxed);
         let total_v = conn.v[1].fetch_add(add, Relaxed) + add;
@@ -2767,6 +2769,7 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             let top = ctx.trigger_depth == 0;
             if top {
                 ctx.fk_child_pending.borrow_mut().clear();
+                ctx.fk_stmt_checks.clear();
             }
             let r = exec_insert(
                 ctx,
@@ -2779,7 +2782,7 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
                 returning.as_deref(),
             )?;
             if top {
-                fk_verify_child_pending(ctx)?;
+                fk_stmt_end(ctx)?;
             }
             Ok(r)
         }),
@@ -2796,6 +2799,7 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             let top = ctx.trigger_depth == 0;
             if top {
                 ctx.fk_child_pending.borrow_mut().clear();
+                ctx.fk_stmt_checks.clear();
             }
             let r = exec_update(
                 ctx,
@@ -2807,7 +2811,7 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
                 from.as_deref(),
             )?;
             if top {
-                fk_verify_child_pending(ctx)?;
+                fk_stmt_end(ctx)?;
             }
             Ok(r)
         }),
@@ -2820,10 +2824,11 @@ fn execute_inner(plan: &Plan, ctx: &mut ExecContext<'_>) -> Result<ExecResult> {
             let top = ctx.trigger_depth == 0;
             if top {
                 ctx.fk_child_pending.borrow_mut().clear();
+                ctx.fk_stmt_checks.clear();
             }
             let r = exec_delete(ctx, table.clone(), source, returning.as_deref())?;
             if top {
-                fk_verify_child_pending(ctx)?;
+                fk_stmt_end(ctx)?;
             }
             Ok(r)
         }
@@ -4024,6 +4029,17 @@ fn fk_write_child_row(
     old_crow: &Row,
     new_crow: &Row,
 ) -> Result<i64> {
+    // An FK action is an UPDATE of the child row (SQLite codes it as a
+    // trigger program): the row's NOT NULL / CHECK constraints and its
+    // own foreign keys apply to the rewritten values.
+    enforce_row_constraints(
+        child,
+        new_crow,
+        &child.col_names,
+        &ctx.params,
+        &ctx.named_params,
+    )?;
+    enforce_child_fks(ctx, child, new_crow)?;
     // Does the rowid-alias column change? (SET NULL / SET DEFAULT onto
     // the alias, or a CASCADE whose new key lives on the alias.)
     let move_target: Option<i64> = if let Some(a) = child.rowid_alias {
@@ -4371,6 +4387,23 @@ fn enforce_parent_delete_fks(
     parent_rowid: i64,
     depth: usize,
 ) -> Result<()> {
+    // The FK action programs count toward total_changes() only when the
+    // whole action completes.
+    let saved = ctx.trigger_changes;
+    let r = enforce_parent_delete_fks_inner(ctx, parent, old_row, parent_rowid, depth);
+    if r.is_err() {
+        ctx.trigger_changes = saved;
+    }
+    r
+}
+
+fn enforce_parent_delete_fks_inner(
+    ctx: &mut ExecContext<'_>,
+    parent: &Table,
+    old_row: &[Value],
+    parent_rowid: i64,
+    depth: usize,
+) -> Result<()> {
     if !ctx.pager.foreign_keys_enabled() || depth > 16 {
         return Ok(());
     }
@@ -4444,7 +4477,10 @@ fn enforce_parent_delete_fks(
                 continue;
             }
             match fk.on_delete {
-                ForeignKeyAction::NoAction if ctx.fk_defer_noaction => {
+                // Inside an FK action (depth > 0) or a REPLACE, NO ACTION is
+                // counted at statement end (SQLite's FK counter): the action
+                // program completes first.
+                ForeignKeyAction::NoAction if ctx.fk_defer_noaction || depth > 0 => {
                     let key: Vec<Value> = if parent_cols.is_empty() {
                         vec![Value::Integer(parent_rowid)]
                     } else {
@@ -4481,8 +4517,17 @@ fn enforce_parent_delete_fks(
                                 None,
                             );
                             let mut bt = Btree::new(ctx.pager, root, false);
-                            bt.delete_table(rowid)?;
+                            let payload = bt.delete_table_get_payload(rowid)?;
                             new_root = bt.root;
+                            // Statement journal: a cascaded delete rolls
+                            // back with the owning statement.
+                            if let Some(p) = payload {
+                                ctx.stmt_undo.push(StmtUndoEntry::Deleted {
+                                    table: Arc::clone(&child2),
+                                    rowid,
+                                    payload: p,
+                                });
+                            }
                         }
                         let lc = child2.name.to_ascii_lowercase();
                         ctx.set_table_root_lc(&lc, new_root);
@@ -4491,7 +4536,8 @@ fn enforce_parent_delete_fks(
                         for idx in indexes {
                             delete_index_entry(ctx, &idx, &child2, &crow, rowid)?;
                         }
-                        ctx.changes += 1;
+                        // FK-action rows count toward total_changes() only.
+                        ctx.trigger_changes += 1;
                         if let Some(&cached) = ctx.max_rowids.get(&lc) {
                             if rowid >= cached {
                                 ctx.invalidate_max_rowid(&lc);
@@ -4527,37 +4573,21 @@ fn enforce_parent_delete_fks(
                                 default_val.unwrap_or(Value::Null)
                             };
                         }
-                        let payload = encode_row_aliased(&crow, child.rowid_alias);
-                        let root = ctx.table_root(&child);
-                        let new_root;
-                        {
-                            // Statement journal: ON DELETE SET NULL / SET
-                            // DEFAULT child rewrites roll back with the
-                            // owning statement (SQLite statement atomicity).
-                            journal_row_rewrite(ctx, child.as_ref(), rowid, &old_crow_snapshot);
-                            // Preupdate: the child row is about to be
-                            // rewritten (SET NULL / SET DEFAULT).
-                            crate::preupdate::fire(
-                                crate::preupdate::PreupdateOp::Update,
-                                child.as_ref(),
-                                rowid,
-                                pre_row.as_deref(),
-                                Some(&crow),
-                            );
-                            let mut bt = Btree::new(ctx.pager, root, false);
-                            let updated = bt.update_table(rowid, &payload).unwrap_or(false);
-                            if !updated {
-                                bt.delete_table(rowid)?;
-                                bt.insert_table(rowid, &payload)?;
-                            }
-                            new_root = bt.root;
-                        }
-                        ctx.set_table_root_lc(&child.name.to_ascii_lowercase(), new_root);
-                        let indexes = ctx.catalog().indexes_on_table(&child.name);
-                        for idx in indexes {
-                            delete_index_entry(ctx, &idx, &child, &crow, rowid)?;
-                        }
-                        ctx.changes += 1;
+                        // Preupdate: the child row is about to be
+                        // rewritten (SET NULL / SET DEFAULT).
+                        crate::preupdate::fire(
+                            crate::preupdate::PreupdateOp::Update,
+                            child.as_ref(),
+                            rowid,
+                            pre_row.as_deref(),
+                            Some(&crow),
+                        );
+                        // The rewrite (journal, index entries old -> new,
+                        // rowid-alias moves, the row's constraints).
+                        fk_write_child_row(ctx, &child, rowid, &old_crow_snapshot, &crow)?;
+                        // FK-action rows count toward total_changes()
+                        // only, like trigger writes.
+                        ctx.trigger_changes += 1;
                     }
                 }
             }
@@ -4579,7 +4609,33 @@ fn enforce_parent_delete_fks(
 /// column (comparing old vs new on the FK's parent columns); a no-op
 /// UPDATE of unrelated columns never touches children (SQLite semantics).
 /// `new_row` / `new_rowid` carry the parent's post-update key.
+#[allow(clippy::too_many_arguments)]
 fn enforce_parent_update_fks(
+    ctx: &mut ExecContext<'_>,
+    parent: &Table,
+    old_row: &[Value],
+    new_row: &[Value],
+    parent_rowid: i64,
+    new_parent_rowid: i64,
+    depth: usize,
+) -> Result<()> {
+    let saved = ctx.trigger_changes;
+    let r = enforce_parent_update_fks_inner(
+        ctx,
+        parent,
+        old_row,
+        new_row,
+        parent_rowid,
+        new_parent_rowid,
+        depth,
+    );
+    if r.is_err() {
+        ctx.trigger_changes = saved;
+    }
+    r
+}
+
+fn enforce_parent_update_fks_inner(
     ctx: &mut ExecContext<'_>,
     parent: &Table,
     old_row: &[Value],
@@ -4697,7 +4753,7 @@ fn enforce_parent_update_fks(
                         // key value IS the b-tree cell key); collisions
                         // follow SQLite's REPLACE semantics.
                         let new_rowid = fk_write_child_row(ctx, &child, rowid, &old_crow, &crow)?;
-                        ctx.changes += 1;
+                        ctx.trigger_changes += 1;
                         // Grandchildren (this child may itself be a parent)
                         // — keyed off the PRE-mutation row values (the
                         // child lookup needs the OLD key) and the rowid
@@ -4746,7 +4802,7 @@ fn enforce_parent_update_fks(
                         // to the (INTEGER) default key (validated in the
                         // pre-write pass).
                         fk_write_child_row(ctx, &child, rowid, &old_crow, &crow)?;
-                        ctx.changes += 1;
+                        ctx.trigger_changes += 1;
                     }
                 }
             }

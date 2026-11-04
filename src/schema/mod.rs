@@ -1384,9 +1384,14 @@ impl Catalog {
                 // in-memory catalog is authoritative until reopen, where
                 // the (unrewritten) SQL re-parses with the old name — so
                 // rewrite the create_sql text as well.
-                let old_ref = format!("REFERENCES {}", old_name);
-                let new_ref = format!("REFERENCES {}", new_name);
-                t2.create_sql = t2.create_sql.replace(&old_ref, &new_ref);
+                let quoted = format!("\"{}\"", new_name.replace('"', "\"\""));
+                if let Some(sql) = crate::sql::constraint_edit::rename_references(
+                    &t2.create_sql,
+                    old_name,
+                    &quoted,
+                ) {
+                    t2.create_sql = sql;
+                }
                 *t = Arc::new(t2);
             }
         }

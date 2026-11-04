@@ -272,6 +272,9 @@ pub(crate) fn fire_triggers(
         let saved_last_insert_rowid = ctx.last_insert_rowid;
         // The body's rows count toward total_changes() only.
         let saved_changes = ctx.changes;
+        // total_changes() takes a program's rows when it completes; a
+        // program that fails (and its nested programs) adds none.
+        let saved_trigger_changes = ctx.trigger_changes;
         ctx.trigger_depth += 1;
         ctx.trigger_stack.push(trig.name.clone());
         // Preupdate depth: rows written by the trigger body are one
@@ -419,8 +422,11 @@ pub(crate) fn fire_triggers(
         ctx.trigger_stack.pop();
         ctx.last_insert_rowid = saved_last_insert_rowid;
         crate::executor::change_counters::note_conn_rowid(saved_last_insert_rowid);
-        ctx.trigger_changes += ctx.changes - saved_changes;
+        let program_changes = ctx.changes - saved_changes;
         ctx.changes = saved_changes;
+        if result.is_ok() {
+            ctx.trigger_changes += program_changes;
+        }
         // A RAISE in this program (an inner program catches its own):
         // IGNORE abandons this program, the rest of this event's programs
         // and the firing row's operation, keeping every change; FAIL /
@@ -428,6 +434,8 @@ pub(crate) fn fire_triggers(
         if result.is_err() {
             match RAISED.with(|r| r.take()) {
                 Some(crate::sql::ast::RaiseAction::Ignore) => {
+                    // RAISE(IGNORE) halts the program normally.
+                    ctx.trigger_changes += program_changes;
                     ctx.raise_ignore = true;
                     return Ok(());
                 }
@@ -439,6 +447,9 @@ pub(crate) fn fire_triggers(
                 }
                 _ => {}
             }
+        }
+        if result.is_err() {
+            ctx.trigger_changes = saved_trigger_changes;
         }
         result?;
     }
