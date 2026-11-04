@@ -116,7 +116,7 @@ impl<'a> Lexer<'a> {
 
     /// Tokenize the entire source.
     pub fn tokenize(mut self) -> Result<Vec<SpannedToken>> {
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity((self.src.len() / 4 + 4).min(4096));
         loop {
             self.skip_whitespace_and_comments()?;
             if self.pos >= self.src.len() {

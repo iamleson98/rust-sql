@@ -4790,7 +4790,7 @@ pub fn apply_where_for_scan_with_use(
     // no-ops for non-Scan plans and for predicates without the shapes.
     let predicate_owned;
     let predicate: &Expr = match &plan {
-        Plan::Scan { table, .. } => {
+        Plan::Scan { table, .. } if has_in_or_or(predicate) => {
             let step1 = rewrite_rowid_single_member_in(predicate, table);
             let step2 = rewrite_or_rowid_in_residuals(&step1, catalog, table, col_use);
             predicate_owned = step2;
@@ -4800,6 +4800,16 @@ pub fn apply_where_for_scan_with_use(
     };
     if let Plan::Scan { table, alias, .. } = &plan {
         let qual = alias.as_deref().unwrap_or(&table.name).to_string();
+        // Common case: no conjunct reads the scanned row — decided over
+        // borrowed conjuncts, without cloning the predicate apart.
+        if let Some(refs) = and_conjunct_refs(predicate) {
+            if !refs
+                .iter()
+                .any(|c| conjunct_bound_reads_row(c, catalog, table, &qual))
+            {
+                return apply_where_for_scan_inner(catalog, plan, predicate, col_use);
+            }
+        }
         let conjuncts = split_and_chain(predicate);
         let (row_dependent, sargable): (Vec<Expr>, Vec<Expr>) = conjuncts
             .into_iter()
@@ -4814,6 +4824,47 @@ pub fn apply_where_for_scan_with_use(
         }
     }
     apply_where_for_scan_inner(catalog, plan, predicate, col_use)
+}
+
+/// Can [`rewrite_rowid_single_member_in`] / [`rewrite_or_rowid_in_residuals`]
+/// change anything? They only act on an `IN` or an `OR` reached through
+/// binary / unary nodes.
+fn has_in_or_or(e: &Expr) -> bool {
+    match e {
+        Expr::In { .. } => true,
+        Expr::Binary {
+            op: BinaryOp::Or, ..
+        } => true,
+        Expr::Binary { left, right, .. } => has_in_or_or(left) || has_in_or_or(right),
+        Expr::Unary { expr, .. } => has_in_or_or(expr),
+        _ => false,
+    }
+}
+
+/// The conjuncts of an AND-chain by reference; `None` when
+/// [`split_and_chain`] would synthesize new terms (row-value comparisons).
+fn and_conjunct_refs(e: &Expr) -> Option<Vec<&Expr>> {
+    fn walk<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) -> bool {
+        match e {
+            Expr::Binary {
+                op: BinaryOp::And,
+                left,
+                right,
+            } => walk(left, out) && walk(right, out),
+            Expr::Binary { left, right, .. }
+                if matches!(left.as_ref(), Expr::Row(_))
+                    || matches!(right.as_ref(), Expr::Row(_)) =>
+            {
+                false
+            }
+            _ => {
+                out.push(e);
+                true
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(e, &mut out).then_some(out)
 }
 
 /// AND `pred` into an access path's own residual (scan predicate /

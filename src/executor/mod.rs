@@ -25265,12 +25265,54 @@ pub(crate) struct IndexMaintState {
     /// uniqueness probe consults it after the tree. Cleared at every
     /// flush (the entries are then in the tree, and a REPLACE delete may
     /// follow).
-    pub pending: Option<std::collections::HashMap<Vec<u8>, i64>>,
+    pub pending: Option<std::collections::HashMap<Vec<u8>, i64, KeyHashBuild>>,
     /// On the FIRST buffered state only: the rowids whose entries sit in
     /// the buffers (every buffered index holds an entry per row). A
     /// REPLACE delete of such a row flushes first; a pre-existing
     /// holder's entries are already in the trees. Cleared at each flush.
     pub stmt_rows: Option<std::collections::HashSet<i64>>,
+}
+
+/// Hasher for encoded index keys. Keys are big-endian-ordered byte
+/// strings whose entropy sits in the LAST bytes, so the multiply-rotate
+/// fold gets a final xor-shift: hashbrown picks buckets from the low
+/// bits, which a bare multiply never reaches from the high ones.
+#[derive(Default)]
+pub(crate) struct KeyHasher(u64);
+
+impl std::hash::Hasher for KeyHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            let w = u64::from_le_bytes(c.try_into().unwrap());
+            self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut buf = [0u8; 8];
+            buf[..rest.len()].copy_from_slice(rest);
+            let w = u64::from_le_bytes(buf);
+            self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        }
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        let x = self.0 ^ (self.0 >> 32);
+        let x = x.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        x ^ (x >> 29)
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct KeyHashBuild;
+
+impl std::hash::BuildHasher for KeyHashBuild {
+    type Hasher = KeyHasher;
+    #[inline]
+    fn build_hasher(&self) -> KeyHasher {
+        KeyHasher::default()
+    }
 }
 
 /// Does `rowid` have index entries still in a sorted-batch buffer?
@@ -27581,12 +27623,13 @@ fn exec_insert_one_row(
                     if index_key_has_null(&st.idx, table, full_row) {
                         continue;
                     }
-                    let key_bytes = st.encode_key(full_row)?.to_vec();
+                    st.encode_key(full_row)?;
+                    let key_bytes: &[u8] = &st.key_buf;
                     let mut ibt = Btree::new(ctx.pager, st.root, true);
-                    let (hit, leaf) = ibt.index_first_with_prefix(&key_bytes)?;
+                    let (hit, leaf) = ibt.index_first_with_prefix(key_bytes)?;
                     // A buffered unique index: this statement's earlier
                     // rows hold keys the tree does not show yet.
-                    let hit = hit.or_else(|| st.pending.as_ref()?.get(&key_bytes).copied());
+                    let hit = hit.or_else(|| st.pending.as_ref()?.get(key_bytes).copied());
                     let Some(existing_rowid) = hit else {
                         // No conflict: the entry's insert lands in the leaf
                         // this probe just descended to.
@@ -28711,23 +28754,24 @@ pub(crate) fn encode_index_key(
     table: &Table,
     row: &[Value],
 ) -> Result<Vec<u8>> {
-    let mut key_bytes = Vec::new();
+    let mut key_bytes = Vec::with_capacity(16);
     for col in &index.columns {
         // Expression index key: evaluate per row (SQLite 3.9+). The
         // expression references columns by bare name; no params. A key
         // that RAISES fails the write, as in SQLite (it used to be stored
         // as a NULL key).
-        let v = if let Some(e) = &col.expr {
+        let v: std::borrow::Cow<'_, Value> = if let Some(e) = &col.expr {
             let named: HashMap<String, Value> = HashMap::new();
-            eval_row(e, row, &table.col_names, &[], &named)?
-        } else if let Some(pos) = table.find_column(&col.name) {
-            row.get(pos).cloned().unwrap_or(Value::Null)
+            std::borrow::Cow::Owned(eval_row(e, row, &table.col_names, &[], &named)?)
+        } else if let Some(v) = table.find_column(&col.name).and_then(|pos| row.get(pos)) {
+            std::borrow::Cow::Borrowed(v)
         } else {
-            Value::Null
+            std::borrow::Cow::Owned(Value::Null)
         };
         // Collated index: fold TEXT keys through the column's
         // collation so probe keys and stored keys agree.
-        crate::plugin::collation_fold_key(&col.collation, &v).encode_order_key_into(&mut key_bytes);
+        crate::plugin::collation_fold_key_ref(&col.collation, &v)
+            .encode_order_key_into(&mut key_bytes);
     }
     Ok(key_bytes)
 }
@@ -28888,8 +28932,11 @@ pub(crate) fn simulate_update_unique(
     }
     // New keys claimed by PROCESSED write-set rows, per index (their old
     // entries are vacated; their new entries are live).
-    let mut pending_new: Vec<std::collections::HashMap<Vec<u8>, i64>> =
-        vec![std::collections::HashMap::with_capacity(write_set.len()); unique_indexes.len()];
+    let mut pending_new: Vec<std::collections::HashMap<Vec<u8>, i64, KeyHashBuild>> =
+        vec![
+            std::collections::HashMap::with_capacity_and_hasher(write_set.len(), KeyHashBuild);
+            unique_indexes.len()
+        ];
     let mut probe: Vec<i64> = Vec::new();
     for pos in 0..write_set.len() {
         let rowid = write_set[pos].0;
@@ -29731,7 +29778,7 @@ pub(crate) fn arm_insert_index_bufs(
                 }
                 None => st.op_buf = Some((Vec::new(), Vec::new())),
             }
-            st.pending = st.idx.unique.then(std::collections::HashMap::new);
+            st.pending = st.idx.unique.then(std::collections::HashMap::default);
             // Only REPLACE deletes ask which rows are buffered.
             st.stmt_rows = (first && replace_all).then(std::collections::HashSet::new);
             first = false;
